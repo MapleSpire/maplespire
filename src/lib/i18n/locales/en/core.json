@@ -1,0 +1,50 @@
+{
+  "common": {
+    "cancel": "Cancel",
+    "back": "Back",
+    "save": "Save",
+    "close": "Close",
+    "delete": "Delete",
+    "loading": "Loading…",
+    "technologyFilter": {
+      "searchLabel": "Search the technology catalog",
+      "searchPlaceholder": "Search technologies",
+      "selected": "Selected",
+      "catalogOffline": "Offline catalog cache",
+      "noOrganization": "Select an organization to filter by technology.",
+      "loading": "Loading technologies…",
+      "unavailable": "Technology catalog unavailable.",
+      "noResults": "No selectable technology found.",
+      "shortQuery": "Type at least 3 characters, or press Enter to search a short name.",
+      "resultsLimited": "First {{count}} results shown. Refine your search to find more.",
+      "moreSelected": "{{count}} more selected"
+    }
+  },
+  "language": {
+    "label": "Language",
+    "english": "English",
+    "french": "Français",
+    "switchTo": "Change language"
+  },
+  "appearance": {
+    "label": "Appearance",
+    "light": "Light",
+    "dark": "Dark",
+    "system": "System"
+  },
+  "account": {
+    "signIn": "Sign in",
+    "signInSubtitle": "Access your organizations",
+    "signInTooltip": "Sign in",
+    "signOut": "Sign out",
+    "settings": "Account settings",
+    "organizations": "Organizations",
+    "newOrg": "New organization",
+    "orgAdmin": "Organization admin",
+    "platformAdmin": "Platform admin",
+    "platformAdminBadge": "Platform admin",
+    "terms": "Terms of Use",
+    "privacy": "Privacy Statement",
+    "switching": "Switching…"
+  }
+}

@@ -1,0 +1,69 @@
+{
+  "shop": {
+    "communityCard": {
+      "renderingPreview": "Génération de l'aperçu…",
+      "previewUnavailable": "Aperçu indisponible",
+      "badge": "Communauté",
+      "update": "Mettre à jour",
+      "reportTitle": "Signaler ce thème",
+      "byAuthor": "par {{author}}",
+      "theCommunity": "la communauté"
+    },
+    "communityGallery": {
+      "title": "Galerie",
+      "publishSample": "Publier l'exemple",
+      "createTheme": "Créer un thème",
+      "publishedSample": "« Blueprint » a été publié dans la galerie.",
+      "confirmReport": "Signaler « {{name}} » pour modération ?",
+      "reportedNotice": "« {{name}} » a été signalé. Merci de votre vigilance.",
+      "loadingGallery": "Chargement de la galerie…",
+      "serverOffline": "Le serveur de la galerie est hors ligne.",
+      "startItWith": "Démarrez-le avec",
+      "noThemesYet": "Aucun thème publié pour l'instant — essayez « Publier l'exemple ».",
+      "install": "Installer",
+      "installWithPrice": "Installer · {{price}}",
+      "needsNewerApp": "Nécessite une version plus récente",
+      "updateToVersion": "Mettre à jour vers la v{{version}}",
+      "installed": "Installé",
+      "needCurrency": "Il vous manque {{price}} V-Bux"
+    },
+    "modal": {
+      "title": "Boutique de thèmes",
+      "subtitle": "De nouveaux skins arrivent tous les 2 jours",
+      "addCurrencyTitle": "Ajouter 1000 V-Bux",
+      "addCurrencyShort": "+1k",
+      "tabShop": "Boutique",
+      "tabCommunity": "Communauté ({{count}})",
+      "tabCollection": "Collection ({{count}})",
+      "featured": "En vedette",
+      "daily": "Quotidien",
+      "yourCommunityThemes": "Vos thèmes communautaires",
+      "noCommunityThemesYet": "Aucun thème installé pour l'instant — parcourez la galerie ci-dessous. Les thèmes communautaires s'exécutent entièrement en bac à sable.",
+      "equipped": "Équipé",
+      "equip": "Équiper",
+      "yourSkins": "Vos skins",
+      "noSkinsYet": "Aucun skin dans votre collection pour l'instant.",
+      "visitShopToBuy": "Rendez-vous dans la boutique pour en acheter."
+    },
+    "skinCard": {
+      "equipped": "Équipé",
+      "equip": "Équiper",
+      "purchased": "Acheté",
+      "priceVBux": "{{price}} V-Bux"
+    },
+    "themeEditor": {
+      "title": "Créer un thème",
+      "subtitle": "Exécution en bac à sable. Modifiez le code et observez l'aperçu se mettre à jour.",
+      "name": "Nom",
+      "author": "Auteur",
+      "priceVBux": "Prix (V-Bux)",
+      "backdrop": "Arrière-plan",
+      "livePreview": "Aperçu en direct",
+      "previewAlt": "aperçu",
+      "compiling": "Compilation…",
+      "publishesAs": "Publié sous l'identifiant",
+      "see": "Voir",
+      "publishToGallery": "Publier dans la galerie"
+    }
+  }
+}

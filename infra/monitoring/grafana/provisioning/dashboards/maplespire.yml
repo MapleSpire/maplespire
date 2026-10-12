@@ -1,0 +1,28 @@
+# Dashboards come from files, never from the Grafana database.
+#
+# `allowUiUpdates: false` means an operator who edits a panel in the browser is
+# editing something the next container restart discards. That is the intended
+# trade -- the dashboard is reviewed like code -- and it is also stated in the
+# maplespire-sponsor-kit repository (docs/production-stack/docker-compose.md).
+
+apiVersion: 1
+
+providers:
+  - name: maplespire
+    orgId: 1
+    folder: MapleSpire
+    type: file
+    disableDeletion: false
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      # Deliberately NOT under /var/lib/grafana: that path is the `grafana_data`
+      # volume, and a bind mount nested inside a named volume works only because
+      # Docker happens to order mounts by depth. /etc/grafana is plain image
+      # filesystem, so the two provisioning mounts are independent siblings.
+      #
+      # scripts/maplespire-compose.test.mjs asserts this path and the compose
+      # mount target are the same string: they are in different files, and a
+      # divergence produces an EMPTY Grafana with no error anywhere.
+      path: /etc/grafana/dashboards
+      foldersFromFilesStructure: false

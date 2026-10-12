@@ -1,0 +1,35 @@
+# Grafana reads Prometheus, and nothing else. There is no second source here on
+# purpose: a panel whose data comes from somewhere the alert rules cannot see is
+# a panel that can disagree with the alerting and be right.
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    # PINNED, and the dashboard JSON references this exact string.
+    #
+    # Grafana mints a random UID when one is not given. A dashboard whose panels
+    # point at a UID that no longer exists renders every panel as "Datasource
+    # not found" -- which reads as a broken dashboard rather than as a broken
+    # deployment, and would be discovered by whoever next opened it. That is why
+    # scripts/monitoring.test.mjs asserts this string and the dashboard's agree.
+    uid: maplespire-prometheus
+    type: prometheus
+    access: proxy
+    # The compose service name. Reachable because prometheus listens on
+    # 0.0.0.0 inside its container -- see the comment on its `command:` block
+    # in compose.maplespire.yml.
+    url: http://prometheus:9090
+    isDefault: true
+    # The file is the source of truth. An edit made in the UI survives until the
+    # next restart and then vanishes, which is what we want for something kept
+    # in version control -- but it must not be a surprise, so it is written down
+    # here and in the maplespire-sponsor-kit repository
+    # (docs/production-stack/docker-compose.md).
+    editable: false
+    jsonData:
+      # Must be >= prometheus.yml's scrape_interval (30s). Grafana uses it as
+      # the minimum step, and a step finer than the data draws a graph full of
+      # gaps -- which looks exactly like an outage and is not one.
+      timeInterval: 30s
+      httpMethod: POST

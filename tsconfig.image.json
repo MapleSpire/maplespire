@@ -1,0 +1,43 @@
+{
+  /* THE PRODUCTION IMAGE BUILD, and the one thing it may not typecheck.
+   *
+   * `docker/nginx/Dockerfile` builds `dist/` from a context that deliberately
+   * EXCLUDES `server/` — `.dockerignore` measures the saving at ~584 MB of
+   * node_modules per build. But `tsconfig.app.json` includes all of `src`,
+   * test files and all, and the conformance tests in `src/lib/automerge/`
+   * import the SERVER's copy of a shared module on purpose so that a divergence
+   * fails `tsc` instead of drifting silently (a comment claiming a gate exists
+   * is worse than no comment).
+   *
+   * COUNTS DROPPED 2026-09-04, not recounted. This said "277 test files, and
+   * two of those import"; on the merge day it was 285 and THREE
+   * (`workspaceBinding.conformance.test.ts` was the third, and the sentence had
+   * not moved). A number nobody recomputes goes stale silently, and neither
+   * number was load-bearing: `src/webImageBuild.test.ts` derives both sets by
+   * walking `src`, so the set is measured on every run rather than transcribed
+   * here.
+   *
+   * Those two facts are individually right and jointly fatal: the image build
+   * failed `TS2307: Cannot find module '../../../server/src/...'` from the day
+   * the conformance suite landed (2026-08-20) until the next deploy tried
+   * (2026-08-24) — four days in which every gate the repository runs was green,
+   * because CI runs `npm run build` at the repository root, where `server/`
+   * exists.
+   *
+   * The resolution is NOT to weaken the gate and NOT to drag the server's
+   * dependency graph into the web image. A test file is never shipped in
+   * `dist/`, so typechecking it is not this build's job; it is `npm run
+   * build`'s, which still does it in CI and locally against the whole tree.
+   * This config is that split, and nothing else — `src/webImageBuild.test.ts`
+   * asserts it differs from `tsconfig.app.json` by the exclusion alone, so a
+   * compiler option added there cannot quietly stop applying to the artifact
+   * that actually reaches users.
+   */
+  "extends": "./tsconfig.app.json",
+  "compilerOptions": {
+    /* Its own, so a local run cannot hand this config the app config's
+     * incremental state or the other way round. */
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.image.tsbuildinfo"
+  },
+  "exclude": ["src/**/*.test.ts", "src/**/*.test.tsx"]
+}

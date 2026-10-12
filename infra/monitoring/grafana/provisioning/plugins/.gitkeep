@@ -1,0 +1,10 @@
+# Deliberately empty, and deliberately COMMITTED.
+#
+# Mounting ./provisioning over /etc/grafana/provisioning replaces the whole
+# directory, so the image's own empty plugins/ folder disappears and Grafana logs
+# at level=error on every single start:
+#   "can't read plugins provisioning files from directory ... no such file or
+#    directory"
+# Nothing is broken. But an error line that is always there and always fine is
+# how a log stops being read, which is the same disease as an alert nobody
+# receives -- and this stack has already paid for that one (#56).

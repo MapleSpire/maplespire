@@ -1,0 +1,55 @@
+{
+  "shareDialog": {
+    "header": {
+      "ariaLabel": "Share this view",
+      "title": "Share this view",
+      "manageSubtitle": "Turn individual links on or off",
+      "exportSubtitle": "Download your model data as a file",
+      "shareSubtitle": "Interactive read-only links",
+      "manageSharing": "Manage sharing",
+      "closeShare": "Close share"
+    },
+    "tabs": {
+      "share": "Share",
+      "export": "Export"
+    },
+    "mainView": {
+      "enableShareLink": "Enable share link ({{version}})",
+      "readOnly": "Read only",
+      "limitToThisDiagram": "Limit to this diagram",
+      "limitToThisDiagramHelp": "On: share only this diagram. Off: share the whole landscape — viewers can switch between diagrams.",
+      "allow3d": "Allow 3D view",
+      "allow3dHelp": "On: viewers can switch between the flat canvas and the 3D board (same read-only data, different perspective). Off: the link stays strictly 2D.",
+      "updatingToCurrentVersion": "Updating to the current version…",
+      "alwaysReflectsCurrentVersion": "Always reflects the current version.",
+      "pinnedTo": "Pinned to “{{label}}” — this snapshot won’t change.",
+      "largeShareWarning": "This share is large ({{size}} MB) and may load slowly — consider limiting it to this diagram.",
+      "versionLinkOff": "This version’s link is off. Turn it on to share it.",
+      "openDiagramToCreate": "Open a diagram to create a share link.",
+      "openDiagramToShare": "Open a diagram to share it.",
+      "viewOnlyNote": "You have view-only access to this workspace, so you can't create or change share links here.",
+      "somethingWentWrong": "Something went wrong",
+      "currentVersionLower": "current version",
+      "thisVersion": "this version"
+    },
+    "audience": {
+      "label": "Who can open this link",
+      "public": "Anyone",
+      "org": "My organization",
+      "domain": "Email domain",
+      "authNote": "Restricted links require the visitor to be signed in (enforced when authentication is on)."
+    },
+    "linkRow": {
+      "copied": "Copied!",
+      "copyLink": "Copy link"
+    },
+    "versionPicker": {
+      "versionLabel": "Version",
+      "currentVersion": "Current version",
+      "pinnedVersion": "Pinned version",
+      "alwaysLatest": "(always latest)",
+      "versionNamePlaceholder": "Version name",
+      "saveCurrentAsVersion": "Save current as a version"
+    }
+  }
+}

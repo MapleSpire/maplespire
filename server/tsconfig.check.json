@@ -1,0 +1,60 @@
+{
+  "//": [
+    "Typecheck-only view of server/, covering what `tsconfig.json` cannot.",
+    "",
+    "`tsconfig.json` is the BUILD config: `rootDir: ./src` and `include: [src/**/*]`,",
+    "so `scripts/**` and `qa/**` are compiled by nothing and checked by nothing.",
+    "That is not theoretical. `qa/eviction-check.mts` called",
+    "`startIdleEviction(repo, root.url, 200, 80)` against a five-parameter",
+    "signature, binding the residency to `200` and leaving `sweepMs` at its 60 s",
+    "default, so no sweep could occur inside the 1 s the check waits: it reported",
+    "FAIL on every run and nothing said so. Two scripts called",
+    "`synchronizer.removeDocument`, which does not exist in the installed",
+    "automerge-repo, behind an `as unknown as` cast.",
+    "",
+    "Do NOT widen `tsconfig.json`'s own `include` instead: its `rootDir` is `./src`,",
+    "so anything outside breaks `npm run build`. Hence a second, emit-less config",
+    "with a wider root.",
+    "",
+    "Two scripts are excluded, and the reason is structural rather than a waiver:",
+    "they import CLIENT source across the package boundary (`../../src/lib/...`)",
+    "with TypeScript extensions, which only `tsx` resolves. Checking them here",
+    "would pull the browser module graph into a NodeNext program it was never",
+    "written for. They stay uncovered; that is a smaller hole than the one this",
+    "file closes, and it is named here rather than left to be discovered.",
+    "",
+    "`exclude` REPLACES the parent's, it does not merge with it, so",
+    "`src/**/*.test.ts` is repeated below on purpose. Dropping it pulls the whole",
+    "test suite into this program and reports 184 pre-existing errors that have",
+    "nothing to do with what this file is for — a checker that reports 184 things",
+    "nobody is going to fix is a checker nobody runs.",
+    "",
+    "Run: cd server && npm run typecheck:all"
+  ],
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": "."
+  },
+  "//files": [
+    "A 'files' entry is NOT filtered by 'exclude', which is the only way to",
+    "typecheck ONE test file while the other 200 stay out.",
+    "",
+    "The seam test carries a '@ts-expect-error' asserting that",
+    "'delete cachedHandles(repo)[id]' is a TS2542. That is the ONLY thing in the",
+    "project that catches deleting from the throwaway Record the getter rebuilds:",
+    "a syntax-only lint rule cannot follow a local alias, and four of the six",
+    "historical sites deleted through one.",
+    "",
+    "vitest transpiles without typechecking, so that assertion was pure decoration",
+    "until this line existed. A mutation run proved it rather than assuming it:",
+    "dropping 'Readonly' from the return type left the whole suite green."
+  ],
+  "files": ["src/automergeRepoCompat.seam.test.ts", "src/syncCells/activityWitness.test.ts", "src/syncCells/placementHysteresis.test.ts", "src/syncCells/placementProposer.test.ts", "src/syncCells/placementProposer.integration.test.ts", "src/syncCells/placementProposerHealth.test.ts", "src/syncCells/placementProposerHealth.integration.test.ts"],
+  "include": ["src/**/*", "scripts/**/*", "qa/**/*"],
+  "exclude": [
+    "src/**/*.test.ts",
+    "scripts/seed-workspace.ts",
+    "scripts/gen-icon-catalog.ts"
+  ]
+}

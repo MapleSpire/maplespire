@@ -1,0 +1,146 @@
+{
+  "modalsCore": {
+    "import": {
+      "title": "Import diagrams",
+      "close": "Close",
+      "sourceLabel": "Import source",
+      "soonBadge": "Soon",
+      "pasteLabel": "Paste {{label}} content",
+      "uploadFile": "Upload file",
+      "loadSample": "Load sample",
+      "hintDiagramsNoneCreated": "No diagrams could be generated from this input. Nothing will be created — check that the workspace defines software systems and structural views.",
+      "diagramsToCreate": "Diagrams to create",
+      "notes": "Notes",
+      "targetLabel": "Import into",
+      "target": {
+        "current": {
+          "label": "Current landscape",
+          "descReadOnly": "View only — you can’t edit this landscape",
+          "desc": "Adds new diagrams and entities here"
+        },
+        "new": {
+          "label": "New landscape",
+          "desc": "Creates a landscape and imports into it"
+        },
+        "draft": {
+          "label": "Review draft",
+          "desc": "Imports into a draft — merge or discard after review"
+        }
+      },
+      "mergePreviewWillCreate": "Will create",
+      "mergePreviewObjects": "objects",
+      "mergePreviewReuseNote": "(reusing {{count}} that already exist — their properties stay untouched)",
+      "mergePreviewConnections": "connections and",
+      "mergePreviewNewDiagram": "new diagram{{plural}}.",
+      "newLandscapeNameLabel": "Landscape name",
+      "newLandscapeNamePlaceholder": "Imported landscape",
+      "draftLandscapeLabel": "Landscape",
+      "draftNameLabel": "Draft name",
+      "draftNamePlaceholder": "Import review",
+      "draftHint": "The import lands in a draft of the chosen landscape. Review every change from the Drafts page, then merge or discard.",
+      "cancel": "Cancel",
+      "parsing": "Parsing…",
+      "parseAndPreview": "Parse & preview",
+      "importing": "Importing…",
+      "createLandscapeAndImport": "Create landscape & import",
+      "createDraftAndImport": "Create draft & import",
+      "importIntoLandscape": "Import into this landscape",
+      "generateDiagrams": "Generate {{count}} diagram{{plural}}",
+      "parsedPrefix": "Parsed",
+      "parsedObjects": "objects,",
+      "parsedConnections": "connections,",
+      "parsedGroups": "groups →",
+      "parsedDiagramsSuffix": "diagrams (L1 {{level1}} · L2 {{level2}} · L3 {{level3}}).",
+      "importedLandscapeName": "Import \"{{name}}\"",
+      "errors": {
+        "workspaceLoadFailed": "The workspace failed to load: {{message}}",
+        "workspaceLoadFailedGeneric": "The workspace failed to load.",
+        "workspaceLoadTimeout": "Timed out waiting for the workspace to load — try again.",
+        "draftCreateFailed": "Could not create the draft"
+      },
+      "typeBadge": {
+        "context": "L1 · Context",
+        "container": "L2 · Container",
+        "component": "L3 · Component"
+      },
+      "mintShortfall": "{{count}} of the imported items could not reserve a synchronization id, so they were created with a temporary one. They are here — keep this tab open for a few seconds, and reload the page if any of them are missing afterwards."
+    },
+    "search": {
+      "placeholder": "Search objects, connections, technologies…",
+      "esc": "ESC",
+      "tooShort": "Type at least {{count}} characters to search",
+      "noResults": "No results found for “{{query}}”",
+      "tryLabel": "Try searching for:",
+      "trySuggestions": ["User", "API service", "React", "PostgreSQL", "Login"],
+      "connectionFallbackLabel": "Connection",
+      "resultCount": "{{count}} result{{plural}}"
+    },
+    "settings": {
+      "title": "Settings",
+      "closeAria": "Close settings",
+      "appearance": {
+        "title": "Appearance",
+        "statusSystem": "System · {{resolved}}",
+        "dark": "Dark",
+        "light": "Light",
+        "darkNow": "Dark now",
+        "lightNow": "Light now",
+        "systemHint": "Match your OS · {{resolvedHint}}",
+        "footnote": "Themed diagrams automatically switch to their matching light or dark variant to stay legible against the canvas.",
+        "options": {
+          "light": { "label": "Light", "description": "Bright and crisp" },
+          "dark": { "label": "Dark", "description": "Easy on the eyes" },
+          "system": { "label": "System", "description": "Match your OS" }
+        }
+      },
+      "diagrams": {
+        "title": "Diagrams",
+        "body": "Connection animation settings are now configured per-diagram. Open the Diagram Settings panel in the right sidebar to customize animations for the current diagram."
+      },
+      "offline": {
+        "title": "Offline availability",
+        "versionTitle": "This landscape version",
+        "description": "Keep the complete indexed model in this browser. Downloads are paged, cancellable, and never include another organization or version.",
+        "states": {
+          "complete": "Available offline",
+          "partial": "Recent items only",
+          "onlineOnly": "Online only",
+          "downloading": "Downloading",
+          "paused": "Download paused",
+          "interrupted": "Resume available",
+          "quotaBlocked": "Paused — storage full",
+          "failed": "Download needs attention"
+        },
+        "cachedSize": "{{size}} cached · {{objects}} objects · {{connections}} connections",
+        "makeAvailable": "Make available offline",
+        "refresh": "Refresh offline copy",
+        "pause": "Pause",
+        "resume": "Resume download",
+        "abandon": "Abandon download",
+        "remove": "Remove offline copy",
+        "persistenceWarning": "The browser did not grant persistent storage. This copy works offline, but the browser may evict it under storage pressure.",
+        "statusFailed": "Couldn't read this browser's offline status.",
+        "downloadFailed": "The offline copy could not be completed.",
+        "discardFailed": "The incomplete offline download could not be abandoned.",
+        "removeFailed": "The offline copy could not be removed.",
+        "cancelled": "The download was paused at its last durable page.",
+        "busyElsewhere": "Another tab is already downloading this version.",
+        "quotaPaused": "The last complete copy remains available. Free browser storage, then resume from the last durable page.",
+        "insufficientStorage": "This browser cannot safely store the complete version. Required: {{required}}; safe cache budget: {{available}}.",
+        "phases": {
+          "preparing": "Checking quota and preparing",
+          "objects": "Caching objects and search index",
+          "connections": "Caching connections",
+          "diagrams": "Caching diagram compositions",
+          "verifying": "Verifying projection consistency",
+          "complete": "Offline copy ready"
+        }
+      },
+      "ai": {
+        "title": "AI Assist",
+        "loadFailed": "Couldn't reach the server to load the AI settings.",
+        "loading": "Loading…"
+      }
+    }
+  }
+}

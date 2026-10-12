@@ -1,0 +1,103 @@
+{
+  "layoutChrome": {
+    "loading": {
+      "model": "Loading model…"
+    },
+    "appShell": {
+      "showShapesPanel": "Show shapes panel",
+      "showPropertiesPanel": "Show properties panel"
+    },
+    "bottomBar": {
+      "tabs": {
+        "tags": "Tags",
+        "technology": "Technology",
+        "status": "Status",
+        "teams": "Teams"
+      },
+      "colorBy": "Color by {{label}}",
+      "hostnames": "Hostnames {{count}}",
+      "region": "Region {{count}}",
+      "accessibility": "Accessibility {{count}}",
+      "perspectives": "Perspectives",
+      "showPerspectives": "Show perspectives",
+      "collapseToButton": "Collapse to button",
+      "collapseLine": "Collapse to one line",
+      "expand": "Expand perspectives",
+      "systemPerspective": "This perspective uses organization-managed values.",
+      "managed": {
+        "pin": "Pin {{value}}",
+        "unpin": "Unpin {{value}}",
+        "focus": "Focus on {{value}}",
+        "unfocus": "Stop focusing on {{value}}",
+        "hide": "Hide {{value}}",
+        "unhide": "Show {{value}}"
+      },
+      "technology": {
+        "empty": "No technologies are used in this diagram"
+      },
+      "status": {
+        "empty": "No statuses are used in this diagram",
+        "values": {
+          "live": "Live",
+          "draft": "Draft",
+          "down": "Down",
+          "unstable": "Unstable"
+        }
+      },
+      "teams": {
+        "empty": "No owners are assigned in this diagram"
+      },
+      "tags": {
+        "loading": "Loading Tag groups…",
+        "loadFailed": "Tag catalog unavailable.",
+        "createFailed": "The Tag catalog change could not be saved.",
+        "noGroups": "No Tags in this diagram",
+        "chooseGroup": "Choose a Tag group",
+        "noValues": "No values in this diagram",
+        "newGroup": "New group",
+        "newTag": "New tag",
+        "managed": "Managed by admin",
+        "more": "More",
+        "pin": "Pin {{value}}",
+        "unpin": "Unpin {{value}}",
+        "focus": "Focus on {{value}}",
+        "unfocus": "Stop focusing on {{value}}",
+        "hide": "Hide {{value}}",
+        "unhide": "Show {{value}}",
+        "focusActive": "Focus active",
+        "clearFocus": "Clear Tag focus",
+        "hiddenCount": "Hidden {{count}}",
+        "showAllHidden": "Show all hidden Tags",
+        "createGroup": "Create a Tag group",
+        "createTag": "Create a Tag in {{group}}",
+        "groupName": "Group name",
+        "tagName": "Tag name",
+        "color": "Color",
+        "reorderGroup": "Reorder {{value}}",
+        "reorderTag": "Reorder {{value}}",
+        "reorderHint": "Drag, or use Left and Right Arrow keys",
+        "reorderFailed": "Unable to save the new order"
+      },
+      "sync": {
+        "connecting": "Connecting…",
+        "saving": "Saving…",
+        "offline": "Offline",
+        "error": "Sync error",
+        "synced": "Synced",
+        "localFallback": "Local content — server unavailable"
+      },
+      "viewOnly": "View only",
+      "viewOnlyTooltip": "Your role on this landscape is view only — editing is disabled"
+    },
+    "consoleShell": {
+      "backToApp": "Back to app"
+    },
+    "leftSidebar": {
+      "collapsePanel": "Collapse panel",
+      "tabs": {
+        "shapes": "Shapes",
+        "flows": "Flows"
+      }
+    }
+  }
+}

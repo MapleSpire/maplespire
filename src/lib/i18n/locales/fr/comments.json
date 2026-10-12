@@ -1,0 +1,56 @@
+{
+  "comments": {
+    "type": {
+      "question": "Question",
+      "inaccuracy": "Inexactitude",
+      "idea": "Idée"
+    },
+    "toolbar": {
+      "aiAssist": "Assistant IA",
+      "movePan": "Déplacer / naviguer",
+      "autoLayout": "Disposition automatique",
+      "clickToAddComment": "Cliquez sur le canevas pour ajouter un commentaire",
+      "addComment": "Ajouter un commentaire",
+      "diagramHistory": "Historique du diagramme",
+      "addShapes": "Ajouter des formes"
+    },
+    "composer": {
+      "askQuestion": "Poser une question",
+      "markAsInaccurate": "Signaler une inexactitude",
+      "addIdea": "Ajouter une idée",
+      "placeholder": "Saisissez votre commentaire…"
+    },
+    "detail": {
+      "pin": "Épingler",
+      "unpin": "Désépingler",
+      "resolve": "Résoudre",
+      "unresolve": "Annuler la résolution",
+      "edit": "Modifier",
+      "delete": "Supprimer",
+      "replyPlaceholder": "Répondre…"
+    },
+    "dropdown": {
+      "title": "Commentaires",
+      "tabYours": "Vos commentaires",
+      "tabMentions": "Mentions",
+      "tabAll": "Tous",
+      "empty": "Aucun commentaire pour le moment",
+      "resolvedComments": "Commentaires résolus ({{count}})",
+      "viewAll": "Voir tous les commentaires",
+      "noText": "Aucun texte"
+    },
+    "panel": {
+      "filterAll": "Tous",
+      "filterUnresolved": "Non résolus",
+      "filterResolved": "Résolus",
+      "emptyAll": "Aucun commentaire pour le moment",
+      "emptyUnresolved": "Aucun commentaire non résolu",
+      "emptyResolved": "Aucun commentaire résolu",
+      "pinned": "Épinglé",
+      "justNow": "à l'instant",
+      "minutesAgo": "il y a {{count}} min",
+      "hoursAgo": "il y a {{count}} h",
+      "daysAgo": "il y a {{count}} j"
+    }
+  }
+}

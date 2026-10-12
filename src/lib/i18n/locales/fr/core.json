@@ -1,0 +1,50 @@
+{
+  "common": {
+    "cancel": "Annuler",
+    "back": "Précédent",
+    "save": "Enregistrer",
+    "close": "Fermer",
+    "delete": "Supprimer",
+    "loading": "Chargement…",
+    "technologyFilter": {
+      "searchLabel": "Rechercher dans le catalogue de technologies",
+      "searchPlaceholder": "Rechercher des technologies",
+      "selected": "Sélectionnée",
+      "catalogOffline": "Catalogue hors ligne en cache",
+      "noOrganization": "Sélectionnez une organisation pour filtrer par technologie.",
+      "loading": "Chargement des technologies…",
+      "unavailable": "Catalogue de technologies indisponible.",
+      "noResults": "Aucune technologie sélectionnable trouvée.",
+      "shortQuery": "Saisissez au moins 3 caractères, ou appuyez sur Entrée pour rechercher un nom court.",
+      "resultsLimited": "Les {{count}} premiers résultats sont affichés. Affinez votre recherche pour en trouver davantage.",
+      "moreSelected": "{{count}} autre(s) sélectionnée(s)"
+    }
+  },
+  "language": {
+    "label": "Langue",
+    "english": "English",
+    "french": "Français",
+    "switchTo": "Changer de langue"
+  },
+  "appearance": {
+    "label": "Apparence",
+    "light": "Clair",
+    "dark": "Sombre",
+    "system": "Système"
+  },
+  "account": {
+    "signIn": "Se connecter",
+    "signInSubtitle": "Accéder à vos organisations",
+    "signInTooltip": "Se connecter",
+    "signOut": "Se déconnecter",
+    "settings": "Paramètres du compte",
+    "organizations": "Organisations",
+    "newOrg": "Nouvelle organisation",
+    "orgAdmin": "Administration de l'organisation",
+    "platformAdmin": "Administration de la plateforme",
+    "platformAdminBadge": "Admin plateforme",
+    "terms": "Conditions d’utilisation",
+    "privacy": "Déclaration de confidentialité",
+    "switching": "Changement…"
+  }
+}

@@ -1,0 +1,69 @@
+{
+  "shop": {
+    "communityCard": {
+      "renderingPreview": "Rendering preview…",
+      "previewUnavailable": "Preview unavailable",
+      "badge": "Community",
+      "update": "Update",
+      "reportTitle": "Report this theme",
+      "byAuthor": "by {{author}}",
+      "theCommunity": "the community"
+    },
+    "communityGallery": {
+      "title": "Gallery",
+      "publishSample": "Publish sample",
+      "createTheme": "Create theme",
+      "publishedSample": "Published \"Blueprint\" to the gallery.",
+      "confirmReport": "Report \"{{name}}\" for moderation?",
+      "reportedNotice": "Reported \"{{name}}\". Thanks for flagging it.",
+      "loadingGallery": "Loading gallery…",
+      "serverOffline": "Gallery server is offline.",
+      "startItWith": "Start it with",
+      "noThemesYet": "No themes published yet — try “Publish sample”.",
+      "install": "Install",
+      "installWithPrice": "Install · {{price}}",
+      "needsNewerApp": "Needs a newer app",
+      "updateToVersion": "Update to v{{version}}",
+      "installed": "Installed",
+      "needCurrency": "Need {{price}} V-Bux"
+    },
+    "modal": {
+      "title": "Theme shop",
+      "subtitle": "New skins drop every 2 days",
+      "addCurrencyTitle": "Add 1000 V-Bux",
+      "addCurrencyShort": "+1k",
+      "tabShop": "Shop",
+      "tabCommunity": "Community ({{count}})",
+      "tabCollection": "Collection ({{count}})",
+      "featured": "Featured",
+      "daily": "Daily",
+      "yourCommunityThemes": "Your community themes",
+      "noCommunityThemesYet": "None installed yet — browse the gallery below. Community themes run fully sandboxed.",
+      "equipped": "Equipped",
+      "equip": "Equip",
+      "yourSkins": "Your skins",
+      "noSkinsYet": "No skins in your collection yet.",
+      "visitShopToBuy": "Visit the shop to buy some."
+    },
+    "skinCard": {
+      "equipped": "Equipped",
+      "equip": "Equip",
+      "purchased": "Purchased",
+      "priceVBux": "{{price}} V-Bux"
+    },
+    "themeEditor": {
+      "title": "Create a theme",
+      "subtitle": "Runs sandboxed. Edit the code and watch the preview update.",
+      "name": "Name",
+      "author": "Author",
+      "priceVBux": "Price (V-Bux)",
+      "backdrop": "Backdrop",
+      "livePreview": "Live preview",
+      "previewAlt": "preview",
+      "compiling": "Compiling…",
+      "publishesAs": "Publishes as",
+      "see": "See",
+      "publishToGallery": "Publish to gallery"
+    }
+  }
+}

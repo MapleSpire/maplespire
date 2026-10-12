@@ -1,0 +1,17 @@
+{
+  "canvasEngine": {
+    "copySize": "Copy size",
+    "copyStyle": "Copy style",
+    "copyToShapes": "{{label}} → {{n}} shapes",
+    "back": "Back",
+    "view": "View",
+    "shapeTypeBadge": {
+      "actor": "Person",
+      "system": "System",
+      "app": "App",
+      "store": "Data store",
+      "component": "Component"
+    },
+    "copyChainHint": "Hold Shift to keep copying"
+  }
+}

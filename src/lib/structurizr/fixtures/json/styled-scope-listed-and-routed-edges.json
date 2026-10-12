@@ -1,0 +1,109 @@
+{
+  "id" : 0,
+  "name" : "Styled workspace whose container view lists its own scope and routes its edges",
+  "description" : "Three cases the other fixtures do not carry: (1) the container view lists the software system it is scoped to among its own elements, with a coordinate, the way structurizr-ui writes it once the boundary has been dragged; (2) element and relationship styles carry real colours, strokes, thicknesses and an icon; (3) relationship views carry hand-placed vertices, an explicit routing and a label position.",
+  "model" : {
+    "people" : [ {
+      "id" : "4",
+      "name" : "Operator",
+      "tags" : "Element,Person",
+      "relationships" : [ {
+        "id" : "22",
+        "tags" : "Relationship",
+        "sourceId" : "4",
+        "destinationId" : "2",
+        "description" : "Administers"
+      } ]
+    } ],
+    "softwareSystems" : [ {
+      "id" : "1",
+      "name" : "Ordering",
+      "tags" : "Element,Software System",
+      "containers" : [ {
+        "id" : "2",
+        "name" : "Web",
+        "technology" : "TypeScript",
+        "tags" : "Element,Container",
+        "relationships" : [ {
+          "id" : "20",
+          "tags" : "Relationship,Async",
+          "sourceId" : "2",
+          "destinationId" : "3",
+          "description" : "Publishes orders to",
+          "technology" : "AMQP",
+          "interactionStyle" : "Asynchronous"
+        } ]
+      }, {
+        "id" : "3",
+        "name" : "Order Queue",
+        "technology" : "RabbitMQ",
+        "tags" : "Element,Container,Queue"
+      } ]
+    } ]
+  },
+  "views" : {
+    "containerViews" : [ {
+      "key" : "Containers",
+      "title" : "Ordering — Containers",
+      "softwareSystemId" : "1",
+      "elements" : [ {
+        "id" : "1",
+        "x" : 700,
+        "y" : 600
+      }, {
+        "id" : "4",
+        "x" : 150,
+        "y" : 150
+      }, {
+        "id" : "2",
+        "x" : 900,
+        "y" : 800
+      }, {
+        "id" : "3",
+        "x" : 900,
+        "y" : 1600
+      } ],
+      "relationships" : [ {
+        "id" : "22",
+        "position" : 20
+      }, {
+        "id" : "20",
+        "routing" : "Orthogonal",
+        "position" : 80,
+        "vertices" : [ {
+          "x" : 1500,
+          "y" : 1200
+        }, {
+          "x" : 1100,
+          "y" : 1500
+        } ]
+      } ]
+    } ],
+    "configuration" : {
+      "styles" : {
+        "elements" : [ {
+          "tag" : "Element",
+          "background" : "#438dd5",
+          "color" : "#ffffff",
+          "stroke" : "#2e6295"
+        }, {
+          "tag" : "Person",
+          "shape" : "Person",
+          "background" : "#08427b"
+        }, {
+          "tag" : "Queue",
+          "shape" : "Pipe",
+          "background" : "#ff0000",
+          "color" : "#000000",
+          "icon" : "https://static.structurizr.com/icons/rabbitmq.png"
+        } ],
+        "relationships" : [ {
+          "tag" : "Async",
+          "color" : "#ff0000",
+          "thickness" : 4,
+          "style" : "Dotted"
+        } ]
+      }
+    }
+  }
+}

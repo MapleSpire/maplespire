@@ -1,0 +1,78 @@
+{
+  "canvasViewChrome": {
+    "bootFailed": {
+      "title": "Ce paysage n’a pas fini de charger",
+      "body": "L’espace de travail se synchronisait encore quand le chargement a abandonné. Rien n’est perdu — réessayez, ou rechargez la page.",
+      "action": "Réessayer"
+    },
+    "diagramNotFound": {
+      "title": "Diagramme introuvable",
+      "body": "Ce diagramme n’existe pas — il a peut-être été supprimé, ou ce lien provient d’une version antérieure de l’espace de travail.",
+      "action": "Aller à un diagramme"
+    },
+    "noDiagrams": {
+      "title": "Aucun diagramme pour l’instant",
+      "body": "Ce paysage ne contient aucun diagramme. Créez-en un pour commencer à placer des formes.",
+      "action": "Créer un diagramme de contexte"
+    },
+    "comment": {
+      "placeHint": "Cliquez sur le canevas pour placer un commentaire"
+    },
+    "zoom": {
+      "zoomOut": "Zoom arrière",
+      "zoomToFit": "Ajuster le zoom",
+      "zoomIn": "Zoom avant",
+      "hideGrid": "Masquer la grille",
+      "showGrid": "Afficher la grille",
+      "fitToScreen": "Ajuster à l’écran"
+    },
+    "camera": {
+      "label": "Style 3D",
+      "preset": {
+        "tilt": "Incliné",
+        "iso": "Iso"
+      },
+      "presetTitle": "Perspective {{name}}",
+      "reset": "Réinitialiser la vue (retour à l’angle du préréglage)",
+      "orbitHint": "Alt+glisser pour orbiter",
+      "align": "Aligner sur la 2D",
+      "alignTitle": "Aligner la 3D sur les emplacements 2D — supprime les ajustements 3D propres à ce diagramme",
+      "alignConfirm": "Réinitialiser les emplacements 3D de ce diagramme ?\n\nTous les ajustements propres à la 3D (positions, routage des connexions) seront supprimés et la vue 3D reflétera à nouveau la disposition 2D. La disposition 2D n’est pas affectée."
+    },
+    "toolMode": {
+      "connection": "Mode connexion — Cliquez sur deux objets pour les relier",
+      "pan": "Mode déplacement"
+    },
+    "contextMenu": {
+      "connectionHeader": "Connexion",
+      "unlockFromAnchors": "Déverrouiller des points d’ancrage",
+      "lockToAnchors": "Verrouiller aux points d’ancrage",
+      "copySize": "Copier la taille",
+      "copyStyle": "Copier le style",
+      "groups": "Groupes",
+      "removeFrom": "Retirer de",
+      "addTo": "Ajouter à",
+      "noGroupsAvailable": "Aucun groupe disponible",
+      "shapesSelected": "{{count}} forme sélectionnée",
+      "shapesSelected_other": "{{count}} formes sélectionnées",
+      "removeFromDiagram": "Retirer de ce diagramme",
+      "deleteFromModel": "Supprimer du modèle",
+      "removeGroupFromDiagram": "Retirer le groupe de ce diagramme",
+      "deleteGroupFromModel": "Supprimer le groupe du modèle",
+      "removeShapesFromDiagram": "Retirer {{count}} forme de ce diagramme",
+      "removeShapesFromDiagram_other": "Retirer {{count}} formes de ce diagramme",
+      "deleteShapesFromModel": "Supprimer {{count}} forme du modèle",
+      "deleteShapesFromModel_other": "Supprimer {{count}} formes du modèle"
+    },
+    "inlineEdit": {
+      "object": {
+        "title": "Modifier le nom de la forme",
+        "description": "Modifier la description de la forme"
+      },
+      "group": {
+        "title": "Modifier le nom du groupe",
+        "description": "Modifier la description du groupe"
+      }
+    }
+  }
+}

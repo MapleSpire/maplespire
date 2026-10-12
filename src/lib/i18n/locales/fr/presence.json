@@ -1,0 +1,9 @@
+{
+  "presence": {
+    "connectedUsers": "Utilisateurs connectés",
+    "connectedUsersWithCount": "{{count}} utilisateur connecté",
+    "connectedUsersWithCount_other": "{{count}} utilisateurs connectés",
+    "you": "Vous",
+    "online": "En ligne"
+  }
+}

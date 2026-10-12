@@ -1,0 +1,375 @@
+{
+  "platform": {
+    "impersonationBanner": {
+      "viewingAs": "Connecté en tant que {{email}} — lecture seule",
+      "thisUser": "cet utilisateur",
+      "exiting": "Sortie en cours…",
+      "exit": "Quitter",
+      "exitFailed": "Impossible de quitter le mode « voir en tant que »"
+    },
+    "shell": {
+      "title": "Plateforme",
+      "subtitle": "Toutes les organisations",
+      "badge": "Plateforme",
+      "footer": "Console d'administration plateforme · opérateur, accès multi-organisation",
+      "loadFailed": "Impossible de charger la console plateforme",
+      "loadingConsole": "Chargement de la console plateforme…",
+      "nav": {
+        "overview": "Vue d'ensemble",
+        "organizations": "Organisations",
+        "users": "Utilisateurs",
+        "technologies": "Technologies",
+        "settings": "Paramètres",
+        "access": "Accès",
+        "audit": "Audit",
+        "accessDebug": "Débogage des accès",
+        "referenceIntegrity": "Intégrité des références"
+      },
+      "forbidden": {
+        "title": "Un accès administrateur plateforme est requis",
+        "description": "Vous êtes connecté, mais vous n'êtes pas administrateur plateforme. Cette console opère sur toutes les organisations — demandez à un administrateur plateforme existant de vous accorder l'accès.",
+        "backToApp": "Retour à l'application"
+      },
+      "errorScreen": {
+        "title": "Impossible de charger la console plateforme",
+        "retry": "Réessayer"
+      }
+    },
+    "overview": {
+      "title": "Vue d'ensemble",
+      "subtitle": "Compteurs multi-organisation et activité en direct.",
+      "loadFailed": "Impossible de charger la vue d'ensemble",
+      "loadImpersonationsFailed": "Impossible de charger les sessions « voir en tant que »",
+      "stats": {
+        "organizations": "Organisations",
+        "users": "Utilisateurs",
+        "landscapes": "Paysages",
+        "versions": "Versions",
+        "liveConnections": "Connexions actives"
+      },
+      "activeImpersonations": {
+        "title": "Sessions « voir en tant que » actives",
+        "subtitle": "Chaque session « voir en tant que » en cours, toutes organisations confondues.",
+        "viewingAs": "vu en tant que",
+        "started": "démarrée {{time}}",
+        "forceStop": "Forcer l'arrêt",
+        "forceStopHint": "Forcer l'arrêt met fin à l'enregistrement de la session ; le cookie de session de la cible expire de lui-même (60 min max).",
+        "empty": {
+          "title": "Aucune session « voir en tant que » active",
+          "description": "Les sessions démarrées via Utilisateurs → Se faire passer pour apparaîtront ici."
+        }
+      }
+    },
+    "technologies": {
+      "title": "Technologies",
+      "subtitle": "Gérez le catalogue public et révisez les soumissions des organisations ou de la plateforme avant leur publication.",
+      "governanceBadge": "Gouvernance du catalogue public",
+      "pending": "Révisions en attente",
+      "loadFailed": "Impossible de charger les révisions de technologies",
+      "loadingMore": "Chargement…",
+      "loadMore": "Charger plus",
+      "selectedCount": "{{count}} sélectionnée(s)",
+      "selectLoadedReviews": "Sélectionner les révisions admissibles chargées",
+      "selectReview": "Sélectionner {{name}}",
+      "publishSelected": "Publier la sélection",
+      "clearSelection": "Effacer",
+      "bulkPublishFailed": "{{count}} révisions n’ont pas pu être publiées. Elles restent sélectionnées.",
+      "review": "Réviser",
+      "emptyTitle": "Aucune technologie en attente",
+      "emptyDescription": "Les demandes des organisations apparaîtront ici après leur approbation privée.",
+      "uncategorized": "Sans catégorie",
+      "reviewTitle": "Réviser {{name}}",
+      "noDescription": "Aucune description fournie.",
+      "category": "Catégorie",
+      "role": "Rôle par défaut",
+      "shapes": "Formes recommandées",
+      "publisher": "Éditeur",
+      "lightPreview": "Icône claire",
+      "darkPreview": "Icône sombre",
+      "publishTitle": "Publier comme nouvelle technologie",
+      "publishDescription": "Crée une identité publique approuvée et redirige l’identité privée soumise vers celle-ci.",
+      "publish": "Approuver et publier",
+      "mergeTitle": "Fusionner avec une technologie existante",
+      "mergePlaceholder": "Identifiant de la technologie publique",
+      "merge": "Fusionner la demande",
+      "compareFields": "Comparer les champs",
+      "mergeSameTechnology": "Une technologie ne peut pas être fusionnée avec elle-même.",
+      "mergeComparator": "Fusion champ par champ",
+      "mergeComparatorDescription": "Comparez la proposition {{proposal}} avec la fiche canonique {{public}}. Cette décision crée une nouvelle révision publique auditée.",
+      "mergeAndCreateRevision": "Fusionner et créer la révision",
+      "field": "Champ",
+      "publicValue": "Valeur publique",
+      "proposalValue": "Proposition",
+      "decision": "Décision",
+      "mergeChoices": {
+        "keep_public": "Garder public",
+        "take_proposal": "Prendre la proposition",
+        "edit": "Modifier"
+      },
+      "mergeFields": {
+        "name": "Nom",
+        "description": "Description",
+        "websiteUrl": "Site Web",
+        "documentationUrl": "Documentation",
+        "aliases": "Alias",
+        "category": "Catégorie",
+        "iconLightPath": "Icône claire",
+        "iconDarkPath": "Icône sombre",
+        "recommendedShapeTypes": "Formes recommandées",
+        "defaultRole": "Rôle par défaut"
+      },
+      "feedbackTitle": "Retourner à l’organisation",
+      "reasonPlaceholder": "Expliquez les changements requis ou le rejet…",
+      "requestChanges": "Demander des changements",
+      "reject": "Rejeter",
+      "actionFailed": "Impossible d’appliquer la décision",
+      "catalogTab": "Catalogue public",
+      "reviewsTab": "File de révision",
+      "catalogSearch": "Rechercher dans le catalogue public…",
+      "reviewStatus": "Statut de révision",
+      "allStatuses": "Tous les statuts",
+      "addPublic": "Ajouter une technologie publique",
+      "catalogEmpty": "Aucune technologie publique trouvée",
+      "catalogEmptyDescription": "Essayez une autre recherche ou créez un brouillon public.",
+      "submitReview": "Soumettre à la révision",
+      "awaitingReviewer": "En attente d’un autre administrateur",
+      "newRevision": "Nouvelle révision",
+      "createRevision": "Créer la révision",
+      "createDraft": "Créer le brouillon public",
+      "searchBeforeCreate": "Rechercher dans le catalogue public",
+      "catalogIconHint": "Choisissez les icônes claires et sombres immuables du catalogue partagé.",
+      "iconOrgRequiredTitle": "Un contexte d’organisation est requis pour les téléversements",
+      "iconOrgRequiredDescription": "Sélectionnez un contexte d’organisation pour cette session d’administration de plateforme avant de téléverser les icônes claires et sombres gouvernées.",
+      "aiDescription": "Utilise le nom et tous les champs non vides comme contexte. Les champs vides sont complétés automatiquement; les modifications proposées aux valeurs existantes restent à valider.",
+      "aiResearching": "Recherche en cours…",
+      "aiOrgRequired": "AI Assist nécessite une session d’administration de plateforme associée à une organisation.",
+      "aiNotConfiguredDescription": "Configurez AI Assist pour votre organisation actuelle avant de rechercher les métadonnées d’une technologie publique.",
+      "applyAiImprovements": "Appliquer {{count}} amélioration(s) proposée(s)",
+      "aiImprovementHint": "Les valeurs existantes ne sont jamais remplacées automatiquement. Vérifiez cette action avant d’appliquer les modifications proposées.",
+      "matchesFound": "Correspondances publiques probables",
+      "noMatchesFound": "Aucune correspondance publique probable",
+      "otherReviewerRequired": "Un autre administrateur de plateforme doit prendre cette décision.",
+      "platformPublishDescription": "Approuve cette révision publique et la rend disponible aux organisations.",
+      "columns": {
+        "technology": "Technologie",
+        "organization": "Organisation",
+        "guidance": "Recommandations",
+        "action": "Action"
+      }
+    },
+    "orgs": {
+      "title": "Organisations",
+      "subtitle": "Toutes les organisations de la plateforme.",
+      "createOrg": "Créer une organisation",
+      "searchPlaceholder": "Rechercher par nom ou identifiant…",
+      "loadFailed": "Impossible de charger les organisations",
+      "loadMoreFailed": "Impossible de charger davantage d'organisations",
+      "loadingMore": "Chargement…",
+      "loadMore": "Charger plus",
+      "statusActive": "Active",
+      "statusSuspended": "Suspendue",
+      "suspend": "Suspendre",
+      "unsuspend": "Réactiver",
+      "empty": {
+        "title": "Aucune organisation trouvée",
+        "tryDifferentSearch": "Essayez une autre recherche.",
+        "createFirst": "Créez la première organisation pour commencer."
+      },
+      "columns": {
+        "organization": "Organisation",
+        "status": "Statut",
+        "members": "Membres",
+        "created": "Créée"
+      },
+      "create": {
+        "title": "Créer une organisation",
+        "name": "Nom",
+        "slug": "Identifiant",
+        "slugHint": "Lettres minuscules, chiffres et tirets uniquement — cet identifiant fait partie des URL et ne peut plus être modifié ensuite.",
+        "slugInvalid": "Seuls les lettres minuscules, les chiffres et les tirets simples sont autorisés.",
+        "slugTaken": "Cet identifiant est déjà pris — essayez-en un autre.",
+        "createFailed": "Impossible de créer l'organisation",
+        "creating": "Création…",
+        "submit": "Créer l'organisation"
+      },
+      "suspendModal": {
+        "suspendTitle": "Suspendre l'organisation",
+        "unsuspendTitle": "Réactiver l'organisation",
+        "suspendDescription": "Suspendre <strong>{{name}}</strong> met fin immédiatement à toutes les sessions actives de cette organisation et bloque toute connexion jusqu'à sa réactivation. Les membres verront un message d'organisation suspendue.",
+        "unsuspendDescription": "Ceci rétablit l'accès pour <strong>{{name}}</strong> — les membres pourront de nouveau se connecter.",
+        "suspendFailed": "Impossible de suspendre l'organisation",
+        "unsuspendFailed": "Impossible de réactiver l'organisation"
+      }
+    },
+    "users": {
+      "title": "Utilisateurs",
+      "subtitle": "Tous les comptes utilisateurs de la plateforme, toutes organisations confondues.",
+      "searchPlaceholder": "Rechercher par nom ou e-mail…",
+      "loadFailed": "Impossible de charger les utilisateurs",
+      "loadMoreFailed": "Impossible de charger davantage d'utilisateurs",
+      "loadingMore": "Chargement…",
+      "loadMore": "Charger plus",
+      "startImpersonationFailed": "Impossible de démarrer le mode « voir en tant que »",
+      "platformAdminBadge": "Administrateur plateforme",
+      "statusActive": "actif",
+      "statusDeactivated": "désactivé",
+      "viewAsThisUser": "Voir en tant que cet utilisateur",
+      "starting": "Démarrage…",
+      "impersonate": "Voir en tant que",
+      "deactivate": "Désactiver",
+      "reactivate": "Réactiver",
+      "revokePlatformAdmin": "Révoquer l'accès administrateur plateforme",
+      "grantPlatformAdmin": "Accorder l'accès administrateur plateforme",
+      "empty": {
+        "title": "Aucun utilisateur trouvé",
+        "tryDifferentSearch": "Essayez une autre recherche.",
+        "willAppear": "Les utilisateurs apparaîtront ici une fois connectés."
+      },
+      "columns": {
+        "user": "Utilisateur",
+        "status": "Statut",
+        "organizations": "Organisations"
+      },
+      "deactivateModal": {
+        "deactivateTitle": "Désactiver l'utilisateur",
+        "reactivateTitle": "Réactiver l'utilisateur",
+        "deactivateDescription": "Désactiver <strong>{{email}}</strong> le déconnecte partout et bloque toute nouvelle connexion, dans toutes les organisations dont il ou elle fait partie.",
+        "reactivateDescription": "Ceci rétablit l'accès de connexion pour <strong>{{email}}</strong>.",
+        "deactivateFailed": "Impossible de désactiver l'utilisateur",
+        "reactivateFailed": "Impossible de réactiver l'utilisateur"
+      },
+      "adminModal": {
+        "grantTitle": "Accorder l'accès administrateur plateforme",
+        "revokeTitle": "Révoquer l'accès administrateur plateforme",
+        "grantDescription": "<strong>{{email}}</strong> obtiendra un accès opérateur complet — toutes les organisations, tous les utilisateurs, le mode « voir en tant que » et les paramètres de la plateforme.",
+        "revokeDescription": "<strong>{{email}}</strong> perdra son accès opérateur. Ses appartenances aux organisations restent inchangées.",
+        "grant": "Accorder",
+        "revoke": "Révoquer",
+        "grantFailed": "Impossible d'accorder l'accès administrateur plateforme",
+        "revokeFailed": "Impossible de révoquer l'accès administrateur plateforme",
+        "lastPlatformAdmin": "C'est le dernier administrateur plateforme — accordez cet accès à quelqu'un d'autre avant de révoquer celui-ci."
+      }
+    },
+    "access": {
+      "title": "Accès",
+      "subtitle": "La matrice de droits de l'admin d'organisation, filtrée par organisation — choisissez une organisation pour voir et modifier ses accès.",
+      "loadFailed": "Impossible de charger les organisations",
+      "organization": "Organisation",
+      "selectOrganization": "Sélectionner une organisation…",
+      "suspended": "suspendue",
+      "empty": {
+        "title": "Aucune organisation",
+        "description": "Créez-en une dans Organisations d'abord."
+      }
+    },
+    "settings": {
+      "title": "Paramètres",
+      "subtitle": "Configurez les règles de gouvernance globales pour tous les administrateurs de la plateforme.",
+      "loadFailed": "Impossible de charger les paramètres de la plateforme",
+      "saveFailed": "Impossible d’enregistrer les paramètres de la plateforme",
+      "saving": "Enregistrement…",
+      "activeAdmins": "{{count}} administrateur(s) de plateforme actif(s)",
+      "governance": {
+        "title": "Gouvernance",
+        "description": "Contrôles des workflows de révision et d’approbation au niveau de la plateforme."
+      },
+      "independentReview": {
+        "title": "Exiger une révision indépendante des technologies",
+        "description": "Lorsque ce réglage est activé, l’administrateur qui crée ou soumet une révision de technologie publique ne peut pas approuver, rejeter ou demander des changements sur cette même révision.",
+        "soleAdminTitle": "La révision indépendante est contournée",
+        "soleAdminDescription": "Il n’existe qu’un seul administrateur de plateforme actif. Il peut décider de ses propres révisions jusqu’à l’ajout d’un autre administrateur actif.",
+        "effectiveTitle": "La révision indépendante est active",
+        "effectiveDescription": "Un autre administrateur de plateforme doit décider des révisions publiques créées ou soumises par un administrateur.",
+        "disabledTitle": "L’auto-révision est autorisée par la politique",
+        "disabledDescription": "Tout administrateur de plateforme peut décider d’une révision publique, y compris une révision qu’il a créée ou soumise."
+      }
+    },
+    "audit": {
+      "title": "Audit",
+      "subtitle": "Chaque modification sur toutes les organisations, ainsi que les événements au niveau plateforme.",
+      "filterByOrgId": "Filtrer par identifiant d'organisation…",
+      "filterByAction": "Filtrer par action…",
+      "loadFailed": "Impossible de charger le journal d'audit",
+      "loadMoreFailed": "Impossible de charger davantage d'entrées",
+      "loadingMore": "Chargement…",
+      "loadMore": "Charger plus",
+      "by": "par {{who}}",
+      "empty": {
+        "title": "Aucune entrée d'audit trouvée",
+        "description": "Essayez de réinitialiser les filtres, ou revenez plus tard après une activité."
+      },
+      "columns": {
+        "when": "Quand",
+        "action": "Action",
+        "target": "Cible",
+        "actor": "Auteur",
+        "org": "Organisation"
+      }
+    },
+    "debug": {
+      "title": "Débogage des accès",
+      "subtitle": "Vérifiez précisément ce qu'un utilisateur peut faire sur un périmètre, et pourquoi — la trace de décision RLS, toutes organisations confondues.",
+      "user": "Utilisateur",
+      "searchPlaceholder": "Rechercher par nom ou e-mail…",
+      "scopeId": "Identifiant du périmètre",
+      "scopeIdPlaceholder": "identifiant de périmètre (paysage / version / domaine)…",
+      "running": "Exécution…",
+      "run": "Exécuter",
+      "runFailed": "Impossible d'exécuter le débogage des accès",
+      "result": "Résultat",
+      "edit": "Modification",
+      "view": "Lecture",
+      "noAccess": "Aucun accès",
+      "for": "pour {{email}}",
+      "via": "via {{via}}",
+      "grantedAtScope": "accordé au périmètre {{scopeId}}",
+      "rawResponse": "Réponse brute"
+    },
+    "referenceIntegrity": {
+      "title": "Intégrité des références",
+      "description": "Références entre entités dont la cible n'existe plus. L'analyse est en lecture seule ; la réparation est explicite, simule par défaut, et porte toujours sur un seul espace de travail.",
+      "landscapeId": "ID de paysage",
+      "versionId": "ID de version",
+      "allWorkspaces": "Tous les espaces",
+      "scan": "Analyser",
+      "scanFailed": "L'analyse a échoué.",
+      "repairFailed": "La réparation a échoué.",
+      "walkDocuments": "Parcourir aussi les documents Automerge.",
+      "walkDocumentsHint": "Ouvre un document par diagramme — plus lent, et le seul moyen de voir les parents de groupe, les clés de disposition et les références d'étapes de flux.",
+      "walkDocumentsNeedsWorkspace": "Nécessite un paysage et une version : le parcours est par espace de travail.",
+      "columns": {
+        "severity": "Gravité",
+        "reference": "Référence",
+        "source": "Source",
+        "target": "Cible"
+      },
+      "severity": {
+        "dangling": "Pendante",
+        "orphaned": "Orpheline",
+        "unreadable": "Illisible",
+        "expected": "Par conception"
+      },
+      "empty": {
+        "title": "Aucune référence pendante trouvée",
+        "description": "Toutes les références vérifiables se résolvent. Voir ci-dessous ce qui n'a pas été examiné."
+      },
+      "coverage": {
+        "title": "Ce que cette analyse n'a pas vérifié",
+        "unchecked": "Jamais vérifié, délibérément : {{kinds}}. Les skins sont des plugins client que le serveur ne peut pas résoudre, et un commentaire vit dans son document de diagramme — il ne peut donc pas pendre.",
+        "documentsNotWalked": "Les documents Automerge n'ont pas été parcourus : les parents de groupe, les clés de disposition et les références d'étapes de flux n'ont pas été vérifiés.",
+        "diagramsSkipped": "{{count}} document(s) de diagramme n'ont pas été ouverts : le parcours a atteint sa limite.",
+        "truncated": "Le résultat a été tronqué par une limite : ces comptes sont des minorants."
+      },
+      "repair": {
+        "title": "Réparation",
+        "dryRun": "Simuler",
+        "apply": "Appliquer {{count}} réparation(s)",
+        "description": "Une simulation indique ce qui changerait sans rien écrire. Appliquer n'est proposé que pour les cas que le serveur a jugés sûrs.",
+        "needsWorkspace": "La réparation exige un paysage et une version — elle n'est jamais globale.",
+        "wouldRepair": "Réparerait {{count}} cas.",
+        "applied": "{{count}} cas réparé(s).",
+        "declinedNoReason": "refusé par le serveur"
+      }
+    }
+  }
+}

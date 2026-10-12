@@ -1,0 +1,48 @@
+{
+  "dataViewsA": {
+    "connectionsTable": {
+      "columnName": "Nom",
+      "columnSender": "Émetteur",
+      "columnReceiver": "Destinataire",
+      "columnDiagrams": "Dans les diagrammes",
+      "columnFlows": "Dans les flux",
+      "unnamedConnection": "Connexion sans nom"
+    },
+    "connectionsView": {
+      "domain": "Domaine",
+      "noDomains": "Aucun domaine dans ce modèle.",
+      "searchPlaceholder": "Rechercher des connexions",
+      "totalConnections": "Connexions au total"
+    },
+    "dependenciesView": {
+      "domain": "Domaine",
+      "noDomains": "Aucun domaine dans ce modèle.",
+      "searchPlaceholder": "Rechercher des dépendances",
+      "incoming": "Entrantes",
+      "outgoing": "Sortantes",
+      "incomingCount": "Entrantes · {{count}}",
+      "outgoingCount": "Sortantes · {{count}}",
+      "emptyTitle": "Choisissez un objet à mettre au centre",
+      "emptyBody": "Choisissez un objet ou un groupe pour explorer ses dépendances",
+      "goToDiagram": "ou accéder à un diagramme",
+      "noPeers": "Aucune dépendance",
+      "showAll": "Afficher les {{count}}",
+      "directCount_one": "{{count}} connexion directe",
+      "directCount_other": "{{count}} connexions directes",
+      "lowerCount_one": "{{count}} connexion de niveau inférieur",
+      "lowerCount_other": "{{count}} connexions de niveau inférieur",
+      "selectConnection": "Sélectionner la connexion",
+      "unknown": "Inconnu",
+      "group": "Groupe",
+      "more": "+{{count}} de plus",
+      "refineWithSearch": "affinez avec la recherche"
+    },
+    "focusPicker": {
+      "selectObject": "Sélectionner un objet…",
+      "objectOfFocus": "Objet au centre",
+      "searchPlaceholder": "Rechercher des objets",
+      "noMatches": "Aucun résultat",
+      "group": "groupe"
+    }
+  }
+}

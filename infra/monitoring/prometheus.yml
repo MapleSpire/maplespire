@@ -1,0 +1,137 @@
+# Scrape configuration for the MapleSpire compose stack.
+#
+# The bearer token lives in a FILE, not in this config and never in a URL: the
+# config is committed and a URL is logged by every proxy it passes through.
+# `node scripts/init-env.mjs` writes the file; it is gitignored.
+#
+# Retention is set on the command line, not here — see compose.maplespire.yml.
+# It is budgeted in bytes rather than days because a disk fills in bytes, and
+# the series count grows with the number of workspaces rather than with time.
+
+global:
+  scrape_interval: 30s
+  evaluation_interval: 30s
+  external_labels:
+    deployment: maplespire-home
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['alertmanager:9093']
+
+scrape_configs:
+  # Delivery counters are distinct from discovery and from an operator receipt.
+  # This endpoint is reachable only within the Compose network.
+  - job_name: alertmanager
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['alertmanager:9093']
+    scrape_timeout: 5s
+
+  # Opt-in dedicated proposer. No targets are configured by default and this
+  # job does not start or enable the process. Mount an explicit file containing
+  # [{"targets":["host.docker.internal:9465"]}] when operating it locally.
+  # An absent target is unconfigured monitoring, never evidence of flag=off.
+  - job_name: placement-proposer
+    metrics_path: /metrics
+    scheme: http
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/metrics-token
+    file_sd_configs:
+      - files: ['/etc/prometheus/placement-proposer-targets*.json']
+        refresh_interval: 30s
+    scrape_timeout: 5s
+
+  # The public WebSocket tier has its own process-local snapshot. A scrape does
+  # not resolve owners or probe Redis/PostgreSQL.
+  - job_name: sync-ws-router
+    metrics_path: /metrics
+    scheme: http
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/metrics-token
+    static_configs:
+      - targets: ['sync-ws-router:9464']
+    scrape_timeout: 5s
+
+  - job_name: maplespire-api
+    metrics_path: /metrics
+    scheme: http
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/metrics-token
+    # BOTH CELLS. They are one JOB and not two, deliberately: every rule
+    # selecting `job="maplespire-api"` — `ApiDown` among them — then covers
+    # every cell, instead of being present, valid and permanently blind to one.
+    #
+    # `up` becomes per-instance, so `ApiDown` fires for whichever cell is down
+    # rather than only when both are. A standby cell is still UP — it serves
+    # and reports `partitionReady=false`; it does not stop answering — so this
+    # does not page on the ordinary standby state.
+    static_configs:
+      - targets: ['api:3001', 'api-b:3001']
+    # The scrape opens a pool connection and runs the fleet status query plus a
+    # drill-history lookup, so it is not free. 30s is well inside every alert's
+    # `for` window while keeping the load off the request path.
+    scrape_timeout: 10s
+
+  # The container that RUNS the backups.
+  #
+  # The api only sees `backup_drill_runs` rows, written at the end of a run, so
+  # a drill container that is dead, crash-looping, or wedged mid-tick would
+  # produce no signal until `BackupDrillStale` noticed the missing row at 36
+  # hours. Scraping it is what makes `up` exist.
+  #
+  # The job NAME is load-bearing: three rules select on `job="backup-drill"`,
+  # and renaming it here leaves them present, valid, and permanently inactive.
+  # `scripts/monitoring.test.mjs` compares the two files for exactly that.
+  #
+  # Same credentials_file as the api: one token, set on both services by
+  # compose.maplespire.yml.
+  - job_name: backup-drill
+    metrics_path: /metrics
+    scheme: http
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/metrics-token
+    static_configs:
+      - targets: ['backup-drill:9464']
+    # 9464 sits below the ephemeral range because this container hands itself
+    # ephemeral ports: `startColdServer` boots the deployed API against the
+    # restored database on an OS-assigned port, once per drill.
+    #
+    # The scrape reads process-local state only — no pool, no query — so unlike
+    # the api's it is free. The timeout is short ON PURPOSE: a scheduler blocked
+    # SYNCHRONOUSLY still answers, just late (measured: a 1.5 s block delays the
+    # response by 1 502 ms), so the timeout is the only thing that can turn that
+    # into `up == 0`. A generous one would hide it.
+    scrape_timeout: 5s
+
+  # The coordination Redis, via its exporter — the only series that can say
+  # anything about redis itself (Redis exposes no Prometheus metrics).
+  #
+  # No `authorization` block: the exporter serves no application data, only
+  # Redis INFO fields, and it is unreachable outside the compose network. The
+  # metrics-token protects the API, drill scheduler and WebSocket router jobs.
+  #
+  # The job NAME is load-bearing exactly as `backup-drill` above is: rules
+  # select on `job="redis"`, and renaming it here leaves them valid and
+  # permanently inactive. `scripts/monitoring.test.mjs` compares the two files.
+  - job_name: redis
+    metrics_path: /metrics
+    scheme: http
+    static_configs:
+      - targets: ['redis-exporter:9121']
+    # The exporter answers from a live connection to Redis; when Redis is down
+    # it still answers, with `redis_up 0`. That distinction is the whole reason
+    # this job exists, so the timeout must be short enough that a hung exporter
+    # becomes `up == 0` rather than a slow scrape.
+    scrape_timeout: 5s
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ['127.0.0.1:9090']

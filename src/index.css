@@ -1,0 +1,634 @@
+@import "tailwindcss";
+
+@font-face {
+  font-family: 'Refinery';
+  src: url('/fonts/Refinery-25SemiBold.woff2') format('woff2');
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Blender Pro';
+  src: url('/fonts/BlenderPro-Book.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Sketch Me';
+  src: url('/fonts/SketchMeFreeVersion.ttf') format('truetype');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+/*
+ * ───────────────────────────────────────────────────────────────────────────
+ *  Theme tokens
+ * ───────────────────────────────────────────────────────────────────────────
+ *  The @theme block holds the LIGHT theme. Every value here is the exact hex
+ *  the chrome used to hard-code, so migrating `bg-[#FFFFFF]` → `bg-surface-100`
+ *  is pixel-identical. The dark theme lives in `:root[data-theme='dark']`
+ *  further down and overrides the same custom properties — Tailwind v4 utilities
+ *  reference `var(--color-…)`, so flipping the attribute reskins the whole app.
+ *
+ *  Naming (so utilities read cleanly):
+ *    surface-*  → backgrounds      → bg-surface-100, bg-surface-200, …
+ *    fg / fg-*  → foreground/text  → text-fg, text-fg-muted, …
+ *    line / line-* → borders       → border-line, border-line-strong
+ *    accent-*   → clay-coral primary accent
+ *    inverse-*  → high-contrast chip/button (dark-on-light ↔ light-on-dark)
+ * ───────────────────────────────────────────────────────────────────────────
+ */
+@theme {
+  --font-sans: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', 'Courier New', monospace;
+
+  /* App backdrop + diagram-area chrome — warm stone */
+  --color-app: #E7E6E2;
+  --color-canvas: #E7E6E2;
+  --color-canvas-grid: #D8D5CE;
+
+  /* Raised surfaces (sidebars, top bar, modals, cards, dropdowns) */
+  --color-sidebar: #FFFFFF;
+  --color-toolbar: #FFFFFF;
+  --color-dropdown: #FFFFFF;
+  --color-panel: #F1EFEB;
+  --color-surface-50: #F7F5F2;
+  --color-surface-100: #FFFFFF;
+  --color-surface-200: #F1EFEB;
+  --color-surface-300: #EFEDE9;
+  --color-surface-400: #E0DBD2;
+  /* Hover/active wash applied on top of surfaces */
+  --color-surface-hover: #F4F2EF;
+
+  /* Foreground / text ramp (darkest → faintest) — warm near-black */
+  --color-fg: #1E1D1B;
+  --color-fg-strong: #3A362F;
+  --color-fg-secondary: #56524C;
+  --color-fg-muted: #8C877F;
+  --color-fg-subtle: #9A958C;
+  --color-fg-inverse: #FFFFFF;
+
+  /* Legacy text aliases (kept so any remaining var() refs resolve) */
+  --color-text-primary: #1E1D1B;
+  --color-text-secondary: #56524C;
+  --color-text-tertiary: #9A958C;
+  --color-text-inverse: #FFFFFF;
+
+  /* Lines / borders */
+  /* Ramps (design-system layer 1 — the aliases below point at these steps).
+     The dark theme redefines the SAME ramp names. */
+  --coral-100: #FBF1E8;
+  --coral-200: #F6DFC9;
+  --coral-300: #EFC7A1;
+  --coral-400: #E7AC78;
+  --coral-500: #DE9156;
+  --coral-600: #D97A3D;
+  --coral-700: #CB6C30;
+  --coral-800: #B85E26;
+  --coral-900: #9A4E16;
+  --coral-1000: #6E3811;
+  --stone-100: #FFFFFF;
+  --stone-150: #F7F5F2;
+  --stone-200: #F1EFEB;
+  --stone-300: #E7E6E2;
+  --stone-400: #E0DBD2;
+  --stone-500: #C9C3BA;
+  --stone-600: #9A958C;
+  --stone-700: #8C877F;
+  --stone-800: #56524C;
+  --stone-900: #3A362F;
+  --stone-1000: #1E1D1B;
+
+  --color-line: #ECEAE6;
+  --color-line-strong: #E0DBD2;
+  /* Subtler internal band divider (within a panel) — see DS tokens/colors.css */
+  --color-line-soft: #EFEDE9;
+  --color-line-focus: #D97A3D;
+  --color-border-default: #ECEAE6;
+  --color-border-light: #E0DBD2;
+  --color-border-focus: #D97A3D;
+
+  /* Accent (primary — clay coral) */
+  --color-accent: #D97A3D;
+  --color-accent-hover: #CB6C30;
+  --color-accent-active: #B85E26;
+  --color-accent-subtle: #FBF1E8;
+  --color-accent-text: #FFFFFF;
+
+  /* High-contrast inverse chip/button (e.g. the near-black "primary" button) */
+  --color-inverse: #1E1D1B;
+  --color-inverse-hover: #332F2A;
+  --color-on-inverse: #FFFFFF;
+
+  /* Modal scrim — translucent warm INK (never cold black), per the design
+     system's overlay spec. */
+  --color-modal-backdrop: rgba(30, 29, 27, 0.42);
+
+  /* Switch/toggle thumb — must CONTRAST the track in both themes (white on
+     light, warm off-white on espresso), so it gets its own alias instead of
+     a hardcoded white. */
+  --color-switch-thumb: #FFFFFF;
+
+  /* C4 object accents — app keys off the brand orange, system reads blue-grey,
+     the rest stay calm warm-greys (differentiated by icon shape, not hue) */
+  --color-c4-actor: #6F6A62;
+  --color-c4-system: #7E8AA3;
+  --color-c4-app: #C06A2C;
+  --color-c4-store: #6F6A62;
+  --color-c4-component: #9A958C;
+
+  /* Semantic */
+  --color-success: #22C55E;
+  --color-warning: #D97706;
+  --color-error: #DC2626;
+  --color-info: #3A6DD9;
+  --color-success-bg: #E7F6EF;
+  --color-success-text: #1F8A5B;
+  --color-warning-bg: #FCEFD8;
+  --color-warning-text: #9A5B12;
+  --color-error-bg: #FBEAE7;
+  /* Boundary for an error surface. Was referenced by `border-error-border` in
+     ten places while undefined, so those borders emitted nothing and fell back
+     to currentColor. 1.66:1 against --color-error-bg — above the 1.20/1.38 the
+     neutral --color-line / --color-line-strong carry against their surfaces. */
+  --color-error-border: #E8AC9E;
+  /* Same 1.66:1 rule, hue-matched to --color-warning, so the warning badge sits
+     in the same family as the error one instead of borrowing `line`. */
+  --color-warning-border: #FAAD53;
+  --color-error-text: #B5392B;
+  --color-info-bg: #EAF1FC;
+  --color-info-text: #3A6DD9;
+  --color-violet: #8B5CF6;
+  --color-violet-bg: #F1ECFB;
+  --color-violet-text: #6D4AC0;
+  --color-orange: #D97A3D;
+  --color-orange-bg: #FBF1E8;
+  --color-orange-text: #9A4E16;
+  --color-pink: #DB5BA0;
+  --color-pink-bg: #FBEAF3;
+  --color-pink-text: #9D2E6B;
+  /* Legacy semantic aliases */
+  --color-semantic-success: #22C55E;
+  --color-semantic-warning: #D97706;
+  --color-semantic-error: #DC2626;
+  --color-semantic-info: #3A6DD9;
+
+  --color-connection: #B7B1A8;
+  --color-connection-highlight: #D97A3D;
+
+  /* Soft coral focus ring (DS name: --shadow-glow; the -blue suffix is a
+     legacy misnomer kept as an alias for any stale var() reference). */
+  --shadow-glow: 0 0 0 3px rgba(217, 122, 61, 0.16);
+  --shadow-glow-blue: 0 0 0 3px rgba(217, 122, 61, 0.16);
+
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-xl: 12px;
+  --radius-full: 9999px;
+}
+
+/* Collaboration presence colors are runtime styles rather than utility
+   classes. `static` keeps every token in the emitted light-theme CSS. */
+@theme static {
+  --presence-saturation: 48%;
+  --presence-lightness-1: 66%;
+  --presence-lightness-2: 71%;
+  --presence-lightness-3: 75%;
+  --presence-on-color: #1E1D1B;
+}
+
+/* Tailwind must emit elevation utilities against a runtime token. Without
+   `inline`, it snapshots the light value while compiling, which makes every
+   `shadow-*` surface cast a warm, visibly lighter halo after switching to the
+   dark theme. The indirection keeps variants such as `hover:shadow-lg`
+   theme-aware without changing component markup. */
+@theme inline {
+  --shadow-sm: var(--elevation-sm);
+  --shadow-md: var(--elevation-md);
+  --shadow-lg: var(--elevation-lg);
+  --shadow-xl: var(--elevation-xl);
+  --shadow-card: var(--elevation-card);
+}
+
+:root {
+  --elevation-sm: 0 1px 2px rgba(38, 34, 28, 0.06);
+  --elevation-md: 0 1px 3px rgba(38, 34, 28, 0.08);
+  --elevation-lg: 0 4px 14px rgba(38, 34, 28, 0.08);
+  --elevation-xl: 0 12px 32px rgba(38, 34, 28, 0.14);
+  --elevation-card: 0 1px 2px rgba(38, 34, 28, 0.06);
+}
+
+/*
+ * ───────────────────────────────────────────────────────────────────────────
+ *  Dark theme — a warm stone/espresso palette tuned for long sessions. Cards
+ *  read as gently elevated planes over a warm near-black backdrop; the orange
+ *  accent is brightened so it stays vivid on dark.
+ * ───────────────────────────────────────────────────────────────────────────
+ */
+:root[data-theme='dark'] {
+  /* Ramps re-tuned for dark (coral brightens, stone flips to espresso). */
+  --coral-100: #34251A;
+  --coral-200: #46301F;
+  --coral-300: #6E4427;
+  --coral-400: #9A5E30;
+  --coral-500: #C2763E;
+  --coral-600: #E89456;
+  --coral-700: #F0A268;
+  --coral-800: #F4B589;
+  --coral-900: #F8CDAC;
+  --coral-1000: #FCE6D3;
+  --stone-100: #211F1C;
+  --stone-150: #1C1A17;
+  --stone-200: #2A2724;
+  --stone-300: #161513;
+  --stone-400: #423D37;
+  --stone-500: #46423C;
+  --stone-600: #6E6960;
+  --stone-700: #8F8A81;
+  --stone-800: #B4AFA7;
+  --stone-900: #D9D5CD;
+  --stone-1000: #F2F0EC;
+
+  --color-app: #161513;
+  --color-canvas: #161513;
+  --color-canvas-grid: #262320;
+
+  --color-sidebar: #211F1C;
+  --color-toolbar: #211F1C;
+  --color-dropdown: #211F1C;
+  --color-panel: #2A2724;
+  --color-surface-50: #1C1A17;
+  --color-surface-100: #211F1C;
+  --color-surface-200: #2A2724;
+  --color-surface-300: #34302B;
+  --color-surface-400: #423D37;
+  --color-surface-hover: #2E2B27;
+
+  --color-fg: #F2F0EC;
+  --color-fg-strong: #D9D5CD;
+  --color-fg-secondary: #B4AFA7;
+  --color-fg-muted: #8F8A81;
+  --color-fg-subtle: #6E6960;
+  --color-fg-inverse: #1A1816;
+
+  --color-text-primary: #F2F0EC;
+  --color-text-secondary: #B4AFA7;
+  --color-text-tertiary: #6E6960;
+  --color-text-inverse: #1A1816;
+
+  --color-line: #34302B;
+  --color-line-strong: #3B362F;
+  --color-line-soft: #2E2A26;
+  --color-line-focus: #E89456;
+  --color-border-default: #34302B;
+  --color-border-light: #3B362F;
+  --color-border-focus: #E89456;
+
+  --color-accent: #E89456;
+  --color-accent-hover: #F0A268;
+  --color-accent-active: #F4B589;
+  --color-accent-subtle: #34251A;
+  --color-accent-text: #21160E;
+
+  --color-inverse: #EEEBE5;
+  --color-inverse-hover: #DEDAD2;
+  --color-on-inverse: #1A1816;
+
+  /* Deeper true-black scrim on dark so the raised modal still reads lifted */
+  --color-modal-backdrop: rgba(0, 0, 0, 0.55);
+
+  --color-switch-thumb: #F2F0EC;
+
+  --color-c4-actor: #A39E95;
+  --color-c4-system: #94A0BD;
+  --color-c4-app: #E89456;
+  --color-c4-store: #A39E95;
+  --color-c4-component: #8F8A81;
+
+  --color-success: #5FC98C;
+  --color-warning: #E0A24B;
+  --color-error: #E5806F;
+  --color-info: #7FA8E6;
+  --color-success-bg: #16271E;
+  --color-success-text: #5FC98C;
+  --color-warning-bg: #2C2410;
+  --color-warning-text: #E0A24B;
+  --color-error-bg: #2C1614;
+  /* Same 1.66:1 against the dark --color-error-bg. */
+  --color-error-border: #5E362E;
+  /* Same 1.65:1 against the dark --color-warning-bg. */
+  --color-warning-border: #624011;
+  --color-error-text: #E5806F;
+  --color-info-bg: #1E2A3E;
+  --color-info-text: #7FA8E6;
+  --color-violet: #B89DF2;
+  --color-violet-bg: #271F3A;
+  --color-violet-text: #C4B5FD;
+  --color-orange: #E89456;
+  --color-orange-bg: #34251A;
+  --color-orange-text: #F0A268;
+  --color-pink: #E58AB8;
+  --color-pink-bg: #341823;
+  --color-pink-text: #F0A8CC;
+  --color-semantic-success: #5FC98C;
+  --color-semantic-warning: #E0A24B;
+  --color-semantic-error: #E5806F;
+  --color-semantic-info: #7FA8E6;
+
+  --color-connection: #46423C;
+  --color-connection-highlight: #E89456;
+
+  --presence-saturation: 52%;
+  --presence-lightness-1: 70%;
+  --presence-lightness-2: 74%;
+  --presence-lightness-3: 78%;
+  --presence-on-color: #1A1816;
+
+  /* Dark elevation — cast in true black (warm ink disappears on a dark
+     backdrop); raised planes get a 1px top highlight so cards read as gently
+     lifted, not flat. Values are the DS-canonical set (tokens/colors.css). */
+  --elevation-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --elevation-md: 0 2px 6px rgba(0, 0, 0, 0.45);
+  --elevation-lg: 0 6px 20px rgba(0, 0, 0, 0.5);
+  --elevation-xl: 0 10px 28px rgba(0, 0, 0, 0.55), inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  --elevation-card: 0 1px 2px rgba(0, 0, 0, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.03);
+  --shadow-glow: 0 0 0 3px rgba(232, 148, 86, 0.28);
+  --shadow-glow-blue: 0 0 0 3px rgba(232, 148, 86, 0.28);
+
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/* Direct helper retained for floating chrome that predates the Tailwind
+   elevation utilities. Both paths now resolve the same runtime token. */
+.elevation-xl {
+  box-shadow: var(--shadow-xl);
+}
+
+html, body, #root {
+  height: 100%;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+body {
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--color-fg);
+  background: var(--color-app);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  transition: background-color 0.2s ease, color 0.2s ease;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--color-surface-400);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-fg-subtle);
+}
+
+/* Native rails are hidden; Perspective strips render a thumb on their divider. */
+.perspective-strip-scrollbar {
+  scrollbar-width: none;
+}
+
+.perspective-strip-scrollbar::-webkit-scrollbar {
+  display: none;
+  height: 0;
+  width: 0;
+}
+
+/* Selection */
+::selection {
+  background: rgba(217, 122, 61, 0.20);
+}
+
+/* Focus visible */
+:focus-visible {
+  outline: 2px solid var(--color-line-focus);
+  outline-offset: -2px;
+}
+
+button:focus-visible {
+  outline-offset: 2px;
+}
+
+/* Tailwind v4 dropped the default pointer cursor on buttons — restore it so
+   clickable controls (menus, etc.) don't show the text/edit cursor. */
+button:not(:disabled),
+[role="button"]:not(:disabled),
+button:not(:disabled) *,
+[role="button"]:not(:disabled) * {
+  cursor: pointer;
+}
+
+/* A native draggable <tr> crosses a number of table descendants while the
+   pointer moves. Keep one cursor across the whole drag surface; this follows
+   the generic button rule so nested icons cannot switch it back to a hand.
+   Real controls and the overflow menu retain their normal affordance. */
+.mo-object-row--draggable,
+.mo-object-row--draggable > td,
+.mo-object-row--draggable > td * {
+  cursor: grab !important;
+}
+
+.mo-object-row--draggable:active,
+.mo-object-row--draggable:active > td,
+.mo-object-row--draggable:active > td * {
+  cursor: grabbing !important;
+}
+
+.mo-object-row--draggable button:not(:disabled),
+.mo-object-row--draggable select,
+.mo-object-row--draggable button:not(:disabled) *,
+.mo-object-row--draggable select * {
+  cursor: pointer !important;
+}
+
+/* ADR markdown content styles — clean page-like rendering, theme-aware */
+.adr-markdown h1,
+.adr-markdown h2,
+.adr-markdown h3,
+.adr-markdown h4 {
+  font-weight: 600;
+  color: var(--color-fg);
+  margin-top: 1.75em;
+  margin-bottom: 0.5em;
+  line-height: 1.4;
+}
+
+.adr-markdown h1 { font-size: 19px; }
+.adr-markdown h2 { font-size: 16px; }
+.adr-markdown h3 { font-size: 13.5px; }
+.adr-markdown h4 { font-size: 13px; }
+
+.adr-markdown h1:first-child,
+.adr-markdown h2:first-child,
+.adr-markdown h3:first-child,
+.adr-markdown h4:first-child {
+  margin-top: 0;
+}
+
+.adr-markdown p {
+  margin-bottom: 0.75em;
+  line-height: 1.7;
+  color: var(--color-fg-strong);
+}
+
+.adr-markdown ul,
+.adr-markdown ol {
+  margin-bottom: 0.75em;
+  padding-left: 1.5em;
+  line-height: 1.7;
+  color: var(--color-fg-strong);
+}
+
+.adr-markdown li {
+  margin-bottom: 0.35em;
+}
+
+.adr-markdown li > p {
+  margin-bottom: 0.25em;
+}
+
+.adr-markdown strong {
+  font-weight: 600;
+  color: var(--color-fg);
+}
+
+.adr-markdown code {
+  background: var(--color-surface-200);
+  padding: 2px 5px;
+  border-radius: 4px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--color-fg);
+}
+
+.adr-markdown pre {
+  background: var(--color-surface-200);
+  padding: 12px 16px;
+  border-radius: 6px;
+  overflow-x: auto;
+  margin-bottom: 0.75em;
+}
+
+.adr-markdown pre code {
+  background: transparent;
+  padding: 0;
+}
+
+.adr-markdown blockquote {
+  border-left: 3px solid var(--color-line);
+  padding-left: 12px;
+  margin-left: 0;
+  margin-bottom: 0.75em;
+  color: var(--color-fg-secondary);
+}
+
+.adr-markdown a {
+  color: var(--color-accent);
+  text-decoration: none;
+}
+
+.adr-markdown a:hover {
+  text-decoration: underline;
+}
+
+.adr-markdown hr {
+  border: none;
+  border-top: 1px solid var(--color-line);
+  margin: 1.5em 0;
+}
+
+/* ADR textarea — no browser focus outline */
+textarea.adr-textarea:focus,
+textarea.adr-textarea:focus-visible {
+  outline: none !important;
+  box-shadow: none !important;
+  ring: none !important;
+}
+
+/* ── Model Viewer (src/components/model-viewer) ──────────────────────────────
+ * The connection overlay + motion bits live here as classes: SVG stroke states
+ * with transitions and keyframes are cleaner as CSS than as utility soup, and
+ * the two WAAPI zoom layers share them by class during a drill transition. */
+
+.mv-canvas {
+  background-color: var(--color-canvas);
+  background-image: radial-gradient(var(--color-canvas-grid) 1px, transparent 1px);
+  background-size: 22px 22px;
+  background-position: -1px -1px;
+}
+
+.mv-edge {
+  fill: none;
+  stroke: var(--color-connection);
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  /* Clicks belong to the wide invisible hit path BENEATH; without this the
+   * visual stroke (SVG visiblePainted) swallows clicks landing exactly on
+   * the line — a 1.6px dead zone on every connection. */
+  pointer-events: none;
+  transition: stroke 150ms ease, stroke-width 150ms ease, opacity 150ms ease;
+}
+.mv-edge--faint { opacity: 0.3; }
+.mv-edge--dim { opacity: 0.07; }
+.mv-edge--in { stroke: var(--color-info); opacity: 1; stroke-width: 2.2; }
+.mv-edge--out { stroke: var(--color-accent); opacity: 1; stroke-width: 2.2; }
+.mv-edge--sel { stroke: var(--color-accent); opacity: 1; stroke-width: 2.6; }
+.mv-edge--pulse { animation: mv-pulse 1.5s ease-in-out infinite; }
+@keyframes mv-pulse {
+  0%, 100% { stroke-opacity: 0.5; }
+  50% { stroke-opacity: 1; }
+}
+.mv-edge-hit {
+  fill: none;
+  stroke: transparent;
+  stroke-width: 16;
+  stroke-linecap: round;
+  pointer-events: stroke;
+  cursor: pointer;
+}
+.mv-flowdot { fill: var(--color-accent); pointer-events: none; }
+.mv-flowdot--in { fill: var(--color-info); }
+.mv-elabel-bg { fill: var(--color-canvas); opacity: 0.94; }
+.mv-elabel-tx { font-size: 10.5px; fill: var(--color-fg-muted); }
+
+.mv-tile-shake { animation: mv-shake 0.45s ease-in-out; }
+@keyframes mv-shake {
+  10%, 90% { translate: -1px 0; }
+  20%, 80% { translate: 2px 0; }
+  30%, 50%, 70% { translate: -4px 0; }
+  40%, 60% { translate: 4px 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mv-edge--pulse { animation: none; stroke-opacity: 0.9; }
+  .mv-flowdot, .mv-flowdot--in { display: none; }
+  .mv-tile-shake { animation: none; }
+}

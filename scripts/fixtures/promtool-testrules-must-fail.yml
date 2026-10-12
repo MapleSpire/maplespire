@@ -1,0 +1,45 @@
+# The CONTROL arm for the `promtool test rules` gate in monitoring.test.mjs.
+#
+# This file MUST fail. It is what distinguishes "promtool ran the fixtures" from
+# "promtool agreed with them" — a wrong entrypoint, a bind mount that landed
+# empty, or a rules file that loaded zero rules would otherwise report SUCCESS
+# on nothing at all, and the gate would be inert while looking green.
+#
+# It is deliberately a DIFFERENT kind of wrong from the parse-level control
+# (`promtool-must-fail.yml`): everything here is syntactically valid and every
+# rule loads. Only the EXPECTATIONS are false, which is the exact failure mode
+# `test rules` exists to detect and `check rules` cannot see.
+#
+# Do not "fix" the expectations below. They are the point.
+
+rule_files:
+  - alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  # A perfectly healthy target. Asserting that the container-down alert fires
+  # here must be refused.
+  - interval: 1m
+    name: this expectation is false on purpose
+    input_series:
+      - series: 'up{job="backup-drill", instance="backup-drill:9464"}'
+        values: '1+0x30'
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="BackupDrillContainerDown", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="BackupDrillContainerDown", alertstate="firing", instance="backup-drill:9464", job="backup-drill", severity="page"}'
+            value: 1
+
+  # ...and the mirror: a dead target that must NOT alert. Two directions, so a
+  # gate that only notices one of them is still caught.
+  - interval: 1m
+    name: this expectation is false in the other direction
+    input_series:
+      - series: 'up{job="backup-drill", instance="backup-drill:9464"}'
+        values: '0+0x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: BackupDrillContainerDown
+        exp_alerts: []

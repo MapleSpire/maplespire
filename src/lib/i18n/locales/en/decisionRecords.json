@@ -1,0 +1,80 @@
+{
+  "decisionRecords": {
+    "status": {
+      "inProgress": "In progress",
+      "approved": "Approved",
+      "rejected": "Rejected"
+    },
+    "list": {
+      "windowLimit": "2,000 records loaded. Refine the search to continue.",
+      "empty": "No decision records found",
+      "ariaLabel": "Decision records"
+    },
+    "detail": {
+      "selectPrompt": "Select a decision record to view details",
+      "titlePlaceholder": "Decision record title",
+      "summaryPlaceholder": "Brief summary of the decision…",
+      "noSummary": "No summary provided.",
+      "status": "Status",
+      "related": "Related",
+      "edit": "Edit",
+      "noContent": "No content provided.",
+      "delete": "Delete",
+      "deleteConfirmTitle": "Delete this decision record?",
+      "deleteConfirmBody": "“{{title}}” will be removed from this landscape. Approved records cannot be deleted — set the status to rejected to withdraw one instead."
+    },
+    "relatedLinks": {
+      "type": {
+        "url": "Link",
+        "adr": "Decision record",
+        "diagram": "Diagram",
+        "draft": "Draft"
+      },
+      "removeLink": "Remove link",
+      "addItem": "Add related item",
+      "typeLabel": "Type",
+      "urlLabel": "URL",
+      "selectLabel": "Select",
+      "choose": "Choose...",
+      "labelLabel": "Label",
+      "displayNamePlaceholder": "Display name",
+      "add": "Add",
+      "deletedTarget": "Target deleted — this link goes nowhere",
+      "unsupportedType": "This link type is not supported by this version",
+      "invalidUrl": "Not a valid web address",
+      "untitled": "Untitled link"
+    },
+    "editor": {
+      "preview": "Preview",
+      "markdown": "Markdown",
+      "done": "Done",
+      "markdownPlaceholder": "## Context&#10;&#10;Describe the problem or context that led to this decision…&#10;&#10;## Decision&#10;&#10;State the decision clearly…",
+      "tool": {
+        "heading": "Heading",
+        "bold": "Bold",
+        "italic": "Italic",
+        "bulletedList": "Bulleted list",
+        "quote": "Quote",
+        "link": "Link",
+        "linkPlaceholder": "link",
+        "code": "Code",
+        "codePlaceholder": "code"
+      }
+    },
+    "timeline": {
+      "noHistory": "No history"
+    },
+    "view": {
+      "newRecordTitle": "New decision record",
+      "defaultAuthor": "You",
+      "panelTitle": "Decision record",
+      "author": "Author",
+      "updated": "Updated",
+      "timeline": "Timeline",
+      "searchPlaceholder": "Search records",
+      "newRecord": "New record",
+      "aiAssist": "AI Assist",
+      "records": "Records"
+    }
+  }
+}

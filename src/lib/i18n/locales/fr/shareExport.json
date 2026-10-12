@@ -1,0 +1,147 @@
+{
+  "shareExport": {
+    "manage": {
+      "back": "Retour",
+      "empty": "Aucun lien de partage pour le moment.",
+      "pinned": "figé",
+      "pinnedWithLabel": "figé · {{label}}",
+      "latest": "dernière version",
+      "viewCount": "{{count}} vues",
+      "enableLink": "Activer le lien",
+      "revokeLink": "Révoquer le lien",
+      "editSettings": "Modifier les paramètres du lien",
+      "noPermission": "Vous n'avez pas la permission de modifier ce lien.",
+      "somethingWentWrong": "Une erreur est survenue"
+    },
+    "embedGrid": {
+      "title": "Intégrer dans",
+      "embedInTarget": "Intégrer dans {{name}}",
+      "previewAriaLabel": "Aperçu du diagramme intégré en lecture seule"
+    },
+    "embedInstructions": {
+      "liveReadOnly": "en direct et en lecture seule",
+      "embedLink": "Lien d'intégration",
+      "copy": "Copier",
+      "copied": "Copié !",
+      "copyIframeSnippet": "Copier l'extrait iframe",
+      "iframeSnippetCopied": "Extrait iframe copié !"
+    },
+    "embedTargets": {
+      "confluence": {
+        "tagline": "Pages Atlassian",
+        "step1": "Modifiez la page Confluence.",
+        "step2": "Tapez /iframe (ou ajoutez la macro Iframe).",
+        "step3": "Collez le lien d'intégration et mettez à jour."
+      },
+      "notion": {
+        "tagline": "Docs & wikis",
+        "step1": "Ouvrez votre page Notion.",
+        "step2": "Collez le lien, puis choisissez « Créer un contenu intégré ».",
+        "step3": "Faites glisser pour redimensionner le bloc du diagramme."
+      },
+      "miro": {
+        "tagline": "Tableaux blancs",
+        "step1": "Ouvrez le panneau Applications de votre tableau.",
+        "step2": "Ajoutez l'application Iframe / Embed.",
+        "step3": "Collez le lien d'intégration pour l'y déposer."
+      },
+      "sharepoint": {
+        "tagline": "Microsoft 365",
+        "step1": "Modifiez la page SharePoint.",
+        "step2": "Ajoutez le composant web Contenu intégré.",
+        "step3": "Collez l'extrait iframe et publiez."
+      },
+      "iframe": {
+        "tagline": "Partout où les iframes fonctionnent",
+        "step1": "Copiez l'extrait iframe ci-dessous.",
+        "step2": "Collez-le dans toute page qui autorise le HTML ou les iframes.",
+        "step3": "Ajustez la largeur et la hauteur selon vos besoins."
+      }
+    },
+    "exportView": {
+      "types": {
+        "json": { "blurb": "Tout votre modèle — objets, connexions, flux, tags et domaines, avec toutes les métadonnées détaillées." },
+        "pdf": { "blurb": "Un document de synthèse mis en forme à partager avec les parties prenantes." },
+        "markdown": { "blurb": "Une synthèse Markdown — à déposer directement dans un wiki ou un dépôt." },
+        "html": { "blurb": "Une page de synthèse HTML autonome." },
+        "llms": { "blurb": "Une synthèse en texte brut structurée pour les grands modèles de langage." },
+        "csv": { "blurb": "Un tableur de vos objets ou connexions du modèle." },
+        "structurizr": { "blurb": "Un espace de travail Structurizr DSL — modèle et vues structurelles, ré-important ici ou dans Structurizr." },
+        "structurizrJson": { "blurb": "Un fichier workspace.json Structurizr — le même modèle et, contrairement au DSL, la mise en page : vos diagrammes arrivent disposés comme vous les avez dessinés." },
+        "mermaid": { "blurb": "Un diagramme Mermaid C4 — à coller dans une documentation, un wiki ou mermaid.live." },
+        "svg": { "blurb": "Le diagramme actuel sous forme d'image vectorielle." },
+        "png": { "blurb": "Le diagramme actuel sous forme d'image matricielle haute résolution." }
+      },
+      "groups": {
+        "fullModel": "Modèle complet",
+        "summary": "Synthèse",
+        "data": "Données",
+        "code": "Code",
+        "image": "Image"
+      },
+      "labels": {
+        "scope": "Portée",
+        "landscape": "Landscape",
+        "diagram": "Diagramme",
+        "domain": "Domaine",
+        "modelObject": "Objet du modèle",
+        "orientation": "Orientation",
+        "portrait": "Portrait",
+        "diagramImage": "Image du diagramme",
+        "none": "Aucune",
+        "include": "Inclure",
+        "contents": "Contenu",
+        "modelObjects": "Objets du modèle",
+        "connections": "Connexions",
+        "theme": "Thème",
+        "legend": "Légende",
+        "separateFile": "Fichier séparé",
+        "inImage": "Dans l'image",
+        "resolution": "Résolution",
+        "resolutionStandard": "1× · standard",
+        "resolutionRetina": "2× · rétina",
+        "resolutionPrint": "3× · impression",
+        "view": "Vue",
+        "view2d": "Plan 2D",
+        "view3d": "Vue 3D"
+      },
+      "unknown": "inconnu",
+      "currentDiagram": "actuel",
+      "scopeLabel": {
+        "landscape": "l'ensemble du landscape",
+        "domain": "le domaine « {{name}} »",
+        "object": "l'objet « {{name}} »",
+        "diagram": "le diagramme « {{name}} »"
+      },
+      "included": {
+        "imageBlocked": "Ouvrez d'abord un diagramme — les exports d'image capturent le diagramme sur lequel vous travaillez.",
+        "thisDiagram": "Ce diagramme",
+        "wholeLandscape": "L'ensemble du landscape",
+        "namedDiagram": "Le diagramme « {{name}} »",
+        "json": "{{scope}} : domaines, flux, connexions du modèle, objets du modèle, groupes et tags — avec chaque champ de métadonnées.",
+        "structurizr": "{{scope}} sous forme d'espace de travail Structurizr DSL : éléments du modèle, relations et vues structurelles.",
+        "structurizrJson": "{{scope}} sous forme de workspace.json Structurizr : éléments du modèle, relations, vues — et la position de chaque forme sur chaque vue, ce que le DSL ne sait pas exprimer.",
+        "mermaidDiagram": "Le diagramme « {{name}} » sous forme de diagramme Mermaid C4, à son propre niveau.",
+        "mermaidLandscape": "L'ensemble du landscape sous forme d'un unique diagramme de contexte Mermaid C4 avec les limites des systèmes.",
+        "summary": "Objets du modèle, connexions, flux et tags dans {{scope}}.{{diagramNote}}",
+        "summaryDiagramNote": " Le diagramme « {{name}} » est intégré au document.",
+        "csvConnections": "Une ligne par connexion : émetteur et destinataire, direction, statut, technologie et description.",
+        "csvObjects": "Une ligne par objet : nom, type, statut, tags, technologie et liens. Les connexions et les flux ne sont pas inclus.",
+        "svg": "Le diagramme « {{name}} » en vecteurs redimensionnables, thème {{theme}}.",
+        "png": "Le diagramme « {{name}} » en thème {{theme}}, à une résolution de {{scale}}×.",
+        "png3d": "Le plateau 3D en direct de « {{name}} », tel que cadré, à une résolution de {{scale}}×.",
+        "legendSeparate": "Une légende de ses formes et connexions est téléchargée dans un second fichier.",
+        "legendEmbedded": "Une légende de ses formes et connexions est intégrée à l'image."
+      },
+      "downloaded": "Téléchargé :",
+      "modelIncomplete": "Le landscape complet n'a pas pu être lu pour l'instant — {{objects}} objets et {{connections}} connexions utilisés par ses diagrammes manquent. Les formats couvrant tout le landscape sont indisponibles jusqu'à son chargement ; reconnectez-vous ou rechargez la page, ou exportez uniquement le diagramme courant.",
+      "notes": "Ce que l'export n'a pas pu transcrire exactement",
+      "preparing": "Préparation…",
+      "downloadType": "Télécharger {{label}}",
+      "errors": {
+        "readModel": "Impossible de lire le modèle. Réessayez.",
+        "exportFailed": "Échec de l'export"
+      }
+    }
+  }
+}

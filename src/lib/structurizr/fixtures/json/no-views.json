@@ -1,0 +1,52 @@
+{
+  "id" : 0,
+  "name" : "Model with no views at all",
+  "description" : "A workspace.json whose views live in a separate .dsl — routine, and the shape that imported as zero diagrams and left the Import button permanently disabled.",
+  "model" : {
+    "people" : [ {
+      "id" : "1",
+      "name" : "Customer",
+      "tags" : "Element,Person",
+      "relationships" : [ {
+        "id" : "30",
+        "tags" : "Relationship",
+        "sourceId" : "1",
+        "destinationId" : "2",
+        "description" : "Banks with"
+      } ]
+    } ],
+    "softwareSystems" : [ {
+      "id" : "2",
+      "name" : "Internet Banking",
+      "tags" : "Element,Software System",
+      "containers" : [ {
+        "id" : "3",
+        "name" : "Web Application",
+        "technology" : "Java",
+        "tags" : "Element,Container",
+        "relationships" : [ {
+          "id" : "31",
+          "tags" : "Relationship",
+          "sourceId" : "3",
+          "destinationId" : "4",
+          "description" : "Reads from"
+        } ],
+        "components" : [ {
+          "id" : "5",
+          "name" : "Sign In Controller",
+          "technology" : "Spring MVC",
+          "tags" : "Element,Component"
+        } ]
+      }, {
+        "id" : "4",
+        "name" : "Database",
+        "technology" : "PostgreSQL",
+        "tags" : "Element,Container,Database"
+      } ]
+    }, {
+      "id" : "6",
+      "name" : "Mainframe",
+      "tags" : "Element,Software System,Existing System"
+    } ]
+  }
+}

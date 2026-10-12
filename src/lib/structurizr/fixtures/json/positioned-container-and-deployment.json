@@ -1,0 +1,277 @@
+{
+  "id" : 0,
+  "name" : "Positioned container view plus a deployment view",
+  "description" : "One workspace carrying a hand-arranged container view AND a deployment view whose boundaries sit on the origin while its instances carry real coordinates, plus themes and a filtered view derived from the container view.",
+  "model" : {
+    "people" : [ {
+      "id" : "1",
+      "name" : "Customer",
+      "tags" : "Element,Person",
+      "location" : "External",
+      "relationships" : [ {
+        "id" : "30",
+        "tags" : "Relationship",
+        "sourceId" : "1",
+        "destinationId" : "3",
+        "description" : "Uses",
+        "technology" : "HTTPS"
+      } ]
+    } ],
+    "softwareSystems" : [ {
+      "id" : "2",
+      "name" : "Internet Banking",
+      "tags" : "Element,Software System",
+      "containers" : [ {
+        "id" : "3",
+        "name" : "Web Application",
+        "technology" : "Java and Spring MVC",
+        "tags" : "Element,Container",
+        "relationships" : [ {
+          "id" : "31",
+          "tags" : "Relationship",
+          "sourceId" : "3",
+          "destinationId" : "4",
+          "description" : "Makes API calls to",
+          "technology" : "JSON/HTTPS"
+        } ]
+      }, {
+        "id" : "4",
+        "name" : "API Application",
+        "technology" : "Java and Spring MVC",
+        "tags" : "Element,Container",
+        "relationships" : [ {
+          "id" : "32",
+          "tags" : "Relationship",
+          "sourceId" : "4",
+          "destinationId" : "5",
+          "description" : "Reads from and writes to",
+          "technology" : "JDBC"
+        } ]
+      }, {
+        "id" : "5",
+        "name" : "Database",
+        "technology" : "Oracle Database 12c",
+        "tags" : "Element,Container,Database",
+        "url" : "https://example.com/runbooks/database",
+        "perspectives" : [ {
+          "name" : "Security",
+          "description" : "Holds personally identifiable information",
+          "value" : "High"
+        }, {
+          "name" : "Ownership",
+          "description" : "Platform team",
+          "value" : "platform@example.com"
+        } ]
+      } ]
+    } ],
+    "deploymentNodes" : [ {
+      "id" : "10",
+      "name" : "Amazon Web Services",
+      "environment" : "Live",
+      "tags" : "Element,Deployment Node",
+      "deploymentGroups" : [ "banking" ],
+      "children" : [ {
+        "id" : "11",
+        "name" : "US-East-1",
+        "environment" : "Live",
+        "tags" : "Element,Deployment Node",
+        "infrastructureNodes" : [ {
+          "id" : "19",
+          "name" : "Route 53",
+          "technology" : "DNS",
+          "environment" : "Live",
+          "tags" : "Element,Infrastructure Node",
+          "relationships" : [ {
+            "id" : "42",
+            "tags" : "Relationship",
+            "sourceId" : "19",
+            "destinationId" : "14",
+            "description" : "Forwards requests to",
+            "technology" : "HTTPS"
+          } ]
+        } ],
+        "children" : [ {
+          "id" : "20",
+          "name" : "Corporate firewall",
+          "description" : "Filters inbound traffic",
+          "technology" : "AWS Network Firewall",
+          "environment" : "Live",
+          "tags" : "Element,Deployment Node"
+        }, {
+          "id" : "12",
+          "name" : "Autoscaling group",
+          "environment" : "Live",
+          "tags" : "Element,Deployment Node",
+          "children" : [ {
+            "id" : "13",
+            "name" : "Amazon EC2 - Ubuntu server",
+            "environment" : "Live",
+            "instances" : "2",
+            "tags" : "Element,Deployment Node",
+            "containerInstances" : [ {
+              "id" : "14",
+              "containerId" : "3",
+              "instanceId" : 1,
+              "environment" : "Live",
+              "tags" : "Element,Container Instance",
+              "relationships" : [ {
+                "id" : "40",
+                "sourceId" : "14",
+                "destinationId" : "16",
+                "description" : "Makes API calls to",
+                "technology" : "JSON/HTTPS",
+                "linkedRelationshipId" : "31"
+              } ]
+            }, {
+              "id" : "16",
+              "containerId" : "4",
+              "instanceId" : 1,
+              "environment" : "Live",
+              "tags" : "Element,Container Instance",
+              "relationships" : [ {
+                "id" : "41",
+                "sourceId" : "16",
+                "destinationId" : "18",
+                "description" : "Reads from and writes to",
+                "technology" : "JDBC",
+                "linkedRelationshipId" : "32"
+              } ]
+            } ]
+          } ]
+        }, {
+          "id" : "15",
+          "name" : "Amazon RDS",
+          "environment" : "Live",
+          "tags" : "Element,Deployment Node",
+          "children" : [ {
+            "id" : "17",
+            "name" : "Oracle",
+            "environment" : "Live",
+            "tags" : "Element,Deployment Node",
+            "containerInstances" : [ {
+              "id" : "18",
+              "containerId" : "5",
+              "instanceId" : 1,
+              "environment" : "Live",
+              "tags" : "Element,Container Instance"
+            } ]
+          } ]
+        } ]
+      } ]
+    } ]
+  },
+  "views" : {
+    "containerViews" : [ {
+      "key" : "Containers",
+      "title" : "Internet Banking — Containers",
+      "softwareSystemId" : "2",
+      "order" : 1,
+      "elements" : [ {
+        "id" : "1",
+        "x" : 150,
+        "y" : 150
+      }, {
+        "id" : "3",
+        "x" : 1000,
+        "y" : 150
+      }, {
+        "id" : "4",
+        "x" : 1000,
+        "y" : 900
+      }, {
+        "id" : "5",
+        "x" : 1000,
+        "y" : 1650
+      } ],
+      "relationships" : [ {
+        "id" : "30"
+      }, {
+        "id" : "31"
+      }, {
+        "id" : "32"
+      } ]
+    } ],
+    "deploymentViews" : [ {
+      "key" : "LiveDeployment",
+      "title" : "Live deployment",
+      "softwareSystemId" : "2",
+      "environment" : "Live",
+      "order" : 2,
+      "elements" : [ {
+        "id" : "10",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "11",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "12",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "13",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "15",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "17",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "20",
+        "x" : 200,
+        "y" : 1100
+      }, {
+        "id" : "19",
+        "x" : 200,
+        "y" : 300
+      }, {
+        "id" : "14",
+        "x" : 1100,
+        "y" : 300
+      }, {
+        "id" : "16",
+        "x" : 1100,
+        "y" : 1100
+      }, {
+        "id" : "18",
+        "x" : 2200,
+        "y" : 1100
+      } ],
+      "relationships" : [ {
+        "id" : "42"
+      }, {
+        "id" : "40"
+      }, {
+        "id" : "41"
+      } ]
+    } ],
+    "filteredViews" : [ {
+      "key" : "ContainersWithoutDatabase",
+      "title" : "Containers without the database",
+      "baseViewKey" : "Containers",
+      "mode" : "Exclude",
+      "tags" : [ "Database" ],
+      "order" : 3
+    } ],
+    "configuration" : {
+      "themes" : [ "https://static.structurizr.com/themes/amazon-web-services-2023.01.31/theme.json", "amazon-web-services-2025.07" ],
+      "styles" : {
+        "elements" : [ {
+          "tag" : "Database",
+          "shape" : "Cylinder"
+        }, {
+          "tag" : "Person",
+          "shape" : "Person"
+        }, {
+          "tag" : "Container Instance",
+          "background" : "#ffffff"
+        } ]
+      }
+    }
+  }
+}

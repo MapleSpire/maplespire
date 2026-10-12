@@ -1,0 +1,346 @@
+{
+  "Bazel": {
+    "description": "Multi-language build and test tool for large codebases."
+  },
+  "Better Auth": {
+    "description": "Authentication and authorization framework for TypeScript.",
+    "website": "https://www.better-auth.com/"
+  },
+  "Biome": {
+    "description": "Fast formatter and linter for JavaScript, TypeScript, JSON and CSS."
+  },
+  "Buildpacks": {
+    "description": "Cloud Native Buildpacks: turn source code into OCI images without Dockerfiles.",
+    "website": "https://buildpacks.io/"
+  },
+  "Ceph": {
+    "description": "Distributed object, block and file storage.",
+    "website": "https://ceph.io/en"
+  },
+  "Chakra UI": {
+    "description": "Accessible React component library.",
+    "website": "https://chakra-ui.com"
+  },
+  "Chaos Mesh": {
+    "description": "Chaos engineering platform for Kubernetes.",
+    "website": "https://chaos-mesh.org/"
+  },
+  "Cloud Custodian": {
+    "description": "Rules engine for cloud governance, security and cost policies.",
+    "website": "https://cloudcustodian.io/"
+  },
+  "CloudEvents": {
+    "description": "Specification for describing event data in a common way.",
+    "website": "https://cloudevents.io/"
+  },
+  "containerd": {
+    "description": "Industry-standard container runtime.",
+    "website": "https://containerd.io/"
+  },
+  "Contour": {
+    "description": "Envoy-based ingress controller for Kubernetes.",
+    "website": "https://projectcontour.io"
+  },
+  "Cortex": {
+    "description": "Horizontally scalable, long-term storage for Prometheus metrics.",
+    "website": "https://cortexmetrics.io/"
+  },
+  "CRI-O": {
+    "description": "Lightweight container runtime implementing the Kubernetes CRI.",
+    "website": "https://cri-o.io/"
+  },
+  "DeepSeek": {
+    "description": "Family of large language models and their API.",
+    "website": "https://deepseek.com/"
+  },
+  "Dex": {
+    "description": "OpenID Connect identity provider that federates other identity sources.",
+    "website": "https://dexidp.io/"
+  },
+  "EMQX": {
+    "description": "Scalable MQTT broker for IoT and real-time messaging.",
+    "website": "https://www.emqx.com/en"
+  },
+  "External Secrets Operator": {
+    "description": "Kubernetes operator that syncs secrets from external secret managers.",
+    "website": "https://external-secrets.io/"
+  },
+  "Falco": {
+    "description": "Runtime security tool that detects threats in containers, Kubernetes and hosts.",
+    "website": "https://falco.org/"
+  },
+  "Forgejo": {
+    "description": "Self-hosted software forge: Git hosting, issues, CI."
+  },
+  "Gleam": {
+    "description": "Type-safe functional language for the Erlang VM and JavaScript.",
+    "website": "https://gleam.run/"
+  },
+  "Groq": {
+    "description": "Low-latency LLM inference API running on Groq LPUs.",
+    "website": "https://groq.com/"
+  },
+  "Headlamp": {
+    "description": "Extensible web UI for Kubernetes.",
+    "website": "https://headlamp.dev"
+  },
+  "Hono": {
+    "description": "Small web framework built on Web Standards, for any JavaScript runtime.",
+    "website": "https://hono.dev/"
+  },
+  "Hoppscotch": {
+    "description": "Open-source API development and testing platform.",
+    "website": "https://hoppscotch.com"
+  },
+  "Java Database Connectivity (JDBC)": {
+    "description": "Java API for connecting to relational databases, maintained by Oracle.",
+    "website": "https://docs.oracle.com/javase/tutorial/jdbc/",
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/java-database-connectivity-jdbc-3dace2e5.png",
+      "/icons/dark/java-database-connectivity-jdbc-ff9ae607.png"
+    ]
+  },
+  "Jetpack Compose": {
+    "description": "Android's declarative UI toolkit."
+  },
+  "k0s": {
+    "description": "Single-binary Kubernetes distribution.",
+    "website": "https://k0sproject.io/"
+  },
+  "k6": {
+    "description": "Load and performance testing tool scripted in JavaScript.",
+    "website": "https://k6.io"
+  },
+  "K8sGPT": {
+    "description": "AI-assisted diagnostics for Kubernetes clusters.",
+    "website": "https://www.k8sgpt.ai"
+  },
+  "Karpenter": {
+    "description": "Just-in-time node provisioning and autoscaling for Kubernetes.",
+    "website": "https://karpenter.sh"
+  },
+  "KEDA": {
+    "description": "Kubernetes event-driven autoscaler.",
+    "website": "https://keda.sh/"
+  },
+  "Knative": {
+    "description": "Serverless and event-driven application platform on Kubernetes.",
+    "website": "https://knative.dev"
+  },
+  "KServe": {
+    "description": "Model inference serving on Kubernetes.",
+    "website": "https://kserve.github.io/website/"
+  },
+  "Kubeflow": {
+    "description": "Machine-learning toolkit for building and running ML workflows on Kubernetes.",
+    "website": "https://kubeflow.org"
+  },
+  "Kubescape": {
+    "description": "Kubernetes security scanner for misconfigurations and vulnerabilities.",
+    "website": "https://kubescape.io/"
+  },
+  "KubeVela": {
+    "description": "Application delivery platform built on the Open Application Model.",
+    "website": "https://kubevela.io"
+  },
+  "KubeVirt": {
+    "description": "Runs virtual machines alongside containers on Kubernetes.",
+    "website": "https://kubevirt.io/"
+  },
+  "Kuma": {
+    "description": "Envoy-based service mesh for Kubernetes and VMs.",
+    "website": "https://kuma.io"
+  },
+  "Kyverno": {
+    "description": "Policy engine for Kubernetes, with policies written as Kubernetes resources.",
+    "website": "https://kyverno.io/"
+  },
+  "Linkerd": {
+    "description": "Lightweight service mesh for Kubernetes.",
+    "website": "https://linkerd.io/"
+  },
+  "Mattermost": {
+    "description": "Self-hostable team collaboration and messaging platform.",
+    "website": "https://mattermost.com/"
+  },
+  "n8n": {
+    "description": "Workflow automation platform with a visual editor and code steps.",
+    "website": "https://n8n.io/"
+  },
+  "Notary Project": {
+    "description": "Standards and tools for signing and verifying container artifacts.",
+    "website": "https://notaryproject.dev/"
+  },
+  "Nx": {
+    "description": "Build system and tooling for monorepos.",
+    "website": "https://nx.dev"
+  },
+  "OpenCost": {
+    "description": "Cost monitoring for Kubernetes and cloud workloads.",
+    "website": "https://www.opencost.io/"
+  },
+  "OpenTofu": {
+    "description": "Open-source infrastructure-as-code tool, the community fork of Terraform.",
+    "website": "https://opentofu.org/"
+  },
+  "Oracle APEX": {
+    "description": "Oracle Application Express, a low-code platform for building apps on Oracle Database.",
+    "website": "https://apex.oracle.com/",
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/oracle-apex-3dace2e5.png",
+      "/icons/dark/oracle-apex-ff9ae607.png"
+    ]
+  },
+  "Oracle ATG Commerce": {
+    "description": "Oracle's Java-based e-commerce platform, formerly Art Technology Group (ATG).",
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/oracle-atg-commerce-3dace2e5.png",
+      "/icons/dark/oracle-atg-commerce-ff9ae607.png"
+    ]
+  },
+  "Oracle Cloud Infrastructure": {
+    "description": "Oracle's public cloud: compute, storage, networking and managed databases.",
+    "website": "https://www.oracle.com/cloud/",
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/oracle-cloud-infrastructure-3dace2e5.png",
+      "/icons/dark/oracle-cloud-infrastructure-ff9ae607.png"
+    ]
+  },
+  "Oracle Database": {
+    "description": "Oracle's multi-model relational database management system.",
+    "website": "https://www.oracle.com/database/",
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/oracle-database-3dace2e5.png",
+      "/icons/dark/oracle-database-ff9ae607.png"
+    ]
+  },
+  "Oracle Essbase": {
+    "description": "Oracle's multidimensional (OLAP) database for analytics and planning.",
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/oracle-essbase-2f273eda.png",
+      "/icons/dark/oracle-essbase-32a2834f.png"
+    ]
+  },
+  "Oracle Forms": {
+    "description": "Oracle's tool for building database-centric forms applications.",
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/oracle-forms-3dace2e5.png",
+      "/icons/dark/oracle-forms-ff9ae607.png"
+    ]
+  },
+  "Oracle JD Edwards": {
+    "description": "Oracle's JD Edwards EnterpriseOne and World ERP suites.",
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/oracle-jd-edwards-3dace2e5.png",
+      "/icons/dark/oracle-jd-edwards-ff9ae607.png"
+    ]
+  },
+  "Oracle Reports": {
+    "description": "Oracle's report authoring and publishing tool for Oracle Database data.",
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/oracle-reports-3dace2e5.png",
+      "/icons/dark/oracle-reports-ff9ae607.png"
+    ]
+  },
+  "PlanetScale": {
+    "description": "Managed MySQL (Vitess) and PostgreSQL database platform.",
+    "website": "https://planetscale.com"
+  },
+  "PM2": {
+    "description": "Production process manager for Node.js applications.",
+    "website": "https://pm2.io/"
+  },
+  "PocketBase": {
+    "description": "Open-source backend in one file: SQLite database, auth, files and realtime API.",
+    "website": "https://pocketbase.io/"
+  },
+  "Polars": {
+    "description": "Fast DataFrame library for Rust and Python.",
+    "website": "https://pola.rs/"
+  },
+  "Railway": {
+    "description": "Deployment platform for applications and databases.",
+    "website": "https://railway.app/"
+  },
+  "Reflex": {
+    "description": "Framework for full-stack web apps in pure Python.",
+    "website": "https://reflex.dev/"
+  },
+  "Render": {
+    "description": "Cloud platform for hosting web services, databases and jobs.",
+    "website": "https://render.com/"
+  },
+  "Rook": {
+    "description": "Cloud-native storage orchestrator for Kubernetes, built on Ceph.",
+    "website": "https://rook.io/"
+  },
+  "Rspack": {
+    "description": "Rust-based web bundler compatible with the webpack ecosystem.",
+    "website": "https://rspack.rs/"
+  },
+  "RxJS": {
+    "description": "Reactive programming library for JavaScript using Observables.",
+    "website": "https://rxjs.dev/"
+  },
+  "SOPS": {
+    "description": "Editor and format for encrypted secrets files (YAML, JSON, ENV).",
+    "website": "https://github.com/getsops"
+  },
+  "SPIFFE": {
+    "description": "Standard for identifying and securing workloads across environments.",
+    "website": "https://spiffe.io/"
+  },
+  "SPIRE": {
+    "description": "Production-ready implementation of the SPIFFE workload identity APIs.",
+    "website": "https://spiffe.io/spire/"
+  },
+  "SST": {
+    "description": "Framework for building full-stack applications on your own cloud.",
+    "website": "https://sst.dev/"
+  },
+  "Strimzi": {
+    "description": "Operators for running Apache Kafka on Kubernetes.",
+    "website": "https://strimzi.io/"
+  },
+  "Teleport": {
+    "description": "Identity-based access platform for servers, Kubernetes, databases and apps.",
+    "website": "https://goteleport.com"
+  },
+  "TiDB": {
+    "description": "Distributed, MySQL-compatible SQL database.",
+    "website": "https://en.pingcap.com"
+  },
+  "Turbopack": {
+    "description": "Rust-based incremental bundler for Next.js.",
+    "website": "https://nextjs.org/docs/app/api-reference/turbopack"
+  },
+  "Turso": {
+    "description": "SQLite-compatible database (libSQL) for edge and embedded replicas.",
+    "website": "https://turso.tech"
+  },
+  "uv": {
+    "description": "Fast Python package and project manager written in Rust.",
+    "website": "https://docs.astral.sh/uv/"
+  },
+  "Volcano": {
+    "description": "Batch scheduling system for Kubernetes (AI, big data, HPC).",
+    "website": "https://volcano.sh/"
+  },
+  "wasmCloud": {
+    "description": "Platform for running distributed WebAssembly applications.",
+    "website": "https://wasmcloud.com"
+  },
+  "YugabyteDB": {
+    "description": "Distributed, PostgreSQL-compatible SQL database.",
+    "website": "https://www.yugabyte.com/yugabytedb/"
+  }
+}

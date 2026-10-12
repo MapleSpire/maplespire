@@ -1,0 +1,140 @@
+name: maplespire-dag-7366-performance
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: maplespire-enterprise-qa-postgres
+    environment:
+      POSTGRES_USER: maplespire
+      POSTGRES_PASSWORD: maplespire
+      POSTGRES_DB: maplespire
+    ports:
+      - "5455:5432"
+    volumes:
+      - performance_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U maplespire -d maplespire"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7.4-alpine
+    container_name: maplespire-enterprise-qa-redis
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--maxmemory", "256mb", "--maxmemory-policy", "noeviction"]
+    ports:
+      - "6391:6379"
+    volumes:
+      - performance_redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  render-cache:
+    image: redis:7.4-alpine
+    container_name: maplespire-enterprise-qa-redis-cache
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "512mb", "--maxmemory-policy", "allkeys-lru"]
+    ports:
+      - "6392:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build:
+      context: ../server
+      dockerfile: Dockerfile
+    image: maplespire-dag-7366-api:performance-validation
+    container_name: maplespire-enterprise-qa-api
+    # The process uses a two-stage shutdown: close/flush, release fenced
+    # ownership, then tear down the Repo. Keep Docker's grace window aligned
+    # with the server's 30 s safety deadline so it is never SIGKILLed while
+    # persisting an accepted edit.
+    stop_grace_period: 40s
+    # Optional: Compose v2 refuses to resolve the file at all when a listed
+    # env_file is missing, which it always is on a fresh checkout and in CI.
+    env_file:
+      - path: ../server/.env
+        required: false
+    environment:
+      PORT: 3015
+      NODE_ENV: development
+      NODE_OPTIONS: "--expose-gc"
+      APP_URL: http://localhost:5196
+      DATABASE_URL: postgres://maplespire:maplespire@postgres:5432/maplespire
+      # Measured: with the C-collated Connections index in place, SQL stays
+      # below 10 ms under mixed load, but the default pool of 10 still waits
+      # ~100 ms p95 at 100 clients.
+      DB_POOL_MAX: "50"
+      REDIS_URL: redis://redis:6379
+      REDIS_REQUIRED: "on"
+      REDIS_KEY_PREFIX: maplespire-dag-7366
+      REDIS_RENDER_CACHE_URL: redis://render-cache:6379
+      REDIS_RENDER_CACHE_KEY_PREFIX: maplespire-dag-7366:render
+      READ_MODEL: "on"
+      AM_SELECTIVE_SYNC: "on"
+      AM_RESET_SYNC_STATE_ON_DISCONNECT: "on"
+      AM_PERSIST_SYNC_STATE: ${AM_PERSIST_SYNC_STATE:-off}
+      # Aggressive only in the dedicated endurance stack: proves inactive
+      # handles are actually released without waiting five production minutes.
+      AM_IDLE_MS: 15000
+      AM_SWEEP_MS: 5000
+      AUTH: "on"
+      AUTH_DEV_LOGIN: "on"
+      ORG_SEED: "on"
+      EMAIL_PROVIDER: local
+      AM_WORKSPACE_ROUTING: "on"
+      SYNC_CELL_OWNERSHIP: "on"
+      SYNC_CELL_ID: dag-7366-performance-cell
+      SYNC_CELL_PARTITION_COUNT: 1
+      SYNC_CELL_TOPOLOGY_GENERATION: dag-7366-v1
+      TECHNOLOGY_ASSET_DIR: /var/lib/maplespire/assets/technologies
+    ports:
+      - "3015:3015"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      render-cache:
+        condition: service_healthy
+    volumes:
+      - performance_assets:/var/lib/maplespire/assets/technologies
+
+  web:
+    build:
+      context: ..
+      dockerfile: docker/nginx/Dockerfile
+      args:
+        VITE_SYNC_API_URL: ""
+        VITE_AUTOMERGE_URL: ""
+        VITE_BOOT_FROM_SERVER: "true"
+        VITE_MODEL_SHARDING: "true"
+        VITE_SERVER_READ_MODEL: "true"
+        VITE_CLIENT_PERF_DIAGNOSTICS: "true"
+    image: maplespire-dag-7366-web:performance-validation
+    container_name: maplespire-enterprise-qa-web-current
+    environment:
+      BACKEND_HOST: api
+      BACKEND_PORT: 3015
+    ports:
+      - "5196:80"
+    depends_on:
+      - api
+    volumes:
+      - performance_assets:/var/lib/maplespire/assets/technologies:ro
+
+volumes:
+  performance_postgres:
+    external: true
+    name: maplespire-enterprise-qa-postgres
+  performance_redis:
+    external: true
+    name: maplespire-enterprise-qa-redis-data
+  performance_assets:
+    external: true
+    name: maplespire-enterprise-qa-assets

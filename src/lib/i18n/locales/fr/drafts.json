@@ -1,0 +1,101 @@
+{
+  "drafts": {
+    "status": {
+      "active": "En cours",
+      "merged": "Fusionné",
+      "discarded": "Supprimé",
+      "archived": "Archivé"
+    },
+    "collection": {
+      "object": "Objet",
+      "connection": "Connexion",
+      "group": "Groupe",
+      "domain": "Domaine",
+      "tag": "Tag",
+      "decisionRecord": "Décision",
+      "diagram": "Diagramme",
+      "layout": "Disposition",
+      "flow": "Flux"
+    },
+    "conflict": {
+      "updateUpdate": "Modifié des deux côtés",
+      "updateDelete": "Modifié ici, supprimé dans le modèle en ligne",
+      "deleteUpdate": "Supprimé ici, modifié dans le modèle en ligne",
+      "unresolved": "Impossible à comparer (source illisible)"
+    },
+    "tabs": {
+      "all": "Tout {{count}}",
+      "created": "Créés",
+      "updated": "Modifiés",
+      "deleted": "Supprimés"
+    },
+    "pill": {
+      "added": "ajouté",
+      "edited": "modifié",
+      "removed": "supprimé"
+    },
+    "changes": {
+      "title": "Changements",
+      "recompute": "Recalculer les changements",
+      "model": "modèle",
+      "diagrams": "diagrammes",
+      "conflicts": "conflits",
+      "empty": "Aucun changement pour l'instant — modifiez le brouillon pour les voir ici.",
+      "loading": "Chargement des changements…",
+      "reviewConflicts": "Examiner les conflits",
+      "reviewAndMerge": "Examiner et fusionner",
+      "showOnCanvas": "Afficher sur le canevas",
+      "conflictBadge": "Conflit"
+    },
+    "table": {
+      "current": "Actuelle",
+      "draftName": "Nom du brouillon",
+      "draftNamePlaceholder": "ex. Refonte des paiements",
+      "creating": "Création…",
+      "createDraft": "Créer un brouillon",
+      "draft": "Brouillon",
+      "branchedFrom": "Créé à partir de {{parent}}",
+      "status": "Statut",
+      "created": "Créé le",
+      "changes": "Changements",
+      "conflicts": "Conflits",
+      "openDraft": "Ouvrir le brouillon",
+      "archiveDraft": "Archiver le brouillon",
+      "archive": "Archiver",
+      "restoreDraft": "Restaurer le brouillon",
+      "restore": "Restaurer",
+      "changesCount": "Changements · {{count}}",
+      "searchPlaceholder": "Rechercher des brouillons",
+      "newDraft": "Nouveau brouillon",
+      "footerLabel": "Brouillons",
+      "colDraft": "Brouillon",
+      "colStatus": "Statut",
+      "colCreated": "Créé le",
+      "loading": "Chargement des brouillons…",
+      "empty": "Aucun brouillon pour l'instant — créez-en un pour explorer de futurs changements en isolation."
+    },
+    "merge": {
+      "title": "Fusionner les changements",
+      "currentModel": "Modèle actuel",
+      "live": "en ligne",
+      "updatedModel": "Modèle mis à jour",
+      "blocked": "bloqué",
+      "conflictsResolveEach": "Conflits — résolvez chacun pour fusionner",
+      "keepMine": "Garder le mien",
+      "keepLive": "Garder l'existant",
+      "mineValue": "le mien : {{value}}",
+      "liveValue": "existant : {{value}}",
+      "cannotResolveHere": "{{reason}} — ne peut pas être résolu ici",
+      "noChangesToMerge": "Aucun changement à fusionner.",
+      "someConflictsCannotAutoResolve": "Certains conflits ne peuvent pas être résolus automatiquement — corrigez-les dans le brouillon, puis fusionnez.",
+      "chooseForEachConflict": "Choisissez Garder le mien ou Garder l'existant pour chaque conflit ({{count}} restant(s)).",
+      "mergeExplainer": "La fusion applique ces changements au modèle en ligne et enregistre une nouvelle version.",
+      "merging": "Fusion…",
+      "mergeChanges": "Fusionner {{count}} changement",
+      "mergeChanges_other": "Fusionner {{count}} changements",
+      "mustBeFixedInDraft": "Certains conflits doivent être corrigés dans le brouillon",
+      "resolveAllToMerge": "Résolvez tous les conflits pour fusionner",
+      "mergeConflictsCount": "Conflits à résoudre ({{count}})"
+    }
+  }
+}

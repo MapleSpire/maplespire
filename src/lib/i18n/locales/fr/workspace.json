@@ -1,0 +1,17 @@
+{
+  "workspace": {
+    "checking": "Vérification de l'accès…",
+    "forbiddenTitle": "Vous n'avez pas accès à ce landscape",
+    "forbiddenBody": "Ce lien partagé pointe vers un landscape ou une version que votre compte ne peut pas ouvrir. Demandez l'accès à un administrateur de cette organisation, ou basculez vers un de vos propres landscapes.",
+    "forbiddenGoToApp": "Aller à mon espace de travail",
+    "contractChanged": {
+      "message": "Ce landscape est passé à un registre hébergé sur le serveur. Rechargez pour continuer à l'éditer.",
+      "reload": "Recharger"
+    },
+    "repointed": {
+      "message": "Un administrateur a changé la version par défaut de ce landscape. Vous avez été maintenu sur celle que vous éditiez, car vous y aviez du travail non enregistré.",
+      "follow": "Aller à la nouvelle version par défaut",
+      "dismiss": "Fermer"
+    }
+  }
+}

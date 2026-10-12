@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" role="img" aria-label="MapleSpire">
+  <style>
+    .background { fill: #F1EFEB; }
+    .upper-soft { fill: #B98570; }
+    .upper-deep { fill: #8F5C48; }
+    .lower { fill: #24262D; }
+    @media (prefers-color-scheme: dark) {
+      .background { fill: #1E1D1B; }
+      .upper-soft { fill: #D0A08A; }
+      .upper-deep { fill: #B67C65; }
+      .lower { fill: #E8E2DA; }
+    }
+  </style>
+  <rect class="background" x="2" y="2" width="44" height="44" rx="10"/>
+  <g transform="scale(.1875)">
+    <g class="upper-soft">
+      <path d="M123 64h10v70h-10z"/>
+      <path d="m83 93 9-5 40 78-9 5z"/>
+    </g>
+    <path class="upper-deep" d="m164 88 9 5-40 78-9-5z"/>
+    <g class="lower">
+      <path d="M123 134h10v62h-10z"/>
+      <path d="m78 132 8-8 47 47-8 8z"/>
+      <path d="m170 124 8 8-47 47-8-8z"/>
+    </g>
+  </g>
+</svg>

@@ -1,0 +1,35 @@
+{
+  "accountSettings": {
+    "email": "E-mail",
+    "firstName": "Prénom",
+    "lastName": "Nom",
+    "profileSaved": "Profil enregistré",
+    "saving": "Enregistrement…",
+    "apiTokens": {
+      "title": "Jetons API",
+      "description": "Jetons porteurs pour les agents IA — connectez Claude Code & co. au serveur MCP à l'adresse",
+      "copyNowWarning": "Copiez ce jeton maintenant — il ne sera plus jamais affiché.",
+      "copyToken": "Copier le jeton",
+      "copied": "Copié.",
+      "namePlaceholder": "Nom du jeton (ex. claude-code laptop)",
+      "creating": "Création…",
+      "create": "Créer",
+      "createdOn": "{{prefix}} · créé le {{date}}",
+      "lastUsedOn": " · dernière utilisation le {{date}}",
+      "neverUsed": " · jamais utilisé",
+      "revokeToken": "Révoquer le jeton",
+      "noTokensYet": "Aucun jeton pour l'instant."
+    },
+    "newOrg": {
+      "description": "Une nouvelle organisation démarre avec son propre paysage et un diagramme vide. Vous en devenez l'administrateur.",
+      "name": "Nom",
+      "creating": "Création…",
+      "create": "Créer l'organisation"
+    },
+    "errors": {
+      "loadTokens": "Échec du chargement des jetons",
+      "createToken": "Échec de la création du jeton",
+      "revokeToken": "Échec de la révocation du jeton"
+    }
+  }
+}

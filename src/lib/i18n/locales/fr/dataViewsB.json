@@ -1,0 +1,115 @@
+{
+  "dataViewsB": {
+    "table": {
+      "headers": {
+        "objectName": "Nom de l'objet",
+        "apps": "Applis",
+        "stores": "Stockages",
+        "components": "Composants",
+        "connections": "Connexions",
+        "inDiagrams": "Dans les diagrammes",
+        "domain": "Domaine"
+      },
+      "inlineAdd": {
+        "app": "Appli",
+        "store": "Stockage",
+        "component": "Composant"
+      },
+      "rowMenu": {
+        "duplicate": "Dupliquer"
+      },
+      "dropHint": "Déposer sur un objet compatible",
+      "rootDropHint": "Déposer ici pour remettre à la racine"
+    },
+    "view": {
+      "searchPlaceholder": "Rechercher des objets",
+      "addObject": "Ajouter un objet",
+      "types": {
+        "actor": "Acteur",
+        "system": "Système",
+        "app": "Appli",
+        "store": "Stockage",
+        "component": "Composant",
+        "group": "Groupe"
+      },
+      "filters": {
+        "type": "Type",
+        "scope": "Portée",
+        "status": "Statut",
+        "tags": "Tags",
+        "technology": "Technologie",
+        "teams": "Équipes",
+        "catalogOffline": "Catalogue hors ligne",
+        "noTechnologies": "Aucune technologie sélectionnable n’est disponible.",
+        "domain": "Domaine",
+        "clearAll": "Effacer tous les filtres"
+      },
+      "scope": {
+        "internal": "Interne",
+        "external": "Externe"
+      },
+      "status": {
+        "live": "En ligne",
+        "draft": "Brouillon",
+        "down": "Indisponible",
+        "unstable": "Instable"
+      },
+      "addMenu": {
+        "title": "Ajouter au modèle"
+      },
+      "footer": {
+        "totalObjects": "Total des objets",
+        "groups": "Groupes"
+      }
+    },
+    "diagrams": {
+      "searchPlaceholder": "Rechercher des diagrammes",
+      "newDiagram": "Nouveau diagramme",
+      "loading": "Chargementâ€¦",
+      "loadMore": "Charger plus",
+      "loadFailed": "Impossible de charger les diagrammes",
+      "partialOffline": "Liste partielle — hors ligne. Affichage des diagrammes disponibles sur cet appareil.",
+      "empty": "Aucun diagramme trouvé",
+      "copySuffix": "{{name}} (copie)",
+      "duplicateFailed": "Impossible de dupliquer « {{name}} » — le placement de ses formes n’est pas disponible ici. Ouvrez-le une fois, puis réessayez.",
+      "levels": {
+        "level1": "Niveau 1",
+        "level2": "Niveau 2",
+        "level3": "Niveau 3"
+      },
+      "filters": {
+        "c4Level": "Niveau C4",
+        "domain": "Domaine"
+      },
+      "createMenu": {
+        "blankTitle": "Diagramme vierge",
+        "blankSubtitle": "Partir d'un canevas vide",
+        "importTitle": "Importer des diagrammes…",
+        "importSubtitle": "Depuis Structurizr DSL et plus"
+      },
+      "rightPanel": {
+        "title": "Diagramme",
+        "c4TypeDiagram": "C4 · Diagramme {{type}}",
+        "level": "Niveau",
+        "objects": "Objets",
+        "connections": "Connexions",
+        "domain": "Domaine",
+        "openInEditor": "Ouvrir dans l'éditeur"
+      },
+      "footer": {
+        "diagrams": "Diagrammes"
+      },
+      "card": {
+        "objectCount": "{{count}} objet",
+        "objectCount_other": "{{count}} objets",
+        "menu": {
+          "label": "Actions pour {{name}}",
+          "openDiagram": "Ouvrir le diagramme",
+          "rename": "Renommer",
+          "duplicate": "Dupliquer",
+          "duplicating": "Duplication…"
+        }
+      }
+    }
+  }
+}

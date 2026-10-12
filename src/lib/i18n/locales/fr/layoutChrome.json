@@ -1,0 +1,103 @@
+{
+  "layoutChrome": {
+    "loading": {
+      "model": "Chargement du modèle…"
+    },
+    "appShell": {
+      "showShapesPanel": "Afficher le panneau des formes",
+      "showPropertiesPanel": "Afficher le panneau des propriétés"
+    },
+    "bottomBar": {
+      "tabs": {
+        "tags": "Tags",
+        "technology": "Technologie",
+        "status": "Statut",
+        "teams": "Équipes"
+      },
+      "colorBy": "Colorer par {{label}}",
+      "hostnames": "Noms d'hôte {{count}}",
+      "region": "Région {{count}}",
+      "accessibility": "Accessibilité {{count}}",
+      "perspectives": "Perspectives",
+      "showPerspectives": "Afficher les perspectives",
+      "collapseToButton": "Réduire en bouton",
+      "collapseLine": "Réduire à une ligne",
+      "expand": "Déployer les perspectives",
+      "systemPerspective": "Cette perspective utilise des valeurs gérées par l’organisation.",
+      "managed": {
+        "pin": "Épingler {{value}}",
+        "unpin": "Désépingler {{value}}",
+        "focus": "Focaliser sur {{value}}",
+        "unfocus": "Arrêter la focalisation sur {{value}}",
+        "hide": "Masquer {{value}}",
+        "unhide": "Afficher {{value}}"
+      },
+      "technology": {
+        "empty": "Aucune technologie n'est utilisée dans ce diagramme"
+      },
+      "status": {
+        "empty": "Aucun statut n'est utilisé dans ce diagramme",
+        "values": {
+          "live": "En service",
+          "draft": "Brouillon",
+          "down": "Indisponible",
+          "unstable": "Instable"
+        }
+      },
+      "teams": {
+        "empty": "Aucun responsable n’est attribué dans ce diagramme"
+      },
+      "tags": {
+        "loading": "Chargement des groupes de Tags…",
+        "loadFailed": "Le catalogue de Tags est indisponible.",
+        "createFailed": "La modification du catalogue de Tags n’a pas pu être enregistrée.",
+        "noGroups": "Aucun Tag dans ce diagramme",
+        "chooseGroup": "Choisissez un groupe de Tags",
+        "noValues": "Aucune valeur dans ce diagramme",
+        "newGroup": "Nouveau groupe",
+        "newTag": "Nouveau Tag",
+        "managed": "Géré par l’administration",
+        "more": "Plus",
+        "pin": "Épingler {{value}}",
+        "unpin": "Désépingler {{value}}",
+        "focus": "Focaliser sur {{value}}",
+        "unfocus": "Arrêter la focalisation sur {{value}}",
+        "hide": "Masquer {{value}}",
+        "unhide": "Afficher {{value}}",
+        "focusActive": "Focalisation active",
+        "clearFocus": "Retirer la focalisation par Tag",
+        "hiddenCount": "Masqués {{count}}",
+        "showAllHidden": "Afficher tous les Tags masqués",
+        "createGroup": "Créer un groupe de Tags",
+        "createTag": "Créer un Tag dans {{group}}",
+        "groupName": "Nom du groupe",
+        "tagName": "Nom du Tag",
+        "color": "Couleur",
+        "reorderGroup": "RÃ©ordonner {{value}}",
+        "reorderTag": "RÃ©ordonner {{value}}",
+        "reorderHint": "Glisser, ou utiliser les flÃ¨ches Gauche et Droite",
+        "reorderFailed": "Impossible dâ€™enregistrer le nouvel ordre"
+      },
+      "sync": {
+        "connecting": "Connexion…",
+        "saving": "Enregistrement…",
+        "offline": "Hors ligne",
+        "error": "Erreur de synchronisation",
+        "synced": "Synchronisé",
+        "localFallback": "Contenu local — serveur indisponible"
+      },
+      "viewOnly": "Lecture seule",
+      "viewOnlyTooltip": "Votre rôle sur ce landscape est en lecture seule — la modification est désactivée"
+    },
+    "consoleShell": {
+      "backToApp": "Retour à l'application"
+    },
+    "leftSidebar": {
+      "collapsePanel": "Réduire le panneau",
+      "tabs": {
+        "shapes": "Formes",
+        "flows": "Flux"
+      }
+    }
+  }
+}

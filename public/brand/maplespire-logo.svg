@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title description">
+  <title id="title">MapleSpire</title>
+  <desc id="description">MapleSpire light-mode logo on overlapping stone, blue-grey, and clay shapes.</desc>
+  <rect width="512" height="512" fill="#F1EFEB"/>
+  <ellipse cx="100" cy="128" rx="208" ry="178" fill="#7E8AA3" opacity=".42"/>
+  <ellipse cx="407" cy="259" rx="164" ry="186" fill="#B98570" opacity=".48"/>
+  <ellipse cx="176" cy="390" rx="150" ry="128" fill="#CFAF98" opacity=".4"/>
+  <g transform="translate(64 48) scale(1.5)">
+    <g fill="#B98570">
+      <path d="M123 64h10v70h-10z"/>
+      <path d="m83 93 9-5 40 78-9 5z"/>
+    </g>
+    <path fill="#8F5C48" d="m164 88 9 5-40 78-9-5z"/>
+    <g fill="#24262D">
+      <path d="M123 134h10v62h-10z"/>
+      <path d="m78 132 8-8 47 47-8 8z"/>
+      <path d="m170 124 8 8-47 47-8-8z"/>
+    </g>
+  </g>
+</svg>

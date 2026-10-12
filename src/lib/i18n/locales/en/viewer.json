@@ -1,0 +1,55 @@
+{
+  "viewer": {
+    "loading": "Loading shared view…",
+    "notFound": "This share link is no longer available.",
+    "loadError": "Couldn't load this shared view.",
+    "readOnly": "Read only",
+    "detailsTab": "Details",
+    "flowsTab": "Flows",
+    "flowSidebarHint": "Read-only playback",
+    "showFlows": "Show flows panel",
+    "showDetails": "Show properties panel",
+    "switchDiagramAriaLabel": "Switch diagram",
+    "sharedDiagramFallback": "Shared diagram",
+    "viewMode": "Canvas view",
+    "view2d": "Flat canvas",
+    "view3d": "Perspective view (click again to reset the camera)",
+    "restricted": {
+      "signInTitle": "Sign in to view this shared view",
+      "signInBody": "This link is restricted. Sign in with an account that has access to open it.",
+      "signInButton": "Sign in",
+      "noAccessTitle": "You don't have access to this shared view",
+      "noAccessBody": "This link is restricted to a specific organization or email domain your account isn't part of."
+    }
+  },
+  "viewerDetails": {
+    "description": "Description",
+    "technology": "Technology",
+    "tags": "Tags",
+    "links": "Links",
+    "connectionFallback": "Connection",
+    "flow": "Flow",
+    "style": "Style",
+    "unknown": "Unknown",
+    "groupFallback": "Group",
+    "members": "Members",
+    "objectCount": "{{count}} objects",
+    "diagramOverview": "Diagram settings",
+    "objects": "Objects",
+    "connections": "Connections",
+    "groups": "Groups",
+    "copyEmails_one": "Copy email",
+    "copyEmails_other": "Copy {{count}} emails",
+    "emptyState": "Click a shape to see its details."
+  },
+  "viewerFlow": {
+    "selectFlow": "Choose a flow",
+    "playFlow": "Play flow",
+    "back": "Back",
+    "next": "Next",
+    "stop": "Stop",
+    "noFlows": "This diagram has no flows.",
+    "stepCounter": "{{current}} / {{total}}",
+    "untitledStep": "Untitled"
+  }
+}

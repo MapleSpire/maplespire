@@ -1,0 +1,10 @@
+{
+  "dateTime": {
+    "justNow": "just now",
+    "unitMinutes": "{{count}}m",
+    "unitHours": "{{count}}h",
+    "unitDays": "{{count}}d",
+    "relativeFuture": "in {{value}}",
+    "relativePast": "{{value}} ago"
+  }
+}

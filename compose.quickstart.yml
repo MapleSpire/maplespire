@@ -1,0 +1,138 @@
+# MapleSpire quickstart — the smallest stack that runs the full application.
+#
+#   node scripts/init-env.mjs
+#   docker compose -f compose.quickstart.yml up -d --build
+#   open http://localhost:8088
+#
+# Three services: PostgreSQL, ONE API process, and the nginx web front end.
+# Authentication, the read model and selective sync are on, exactly as in
+# production; there is no Redis, no second sync cell, no WebSocket router, no
+# monitoring and no backup drill. Those are what `compose.maplespire.yml` adds
+# for a production-shaped deployment.
+#
+# Guide: docs/getting-started.md
+
+name: maplespire-quickstart
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: maplespire
+      POSTGRES_PASSWORD: ${MAPLESPIRE_POSTGRES_PASSWORD:?Run node scripts/init-env.mjs first - see docs/getting-started.md}
+      POSTGRES_DB: maplespire
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U maplespire -d maplespire"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  api:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+      # Name the stage: the last stage of the Dockerfile is the backup drill,
+      # whose entrypoint never binds :3001.
+      target: runtime
+    restart: unless-stopped
+    stop_grace_period: 40s
+    environment:
+      PORT: "3001"
+      NODE_ENV: production
+      APP_URL: ${MAPLESPIRE_APP_URL:-http://localhost:8088}
+      SERVER_URL: ${MAPLESPIRE_APP_URL:-http://localhost:8088}
+      DATABASE_URL: postgres://maplespire:${MAPLESPIRE_POSTGRES_PASSWORD}@postgres:5432/maplespire
+      # Production guardrails: the server refuses to start in production
+      # without these.
+      AUTH: "on"
+      READ_MODEL: "on"
+      AM_SELECTIVE_SYNC: "on"
+      AUTH_SECRET: ${MAPLESPIRE_AUTH_SECRET:?Run node scripts/init-env.mjs first - see docs/getting-started.md}
+      AUTH_DEV_LOGIN: "off"
+      AUTH_PASSWORD_LOGIN: "on"
+      AUTH_LEGAL_ACCEPTANCE: "on"
+      AUTH_COOKIE_SECURE: ${MAPLESPIRE_AUTH_COOKIE_SECURE:-on}
+      PLATFORM_ADMIN_BOOTSTRAP_EMAIL: ${PLATFORM_ADMIN_BOOTSTRAP_EMAIL:-}
+      # One process, so no distributed runtime: no Redis, no partition
+      # ownership, no owner routing. Rate limits fall back to in-memory.
+      REDIS_URL: ""
+      REDIS_REQUIRED: "off"
+      REDIS_RENDER_CACHE_URL: ""
+      SYNC_CELL_OWNERSHIP: "off"
+      AM_WORKSPACE_ROUTING: "off"
+      # `local` keeps every email on this machine; read it at
+      # <APP_URL>/api/dev/outbox. The default outbox directory is not writable
+      # by the runtime user, hence OUTBOX_DIR.
+      EMAIL_PROVIDER: ${EMAIL_PROVIDER:-local}
+      OUTBOX_DIR: /tmp/maplespire-outbox
+      EMAIL_FROM: ${EMAIL_FROM:-}
+      AWS_REGION: ${AWS_REGION:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      CLOUDFLARE_ACCOUNT_ID: ${CLOUDFLARE_ACCOUNT_ID:-}
+      CLOUDFLARE_EMAIL_API_TOKEN: ${CLOUDFLARE_EMAIL_API_TOKEN:-}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      MS_CLIENT_ID: ${MS_CLIENT_ID:-}
+      MS_CLIENT_SECRET: ${MS_CLIENT_SECRET:-}
+      MS_TENANT: ${MS_TENANT:-}
+      # Exact custom AI endpoints (LM Studio, OpenAI-compatible) the server may
+      # call; hosted providers need nothing. See docs/ai-assist.md.
+      AI_ALLOWED_BASE_URLS: ${AI_ALLOWED_BASE_URLS:-}
+      TECHNOLOGY_ASSET_DIR: /var/lib/maplespire/assets/technologies
+    # Lets the API reach a model server on this machine (LM Studio, Ollama) as
+    # host.docker.internal, on Linux as well as Docker Desktop.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - technology_assets:/var/lib/maplespire/assets/technologies
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/api/ready').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  web:
+    build:
+      context: .
+      dockerfile: docker/nginx/Dockerfile
+      args:
+        VITE_SYNC_API_URL: ""
+        VITE_AUTOMERGE_URL: ""
+        # These three go together: boot from the server WITHOUT the server
+        # read model silently truncates the global views.
+        VITE_BOOT_FROM_SERVER: "true"
+        VITE_MODEL_SHARDING: "true"
+        VITE_SERVER_READ_MODEL: "true"
+    restart: unless-stopped
+    environment:
+      # REST and the Automerge WebSocket both go to the single API process.
+      BACKEND_HOST: api
+      BACKEND_PORT: "3001"
+      SYNC_WS_HOST: api
+      SYNC_WS_PORT: "3001"
+      # Microsoft Entra publisher-domain verification file; empty = off.
+      MS_IDENTITY_ASSOCIATION_APP_ID: ${MS_IDENTITY_ASSOCIATION_APP_ID:-}
+    ports:
+      - "127.0.0.1:${MAPLESPIRE_WEB_PORT:-8088}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    volumes:
+      - technology_assets:/var/lib/maplespire/assets/technologies:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+volumes:
+  postgres_data:
+  technology_assets:

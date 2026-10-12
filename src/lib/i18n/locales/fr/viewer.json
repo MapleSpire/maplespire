@@ -1,0 +1,55 @@
+{
+  "viewer": {
+    "loading": "Chargement de la vue partagée…",
+    "notFound": "Ce lien de partage n'est plus disponible.",
+    "loadError": "Impossible de charger cette vue partagée.",
+    "readOnly": "Lecture seule",
+    "detailsTab": "Détails",
+    "flowsTab": "Flux",
+    "flowSidebarHint": "Lecture seule",
+    "showFlows": "Afficher le panneau des flux",
+    "showDetails": "Afficher le panneau des propriétés",
+    "switchDiagramAriaLabel": "Changer de diagramme",
+    "sharedDiagramFallback": "Diagramme partagé",
+    "viewMode": "Vue du canevas",
+    "view2d": "Canevas à plat",
+    "view3d": "Vue en perspective (cliquer à nouveau pour réinitialiser la caméra)",
+    "restricted": {
+      "signInTitle": "Connectez-vous pour voir cette vue partagée",
+      "signInBody": "Ce lien est restreint. Connectez-vous avec un compte qui y a accès pour l'ouvrir.",
+      "signInButton": "Se connecter",
+      "noAccessTitle": "Vous n'avez pas accès à cette vue partagée",
+      "noAccessBody": "Ce lien est restreint à une organisation ou à un domaine e-mail dont votre compte ne fait pas partie."
+    }
+  },
+  "viewerDetails": {
+    "description": "Description",
+    "technology": "Technologie",
+    "tags": "Étiquettes",
+    "links": "Liens",
+    "connectionFallback": "Connexion",
+    "flow": "Flux",
+    "style": "Style",
+    "unknown": "Inconnu",
+    "groupFallback": "Groupe",
+    "members": "Membres",
+    "objectCount": "{{count}} objets",
+    "diagramOverview": "Paramètres du diagramme",
+    "objects": "Objets",
+    "connections": "Connexions",
+    "groups": "Groupes",
+    "copyEmails_one": "Copier le courriel",
+    "copyEmails_other": "Copier les {{count}} courriels",
+    "emptyState": "Cliquez sur une forme pour voir ses détails."
+  },
+  "viewerFlow": {
+    "selectFlow": "Choisir un flux",
+    "playFlow": "Lire le flux",
+    "back": "Précédent",
+    "next": "Suivant",
+    "stop": "Arrêter",
+    "noFlows": "Ce diagramme n'a aucun flux.",
+    "stepCounter": "{{current}} / {{total}}",
+    "untitledStep": "Sans titre"
+  }
+}

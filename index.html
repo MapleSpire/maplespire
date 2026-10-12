@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MapleSpire &mdash; Architecture clarity that moves teams forward</title>
+    <meta name="description" content="Collaborative diagramming and modelling for software architecture. Turn scattered diagrams into a single, trusted source of truth." />
+    <meta name="robots" content="noindex,nofollow,noarchive" />
+    <meta name="application-name" content="MapleSpire" />
+    <meta name="theme-color" media="(prefers-color-scheme: light)" content="#F1EFEB" />
+    <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#161513" />
+    <link rel="canonical" href="https://app.maplespire.ca/" />
+
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="icon" href="/favicon-32x32.png" sizes="32x32" type="image/png" />
+    <link rel="icon" href="/favicon-16x16.png" sizes="16x16" type="image/png" />
+    <link rel="shortcut icon" href="/favicon.ico" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+    <link rel="manifest" href="/site.webmanifest" />
+
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="MapleSpire" />
+    <meta property="og:title" content="MapleSpire — Architecture clarity that moves teams forward" />
+    <meta property="og:description" content="Collaborative diagramming and modelling for software architecture. Turn scattered diagrams into a single, trusted source of truth." />
+    <meta property="og:url" content="https://app.maplespire.ca/" />
+    <meta property="og:locale" content="en_CA" />
+    <meta property="og:locale:alternate" content="fr_CA" />
+    <meta property="og:image" content="https://maplespire.ca/social/maplespire-og.png" />
+    <meta property="og:image:secure_url" content="https://maplespire.ca/social/maplespire-og.png" />
+    <meta property="og:image:type" content="image/png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="MapleSpire architecture diagramming workspace" />
+
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="MapleSpire — Architecture clarity that moves teams forward" />
+    <meta name="twitter:description" content="Collaborative diagramming and modelling for software architecture. Turn scattered diagrams into a single, trusted source of truth." />
+    <meta name="twitter:image" content="https://maplespire.ca/social/maplespire-og.png" />
+    <meta name="twitter:image:alt" content="MapleSpire architecture diagramming workspace" />
+    <script>
+      // Keep browser-visible metadata aligned with the language selected by the
+      // user. Dedicated image assets prevent mixed-language social cards.
+      (function () {
+        try {
+          var raw = localStorage.getItem('maplespire:language') || navigator.language || 'en';
+          if (String(raw).toLowerCase().split('-')[0] !== 'fr') return;
+
+          var title = 'MapleSpire — Une architecture claire qui fait avancer les équipes';
+          var description = 'Outil collaboratif de diagrammes et de modélisation pour l’architecture logicielle. Transformez des diagrammes éparpillés en une source de vérité unique et fiable.';
+          var image = 'https://maplespire.ca/social/maplespire-og-fr.png';
+          var imageAlt = 'Espace de modélisation d’architecture MapleSpire';
+          var setMeta = function (selector, value) {
+            var element = document.querySelector(selector);
+            if (element) element.setAttribute('content', value);
+          };
+
+          document.title = title;
+          setMeta('meta[name="description"]', description);
+          setMeta('meta[property="og:title"]', title);
+          setMeta('meta[property="og:description"]', description);
+          setMeta('meta[property="og:locale"]', 'fr_CA');
+          setMeta('meta[property="og:locale:alternate"]', 'en_CA');
+          setMeta('meta[property="og:image"]', image);
+          setMeta('meta[property="og:image:secure_url"]', image);
+          setMeta('meta[property="og:image:alt"]', imageAlt);
+          setMeta('meta[name="twitter:title"]', title);
+          setMeta('meta[name="twitter:description"]', description);
+          setMeta('meta[name="twitter:image"]', image);
+          setMeta('meta[name="twitter:image:alt"]', imageAlt);
+        } catch (e) {
+          // English metadata remains the safe default when storage is unavailable.
+        }
+      })();
+    </script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Press+Start+2P&display=swap" rel="stylesheet">
+  </head>
+  <body>
+    <script>
+      // Apply the saved (or system) theme before first paint to avoid a flash
+      // of the wrong theme. Mirrors the logic in src/stores/themeStore.ts.
+      (function () {
+        try {
+          var stored = localStorage.getItem('maplespire:theme') || localStorage.getItem('maplespire-theme');
+          var mode = stored === 'light' || stored === 'dark' || stored === 'system' ? stored : 'system';
+          var systemDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+          var resolved = mode === 'system' ? (systemDark ? 'dark' : 'light') : mode;
+          document.documentElement.setAttribute('data-theme', resolved);
+        } catch (e) {
+          document.documentElement.setAttribute('data-theme', 'light');
+        }
+      })();
+      // Set <html lang> before first paint (a11y / screen readers). Mirrors the
+      // detection in src/lib/i18n/index.ts: stored choice → browser → 'en',
+      // collapsing fr-FR/fr-CA → fr and everything else → en.
+      (function () {
+        try {
+          var raw = localStorage.getItem('maplespire:language') || navigator.language || 'en';
+          var base = String(raw).toLowerCase().split('-')[0];
+          document.documentElement.setAttribute('lang', base === 'fr' ? 'fr' : 'en');
+        } catch (e) {
+          document.documentElement.setAttribute('lang', 'en');
+        }
+      })();
+    </script>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

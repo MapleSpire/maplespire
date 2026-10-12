@@ -1,0 +1,147 @@
+{
+  "shareExport": {
+    "manage": {
+      "back": "Back",
+      "empty": "No share links yet.",
+      "pinned": "pinned",
+      "pinnedWithLabel": "pinned · {{label}}",
+      "latest": "latest",
+      "viewCount": "{{count}} views",
+      "enableLink": "Enable link",
+      "revokeLink": "Revoke link",
+      "editSettings": "Edit link settings",
+      "noPermission": "You don't have permission to change this link.",
+      "somethingWentWrong": "Something went wrong"
+    },
+    "embedGrid": {
+      "title": "Embed in",
+      "embedInTarget": "Embed in {{name}}",
+      "previewAriaLabel": "Preview of the read-only embedded diagram"
+    },
+    "embedInstructions": {
+      "liveReadOnly": "live & read-only",
+      "embedLink": "Embed link",
+      "copy": "Copy",
+      "copied": "Copied!",
+      "copyIframeSnippet": "Copy iframe snippet",
+      "iframeSnippetCopied": "iframe snippet copied!"
+    },
+    "embedTargets": {
+      "confluence": {
+        "tagline": "Atlassian pages",
+        "step1": "Edit the Confluence page.",
+        "step2": "Type /iframe (or add the Iframe macro).",
+        "step3": "Paste the embed link and update."
+      },
+      "notion": {
+        "tagline": "Docs & wikis",
+        "step1": "Open your Notion page.",
+        "step2": "Paste the link, then choose “Create embed”.",
+        "step3": "Drag to resize the diagram block."
+      },
+      "miro": {
+        "tagline": "Whiteboards",
+        "step1": "Open the Apps panel on your board.",
+        "step2": "Add the Iframe / Embed app.",
+        "step3": "Paste the embed link to drop it in."
+      },
+      "sharepoint": {
+        "tagline": "Microsoft 365",
+        "step1": "Edit the SharePoint page.",
+        "step2": "Add the Embed web part.",
+        "step3": "Paste the iframe snippet and publish."
+      },
+      "iframe": {
+        "tagline": "Anywhere iframes work",
+        "step1": "Copy the iframe snippet below.",
+        "step2": "Paste it into any page that allows HTML / iframes.",
+        "step3": "Adjust width & height to taste."
+      }
+    },
+    "exportView": {
+      "types": {
+        "json": { "blurb": "Your entire model — objects, connections, flows, tags and domains, with all granular metadata." },
+        "pdf": { "blurb": "A formatted summary document to share with stakeholders." },
+        "markdown": { "blurb": "A Markdown summary — drop it straight into a wiki or repo." },
+        "html": { "blurb": "A self-contained HTML summary page." },
+        "llms": { "blurb": "A plain-text summary structured for large language models." },
+        "csv": { "blurb": "A spreadsheet of your model objects or connections." },
+        "structurizr": { "blurb": "A Structurizr DSL workspace — model plus structural views, re-importable here or in Structurizr." },
+        "structurizrJson": { "blurb": "A Structurizr workspace.json — the same model, and unlike the DSL it also carries the layout, so your diagrams arrive arranged the way you drew them." },
+        "mermaid": { "blurb": "A Mermaid C4 diagram — paste it into docs, wikis or mermaid.live." },
+        "svg": { "blurb": "The current diagram as a scalable vector image." },
+        "png": { "blurb": "The current diagram as a high-resolution raster image." }
+      },
+      "groups": {
+        "fullModel": "Full model",
+        "summary": "Summary",
+        "data": "Data",
+        "code": "Code",
+        "image": "Image"
+      },
+      "labels": {
+        "scope": "Scope",
+        "landscape": "Landscape",
+        "diagram": "Diagram",
+        "domain": "Domain",
+        "modelObject": "Model object",
+        "orientation": "Orientation",
+        "portrait": "Portrait",
+        "diagramImage": "Diagram image",
+        "none": "None",
+        "include": "Include",
+        "contents": "Contents",
+        "modelObjects": "Model objects",
+        "connections": "Connections",
+        "theme": "Theme",
+        "legend": "Legend",
+        "separateFile": "Separate file",
+        "inImage": "In image",
+        "resolution": "Resolution",
+        "resolutionStandard": "1× · standard",
+        "resolutionRetina": "2× · retina",
+        "resolutionPrint": "3× · print",
+        "view": "View",
+        "view2d": "2D board",
+        "view3d": "3D view"
+      },
+      "unknown": "unknown",
+      "currentDiagram": "current",
+      "scopeLabel": {
+        "landscape": "the whole landscape",
+        "domain": "the “{{name}}” domain",
+        "object": "the “{{name}}” object",
+        "diagram": "the “{{name}}” diagram"
+      },
+      "included": {
+        "imageBlocked": "Open a diagram first — image exports capture the diagram you are working on.",
+        "thisDiagram": "This diagram",
+        "wholeLandscape": "The whole landscape",
+        "namedDiagram": "The “{{name}}” diagram",
+        "json": "{{scope}}: domains, flows, model connections, model objects, groups and tags — with every field of metadata.",
+        "structurizr": "{{scope}} as a Structurizr DSL workspace: model elements, relationships and structural views.",
+        "structurizrJson": "{{scope}} as a Structurizr workspace.json: model elements, relationships, views — and the position of every shape on every view, which the DSL cannot express.",
+        "mermaidDiagram": "The “{{name}}” diagram as a Mermaid C4 diagram, at its own level.",
+        "mermaidLandscape": "The whole landscape as one Mermaid C4 context diagram with system boundaries.",
+        "summary": "Model objects, connections, flows and tags in {{scope}}.{{diagramNote}}",
+        "summaryDiagramNote": " The “{{name}}” diagram is drawn into the document.",
+        "csvConnections": "One row per connection: sender & receiver, direction, status, technology and description.",
+        "csvObjects": "One row per object: name, type, status, tags, technology and links. Connections and flows are not included.",
+        "svg": "The “{{name}}” diagram as scalable vectors, in {{theme}} theme.",
+        "png": "The “{{name}}” diagram in {{theme}} theme, at {{scale}}× resolution.",
+        "png3d": "The live 3D board of “{{name}}”, exactly as framed, at {{scale}}× resolution.",
+        "legendSeparate": "A legend of its shapes and connections downloads as a second file.",
+        "legendEmbedded": "A legend of its shapes and connections is drawn into the image."
+      },
+      "downloaded": "Downloaded",
+      "modelIncomplete": "The whole landscape could not be read right now — {{objects}} objects and {{connections}} connections used by its diagrams are missing. Landscape-wide formats are unavailable until it loads; reconnect or reload, or export just the current diagram.",
+      "notes": "What the export could not say exactly",
+      "preparing": "Preparing…",
+      "downloadType": "Download {{label}}",
+      "errors": {
+        "readModel": "Could not read the model. Try again.",
+        "exportFailed": "Export failed"
+      }
+    }
+  }
+}

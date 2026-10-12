@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "provider": "aws-sns-cloudwatch",
+  "heartbeatIntervalSeconds": 60,
+  "graceSeconds": 300,
+  "deviceReceiptWindowSeconds": [300, 480],
+  "region": "ca-central-1",
+  "heartbeatTopicName": "maplespire-watchdog",
+  "notificationTopicName": "maplespire-alerting-notifications",
+  "alarmName": "MapleSpireWatchdogMissing",
+  "metric": {
+    "namespace": "AWS/SNS",
+    "name": "NumberOfMessagesPublished",
+    "dimension": "TopicName",
+    "statistic": "Sum",
+    "periodSeconds": 60,
+    "expression": "FILL(m1, 0)"
+  },
+  "alarm": {
+    "comparisonOperator": "LessThanThreshold",
+    "threshold": 1,
+    "evaluationPeriods": 5,
+    "datapointsToAlarm": 5,
+    "treatMissingData": "breaching"
+  }
+}

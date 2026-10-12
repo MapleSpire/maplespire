@@ -1,0 +1,500 @@
+name: maplespire
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+# Settings every sync cell must share. The per-cell identity
+# (`SYNC_CELL_ID`, `SYNC_CELL_ADVERTISE_URL`) is set on each cell instead:
+# two cells with the same identity cannot resolve the partition lease.
+#
+# With one partition and two cells, one cell owns the partition and the other
+# is a warm standby. Raising `SYNC_CELL_PARTITION_COUNT` re-buckets every
+# workspace and needs a migration.
+x-api-environment: &api-environment
+  PORT: "3001"
+  NODE_ENV: production
+  # DNS lookups run on the libuv threadpool (4 threads by default). When a
+  # dependency stops resolving, failed lookups block those threads and new
+  # connections to healthy hosts queue behind them. 64 removed that stall in
+  # Redis-outage tests.
+  UV_THREADPOOL_SIZE: "64"
+  APP_URL: ${MAPLESPIRE_APP_URL:-http://localhost:8088}
+  SERVER_URL: ${MAPLESPIRE_APP_URL:-http://localhost:8088}
+  DATABASE_URL: postgres://maplespire:${MAPLESPIRE_POSTGRES_PASSWORD}@postgres:5432/maplespire
+  REDIS_URL: redis://redis:6379
+  REDIS_REQUIRED: "on"
+  REDIS_KEY_PREFIX: maplespire
+  REDIS_RENDER_CACHE_URL: redis://render-cache:6379
+  REDIS_RENDER_CACHE_KEY_PREFIX: maplespire:render
+  READ_MODEL: "on"
+  AM_SELECTIVE_SYNC: "on"
+  AM_WORKSPACE_ROUTING: "on"
+  SYNC_CELL_OWNERSHIP: "on"
+  SYNC_CELL_PARTITION_COUNT: "1"
+  SYNC_CELL_TOPOLOGY_GENERATION: maplespire-v1
+  AUTH: "on"
+  AUTH_DEV_LOGIN: "off"
+  AUTH_PASSWORD_LOGIN: "on"
+  AUTH_LEGAL_ACCEPTANCE: "on"
+  AUTH_SECRET: ${MAPLESPIRE_AUTH_SECRET:?Run node scripts/init-env.mjs first - see docs/getting-started.md}
+  AUTH_COOKIE_SECURE: ${MAPLESPIRE_AUTH_COOKIE_SECURE:-on}
+  GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+  GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+  MS_CLIENT_ID: ${MS_CLIENT_ID:-}
+  MS_CLIENT_SECRET: ${MS_CLIENT_SECRET:-}
+  MS_TENANT: ${MS_TENANT:-}
+  # Exact custom AI endpoints (LM Studio, OpenAI-compatible) the server may
+  # call; hosted providers need nothing. See docs/ai-assist.md.
+  AI_ALLOWED_BASE_URLS: ${AI_ALLOWED_BASE_URLS:-}
+  METRICS_TOKEN: ${MAPLESPIRE_METRICS_TOKEN:?Run node scripts/init-env.mjs first - see docs/getting-started.md}
+  PLATFORM_ADMIN_BOOTSTRAP_EMAIL: ${PLATFORM_ADMIN_BOOTSTRAP_EMAIL:-}
+  EMAIL_PROVIDER: ${EMAIL_PROVIDER:-local}
+  # Where `EMAIL_PROVIDER=local` writes messages (read through
+  # `/api/dev/outbox`). The default path is not writable by the runtime user.
+  OUTBOX_DIR: /tmp/maplespire-outbox
+  EMAIL_FROM: ${EMAIL_FROM:-}
+  CLOUDFLARE_ACCOUNT_ID: ${CLOUDFLARE_ACCOUNT_ID:-}
+  CLOUDFLARE_EMAIL_API_TOKEN: ${CLOUDFLARE_EMAIL_API_TOKEN:-}
+  AWS_REGION: ${AWS_REGION:-}
+  AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+  AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+  TECHNOLOGY_ASSET_DIR: /var/lib/maplespire/assets/technologies
+
+x-api-healthcheck: &api-healthcheck
+  test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/api/ready').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+  interval: 10s
+  timeout: 5s
+  retries: 30
+  start_period: 30s
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    logging: *default-logging
+    restart: always
+    # TCP keepalives close a backend whose client vanished without a FIN/RST
+    # (firewall or NAT eviction) after ~2 minutes instead of the OS default of
+    # 2 hours. Set all three: idle alone leaves detection at ~12 minutes.
+    # Check them over TCP (`psql -h 127.0.0.1`); a Unix-socket session reads 0.
+    command:
+      - postgres
+      - -c
+      - tcp_keepalives_idle=60
+      - -c
+      - tcp_keepalives_interval=10
+      - -c
+      - tcp_keepalives_count=6
+    environment:
+      POSTGRES_USER: maplespire
+      POSTGRES_PASSWORD: ${MAPLESPIRE_POSTGRES_PASSWORD:?Run node scripts/init-env.mjs first - see docs/getting-started.md}
+      POSTGRES_DB: maplespire
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U maplespire -d maplespire"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # Coordination state only (ownership leases, fencing floors, rate limits).
+  # PostgreSQL holds the durable fencing token and every key is rebuilt or
+  # expires, so persistence is OFF: a torn AOF/RDB file after an unclean
+  # shutdown would stop Redis from starting, and the API with it. Keep both
+  # `--save ""` and `--appendonly no`.
+  #
+  # `noeviction` is required: an evicted owner key is a lease nobody released.
+  # Do not switch it to `allkeys-lru` like render-cache.
+  redis:
+    image: redis:7.4-alpine
+    logging: *default-logging
+    restart: always
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "noeviction"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # No `depends_on`, so it keeps publishing `redis_up 0` while Redis is down.
+  # No healthcheck either: the image is distroless and has no tool that could
+  # probe the listener. `up{job="redis"}` and the `RedisExporterDown` alert
+  # cover it.
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.67.0
+    logging: *default-logging
+    restart: always
+    command: ["--redis.addr", "redis://redis:6379"]
+
+  render-cache:
+    image: redis:7.4-alpine
+    logging: *default-logging
+    restart: always
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "512mb", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # First sync cell. nginx sends REST traffic here.
+  api:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+      # Required: without a target BuildKit builds the last stage (`drill`),
+      # which never starts the API.
+      target: runtime
+    logging: *default-logging
+    restart: always
+    stop_grace_period: 40s
+    environment:
+      <<: *api-environment
+      SYNC_CELL_ID: maplespire-home
+      # The address other cells and the WebSocket router use to reach this
+      # cell. Required as soon as there are two cells.
+      SYNC_CELL_ADVERTISE_URL: http://api:3001
+    # Lets the API reach a model server on this machine as host.docker.internal.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      render-cache:
+        condition: service_healthy
+    volumes:
+      - technology_assets:/var/lib/maplespire/assets/technologies
+    healthcheck: *api-healthcheck
+
+  # Second sync cell, a warm standby. It takes over the partition when `api`
+  # restarts and keeps it afterwards; workspace-scoped REST requests reaching
+  # `api` are forwarded to whichever cell owns the partition.
+  # `/api/ready` reports whether the cell can serve, not whether it owns a
+  # partition, so a standby is healthy.
+  api-b:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+      target: runtime
+    logging: *default-logging
+    restart: always
+    stop_grace_period: 40s
+    environment:
+      <<: *api-environment
+      SYNC_CELL_ID: maplespire-home-b
+      SYNC_CELL_ADVERTISE_URL: http://api-b:3001
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      render-cache:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    volumes:
+      - technology_assets:/var/lib/maplespire/assets/technologies
+    healthcheck: *api-healthcheck
+
+  # Owner-aware WebSocket router: looks up the partition owner in Redis and
+  # tunnels each `/automerge` upgrade straight to that cell.
+  # It does not use `*api-environment` (no auth or mail secrets). The database,
+  # Redis and topology values must match the cells' —
+  # `server/src/syncCells/routerDeployment.test.ts` checks them.
+  sync-ws-router:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+      target: runtime
+    logging: *default-logging
+    restart: always
+    command: ["node", "dist/syncCells/routerMain.js"]
+    # Metrics, on the Compose network only.
+    expose:
+      - "9464"
+    environment:
+      DATABASE_URL: postgres://maplespire:${MAPLESPIRE_POSTGRES_PASSWORD}@postgres:5432/maplespire
+      REDIS_URL: redis://redis:6379
+      REDIS_REQUIRED: "on"
+      REDIS_KEY_PREFIX: maplespire
+      PORT: "3010"
+      METRICS_TOKEN: ${MAPLESPIRE_METRICS_TOKEN:?Run node scripts/init-env.mjs first - see docs/getting-started.md}
+      SYNC_ROUTER_METRICS_PORT: "9464"
+      SYNC_CELL_PARTITION_COUNT: "1"
+      SYNC_CELL_TOPOLOGY_GENERATION: maplespire-v1
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3010/api/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  web:
+    build:
+      context: .
+      dockerfile: docker/nginx/Dockerfile
+      args:
+        VITE_SYNC_API_URL: ""
+        VITE_AUTOMERGE_URL: ""
+        VITE_BOOT_FROM_SERVER: "true"
+        VITE_MODEL_SHARDING: "true"
+        VITE_SERVER_READ_MODEL: "true"
+    logging: *default-logging
+    restart: always
+    environment:
+      BACKEND_HOST: api
+      BACKEND_PORT: "3001"
+      # Only `/automerge` goes through the router; REST goes straight to `api`.
+      SYNC_WS_HOST: sync-ws-router
+      SYNC_WS_PORT: "3010"
+      # Microsoft Entra publisher-domain verification file; empty = off.
+      MS_IDENTITY_ASSOCIATION_APP_ID: ${MS_IDENTITY_ASSOCIATION_APP_ID:-}
+    ports:
+      - "127.0.0.1:${MAPLESPIRE_WEB_PORT:-8088}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+      sync-ws-router:
+        condition: service_healthy
+    volumes:
+      - technology_assets:/var/lib/maplespire/assets/technologies:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  # Runs the backup-and-restore drill on a schedule: the API image plus
+  # pg_dump. Keeps its bundles in its own volume, pruned to a byte budget.
+  backup-drill:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+      target: drill
+      args:
+        PG_MAJOR: "16"
+    logging: *default-logging
+    restart: always
+    # Must exceed BACKUP_DRILL_ABORT_GRACE_SECONDS, so an interrupted drill can
+    # drop its temporary restore database before Docker sends SIGKILL.
+    stop_grace_period: 420s
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgres://maplespire:${MAPLESPIRE_POSTGRES_PASSWORD}@postgres:5432/maplespire
+      BACKUP_DRILL_DEADLINE_HOURS: "6"
+      BACKUP_DRILL_ABORT_GRACE_SECONDS: "300"
+      # Both are needed: BACKUP_BUNDLE_ROOT is the directory the scheduler
+      # prunes; BACKUP_DIRECTORY is also set by the image.
+      BACKUP_BUNDLE_ROOT: /var/lib/maplespire/backups
+      BACKUP_DIRECTORY: /var/lib/maplespire/backups
+      # Same token as the API, so Prometheus can scrape both. Without it the
+      # metrics endpoint returns 404 and the drill looks down.
+      METRICS_TOKEN: ${MAPLESPIRE_METRICS_TOKEN:?Run node scripts/init-env.mjs first - see docs/getting-started.md}
+      TECHNOLOGY_ASSET_DIR: /var/lib/maplespire/assets/technologies
+      BACKUP_DRILL_INTERVAL_HOURS: ${MAPLESPIRE_DRILL_INTERVAL_HOURS:-24}
+      BACKUP_DRILL_COLD_API: ${MAPLESPIRE_DRILL_COLD_API:-on}
+      # Signs drill reports. Optional; a warning is logged when unset.
+      BACKUP_DRILL_SIGNING_KEY: ${MAPLESPIRE_DRILL_SIGNING_KEY:-}
+      BACKUP_DRILL_SIGNING_KEY_ID: ${MAPLESPIRE_DRILL_SIGNING_KEY_ID:-maplespire-home}
+      # Retention budgets. The newest bundle is never deleted, so size the
+      # `backups` volume above BACKUP_BUNDLE_MAX_BYTES.
+      BACKUP_DRILL_HISTORY_MAX_BYTES: ${MAPLESPIRE_DRILL_HISTORY_MAX_BYTES:-64MB}
+      BACKUP_BUNDLE_MAX_BYTES: ${MAPLESPIRE_BACKUP_BUNDLE_MAX_BYTES:-20GB}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - backups:/var/lib/maplespire/backups
+      - technology_assets:/var/lib/maplespire/assets/technologies:ro
+    # Passes on any HTTP response (401 included): it checks that the scheduler
+    # answers, not the token.
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:9464/metrics').then(()=>process.exit(0)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+  # Scrapes the app's metrics and evaluates infra/monitoring/alerts.yml.
+  # Retention is a byte budget; Prometheus drops the oldest blocks itself.
+  #
+  # No `depends_on`: the monitoring must start even when Redis or the API
+  # cannot, since that is the outage it reports.
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    logging: *default-logging
+    restart: always
+    user: "nobody"
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --rules.alert.resend-delay=15s
+      # Keep the volume about 1.5x this size: the WAL and head block are not
+      # counted.
+      - --storage.tsdb.retention.size=${MAPLESPIRE_METRICS_RETENTION_SIZE:-4GB}
+      # Reachable by Grafana on the Compose network; not published on the host.
+      # The lifecycle and admin APIs stay disabled.
+      - --web.listen-address=0.0.0.0:9090
+    volumes:
+      - ./infra/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./infra/monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
+      # Created by `node scripts/init-env.mjs`.
+      - ./infra/monitoring/metrics-token:/etc/prometheus/metrics-token:ro
+      - prometheus_data:/prometheus
+
+  # Optional alert delivery (email via SES SMTP, heartbeat via SNS), enabled
+  # with `--profile alerting`. Setup guide: maplespire-sponsor-kit,
+  # docs/operations/alerting-smtp.md.
+  alertmanager:
+    profiles: ["alerting"]
+    image: prom/alertmanager:v0.34.0@sha256:690c7b525f4367aa91f73e2f91c632206d32e97c6384bdbf2fb7a861b420340d
+    logging: *default-logging
+    restart: always
+    user: "nobody"
+    command:
+      - --config.file=/etc/alertmanager/maplespire.yml
+      - --storage.path=/alertmanager
+      - --web.listen-address=0.0.0.0:9093
+      - --cluster.listen-address=
+    configs:
+      - source: alertmanager
+        target: /etc/alertmanager/maplespire.yml
+    volumes:
+      - alertmanager_data:/alertmanager
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:9093/-/ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+
+  # Dashboards over the Prometheus data. Bound to the host loopback only.
+  grafana:
+    image: grafana/grafana:12.0.2
+    logging: *default-logging
+    restart: always
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${MAPLESPIRE_GRAFANA_ADMIN_PASSWORD:?Run node scripts/init-env.mjs first - see docs/getting-started.md}
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+    ports:
+      - "127.0.0.1:${MAPLESPIRE_GRAFANA_PORT:-3030}:3000"
+    volumes:
+      - ./infra/monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      # Must match the path in the dashboard provider file under
+      # infra/monitoring/grafana/provisioning, or Grafana starts empty.
+      - ./infra/monitoring/grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      prometheus:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:3000/api/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+
+  # Optional: publish the stack through a Cloudflare tunnel, enabled with
+  # `--profile tunnel`.
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    profiles: ["tunnel"]
+    logging: *default-logging
+    restart: always
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    depends_on:
+      web:
+        condition: service_healthy
+
+configs:
+  # Compose interpolates this block even when the `alerting` profile is off, so
+  # the variables use `:-` (an empty default) rather than `:?`.
+  # `node scripts/init-env.mjs` refuses empty values for enabled profiles.
+  # The resolved config contains secrets: use `docker compose config -q`,
+  # never publish its full output.
+  alertmanager:
+    content: |
+      global:
+        resolve_timeout: 5m
+      route:
+        receiver: 'null'
+        group_by: ['alertname', 'deployment']
+        group_wait: 30s
+        group_interval: 5m
+        repeat_interval: 4h
+        routes:
+          - receiver: watchdog-sns
+            matchers: ['alertname="Watchdog"', 'severity="watchdog"']
+            group_wait: 0s
+            group_interval: 1m
+            # The group interval sets the one-minute heartbeat; equal repeat
+            # and group intervals skip ticks in Alertmanager v0.34.0.
+            repeat_interval: 1s
+          # A mislabelled Watchdog must neither mail nor feed the heartbeat.
+          - receiver: 'null'
+            matchers: ['alertname="Watchdog"']
+          - receiver: smtp-failure-sns
+            matchers: ['alertname="AlertmanagerEmailDeliveryFailed"', 'severity="page"']
+            group_wait: 0s
+            group_interval: 30s
+            repeat_interval: 4h
+          - receiver: ses-email
+            matchers: ['severity="page"']
+      receivers:
+        - name: 'null'
+        - name: watchdog-sns
+          sns_configs:
+            - topic_arn: '${MAPLESPIRE_ALERT_SNS_WATCHDOG_TOPIC_ARN:-}'
+              subject: 'MapleSpire Watchdog'
+              sigv4:
+                region: '${MAPLESPIRE_ALERT_SNS_REGION:-}'
+                access_key: '${MAPLESPIRE_ALERT_SNS_ACCESS_KEY_ID:-}'
+                secret_key: '${MAPLESPIRE_ALERT_SNS_SECRET_ACCESS_KEY:-}'
+              send_resolved: false
+        - name: smtp-failure-sns
+          sns_configs:
+            - topic_arn: '${MAPLESPIRE_ALERT_SNS_NOTIFICATION_TOPIC_ARN:-}'
+              # SNS rejects subjects of 100 characters or more.
+              subject: 'MapleSpire SMTP delivery failure'
+              sigv4:
+                region: '${MAPLESPIRE_ALERT_SNS_REGION:-}'
+                access_key: '${MAPLESPIRE_ALERT_SNS_ACCESS_KEY_ID:-}'
+                secret_key: '${MAPLESPIRE_ALERT_SNS_SECRET_ACCESS_KEY:-}'
+              send_resolved: false
+        - name: ses-email
+          email_configs:
+            - to: '${MAPLESPIRE_ALERT_EMAIL_TO:-}'
+              from: '${MAPLESPIRE_ALERT_EMAIL_FROM:-}'
+              smarthost: 'email-smtp.${MAPLESPIRE_ALERT_SMTP_REGION:-}.amazonaws.com:587'
+              auth_username: '${MAPLESPIRE_ALERT_SMTP_USERNAME:-}'
+              auth_password: '${MAPLESPIRE_ALERT_SMTP_PASSWORD:-}'
+              require_tls: true
+              send_resolved: true
+
+volumes:
+  postgres_data:
+  technology_assets:
+  backups:
+  prometheus_data:
+  alertmanager_data:
+  # Grafana sessions and settings only; dashboards are provisioned from the repo.
+  grafana_data:

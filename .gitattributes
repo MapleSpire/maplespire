@@ -1,0 +1,38 @@
+# Line endings. Measured on 2026-08-23 across 9 626 tracked files: the history
+# is 100 % LF — ZERO committed blobs contain a CR, fully or mixed — while 1 642
+# files (22 MB) sat CRLF in a working tree. Nothing was lost, because all 1 642
+# differed from HEAD by line endings ALONE and none by content.
+#
+# The cause is a config sandwich, not a checkout: Git for Windows ships
+# `core.autocrlf = true` in C:/Program Files/Git/etc/gitconfig, and this repo
+# overrides it locally with `core.autocrlf = false` + `core.eol = lf`. With
+# autocrlf off, git performs no conversion either way, so any editor or tool
+# that writes CRLF on Windows leaves a file that no longer matches its LF blob.
+# git then reports it as wholly rewritten — 300 to 700 lines of diff carrying
+# no change — but only once something invalidates its stat cache, which is why
+# the tree looks clean until you touch a file.
+#
+# `text=auto` makes git compare and store NORMALISED content, so a CRLF working
+# file is equal to its LF blob and the phantom diff cannot occur regardless of
+# which tool wrote it. `eol=lf` checks out LF, which is what this repo's own
+# local config already asked for and what "tests must work for off-windows
+# data" requires. Deliberately NOT paired with a renormalising commit: no file
+# needs rewriting for this to work — they normalise on their next checkout —
+# and rewriting 1 642 of them would collide with every in-flight branch across
+# the 28 worktrees this repo currently has.
+#
+# Binary files are left alone by `text=auto`'s NUL-byte heuristic; add an
+# explicit `binary` line here for any format that heuristic gets wrong.
+* text=auto eol=lf
+
+# Redundant under the rule above, kept because it states an intent that must
+# survive any future narrowing of it. Container entrypoints are exec'd by the
+# kernel, which reads the shebang literally: a CRLF checkout makes `#!/bin/sh\r`
+# and the exec fails with "no such file or directory" — a message that names
+# neither the script nor the real cause. The GLOB is the load-bearing part, and
+# it is why this line survived a merge that could have taken either side:
+# naming one script per line is how this keeps being missed, and it already had
+# been — `server/docker-entrypoint-drill.sh` exists and the literal
+# `server/docker-entrypoint.sh` above never covered it.
+server/docker-entrypoint*.sh text eol=lf
+

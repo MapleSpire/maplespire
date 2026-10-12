@@ -1,0 +1,105 @@
+{
+  "modelViewer": {
+    "breadcrumb": {
+      "root": "Landscape",
+      "level": {
+        "context": "Context",
+        "container": "Container",
+        "component": "Component"
+      },
+      "objects": "objects",
+      "connections": "connections"
+    },
+    "searchPlaceholder": "Search objects",
+    "filterDomain": "Domain",
+    "boundary": {
+      "back": "Back",
+      "backTo": "Back to {{level}}"
+    },
+    "tile": {
+      "openLower": "Open lower level",
+      "external": "ext"
+    },
+    "zoom": {
+      "in": "Zoom in",
+      "out": "Zoom out",
+      "fit": "Fit to view"
+    },
+    "view": {
+      "button": "View",
+      "connections": "Connections",
+      "routing": "Routing",
+      "routingCurved": "Curved",
+      "routingOrthogonal": "Right",
+      "routingStraight": "Direct",
+      "layout": "Layout",
+      "density": "Density",
+      "densityComfortable": "Roomy",
+      "densityCompact": "Compact",
+      "descriptions": "Descriptions",
+      "on": "On",
+      "off": "Off",
+      "emptyObjects": "Empty objects",
+      "show": "Show",
+      "hide": "Hide",
+      "motion": "Motion",
+      "zoomSpeed": "Zoom speed"
+    },
+    "mode": {
+      "flat": "2D",
+      "board": "3D"
+    },
+    "panel": {
+      "objectTitle": "Object",
+      "connectionTitle": "Connection",
+      "viewOnly": "View only",
+      "tabDetails": "Details",
+      "tabConnections": "Connections · {{count}}",
+      "type": "Type",
+      "scope": "Scope",
+      "status": "Status",
+      "belongsTo": "Belongs to",
+      "domain": "Domain",
+      "noDomain": "No domain",
+      "connectionsRow": "Connections",
+      "connectionsCount": "{{count}} connections",
+      "inDiagramsRow": "In diagrams",
+      "diagramsCount": "{{count}} diagrams",
+      "technology": "Technology",
+      "tags": "Tags",
+      "links": "Links",
+      "openLower": "Open lower level",
+      "editInModelObjects": "Open in Model objects to edit",
+      "editInConnections": "Open in Model connections to edit",
+      "outgoing": "Outgoing · {{count}}",
+      "incoming": "Incoming · {{count}}",
+      "noConnections": "No connections",
+      "flow": "Flow",
+      "direct": "Direct connection",
+      "directMany": "Direct connections · {{count}}",
+      "directFallback": "Direct relationship at this level.",
+      "lower": "Lower connections",
+      "lowerCount": "Lower connections · {{count}}",
+      "noLower": "No lower connections — this is the deepest level.",
+      "lowerTruncated": "Large subtrees — this rollup may be incomplete.",
+      "inDiagrams": "In diagrams · {{count}}",
+      "notInDiagrams": "Not shown in any diagram yet."
+    },
+    "footer": {
+      "objects": "Objects",
+      "connections": "Connections",
+      "level": "Level"
+    },
+    "window": {
+      "loadMore": "Load next window",
+      "loadingMore": "Loading…",
+      "objectsLimited": "Showing {{visible}} of {{total}} objects. Search or filter to refine.",
+      "connectionsLimited": "Visible connections are capped for renderer performance. Refine the level to see more.",
+      "offlinePartial": "Offline working set only. Make this version available offline for complete results."
+    },
+    "empty": {
+      "title": "Nothing to explore yet",
+      "body": "This landscape has no objects. Add them in Model objects or draw them on a diagram."
+    }
+  }
+}

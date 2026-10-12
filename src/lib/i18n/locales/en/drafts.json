@@ -1,0 +1,101 @@
+{
+  "drafts": {
+    "status": {
+      "active": "In progress",
+      "merged": "Merged",
+      "discarded": "Deleted",
+      "archived": "Archived"
+    },
+    "collection": {
+      "object": "Object",
+      "connection": "Connection",
+      "group": "Group",
+      "domain": "Domain",
+      "tag": "Tag",
+      "decisionRecord": "Decision",
+      "diagram": "Diagram",
+      "layout": "Layout",
+      "flow": "Flow"
+    },
+    "conflict": {
+      "updateUpdate": "Edited on both sides",
+      "updateDelete": "Edited here, deleted in the live model",
+      "deleteUpdate": "Deleted here, edited in the live model",
+      "unresolved": "Couldn't be compared (unreadable upstream)"
+    },
+    "tabs": {
+      "all": "All {{count}}",
+      "created": "Created",
+      "updated": "Updated",
+      "deleted": "Deleted"
+    },
+    "pill": {
+      "added": "added",
+      "edited": "edited",
+      "removed": "removed"
+    },
+    "changes": {
+      "title": "Changes",
+      "recompute": "Recompute changes",
+      "model": "model",
+      "diagrams": "diagrams",
+      "conflicts": "conflicts",
+      "empty": "No changes yet — edit the draft to see them here.",
+      "loading": "Loading changes…",
+      "reviewConflicts": "Review conflicts",
+      "reviewAndMerge": "Review & merge",
+      "showOnCanvas": "Show on the canvas",
+      "conflictBadge": "Conflict"
+    },
+    "table": {
+      "current": "Current",
+      "draftName": "Draft name",
+      "draftNamePlaceholder": "e.g. Payments redesign",
+      "creating": "Creating…",
+      "createDraft": "Create draft",
+      "draft": "Draft",
+      "branchedFrom": "Branched from {{parent}}",
+      "status": "Status",
+      "created": "Created",
+      "changes": "Changes",
+      "conflicts": "Conflicts",
+      "openDraft": "Open draft",
+      "archiveDraft": "Archive draft",
+      "archive": "Archive",
+      "restoreDraft": "Restore draft",
+      "restore": "Restore",
+      "changesCount": "Changes · {{count}}",
+      "searchPlaceholder": "Search drafts",
+      "newDraft": "New draft",
+      "footerLabel": "Drafts",
+      "colDraft": "Draft",
+      "colStatus": "Status",
+      "colCreated": "Created",
+      "loading": "Loading drafts…",
+      "empty": "No drafts yet — create one to explore future changes in isolation."
+    },
+    "merge": {
+      "title": "Merge changes",
+      "currentModel": "Current model",
+      "live": "live",
+      "updatedModel": "Updated model",
+      "blocked": "blocked",
+      "conflictsResolveEach": "Conflicts — resolve each to merge",
+      "keepMine": "Keep mine",
+      "keepLive": "Keep live",
+      "mineValue": "mine: {{value}}",
+      "liveValue": "live: {{value}}",
+      "cannotResolveHere": "{{reason}} — can't be resolved here",
+      "noChangesToMerge": "No changes to merge.",
+      "someConflictsCannotAutoResolve": "Some conflicts can't be auto-resolved — fix them in the draft, then merge.",
+      "chooseForEachConflict": "Choose Keep mine or Keep live for each conflict ({{count}} left).",
+      "mergeExplainer": "Merging applies these changes to the live model and records a new version.",
+      "merging": "Merging…",
+      "mergeChanges": "Merge {{count}} change",
+      "mergeChanges_other": "Merge {{count}} changes",
+      "mustBeFixedInDraft": "Some conflicts must be fixed in the draft",
+      "resolveAllToMerge": "Resolve all conflicts to merge",
+      "mergeConflictsCount": "Merge conflicts ({{count}})"
+    }
+  }
+}

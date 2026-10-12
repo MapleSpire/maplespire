@@ -1,0 +1,56 @@
+{
+  "exportEngine": {
+    "docTitle": "{{landscape}} — model summary",
+    "scope": {
+      "landscape": "the whole landscape",
+      "domain": "the “{{name}}” domain",
+      "object": "the “{{name}}” object",
+      "diagram": "the “{{name}}” diagram",
+      "unknown": "unknown"
+    },
+    "meta": {
+      "markdown": "Covers {{scope}} — {{objects}} objects · {{connections}} connections · {{flows}} flows. Generated {{date}} by MapleSpire.",
+      "htmlOrPdf": "Covers {{scope}} — {{objects}} objects · {{connections}} connections · {{flows}} flows · generated {{date}} by MapleSpire"
+    },
+    "llmsBlurb": "A C4 architecture model of {{landscape}}, covering {{scope}}: model objects, connections, flows and tags.",
+    "sections": {
+      "domains": "Domains",
+      "modelObjects": "Model objects",
+      "connections": "Connections",
+      "flows": "Flows",
+      "tags": "Tags"
+    },
+    "flowStep": {
+      "message": "{{from}} → {{to}}: {{title}}",
+      "process": "On {{obj}}: {{title}}"
+    },
+    "describe": {
+      "external": "external",
+      "domain": "domain: {{name}}",
+      "inside": "inside: {{name}}",
+      "tags": "tags: {{names}}"
+    },
+    "objectCount": "{{count}} objects",
+    "legend": {
+      "title": "Legend",
+      "external": "External",
+      "boundary": "Boundary",
+      "group": "Group",
+      "connection": "Connection",
+      "dashedConnection": "Dashed connection",
+      "dottedConnection": "Dotted connection",
+      "crossLevelConnection": "Cross-level connection"
+    },
+    "errors": {
+      "noDiagramToExport": "No diagram to export",
+      "openADiagramForImage": "Open a diagram to export an image",
+      "no3dView": "Open the 3D view before exporting it",
+      "couldNotRasteriseLegend": "Could not rasterise the legend",
+      "couldNotRasteriseDiagram": "Could not rasterise the diagram",
+      "modelIncomplete": "The whole landscape could not be read, so this export would be missing {{objects}} objects and {{connections}} connections that its diagrams use. Reconnect or reload and try again, or export just the current diagram."
+    },
+    "warnings": {
+      "missingReferences": "{{objects}} objects and {{connections}} connections referenced by the exported diagrams are not in the model and were left out."
+    }
+  }
+}

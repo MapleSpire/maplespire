@@ -1,0 +1,40 @@
+<!doctype html>
+<!--
+  SPDX-License-Identifier: AGPL-3.0-or-later
+  Copyright (c) 2026 Olivier Albertini
+
+  This file is part of MapleSpire.
+  MapleSpire is free software: you can redistribute it and/or modify
+  it under the terms of the GNU Affero General Public License as published
+  by the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  MapleSpire is distributed in the hope that it will be useful,
+  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+  GNU Affero General Public License for more details.
+-->
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Canvas 2D bench</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Press+Start+2P&display=swap" rel="stylesheet">
+    <style>
+      body { margin: 0; font: 12px system-ui, sans-serif; background: #fff; }
+      #stage { position: relative; width: 1600px; height: 900px; overflow: hidden; }
+      #stage canvas { display: block; }
+      #status { padding: 4px 8px; }
+      #compare { display: flex; gap: 8px; padding: 8px; flex-wrap: wrap; }
+      #compare figure { margin: 0; }
+      #compare img { width: 520px; border: 1px solid #ccc; }
+    </style>
+  </head>
+  <body>
+    <div id="status">loading…</div>
+    <div id="stage"></div>
+    <div id="compare"></div>
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>

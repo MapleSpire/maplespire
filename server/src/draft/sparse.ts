@@ -1,0 +1,635 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 Olivier Albertini
+//
+// This file is part of MapleSpire.
+// MapleSpire is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published
+// by the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// MapleSpire is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Affero General Public License for more details.
+
+import { getHeads, view } from '@automerge/automerge'
+import {
+  isValidAutomergeUrl,
+  type DocHandle,
+  type Repo,
+} from '@automerge/automerge-repo'
+import type { SealedRepo } from '../rbac/sealedRepo.js'
+import { claimWorkspaceDocuments } from '../rbac/documentClaims.js'
+import { purgeServerCreationPlacement } from '../rbac/serverCreationPlacement.js'
+import { openBootstrapScope, type BootstrapScope } from '../bootstrapScope.js'
+import { pool } from '../db.js'
+import { buildModelMeta } from '../modelMeta.js'
+import { copyRootShape } from '../rootShape.js'
+import type { WorkspaceKey } from '../readModel/projector.js'
+import { registerStaticReadModelDocuments } from '../readModel/staticWorkspace.js'
+import type { Queryable } from '../readModel/types.js'
+import type { FullDiagram, FullModel, DiagramDetail } from './materialize.js'
+import {
+  isSparseDraftManifest,
+  type DraftBaseManifest,
+  type SparseDraftManifest,
+} from './manifest.js'
+import { findReadyDocument } from '../automergeRepoCompat.js'
+
+type Json = Record<string, unknown>
+
+interface RootLike {
+  modelUrl?: string
+  modelMetaUrl?: string
+  shardUrls?: string[]
+  registrySummaryOnly?: boolean
+  diagramCount?: number
+  registryWriteUrl?: string
+}
+
+interface SparseRootLike extends RootLike {
+  sparseDraftBaseVersionId?: string
+  sparseDraftBaseRootUrl?: string
+}
+
+interface MetaLike extends Json {
+  staticBaseline?: boolean
+  objectShardUrls?: string[]
+  connectionShardUrls?: string[]
+  editsObjectShardUrl?: string
+  editsObjectShardUrls?: string[]
+  editsConnectionShardUrl?: string
+  editsConnectionShardUrls?: string[]
+  deletedObjectIds?: string[]
+  deletedConnectionIds?: string[]
+  deletedDecisionRecordIds?: string[]
+  groups?: Record<string, unknown>
+  domains?: Record<string, unknown>
+  tagSnapshots?: Record<string, unknown>
+  decisionRecords?: Record<string, unknown>
+  draftBaseInline?: {
+    groups: Record<string, unknown>
+    domains: Record<string, unknown>
+    tagSnapshots: Record<string, unknown>
+  }
+}
+
+interface RegistryLike {
+  diagrams?: Record<string, Json>
+}
+
+export interface SparseDraftRootResult {
+  rootUrl: string
+  modelMetaUrl: string
+  objectOverlayUrl: string
+  connectionOverlayUrl: string
+  registryUrl: string
+  allowedDocuments: Array<{ documentId: string; kind: string; entityId?: string }>
+  /** EVERY document this control graph created — the six of them,
+   * including the legacy monolith, which `allowedDocuments` deliberately
+   * omits. The publisher (createDraft) batch-claims these after its INSERT
+   * INTO versions, then poses the coverage marker. */
+  createdDocumentIds: string[]
+  manifest: SparseDraftManifest
+}
+
+const documentIdOf = (url: string) => url.replace(/^automerge:/, '').split('?')[0]
+const plain = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T
+
+async function find<T>(repo: SealedRepo, url: string): Promise<DocHandle<T>> {
+  if (!isValidAutomergeUrl(url)) throw new Error(`invalid Automerge url: ${url}`)
+  const handle = await findReadyDocument<T>(repo, url)
+  if (!handle.doc()) throw new Error(`document unavailable: ${url}`)
+  return handle
+}
+
+/** True only for the immutable/read-model-backed shape that supports bounded
+ * copy-on-write. Ordinary workspaces keep the existing deep-fork semantics. */
+export async function canCreateSparseDraft(repo: SealedRepo, rootUrl: string): Promise<boolean> {
+  const root = (await find<RootLike>(repo, rootUrl)).doc()
+  if (root?.registrySummaryOnly !== true || !root.modelMetaUrl) return false
+  const meta = (await find<MetaLike>(repo, root.modelMetaUrl)).doc()
+  return meta?.staticBaseline === true
+}
+
+/**
+ * Create a bounded draft control graph. No registry baseline shard, model
+ * baseline shard or DiagramDoc is opened/copied here; those immutable values
+ * continue to be served from the parent's relational read model. A DiagramDoc
+ * is cloned lazily on first open, while object/connection edits land in fresh
+ * overlay segments owned only by this draft.
+ */
+export async function createSparseDraftRoot(
+  repo: Repo,
+  parentRootUrl: string,
+  parentVersionId: string,
+  /** THE SCOPE the draft is created in (`bootstrapScope.ts`): its
+   *  `target` is the DRAFT's `(landscapeId, versionId)` — generated by the
+   *  caller before this runs, inserted after; every document below is named
+   *  with an id bound to it (`bootstrapMint.ts`), and the parent's baseline is
+   *  never copied and keeps the parent's names — and its AUTHORITY is the
+   *  parent's lease, which is what the router places `POST /drafts` on. */
+  scope: BootstrapScope,
+): Promise<SparseDraftRootResult> {
+  if (!scope || typeof scope.create !== 'function') {
+    throw new Error('createSparseDraftRoot: a BootstrapScope is required (openBootstrapScope(target, authority))')
+  }
+  const parentRoot = (await find<RootLike>(repo, parentRootUrl)).doc()
+  if (!parentRoot?.modelMetaUrl || parentRoot.registrySummaryOnly !== true) {
+    throw new Error('sparse draft requires a summary-only sharded root')
+  }
+  const parentMeta = (await find<MetaLike>(repo, parentRoot.modelMetaUrl)).doc()
+  if (!parentMeta?.staticBaseline) throw new Error('sparse draft requires a static baseline')
+
+  const create = <T extends object>(value: T) => scope.create(repo, value)
+  const monolith = create({
+    objects: {}, connections: {}, groups: {}, domains: {}, tagSnapshots: {}, decisionRecords: {},
+  })
+  const objectOverlay = create({ objects: {}, writeHeadVersion: 1, writeBatchIds: [] })
+  const connectionOverlay = create({ connections: {}, writeHeadVersion: 1, writeBatchIds: [] })
+  await Promise.all([monolith, objectOverlay, connectionOverlay].map((handle) => handle.whenReady()))
+  await repo.flush([monolith.documentId, objectOverlay.documentId, connectionOverlay.documentId])
+
+  const groups = plain(parentMeta.groups ?? {})
+  const domains = plain(parentMeta.domains ?? {})
+  const tagSnapshots = plain(parentMeta.tagSnapshots ?? {})
+  const modelMeta = create<MetaLike>({
+    // The head/shard/version fields come from the ONE ModelMeta constructor, so
+    // a future head-field change cannot silently miss this producer.
+    ...buildModelMeta({
+      objectWriteHead: objectOverlay.url,
+      connectionWriteHead: connectionOverlay.url,
+      groups,
+      domains,
+      tagSnapshots,
+      decisionRecords: {},
+    }),
+    staticBaseline: true,
+    sparseDraftBaseVersionId: parentVersionId,
+    decisionRecordShardUrls: [],
+    deletedObjectIds: [],
+    deletedConnectionIds: [],
+    deletedDecisionRecordIds: [],
+    draftBaseInline: { groups: plain(groups), domains: plain(domains), tagSnapshots: plain(tagSnapshots) },
+  })
+  const registry = create<RegistryLike>({ diagrams: {} })
+  await Promise.all([modelMeta, registry].map((handle) => handle.whenReady()))
+  await repo.flush([modelMeta.documentId, registry.documentId])
+
+  // Root fields go through the ONE root-shape mapper (rootShape.ts), for the
+  // same reason as the buildModelMeta call above.
+  const root = create<SparseRootLike>(copyRootShape(undefined, {
+    modelUrl: monolith.url,
+    modelMetaUrl: modelMeta.url,
+    shardUrls: [registry.url],
+    registryWriteUrl: registry.url,
+    registrySummaryOnly: true,
+    diagramCount: parentRoot.diagramCount ?? 0,
+    sparseDraftBaseVersionId: parentVersionId,
+    sparseDraftBaseRootUrl: parentRootUrl,
+  }))
+  await root.whenReady()
+  await repo.flush([root.documentId])
+
+  const manifest: SparseDraftManifest = {
+    schema: 2,
+    mode: 'sparse-static',
+    createdAt: new Date().toISOString(),
+    rootUrl: parentRootUrl,
+    parentVersionId,
+    diagramBases: {},
+  }
+  return {
+    rootUrl: root.url,
+    modelMetaUrl: modelMeta.url,
+    objectOverlayUrl: objectOverlay.url,
+    connectionOverlayUrl: connectionOverlay.url,
+    registryUrl: registry.url,
+    manifest,
+    // Produced by the scope through the act of creating, never a hand-kept list.
+    createdDocumentIds: [...scope.createdDocumentIds],
+    allowedDocuments: [
+      { documentId: root.documentId, kind: 'root' },
+      { documentId: modelMeta.documentId, kind: 'model-meta' },
+      { documentId: objectOverlay.documentId, kind: 'object-overlay' },
+      { documentId: connectionOverlay.documentId, kind: 'connection-overlay' },
+      { documentId: registry.documentId, kind: 'registry-shard' },
+    ].map((entry) => ({ ...entry, documentId: String(entry.documentId) })),
+  }
+}
+
+const ENTITY_TABLE = {
+  object: 'ro_objects',
+  connection: 'ro_connections',
+  group: 'ro_groups',
+  diagram: 'ro_diagrams',
+  decision_record: 'ro_decision_records',
+} as const
+
+export type SparseEntityKind = keyof typeof ENTITY_TABLE
+
+/** Called inside the parent's projection transaction immediately before an
+ * upsert/delete. Every active sparse child captures the old value once. */
+export async function captureSparseDraftEntityBases(
+  db: Queryable,
+  parent: WorkspaceKey,
+  kind: SparseEntityKind,
+  ids: readonly string[],
+): Promise<void> {
+  const uniqueIds = [...new Set(ids.filter(Boolean))]
+  if (!uniqueIds.length) return
+  const table = ENTITY_TABLE[kind]
+  await db.query(
+    `INSERT INTO draft_sparse_base_entities (
+       landscape_id, draft_version_id, entity_kind, entity_id, data, existed
+     )
+     SELECT $1, draft.id, $3, entity.id, current.data, current.id IS NOT NULL
+     FROM versions draft
+     CROSS JOIN unnest($4::text[]) AS entity(id)
+     LEFT JOIN ${table} current
+       ON current.landscape_id = $1
+      AND current.version_id = $2
+      AND current.id = entity.id
+     WHERE draft.landscape_id = $1
+       AND draft.parent_version_id = $2
+       AND draft.kind = 'draft'
+       AND draft.status = 'active'
+       AND draft.base_manifest->>'mode' = 'sparse-static'
+     ON CONFLICT (landscape_id, draft_version_id, entity_kind, entity_id) DO NOTHING`,
+    [parent.landscapeId, parent.versionId, kind, uniqueIds],
+  )
+}
+
+function asRecordMap(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {}
+}
+
+function diagramProjectionToDoc(projection: Json): Json {
+  const { id, docUrl, shapeCount, ...body } = plain(projection)
+  void id
+  void docUrl
+  void shapeCount
+  body.objectIds = Array.isArray(body.objectIds) ? body.objectIds : []
+  body.connectionIds = Array.isArray(body.connectionIds) ? body.connectionIds : []
+  body.groupIds = Array.isArray(body.groupIds) ? body.groupIds : []
+  body.layouts = asRecordMap(body.layouts)
+  body.flows = asRecordMap(body.flows)
+  body.comments = asRecordMap(body.comments)
+  body.checkpoints = Array.isArray(body.checkpoints) ? body.checkpoints : []
+  return body
+}
+
+function diagramDocToProjection(id: string, docUrl: string, doc: Json): Json {
+  return { id, docUrl, ...plain(doc) }
+}
+
+function diagramMetaFromDoc(id: string, docUrl: string, doc: Json): Json {
+  return {
+    id,
+    name: typeof doc.name === 'string' ? doc.name : id,
+    type: typeof doc.type === 'string' ? doc.type : 'context',
+    docUrl,
+    ...(typeof doc.parentObjectId === 'string' ? { parentObjectId: doc.parentObjectId } : {}),
+    objectIds: Array.isArray(doc.objectIds) ? plain(doc.objectIds) : [],
+    connectionIds: Array.isArray(doc.connectionIds) ? plain(doc.connectionIds) : [],
+    groupIds: Array.isArray(doc.groupIds) ? plain(doc.groupIds) : [],
+  }
+}
+
+/** Lazily clone one DiagramDoc into a sparse draft. The version row lock makes
+ * concurrent opens idempotent; the root already references the one bounded
+ * registry overlay, so publishing the registry entry never exposes an
+ * unresolved DiagramDoc. */
+export async function ensureSparseDraftDiagram(
+  repo: Repo,
+  landscapeId: string,
+  draftId: string,
+  diagramId: string,
+  parentProjection: Json,
+): Promise<Json | undefined> {
+  const client = await pool.connect()
+  // Hoisted so the transaction's catch can retire it: a COMMIT that fails
+  // after the claim must leave the clone's note RETIRED, never purged and
+  // never live.
+  let scope: BootstrapScope | null = null
+  try {
+    await client.query('BEGIN')
+    const { rows } = await client.query<{
+      root_url: string
+      status: string
+      base_manifest: DraftBaseManifest | null
+    }>(
+      `SELECT root_url, status, base_manifest
+       FROM versions
+       WHERE landscape_id = $1 AND id = $2 AND kind = 'draft'
+       FOR UPDATE`,
+      [landscapeId, draftId],
+    )
+    const row = rows[0]
+    if (!row || row.status !== 'active' || !isSparseDraftManifest(row.base_manifest)) {
+      await client.query('ROLLBACK')
+      return undefined
+    }
+    const manifest = row.base_manifest
+    const existing = manifest.diagramBases[diagramId]
+    if (existing) {
+      const handle = await find<Json>(repo, existing.docUrl)
+      await client.query('COMMIT')
+      return diagramDocToProjection(diagramId, existing.docUrl, handle.doc()!)
+    }
+
+    const captured = await client.query<{ data: Json | null; existed: boolean }>(
+      `SELECT data, existed FROM draft_sparse_base_entities
+       WHERE landscape_id = $1 AND draft_version_id = $2
+         AND entity_kind = 'diagram' AND entity_id = $3`,
+      [landscapeId, draftId, diagramId],
+    )
+    if (captured.rows[0]?.existed === false) {
+      await client.query('ROLLBACK')
+      return undefined
+    }
+    const baseProjection = captured.rows[0]?.data ?? parentProjection
+    const sourceDocUrl = String(baseProjection.docUrl ?? parentProjection.docUrl ?? '')
+    if (!isValidAutomergeUrl(sourceDocUrl)) throw new Error(`diagram ${diagramId} has no valid source document`)
+
+    // Named for the DRAFT, and CLAIMED before the registry publishes its link
+    // (the `findOrCreateRegistryShard` discipline): this is the one bootstrap
+    // site with no publisher behind it — the draft's versions row already
+    // exists — so nothing else would claim the clone until a peer attaches. A
+    // claim throw aborts the transaction below (ROLLBACK in the catch); the
+    // flushed clone is then STRANDED, not reaped: its id is bound to a version
+    // that exists, which `mintedOrphanReaper.ts` counts on
+    // `_stranded_documents_total` and never deletes, and the lazy walk claims
+    // it at the next attach.
+    //
+    // FENCED UNDER THE DRAFT'S OWN LEASE: the draft's row exists,
+    // so it is lease-able, and the router placed this request on its owner.
+    // The scope asks for that authority before the clone is minted and the
+    // storage fence checks it on the flush; the claim right after is what
+    // purges the note.
+    scope = openBootstrapScope(
+      { landscapeId, versionId: draftId },
+      { kind: 'forker', workspace: { landscapeId, versionId: draftId } },
+    )
+    const clone = scope.create<Json>(repo, diagramProjectionToDoc(baseProjection))
+    await clone.whenReady()
+    let claimedHere: string[] = []
+    try {
+      await repo.flush([clone.documentId])
+      // CLAIMED ON THIS TRANSACTION'S OWN CLIENT, NOT THROUGH THE AUTOCOMMIT
+      // HOOK. `notifyWorkspaceDocumentsCreated` would INSERT on another pooled
+      // connection while this client holds `SELECT … FOR UPDATE` on the
+      // draft's `versions` row. `automerge_document_workspace.version_id`
+      // REFERENCES `versions(id)`, so that INSERT needs a KEY SHARE lock on
+      // the row this transaction holds FOR UPDATE: it waits for us, we wait
+      // for it, and Postgres cannot see the cycle because our half waits in
+      // JavaScript — a permanent hang. Same client, same transaction: the
+      // claim commits WITH the manifest, or neither does.
+      const claim = await claimWorkspaceDocuments(client, { landscapeId, versionId: draftId }, [String(clone.documentId)])
+      if (claim.missingVersion) throw new Error(`sparse clone for ${landscapeId}/${draftId}: the draft row vanished under FOR UPDATE`)
+      if (claim.foreign.length > 0) {
+        const loser = claim.foreign[0]!
+        throw new Error(`sparse clone ${loser.documentId} is already assigned to ${loser.winner.landscapeId}/${loser.winner.versionId}`)
+      }
+      claimedHere = [...claim.claimed, ...claim.alreadyOurs]
+    } catch (error) {
+      // The clone was minted and not claimed: keep its note as residue so the
+      // armed write-back stays fenced, then let the outer catch ROLLBACK.
+      scope.retire()
+      throw error
+    }
+
+    const root = (await find<SparseRootLike>(repo, row.root_url)).doc()
+    const registryUrl = root?.shardUrls?.[0]
+    if (!registryUrl) throw new Error('sparse draft registry unavailable')
+    const registry = await find<RegistryLike>(repo, registryUrl)
+    registry.change((doc) => {
+      if (!doc.diagrams) doc.diagrams = {}
+      doc.diagrams[diagramId] = diagramMetaFromDoc(diagramId, clone.url, clone.doc()!)
+    })
+    await repo.flush([registry.documentId])
+
+    const next: SparseDraftManifest = plain(manifest)
+    next.diagramBases[diagramId] = {
+      docUrl: clone.url,
+      heads: getHeads(clone.doc()!),
+      sourceDocUrl,
+    }
+    await client.query(
+      `UPDATE versions SET base_manifest = $3
+       WHERE landscape_id = $1 AND id = $2 AND kind = 'draft'`,
+      [landscapeId, draftId, JSON.stringify(next)],
+    )
+    await registerStaticReadModelDocuments(client, { landscapeId, versionId: draftId }, [
+      { documentId: documentIdOf(registry.url), kind: 'registry-shard' },
+      { documentId: documentIdOf(clone.url), kind: 'diagram', entityId: diagramId },
+    ])
+    await client.query('COMMIT')
+    // The note is purged AFTER the commit and nowhere earlier (as in
+    // `applyMerge.ts`): until this line the durable row is
+    // not visible to any other connection, and a rollback would have left the
+    // clone with neither a row nor a note.
+    purgeServerCreationPlacement(claimedHere)
+    return diagramDocToProjection(diagramId, clone.url, clone.doc()!)
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined)
+    // Idempotent: the mint/claim catch above may already have retired it. A
+    // COMMIT failure reaches only this one, and the note must survive retired.
+    scope?.retire()
+    throw error
+  } finally {
+    client.release()
+  }
+}
+
+function emptyModel(): FullModel {
+  return {
+    objects: {}, connections: {}, groups: {}, domains: {}, tagSnapshots: {}, decisionRecords: {},
+    diagrams: {}, missing: [],
+  }
+}
+
+function splitDiagram(doc: Json): DiagramDetail {
+  const { objectIds, connectionIds, groupIds, layouts, flows, comments, checkpoints, ...settings } = plain(doc)
+  void comments
+  void checkpoints
+  return {
+    settings,
+    objectIds: Array.isArray(objectIds) ? objectIds as string[] : [],
+    connectionIds: Array.isArray(connectionIds) ? connectionIds as string[] : [],
+    groupIds: Array.isArray(groupIds) ? groupIds as string[] : [],
+    layouts: asRecordMap(layouts),
+    flows: asRecordMap(flows),
+  }
+}
+
+function fullDiagram(id: string, projection: Json | undefined): FullDiagram | undefined {
+  if (!projection) return undefined
+  const docUrl = String(projection.docUrl ?? '')
+  const doc = diagramProjectionToDoc(projection)
+  return { id, meta: diagramMetaFromDoc(id, docUrl, doc), detail: splitDiagram(doc) }
+}
+
+async function currentEntities(
+  db: Queryable,
+  key: WorkspaceKey,
+  table: string,
+  ids: string[],
+): Promise<Map<string, Json>> {
+  if (!ids.length) return new Map()
+  const { rows } = await db.query<{ id: string; data: Json }>(
+    `SELECT id, data FROM ${table}
+     WHERE landscape_id = $1 AND version_id = $2 AND id = ANY($3::text[])`,
+    [key.landscapeId, key.versionId, ids],
+  )
+  return new Map(rows.map((row) => [row.id, row.data]))
+}
+
+async function capturedBases(
+  db: Queryable,
+  landscapeId: string,
+  draftId: string,
+  kind: SparseEntityKind,
+  ids: string[],
+): Promise<Map<string, { existed: boolean; data?: Json }>> {
+  if (!ids.length) return new Map()
+  const { rows } = await db.query<{ entity_id: string; existed: boolean; data: Json | null }>(
+    `SELECT entity_id, existed, data
+     FROM draft_sparse_base_entities
+     WHERE landscape_id = $1 AND draft_version_id = $2
+       AND entity_kind = $3 AND entity_id = ANY($4::text[])`,
+    [landscapeId, draftId, kind, ids],
+  )
+  return new Map(rows.map((row) => [row.entity_id, {
+    existed: row.existed,
+    ...(row.data ? { data: row.data } : {}),
+  }]))
+}
+
+async function overlayValues(repo: SealedRepo, urls: string[], field: 'objects' | 'connections'): Promise<Record<string, Json>> {
+  const values: Record<string, Json> = {}
+  for (const url of urls) {
+    if (!isValidAutomergeUrl(url)) continue
+    const doc = (await find<Record<string, Record<string, Json>>>(repo, url)).doc()
+    Object.assign(values, doc?.[field] ?? {})
+  }
+  return values
+}
+
+async function fillSparseCollection(
+  db: Queryable,
+  base: Record<string, unknown>,
+  ours: Record<string, unknown>,
+  theirs: Record<string, unknown>,
+  params: {
+    parent: WorkspaceKey
+    draftId: string
+    kind: SparseEntityKind
+    table: string
+    draftValues: Record<string, Json>
+    deletedIds?: string[]
+  },
+): Promise<void> {
+  const ids = [...new Set([...Object.keys(params.draftValues), ...(params.deletedIds ?? [])])]
+  const [current, captured] = await Promise.all([
+    currentEntities(db, params.parent, params.table, ids),
+    capturedBases(db, params.parent.landscapeId, params.draftId, params.kind, ids),
+  ])
+  const deleted = new Set(params.deletedIds ?? [])
+  for (const id of ids) {
+    const currentValue = current.get(id)
+    const capturedValue = captured.get(id)
+    if (capturedValue ? capturedValue.existed : currentValue !== undefined) {
+      base[id] = capturedValue?.data ?? currentValue!
+    }
+    if (currentValue !== undefined) ours[id] = currentValue
+    if (!deleted.has(id) && params.draftValues[id] !== undefined) theirs[id] = params.draftValues[id]
+  }
+}
+
+/** Materialize only the entities/diagrams touched by a sparse draft. Because
+ * diffModels iterates the union of these partial maps, this is semantically the
+ * same three-way diff without ever loading the 500k-entity baseline. */
+export async function materializeSparseDraftModels(
+  repo: SealedRepo,
+  db: Queryable,
+  landscapeId: string,
+  draftId: string,
+  draftRootUrl: string,
+  parentVersionId: string,
+  manifest: SparseDraftManifest,
+): Promise<{ base: FullModel; ours: FullModel; theirs: FullModel }> {
+  const base = emptyModel()
+  const ours = emptyModel()
+  const theirs = emptyModel()
+  const parent = { landscapeId, versionId: parentVersionId }
+  const root = (await find<SparseRootLike>(repo, draftRootUrl)).doc()!
+  const meta = (await find<MetaLike>(repo, root.modelMetaUrl!)).doc()!
+
+  const draftObjects = await overlayValues(repo, meta.editsObjectShardUrls ?? meta.objectShardUrls ?? [], 'objects')
+  const draftConnections = await overlayValues(repo, meta.editsConnectionShardUrls ?? meta.connectionShardUrls ?? [], 'connections')
+  await fillSparseCollection(db, base.objects, ours.objects, theirs.objects, {
+    parent, draftId, kind: 'object', table: 'ro_objects', draftValues: draftObjects,
+    deletedIds: meta.deletedObjectIds,
+  })
+  await fillSparseCollection(db, base.connections, ours.connections, theirs.connections, {
+    parent, draftId, kind: 'connection', table: 'ro_connections', draftValues: draftConnections,
+    deletedIds: meta.deletedConnectionIds,
+  })
+  await fillSparseCollection(db, base.decisionRecords, ours.decisionRecords, theirs.decisionRecords, {
+    parent, draftId, kind: 'decision_record', table: 'ro_decision_records',
+    draftValues: (meta.decisionRecords ?? {}) as Record<string, Json>,
+    deletedIds: meta.deletedDecisionRecordIds,
+  })
+
+  const parentRootUrl = manifest.rootUrl
+  const parentRoot = (await find<RootLike>(repo, parentRootUrl)).doc()
+  const parentMeta = parentRoot?.modelMetaUrl
+    ? (await find<MetaLike>(repo, parentRoot.modelMetaUrl)).doc()
+    : undefined
+  const inlineBase = meta.draftBaseInline ?? { groups: {}, domains: {}, tagSnapshots: {} }
+  base.groups = plain(inlineBase.groups)
+  base.domains = plain(inlineBase.domains)
+  base.tagSnapshots = plain(inlineBase.tagSnapshots)
+  ours.groups = plain(parentMeta?.groups ?? {})
+  ours.domains = plain(parentMeta?.domains ?? {})
+  ours.tagSnapshots = plain(parentMeta?.tagSnapshots ?? {})
+  theirs.groups = plain(meta.groups ?? {})
+  theirs.domains = plain(meta.domains ?? {})
+  theirs.tagSnapshots = plain(meta.tagSnapshots ?? {})
+
+  const diagramIds = Object.keys(manifest.diagramBases)
+  const [currentDiagrams, capturedDiagrams] = await Promise.all([
+    currentEntities(db, parent, 'ro_diagrams', diagramIds),
+    capturedBases(db, landscapeId, draftId, 'diagram', diagramIds),
+  ])
+  for (const id of diagramIds) {
+    const entry = manifest.diagramBases[id]
+    const clone = await find<Json>(repo, entry.docUrl)
+    const liveDoc = clone.doc()!
+    let baseDoc: Json | undefined
+    try {
+      baseDoc = view(liveDoc as never, entry.heads) as Json
+    } catch {
+      base.missing.push({ url: entry.docUrl, kind: 'diagram', reason: 'heads-unknown' })
+    }
+    if (baseDoc) base.diagrams[id] = {
+      id,
+      meta: diagramMetaFromDoc(id, entry.sourceDocUrl, baseDoc),
+      detail: splitDiagram(baseDoc),
+    }
+    theirs.diagrams[id] = {
+      id,
+      meta: diagramMetaFromDoc(id, entry.docUrl, liveDoc),
+      detail: splitDiagram(liveDoc),
+    }
+    const captured = capturedDiagrams.get(id)
+    const current = currentDiagrams.get(id)
+    const oursProjection = captured?.existed === false ? undefined : current
+    const oursDiagram = fullDiagram(id, oursProjection)
+    if (oursDiagram) ours.diagrams[id] = oursDiagram
+  }
+  return { base, ours, theirs }
+}

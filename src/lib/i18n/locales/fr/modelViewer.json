@@ -1,0 +1,105 @@
+{
+  "modelViewer": {
+    "breadcrumb": {
+      "root": "Paysage",
+      "level": {
+        "context": "Contexte",
+        "container": "Conteneur",
+        "component": "Composant"
+      },
+      "objects": "objets",
+      "connections": "connexions"
+    },
+    "searchPlaceholder": "Rechercher des objets",
+    "filterDomain": "Domaine",
+    "boundary": {
+      "back": "Retour",
+      "backTo": "Retour au niveau {{level}}"
+    },
+    "tile": {
+      "openLower": "Ouvrir le niveau inférieur",
+      "external": "ext"
+    },
+    "zoom": {
+      "in": "Zoomer",
+      "out": "Dézoomer",
+      "fit": "Ajuster à la vue"
+    },
+    "view": {
+      "button": "Vue",
+      "connections": "Connexions",
+      "routing": "Routage",
+      "routingCurved": "Courbé",
+      "routingOrthogonal": "Angles droits",
+      "routingStraight": "Direct",
+      "layout": "Disposition",
+      "density": "Densité",
+      "densityComfortable": "Aérée",
+      "densityCompact": "Compacte",
+      "descriptions": "Descriptions",
+      "on": "Oui",
+      "off": "Non",
+      "emptyObjects": "Objets vides",
+      "show": "Afficher",
+      "hide": "Masquer",
+      "motion": "Animation",
+      "zoomSpeed": "Vitesse du zoom"
+    },
+    "mode": {
+      "flat": "2D",
+      "board": "3D"
+    },
+    "panel": {
+      "objectTitle": "Objet",
+      "connectionTitle": "Connexion",
+      "viewOnly": "Lecture seule",
+      "tabDetails": "Détails",
+      "tabConnections": "Connexions · {{count}}",
+      "type": "Type",
+      "scope": "Portée",
+      "status": "Statut",
+      "belongsTo": "Appartient à",
+      "domain": "Domaine",
+      "noDomain": "Sans domaine",
+      "connectionsRow": "Connexions",
+      "connectionsCount": "{{count}} connexions",
+      "inDiagramsRow": "Dans les diagrammes",
+      "diagramsCount": "{{count}} diagrammes",
+      "technology": "Technologie",
+      "tags": "Étiquettes",
+      "links": "Liens",
+      "openLower": "Ouvrir le niveau inférieur",
+      "editInModelObjects": "Modifier dans Objets du modèle",
+      "editInConnections": "Modifier dans Connexions du modèle",
+      "outgoing": "Sortantes · {{count}}",
+      "incoming": "Entrantes · {{count}}",
+      "noConnections": "Aucune connexion",
+      "flow": "Flux",
+      "direct": "Connexion directe",
+      "directMany": "Connexions directes · {{count}}",
+      "directFallback": "Relation directe à ce niveau.",
+      "lower": "Connexions inférieures",
+      "lowerCount": "Connexions inférieures · {{count}}",
+      "noLower": "Aucune connexion inférieure — c'est le niveau le plus profond.",
+      "lowerTruncated": "Sous-arbres volumineux — ce cumul peut être incomplet.",
+      "inDiagrams": "Dans les diagrammes · {{count}}",
+      "notInDiagrams": "Ne figure encore dans aucun diagramme."
+    },
+    "footer": {
+      "objects": "Objets",
+      "connections": "Connexions",
+      "level": "Niveau"
+    },
+    "window": {
+      "loadMore": "Charger la fenêtre suivante",
+      "loadingMore": "Chargement…",
+      "objectsLimited": "Affichage de {{visible}} objets sur {{total}}. Recherchez ou filtrez pour affiner.",
+      "connectionsLimited": "Les connexions visibles sont limitées pour préserver les performances du rendu. Affinez le niveau pour en voir davantage.",
+      "offlinePartial": "Jeu de travail hors ligne partiel. Rendez cette version disponible hors ligne pour des résultats complets."
+    },
+    "empty": {
+      "title": "Rien à explorer pour l'instant",
+      "body": "Ce paysage ne contient aucun objet. Ajoutez-les dans Objets du modèle ou dessinez-les sur un diagramme."
+    }
+  }
+}

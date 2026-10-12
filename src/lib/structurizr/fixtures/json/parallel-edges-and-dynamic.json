@@ -1,0 +1,153 @@
+{
+  "id" : 0,
+  "name" : "Parallel edges and a dynamic view",
+  "description" : "Three authored relationships between the SAME pair with different descriptions, one edge back the other way, and a dynamic view that repeats relationship ids across steps, uses nested step orders and marks two steps as responses.",
+  "model" : {
+    "people" : [ {
+      "id" : "4",
+      "name" : "Trader",
+      "tags" : "Element,Person",
+      "relationships" : [ {
+        "id" : "24",
+        "tags" : "Relationship",
+        "sourceId" : "4",
+        "destinationId" : "2",
+        "description" : "Places orders with",
+        "technology" : "HTTPS"
+      } ]
+    } ],
+    "softwareSystems" : [ {
+      "id" : "1",
+      "name" : "Trading Platform",
+      "tags" : "Element,Software System",
+      "containers" : [ {
+        "id" : "2",
+        "name" : "Order Service",
+        "technology" : "Java",
+        "tags" : "Element,Container",
+        "relationships" : [ {
+          "id" : "20",
+          "tags" : "Relationship",
+          "sourceId" : "2",
+          "destinationId" : "3",
+          "description" : "Reads from",
+          "technology" : "SQL"
+        }, {
+          "id" : "21",
+          "tags" : "Relationship",
+          "sourceId" : "2",
+          "destinationId" : "3",
+          "description" : "Writes to",
+          "technology" : "SQL"
+        }, {
+          "id" : "22",
+          "tags" : "Relationship",
+          "sourceId" : "2",
+          "destinationId" : "3",
+          "description" : "Deletes from",
+          "technology" : "SQL"
+        } ]
+      }, {
+        "id" : "3",
+        "name" : "Order Store",
+        "technology" : "PostgreSQL",
+        "tags" : "Element,Container,Database",
+        "relationships" : [ {
+          "id" : "23",
+          "tags" : "Relationship",
+          "sourceId" : "3",
+          "destinationId" : "2",
+          "description" : "Notifies",
+          "technology" : "LISTEN/NOTIFY",
+          "interactionStyle" : "Asynchronous"
+        } ]
+      } ]
+    } ]
+  },
+  "views" : {
+    "containerViews" : [ {
+      "key" : "Containers",
+      "title" : "Trading Platform — Containers",
+      "softwareSystemId" : "1",
+      "order" : 1,
+      "elements" : [ {
+        "id" : "4",
+        "x" : 150,
+        "y" : 150
+      }, {
+        "id" : "2",
+        "x" : 150,
+        "y" : 900
+      }, {
+        "id" : "3",
+        "x" : 1050,
+        "y" : 900
+      } ],
+      "relationships" : [ {
+        "id" : "24"
+      }, {
+        "id" : "20"
+      }, {
+        "id" : "21"
+      }, {
+        "id" : "22"
+      }, {
+        "id" : "23"
+      } ]
+    } ],
+    "dynamicViews" : [ {
+      "key" : "PlaceOrder",
+      "title" : "Placing an order",
+      "elementId" : "1",
+      "order" : 2,
+      "elements" : [ {
+        "id" : "4",
+        "x" : 150,
+        "y" : 150
+      }, {
+        "id" : "2",
+        "x" : 150,
+        "y" : 900
+      }, {
+        "id" : "3",
+        "x" : 1050,
+        "y" : 900
+      } ],
+      "relationships" : [ {
+        "id" : "24",
+        "order" : "1",
+        "description" : "Submits an order"
+      }, {
+        "id" : "20",
+        "order" : "2",
+        "description" : "Loads the account"
+      }, {
+        "id" : "20",
+        "order" : "2.1",
+        "description" : "Loads open positions"
+      }, {
+        "id" : "21",
+        "order" : "3",
+        "description" : "Persists the order"
+      }, {
+        "id" : "20",
+        "order" : "4",
+        "description" : "Returns the stored order",
+        "response" : true
+      }, {
+        "id" : "24",
+        "order" : "5",
+        "description" : "Confirms the order",
+        "response" : true
+      } ]
+    } ],
+    "configuration" : {
+      "styles" : {
+        "elements" : [ {
+          "tag" : "Database",
+          "shape" : "Cylinder"
+        } ]
+      }
+    }
+  }
+}

@@ -1,0 +1,129 @@
+name: Sync cells
+
+# Runs the `verify:sync-*` gates against the multi-container sync-cell bench.
+# A gate that no workflow runs can regress unnoticed (a compose change once
+# stopped the two-partition bench from starting and nothing caught it).
+#
+# WHY A SEPARATE FILE AND NOT A THIRD JOB IN `ci.yml`. That file's two jobs are
+# the definition of a green branch, and `scripts/ci-local-parity.test.mjs` binds
+# `npm run ci:local` to them as a two-way contract — a developer's laptop must be
+# able to reproduce them. Nothing on a laptop reproduces a seven-container
+# Docker stack in the same sense, and putting a non-required job in a file whose
+# whole claim is "these jobs are the bar" weakens the claim rather than the job.
+#
+# WHAT THIS WORKFLOW DOES NOT MEASURE. Numbers printed here are NOT comparable
+# with the load-qualification measurements. The compose file pins
+# `DB_READ_MODEL_POOL_MAX`, `UV_THREADPOOL_SIZE` and `SYNC_CELL_ADMISSION_CONCURRENCY`
+# to values derived on developer hardware; a two-vCPU shared
+# runner is a different machine and a latency number taken here attributes its CPU
+# share to the product. Treat every leg as a pass/fail liveness gate, never as a
+# measurement.
+
+on:
+  pull_request:
+    # Paths-filtered, because the defect class this exists to catch is
+    # overwhelmingly "the bench no longer comes up" (a compose regression, not a
+    # latency regression). A change that cannot touch the
+    # topology does not need twenty minutes of containers to prove it.
+    paths:
+      - 'infra/compose/**'
+      - 'server/Dockerfile'
+      - 'server/scripts/sync-cell-bench.mjs'
+      - 'server/scripts/verify-sync-cell-*'
+      - 'server/src/syncCells/**'
+      # Where all five gates and `bench:sync-cell` are declared. A rename there
+      # changes what the bench runs without touching any file above it.
+      - 'server/package.json'
+      - '.github/workflows/sync-cells.yml'
+  schedule:
+    # 03:20 UTC daily. The three legs that are not on the pull-request path run
+    # here — see `nightly` below for why each one is not a required check today.
+    - cron: '20 3 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: sync-cells-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # The required leg: it catches a bench that no longer comes up. Measured on a
+  # developer machine: 12.8 s to bring the stack up and 5.0 s to run the gate.
+  # It makes no wall-clock assertion about the product —
+  # its ceilings are 60 s and 90 s liveness timeouts — so it is the leg that can
+  # be trusted on borrowed hardware.
+  active-active:
+    name: Two-partition active/active
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+
+      # The bench itself needs no dependencies — it is `node:` built-ins and the
+      # docker CLI — but the gate it launches imports `ws` from server/.
+      - name: Install server dependencies
+        run: npm --prefix server ci
+
+      # `sync-cell-bench.mjs` owns the whole lifecycle: it resolves the compose
+      # file, refuses on a service it can neither start nor classify, brings the
+      # stack up, PROVES every cell and the public router answer `/api/ready` on
+      # their published ports before any gate runs, runs the gate, and tears the
+      # stack down in a `finally`. The bring-up is not inlined here on purpose —
+      # a procedure that exists only inside a workflow cannot be run by the
+      # person debugging it.
+      - name: Bench — active-active leg
+        run: npm --prefix server run bench:sync-cell -- --leg=active-active
+
+  # THE OTHER THREE LEGS (failover, redis-failover, load-soak) run nightly and
+  # on demand rather than as required pull-request checks: they are slower and
+  # more sensitive to shared-runner hardware.
+  #
+  # They are a MATRIX so the legs cannot mask one another: one red job is one red
+  # leg, and a fourth failure appearing tomorrow is visible beside three known
+  # ones instead of hidden behind them. `fail-fast: false` for the same reason.
+  #
+  # There is deliberately no `continue-on-error:` here, no `if: false`, and no
+  # `|| true` on the step. Each turns a red leg green or stops it running while
+  # the file goes on looking correct, and `scripts/sync-gate-wiring.test.mjs`
+  # refuses all three by name. The `if:` below is an event guard, which is how a schedule-only job
+  # is spelled; that gate rejects the literal `false`, not every condition.
+  nightly:
+    name: Bench leg — ${{ matrix.leg }}
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        leg: [failover, redis-failover, load-soak]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+
+      - name: Install server dependencies
+        run: npm --prefix server ci
+
+      - name: Bench — ${{ matrix.leg }} leg
+        run: npm --prefix server run bench:sync-cell -- --leg=${{ matrix.leg }}
+        # The load-soak latency budgets were set on developer hardware; here
+        # they are liveness ceilings (see the header). Measured on this runner
+        # on 2026-10-12: spare-cell takeover 8.3-8.6 s, event-loop p99 174 ms,
+        # and 3 of ~250 diagnostics reads past 1.5 s. The other legs do not
+        # read these variables.
+        env:
+          SYNC_LOAD_TAKEOVER_MS: '30000'
+          SYNC_LOAD_MAX_EVENT_LOOP_P99_MS: '2000'
+          SYNC_LOAD_DIAGNOSTIC_TIMEOUT_MS: '10000'

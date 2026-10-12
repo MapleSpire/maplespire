@@ -1,0 +1,35 @@
+{
+  "accountSettings": {
+    "email": "Email",
+    "firstName": "First name",
+    "lastName": "Last name",
+    "profileSaved": "Profile saved",
+    "saving": "Saving…",
+    "apiTokens": {
+      "title": "API tokens",
+      "description": "Bearer tokens for AI agents — connect Claude Code & co. to the MCP server at",
+      "copyNowWarning": "Copy this token now — it won't be shown again.",
+      "copyToken": "Copy token",
+      "copied": "Copied.",
+      "namePlaceholder": "Token name (e.g. claude-code laptop)",
+      "creating": "Creating…",
+      "create": "Create",
+      "createdOn": "{{prefix}} · created {{date}}",
+      "lastUsedOn": " · last used {{date}}",
+      "neverUsed": " · never used",
+      "revokeToken": "Revoke token",
+      "noTokensYet": "No tokens yet."
+    },
+    "newOrg": {
+      "description": "A new organization starts with its own landscape and an empty diagram. You become its admin.",
+      "name": "Name",
+      "creating": "Creating…",
+      "create": "Create organization"
+    },
+    "errors": {
+      "loadTokens": "Failed to load tokens",
+      "createToken": "Failed to create token",
+      "revokeToken": "Failed to revoke token"
+    }
+  }
+}

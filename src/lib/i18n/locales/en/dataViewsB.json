@@ -1,0 +1,115 @@
+{
+  "dataViewsB": {
+    "table": {
+      "headers": {
+        "objectName": "Object name",
+        "apps": "Apps",
+        "stores": "Stores",
+        "components": "Components",
+        "connections": "Connections",
+        "inDiagrams": "In diagrams",
+        "domain": "Domain"
+      },
+      "inlineAdd": {
+        "app": "App",
+        "store": "Store",
+        "component": "Component"
+      },
+      "rowMenu": {
+        "duplicate": "Duplicate"
+      },
+      "dropHint": "Move to a compatible object",
+      "rootDropHint": "Drop here to move to the root"
+    },
+    "view": {
+      "searchPlaceholder": "Search objects",
+      "addObject": "Add object",
+      "types": {
+        "actor": "Actor",
+        "system": "System",
+        "app": "App",
+        "store": "Store",
+        "component": "Component",
+        "group": "Group"
+      },
+      "filters": {
+        "type": "Type",
+        "scope": "Scope",
+        "status": "Status",
+        "tags": "Tags",
+        "technology": "Technology",
+        "teams": "Teams",
+        "catalogOffline": "Offline catalog",
+        "noTechnologies": "No selectable technology is available.",
+        "domain": "Domain",
+        "clearAll": "Clear all filters"
+      },
+      "scope": {
+        "internal": "Internal",
+        "external": "External"
+      },
+      "status": {
+        "live": "Live",
+        "draft": "Draft",
+        "down": "Down",
+        "unstable": "Unstable"
+      },
+      "addMenu": {
+        "title": "Add to the model"
+      },
+      "footer": {
+        "totalObjects": "Total objects",
+        "groups": "Groups"
+      }
+    },
+    "diagrams": {
+      "searchPlaceholder": "Search diagrams",
+      "newDiagram": "New diagram",
+      "loading": "Loadingâ€¦",
+      "loadMore": "Load more",
+      "loadFailed": "Unable to load diagrams",
+      "partialOffline": "Partial list — offline. Showing the diagrams available on this device.",
+      "empty": "No diagrams found",
+      "copySuffix": "{{name}} (copy)",
+      "duplicateFailed": "Couldn’t duplicate “{{name}}” — its shape placement isn’t available here. Open it once, then retry.",
+      "levels": {
+        "level1": "Level 1",
+        "level2": "Level 2",
+        "level3": "Level 3"
+      },
+      "filters": {
+        "c4Level": "C4 level",
+        "domain": "Domain"
+      },
+      "createMenu": {
+        "blankTitle": "Blank diagram",
+        "blankSubtitle": "Start from an empty canvas",
+        "importTitle": "Import diagrams…",
+        "importSubtitle": "From Structurizr DSL & more"
+      },
+      "rightPanel": {
+        "title": "Diagram",
+        "c4TypeDiagram": "C4 · {{type}} diagram",
+        "level": "Level",
+        "objects": "Objects",
+        "connections": "Connections",
+        "domain": "Domain",
+        "openInEditor": "Open in editor"
+      },
+      "footer": {
+        "diagrams": "Diagrams"
+      },
+      "card": {
+        "objectCount": "{{count}} object",
+        "objectCount_other": "{{count}} objects",
+        "menu": {
+          "label": "Actions for {{name}}",
+          "openDiagram": "Open diagram",
+          "rename": "Rename",
+          "duplicate": "Duplicate",
+          "duplicating": "Duplicating…"
+        }
+      }
+    }
+  }
+}

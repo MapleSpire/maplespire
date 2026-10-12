@@ -1,0 +1,48 @@
+# The web Dockerfile installs from package-lock.json and COPYs only index.html,
+# the tsconfigs (including tsconfig.image.json), vite.config.ts, public, src,
+# docker/icons and one server script — so nothing below is ever read by a build.
+# Without this file the daemon still transfers all of it: ~584 MB of
+# node_modules alone, on every build.
+#
+# CORRECTED 2026-09-04, and the correction is the point. This paragraph used to
+# say `server/src` was on that list "because the client's typecheck reaches
+# across the package boundary", and that `server/src` "must stay transferable".
+# It was never true: no Dockerfile in this repository has ever COPYd
+# `server/src`, on any branch — the paragraph described a fix that was
+# considered and rejected, in the present tense. The boundary is closed the
+# other way round: `tsconfig.image.json` EXCLUDES test files from the image
+# typecheck, so the three conformance tests in `src/lib/automerge/` that import
+# the server's implementation on purpose are simply not compiled there. They are
+# compiled at the repository root, by `npm run build`, in CI and in ci:local.
+#
+# The one server path the WEB build reads is
+# `server/patch-automerge-peer-sync-state.mjs`, named file by file in the
+# Dockerfile. `server/node_modules` and `server/dist` stay excluded below.
+#
+# `server/src` is NOT excluded, and this file no longer claims a reason for
+# that: it is simply still transferred, and no stage of the web image reads it.
+# Excluding it would cost the API image nothing — that one builds from
+# `context: ./server` (compose.maplespire.yml), so this list never applies to
+# it — but the saving has not been measured and a merge is not where to find
+# out. What this paragraph had to stop doing is describing a COPY that has never
+# existed on any branch.
+node_modules
+server/node_modules
+.git
+.claude
+dist
+server/dist
+data
+reports
+.probes
+.env
+.env.*
+server/.env
+server/.env.*
+test-results
+playwright-report
+e2e
+docs
+*.png
+*.jpeg
+*.jpg

@@ -1,0 +1,963 @@
+{
+  "Bazel": {
+    "source": "devicon",
+    "sourceVersion": "2.17.0",
+    "light": "https://cdn.jsdelivr.net/gh/devicons/devicon@2.17.0/icons/bazel/bazel-original.svg",
+    "lightSha256": "469891274125220d85efa8a48d2f4b3031b60da42eee90f94825cd278b586ae1",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; Devicon artwork (MIT)",
+    "files": [
+      "/icons/light/bazel-fbb157fc.png",
+      "/icons/dark/bazel-fbb157fc.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "Better Auth": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/better-auth_light.svg",
+    "lightSha256": "b02520d041ef83a5e1a6bd99622cc61e9915ecbe65dabf91b3996cd447460665",
+    "dark": "https://svgl.app/library/better-auth_dark.svg",
+    "darkSha256": "e18ef264abb7a7dc93381fb4843c9cc0dbf64703ab2741b7235b8016b40b5285",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/better-auth-71cfe50f.png",
+      "/icons/dark/better-auth-342cea6b.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "Biome": {
+    "source": "devicon",
+    "sourceVersion": "2.17.0",
+    "light": "https://cdn.jsdelivr.net/gh/devicons/devicon@2.17.0/icons/biome/biome-original.svg",
+    "lightSha256": "852e7033b7ae4b5f9e022c4ccd8e61e0b3dc2487a209ed21b75746e379f90d6b",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; Devicon artwork (MIT)",
+    "files": [
+      "/icons/light/biome-ecfed059.png",
+      "/icons/dark/biome-ecfed059.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "Buildpacks": {
+    "source": "cncf",
+    "light": "https://raw.githubusercontent.com/cncf/artwork/main/projects/buildpacks/icon/color/buildpacks-icon-color.svg",
+    "lightSha256": "30f4454ba4baa11d4a99b92cf86ebac227d58bfeeaa3a1cdcc7f15feaa962258",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; cncf/artwork, under the Linux Foundation trademark policy",
+    "files": [
+      "/icons/light/buildpacks-7fb718cc.png",
+      "/icons/dark/buildpacks-dc64ea32.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "Ceph": {
+    "source": "simple-icons",
+    "sourceVersion": "16.35.0",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/ceph.svg",
+    "lightSha256": "d86e5a80df62b084b473f06a5d5b10f87e96931c049c94862b02de7443a22f44",
+    "dark": "derived (house dark rule)",
+    "fill": "#EF5C55",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://github.com/ceph/ceph/blob/b106a03dcddaee80493825e85bc5e399ab4d8746/src/pybind/mgr/dashboard/frontend/src/assets/Ceph_Logo.svg",
+    "files": [
+      "/icons/light/ceph-9a1ea5ca.png",
+      "/icons/dark/ceph-9a1ea5ca.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "Chakra UI": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/chakra-ui.svg",
+    "lightSha256": "cd5ea7e1068f3ad2fcf65693559ffd084f7772de1e4281d8e79469d7dc9a0a6c",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/chakra-ui-e9be9886.png",
+      "/icons/dark/chakra-ui-e9be9886.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "Chaos Mesh": {
+    "source": "cncf",
+    "light": "https://raw.githubusercontent.com/cncf/artwork/main/projects/chaosmesh/icon/color/chaosmesh-icon-color.svg",
+    "lightSha256": "b7a645c12eabb3803473e7c04e1ea3811ca6d2cc8c7bd5e4966fa56db36bcb80",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; cncf/artwork, under the Linux Foundation trademark policy",
+    "files": [
+      "/icons/light/chaos-mesh-b3aee180.png",
+      "/icons/dark/chaos-mesh-06f3f2ef.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "Cloud Custodian": {
+    "source": "cncf",
+    "light": "https://raw.githubusercontent.com/cncf/artwork/main/projects/cloudcustodian/icon/color/cloudcustodian-icon-color.svg",
+    "lightSha256": "864a04b0c9461203aab48f0cde99a0d5a2a699f81ed71f9d3fb59ef1ebb2470b",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; cncf/artwork, under the Linux Foundation trademark policy",
+    "files": [
+      "/icons/light/cloud-custodian-e0248534.png",
+      "/icons/dark/cloud-custodian-e0248534.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "CloudEvents": {
+    "source": "cncf",
+    "light": "https://raw.githubusercontent.com/cncf/artwork/main/projects/cloudevents/icon/color/cloudevents-icon-color-reversed.svg",
+    "lightSha256": "410bbcc8c4a434a67f0912c3a8a1e7a337e4a5917dee35e1a5ac0be301c6ef4c",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; cncf/artwork, under the Linux Foundation trademark policy",
+    "files": [
+      "/icons/light/cloudevents-4fbe2f7e.png",
+      "/icons/dark/cloudevents-4fbe2f7e.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "containerd": {
+    "source": "cncf",
+    "light": "https://raw.githubusercontent.com/cncf/artwork/main/projects/containerd/icon/color/containerd-icon-color.svg",
+    "lightSha256": "eafe28eeeb362a96ed409f104a7beceaa94009c83ac8d35a5aa71a359e2b9d73",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; cncf/artwork, under the Linux Foundation trademark policy",
+    "files": [
+      "/icons/light/containerd-f400c5f0.png",
+      "/icons/dark/containerd-02a075bf.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "Contour": {
+    "source": "cncf",
+    "light": "https://raw.githubusercontent.com/cncf/artwork/main/projects/contour/icon/color/contour-icon-color.svg",
+    "lightSha256": "1ef7860e239a32a60acfe62eedbf104ee35ce794f69f0f01c86e7a3205bf2bef",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; cncf/artwork, under the Linux Foundation trademark policy",
+    "files": [
+      "/icons/light/contour-dc1f7d37.png",
+      "/icons/dark/contour-dc1f7d37.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "Cortex": {
+    "source": "cncf",
+    "light": "https://raw.githubusercontent.com/cncf/artwork/main/projects/cortex/icon/color/cortex-icon-color.svg",
+    "lightSha256": "50d2e99b22b9fb5aa0ec262638fa5f3b3c7373a949f336859441043db968b95a",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; cncf/artwork, under the Linux Foundation trademark policy",
+    "files": [
+      "/icons/light/cortex-57db3ed3.png",
+      "/icons/dark/cortex-57db3ed3.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "CRI-O": {
+    "source": "cncf",
+    "light": "https://raw.githubusercontent.com/cncf/artwork/main/projects/crio/icon/color/crio-icon-color.svg",
+    "lightSha256": "368a8bea52003eb55e064a5e4b372688ba3bf37af8731150f33139ea2ada25d7",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; cncf/artwork, under the Linux Foundation trademark policy",
+    "files": [
+      "/icons/light/cri-o-69c21d55.png",
+      "/icons/dark/cri-o-05b295de.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "DeepSeek": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/deepseek.svg",
+    "lightSha256": "360336e87a3336f60b7d2432ecdea2982537806886e20b170163fd5d3dda825b",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/deepseek-998b69d3.png",
+      "/icons/dark/deepseek-998b69d3.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "Dex": {
+    "source": "cncf",
+    "light": "https://raw.githubusercontent.com/cncf/artwork/main/projects/dex/icon/color/dex-icon-color.svg",
+    "lightSha256": "40930bb3efc60675a12df00fbb8c3c1a645fc007806cf84be0929f43b1004959",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; cncf/artwork, under the Linux Foundation trademark policy",
+    "files": [
+      "/icons/light/dex-80f69344.png",
+      "/icons/dark/dex-80f69344.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "EMQX": {
+    "source": "cncf",
+    "light": "https://raw.githubusercontent.com/cncf/landscape/master/hosted_logos/emqx.svg",
+    "lightSha256": "62b09b9c09336cf6acde07b7d363d5b086d9e17315821ab381e9c6b29d05dbad",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; CNCF Landscape hosted logo, under the Linux Foundation trademark policy",
+    "files": [
+      "/icons/light/emqx-ccf2675a.png",
+      "/icons/dark/emqx-ccf2675a.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "External Secrets Operator": {
+    "source": "cncf",
+    "light": "https://raw.githubusercontent.com/cncf/artwork/main/projects/external-secrets-operator/icon/color/eso-icon-color.svg",
+    "lightSha256": "515be6601856c792fa8599f289472fec0c5092c79aa75c7f212e2586ac0cd1ad",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; cncf/artwork, under the Linux Foundation trademark policy",
+    "files": [
+      "/icons/light/external-secrets-operator-42ad83d1.png",
+      "/icons/dark/external-secrets-operator-2ed73e19.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "Falco": {
+    "source": "cncf",
+    "light": "https://raw.githubusercontent.com/cncf/artwork/main/projects/falco/icon/color/falco-icon-color.svg",
+    "lightSha256": "bf9150b6fca5c518f45befc9f84854189ca9d28e9c7ea3e6793f2ea653cd13d5",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; cncf/artwork, under the Linux Foundation trademark policy",
+    "files": [
+      "/icons/light/falco-01bca3a5.png",
+      "/icons/dark/falco-01bca3a5.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "Forgejo": {
+    "source": "devicon",
+    "sourceVersion": "2.17.0",
+    "light": "https://cdn.jsdelivr.net/gh/devicons/devicon@2.17.0/icons/forgejo/forgejo-original.svg",
+    "lightSha256": "5b12eac251f1c7e71d66d415a6b3c712fb539871f849f81da8ac5af8c008296f",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; Devicon artwork (MIT)",
+    "files": [
+      "/icons/light/forgejo-63b96647.png",
+      "/icons/dark/forgejo-63b96647.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "Gleam": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/gleam.svg",
+    "lightSha256": "8570057d096e35137dcb2323fa634d427c1f04a17a7f3dac6cb2239052dd7d07",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/gleam-5711701a.png",
+      "/icons/dark/gleam-64805f9e.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "Groq": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/groq.svg",
+    "lightSha256": "f8b4420340ff8875a1f04ce80909325dd81b0cb78d0c7a15fd567977338ae956",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/groq-322fd7e3.png",
+      "/icons/dark/groq-322fd7e3.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "Headlamp": {
+    "source": "cncf",
+    "light": "https://raw.githubusercontent.com/cncf/artwork/main/projects/headlamp/icon/color/headlamp-icon-color.svg",
+    "lightSha256": "b2183b825ec50729bf50df93ec24701c7e071d5067398287fdd361c3fa931dcb",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; cncf/artwork, under the Linux Foundation trademark policy",
+    "files": [
+      "/icons/light/headlamp-27f6bc58.png",
+      "/icons/dark/headlamp-cc34fbfb.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "Hono": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/hono.svg",
+    "lightSha256": "a557ab8856080d16ba8a5a2b3d04ef60e1bfa66eada2abe292d69bdb94988c48",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/hono-51e4b070.png",
+      "/icons/dark/hono-51e4b070.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "Hoppscotch": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/hoppscotch.svg",
+    "lightSha256": "a248b53681949dd21f0a93d307d96664c66b4382f6fad1653a04aec6c3ac2784",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "guidelines": "https://hoppscotch.com/brand",
+    "files": [
+      "/icons/light/hoppscotch-a6925834.png",
+      "/icons/dark/hoppscotch-a6925834.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "Java Database Connectivity (JDBC)": {
+    "source": "oracle-official",
+    "light": "docs/tech-icons/sources/oracle-o.svg",
+    "lightSha256": "0e16648087b02d3c06b0fb13127c0b1a36494b13a8d0863e90b488794458d025",
+    "dark": "derived (house dark rule)",
+    "license": "Oracle trademark. Derived mark: the O of the ORACLE wordmark (Oracle_rgb_web.svg), path copied verbatim, other letters removed",
+    "origin": "https://raw.githubusercontent.com/cncf/landscape/master/hosted_logos/oracle.svg",
+    "files": [
+      "/icons/light/java-database-connectivity-jdbc-ee6634ea.png",
+      "/icons/dark/java-database-connectivity-jdbc-ee6634ea.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "Jetpack Compose": {
+    "source": "devicon",
+    "sourceVersion": "2.17.0",
+    "light": "https://cdn.jsdelivr.net/gh/devicons/devicon@2.17.0/icons/jetpackcompose/jetpackcompose-original.svg",
+    "lightSha256": "aaf2741b2e2c655142264aba92d7c6805b549a34eab2a01e4f26f7e623749d18",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; Devicon artwork (MIT)",
+    "files": [
+      "/icons/light/jetpack-compose-223d6800.png",
+      "/icons/dark/jetpack-compose-caaadf2b.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "k0s": {
+    "source": "cncf",
+    "light": "https://raw.githubusercontent.com/cncf/artwork/main/projects/k0s/icon/color/k0s-logo-2025-icon.svg",
+    "lightSha256": "521396da8b4e1882a140207e50f202f1dcd8cde200574727ed69d9960544ef0a",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; cncf/artwork, under the Linux Foundation trademark policy",
+    "files": [
+      "/icons/light/k0s-a5c98694.png",
+      "/icons/dark/k0s-15173424.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "k6": {
+    "source": "devicon",
+    "sourceVersion": "2.17.0",
+    "light": "https://cdn.jsdelivr.net/gh/devicons/devicon@2.17.0/icons/k6/k6-original.svg",
+    "lightSha256": "853be75e560db7b0661602a0e6c5c868e1382cfe5a5e8ab108298610dc53d399",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; Devicon artwork (MIT)",
+    "files": [
+      "/icons/light/k6-287fb828.png",
+      "/icons/dark/k6-287fb828.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "K8sGPT": {
+    "source": "cncf",
+    "light": "https://raw.githubusercontent.com/cncf/artwork/main/projects/k8sgpt/icon/color/k8sgpt-icon-color.svg",
+    "lightSha256": "06b666df9c30711ef060fd841f3a448fb594a695ec72c9cff74debb22b11f0a7",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; cncf/artwork, under the Linux Foundation trademark policy",
+    "files": [
+      "/icons/light/k8sgpt-fa81e82f.png",
+      "/icons/dark/k8sgpt-0bb1504f.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "Karpenter": {
+    "source": "cncf",
+    "light": "https://raw.githubusercontent.com/cncf/landscape/master/hosted_logos/karpenter.svg",
+    "lightSha256": "d0662b4c287dcdd7e7b13998120017a79c4be633af9ce8543c47b801da5ba2d4",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; CNCF Landscape hosted logo, under the Linux Foundation trademark policy",
+    "files": [
+      "/icons/light/karpenter-16b0281d.png",
+      "/icons/dark/karpenter-fb9c9dc5.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "KEDA": {
+    "source": "cncf",
+    "light": "https://raw.githubusercontent.com/cncf/artwork/main/projects/keda/icon/color/keda-icon-color.svg",
+    "lightSha256": "7735ec93010a15a7498eb10cafb05f55f82a36fa5fa49e998ecfe512d189149f",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; cncf/artwork, under the Linux Foundation trademark policy",
+    "files": [
+      "/icons/light/keda-ca916556.png",
+      "/icons/dark/keda-ca916556.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "Knative": {
+    "source": "cncf",
+    "light": "https://raw.githubusercontent.com/cncf/artwork/main/projects/knative/icon/color/knative-icon-color.svg",
+    "lightSha256": "f6b52d202ee7ea2f6e0ae41e02c4a743c2c4bfb509f88ec5ca9707007034c7b7",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; cncf/artwork, under the Linux Foundation trademark policy",
+    "files": [
+      "/icons/light/knative-ed3c1aa9.png",
+      "/icons/dark/knative-ed3c1aa9.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "KServe": {
+    "source": "cncf",
+    "light": "https://raw.githubusercontent.com/cncf/artwork/main/projects/kserve/icon/color/k-serve-icon-color.svg",
+    "lightSha256": "9c8cacd1a31db26f7c9c1ee769b898452226f1a7a5615954d6e00226915eb04b",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; cncf/artwork, under the Linux Foundation trademark policy",
+    "files": [
+      "/icons/light/kserve-0b2e377d.png",
+      "/icons/dark/kserve-0b2e377d.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "Kubeflow": {
+    "source": "cncf",
+    "light": "https://raw.githubusercontent.com/cncf/artwork/main/projects/kubeflow/icon/color/kubeflow-icon.svg",
+    "lightSha256": "281d565f7b18c80717c5c434ef0142193f9244527e65ad29e2c9c65bdc4eb267",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; cncf/artwork, under the Linux Foundation trademark policy",
+    "files": [
+      "/icons/light/kubeflow-ac5205d4.png",
+      "/icons/dark/kubeflow-ac5205d4.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "Kubescape": {
+    "source": "cncf",
+    "light": "https://raw.githubusercontent.com/cncf/artwork/main/projects/kubescape/icon/color/kubescape-icon-color.svg",
+    "lightSha256": "9fcdae3b66e9f1aef97732e046ec11530bf7d91a126cb82f6f16a63b1301bba0",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; cncf/artwork, under the Linux Foundation trademark policy",
+    "files": [
+      "/icons/light/kubescape-e7541a8c.png",
+      "/icons/dark/kubescape-96c3acf2.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "KubeVela": {
+    "source": "cncf",
+    "light": "https://raw.githubusercontent.com/cncf/artwork/main/projects/kubevela/icon/color/kubevela-icon-color.svg",
+    "lightSha256": "363e349847b23bd6185768c0c07b45962ecda9ed0ae97133f221eae0af4d33da",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; cncf/artwork, under the Linux Foundation trademark policy",
+    "files": [
+      "/icons/light/kubevela-cc4ce9e9.png",
+      "/icons/dark/kubevela-19b22480.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "KubeVirt": {
+    "source": "cncf",
+    "light": "https://raw.githubusercontent.com/cncf/artwork/main/projects/kubevirt/icon/color/kubevirt-icon-color.svg",
+    "lightSha256": "13b92d8667e3a20c436f91dc1eb062c2a86409e558cfc7f7cf6d8ba5eda9d251",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; cncf/artwork, under the Linux Foundation trademark policy",
+    "files": [
+      "/icons/light/kubevirt-1c27f853.png",
+      "/icons/dark/kubevirt-1c27f853.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "Kuma": {
+    "source": "cncf",
+    "light": "https://raw.githubusercontent.com/cncf/artwork/main/projects/kuma/icon/color/kuma-icon-color.svg",
+    "lightSha256": "fc005afd02ff40513b87fd6aca27148f694599e5ad1715b95c8ee29f97d6ea36",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; cncf/artwork, under the Linux Foundation trademark policy",
+    "files": [
+      "/icons/light/kuma-f015ee7a.png",
+      "/icons/dark/kuma-031c85c3.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "Kyverno": {
+    "source": "cncf",
+    "light": "https://raw.githubusercontent.com/cncf/artwork/main/projects/kyverno/icon/color/kyverno-icon-color.svg",
+    "lightSha256": "41b8a114fe1856b62caeb600c665724d3caeade4ecd9350fb07c0d1e42ba2f92",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; cncf/artwork, under the Linux Foundation trademark policy",
+    "files": [
+      "/icons/light/kyverno-536735ff.png",
+      "/icons/dark/kyverno-536735ff.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "Linkerd": {
+    "source": "cncf",
+    "light": "https://raw.githubusercontent.com/cncf/artwork/main/projects/linkerd/icon/color/linkerd-icon-color.svg",
+    "lightSha256": "e43dda1077018cb44d0dc7bc8d3183aa05ddfa85f7544371475efaa0878c1764",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; cncf/artwork, under the Linux Foundation trademark policy",
+    "files": [
+      "/icons/light/linkerd-1e6c356f.png",
+      "/icons/dark/linkerd-1e6c356f.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "Mattermost": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/mattermost-light.svg",
+    "lightSha256": "84bc3301b54d0e0a7ecc6350a48788a5c8f3a54f7ce83f34cfedc2680c182dc1",
+    "dark": "https://svgl.app/library/mattermost-dark.svg",
+    "darkSha256": "bfb90e01572ee6a23a08d0559ae97e52aabace33da1528a2dfef13a8fd2c19d6",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/mattermost-59b2ce2a.png",
+      "/icons/dark/mattermost-f490fccc.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "n8n": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/n8n.svg",
+    "lightSha256": "de2f3496ee97a2f7adeaa65b7e5cab617b425ab37aab4c14c87057a4e2af77f8",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/n8n-e08e2086.png",
+      "/icons/dark/n8n-e08e2086.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "Notary Project": {
+    "source": "cncf",
+    "light": "https://raw.githubusercontent.com/cncf/artwork/main/projects/notary/icon/color/notary-project-icon-color.svg",
+    "lightSha256": "0d57dca351b23deb8270ec9ed7c6d35f7054ef07b57ab2bde906ec8e630c6de0",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; cncf/artwork, under the Linux Foundation trademark policy",
+    "files": [
+      "/icons/light/notary-project-19cf0165.png",
+      "/icons/dark/notary-project-adff0d94.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "Nx": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/nx_light.svg",
+    "lightSha256": "8eb6cd5f40c38a38354fe891a6996c2103d77c55f34dcf13e459199540ce599c",
+    "dark": "https://svgl.app/library/nx_dark.svg",
+    "darkSha256": "f9e553d76fb5790e9e83bae15fcb76b2496355cba130d9287c1c4160efd93060",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/nx-e691fc78.png",
+      "/icons/dark/nx-7b0dabae.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "OpenCost": {
+    "source": "cncf",
+    "light": "https://raw.githubusercontent.com/cncf/artwork/main/projects/opencost/icon/color/Opencost_Icon_Color.svg",
+    "lightSha256": "6d51de453044478901346540de4c7adbb5207bcb8e4d3471358b704fe42eff6c",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; cncf/artwork, under the Linux Foundation trademark policy",
+    "files": [
+      "/icons/light/opencost-1fb313f3.png",
+      "/icons/dark/opencost-4312a1ae.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "OpenTofu": {
+    "source": "cncf",
+    "light": "https://raw.githubusercontent.com/cncf/artwork/main/projects/opentofu/icon/color/opentofu-icon-color.svg",
+    "lightSha256": "8bbde074dfc2b0e31461a10a7a08ad6c43b3273f5fc3fc334459ee4c54570ec8",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; cncf/artwork, under the Linux Foundation trademark policy",
+    "files": [
+      "/icons/light/opentofu-95c0d031.png",
+      "/icons/dark/opentofu-b6e02c3b.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "Oracle APEX": {
+    "source": "oracle-official",
+    "light": "docs/tech-icons/sources/oracle-o.svg",
+    "lightSha256": "0e16648087b02d3c06b0fb13127c0b1a36494b13a8d0863e90b488794458d025",
+    "dark": "derived (house dark rule)",
+    "license": "Oracle trademark. Derived mark: the O of the ORACLE wordmark (Oracle_rgb_web.svg), path copied verbatim, other letters removed",
+    "origin": "https://raw.githubusercontent.com/cncf/landscape/master/hosted_logos/oracle.svg",
+    "files": [
+      "/icons/light/oracle-apex-ee6634ea.png",
+      "/icons/dark/oracle-apex-ee6634ea.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "Oracle ATG Commerce": {
+    "source": "oracle-official",
+    "light": "docs/tech-icons/sources/oracle-o.svg",
+    "lightSha256": "0e16648087b02d3c06b0fb13127c0b1a36494b13a8d0863e90b488794458d025",
+    "dark": "derived (house dark rule)",
+    "license": "Oracle trademark. Derived mark: the O of the ORACLE wordmark (Oracle_rgb_web.svg), path copied verbatim, other letters removed",
+    "origin": "https://raw.githubusercontent.com/cncf/landscape/master/hosted_logos/oracle.svg",
+    "files": [
+      "/icons/light/oracle-atg-commerce-ee6634ea.png",
+      "/icons/dark/oracle-atg-commerce-ee6634ea.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "Oracle Cloud Infrastructure": {
+    "source": "oracle-official",
+    "light": "docs/tech-icons/sources/oracle-o.svg",
+    "lightSha256": "0e16648087b02d3c06b0fb13127c0b1a36494b13a8d0863e90b488794458d025",
+    "dark": "derived (house dark rule)",
+    "license": "Oracle trademark. Derived mark: the O of the ORACLE wordmark (Oracle_rgb_web.svg), path copied verbatim, other letters removed",
+    "origin": "https://raw.githubusercontent.com/cncf/landscape/master/hosted_logos/oracle.svg",
+    "files": [
+      "/icons/light/oracle-cloud-infrastructure-ee6634ea.png",
+      "/icons/dark/oracle-cloud-infrastructure-ee6634ea.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "Oracle Database": {
+    "source": "oracle-official",
+    "light": "docs/tech-icons/sources/oracle-o.svg",
+    "lightSha256": "0e16648087b02d3c06b0fb13127c0b1a36494b13a8d0863e90b488794458d025",
+    "dark": "derived (house dark rule)",
+    "license": "Oracle trademark. Derived mark: the O of the ORACLE wordmark (Oracle_rgb_web.svg), path copied verbatim, other letters removed",
+    "origin": "https://raw.githubusercontent.com/cncf/landscape/master/hosted_logos/oracle.svg",
+    "files": [
+      "/icons/light/oracle-database-ee6634ea.png",
+      "/icons/dark/oracle-database-ee6634ea.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "Oracle Essbase": {
+    "source": "oracle-official",
+    "light": "docs/tech-icons/sources/oracle-o.svg",
+    "lightSha256": "0e16648087b02d3c06b0fb13127c0b1a36494b13a8d0863e90b488794458d025",
+    "dark": "derived (house dark rule)",
+    "license": "Oracle trademark. Derived mark: the O of the ORACLE wordmark (Oracle_rgb_web.svg), path copied verbatim, other letters removed",
+    "origin": "https://raw.githubusercontent.com/cncf/landscape/master/hosted_logos/oracle.svg",
+    "files": [
+      "/icons/light/oracle-essbase-ee6634ea.png",
+      "/icons/dark/oracle-essbase-ee6634ea.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "Oracle Forms": {
+    "source": "oracle-official",
+    "light": "docs/tech-icons/sources/oracle-o.svg",
+    "lightSha256": "0e16648087b02d3c06b0fb13127c0b1a36494b13a8d0863e90b488794458d025",
+    "dark": "derived (house dark rule)",
+    "license": "Oracle trademark. Derived mark: the O of the ORACLE wordmark (Oracle_rgb_web.svg), path copied verbatim, other letters removed",
+    "origin": "https://raw.githubusercontent.com/cncf/landscape/master/hosted_logos/oracle.svg",
+    "files": [
+      "/icons/light/oracle-forms-ee6634ea.png",
+      "/icons/dark/oracle-forms-ee6634ea.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "Oracle JD Edwards": {
+    "source": "oracle-official",
+    "light": "docs/tech-icons/sources/oracle-o.svg",
+    "lightSha256": "0e16648087b02d3c06b0fb13127c0b1a36494b13a8d0863e90b488794458d025",
+    "dark": "derived (house dark rule)",
+    "license": "Oracle trademark. Derived mark: the O of the ORACLE wordmark (Oracle_rgb_web.svg), path copied verbatim, other letters removed",
+    "origin": "https://raw.githubusercontent.com/cncf/landscape/master/hosted_logos/oracle.svg",
+    "files": [
+      "/icons/light/oracle-jd-edwards-ee6634ea.png",
+      "/icons/dark/oracle-jd-edwards-ee6634ea.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "Oracle Reports": {
+    "source": "oracle-official",
+    "light": "docs/tech-icons/sources/oracle-o.svg",
+    "lightSha256": "0e16648087b02d3c06b0fb13127c0b1a36494b13a8d0863e90b488794458d025",
+    "dark": "derived (house dark rule)",
+    "license": "Oracle trademark. Derived mark: the O of the ORACLE wordmark (Oracle_rgb_web.svg), path copied verbatim, other letters removed",
+    "origin": "https://raw.githubusercontent.com/cncf/landscape/master/hosted_logos/oracle.svg",
+    "files": [
+      "/icons/light/oracle-reports-ee6634ea.png",
+      "/icons/dark/oracle-reports-ee6634ea.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "PlanetScale": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/planetscale.svg",
+    "lightSha256": "e82ee94c34a2a832fd499aee243e64084c03c51d46a7d1c11fd27b540a48e21c",
+    "dark": "https://svgl.app/library/planetscale_dark.svg",
+    "darkSha256": "cba6b59b8cd79e9b4d9e29a3649371b69c15a7caac539072235e4e71afdf35c2",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/planetscale-1acd478f.png",
+      "/icons/dark/planetscale-45fdaddb.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "PM2": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/pm2.svg",
+    "lightSha256": "7a57ed0eda8a6ee1a43d0229e12dc8b67dc3f9c68c0667222795cd1483c77faa",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/pm2-f36949b2.png",
+      "/icons/dark/pm2-f36949b2.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "PocketBase": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/pocket-base.svg",
+    "lightSha256": "9f96301c9d3569325abc4560a36c9ceadbbe34960acb1f43d9b7a1869e7a7d46",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/pocketbase-cd90cc3e.png",
+      "/icons/dark/pocketbase-f4518258.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "Polars": {
+    "source": "simple-icons",
+    "sourceVersion": "16.35.0",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/polars.svg",
+    "lightSha256": "713f2cef177d511b8baff99abac9e484cff80354b1beb1b557cf60177f4b4224",
+    "dark": "derived (house dark rule)",
+    "fill": "#0075FF",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://pola.rs",
+    "files": [
+      "/icons/light/polars-561c8da4.png",
+      "/icons/dark/polars-561c8da4.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "Railway": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/railway.svg",
+    "lightSha256": "3e22cde367ddca01e9b78fb3a2f7288c9cc72fb76ef0133a6a6600cef7ca9057",
+    "dark": "https://svgl.app/library/railway_dark.svg",
+    "darkSha256": "e9141826a7590b6bfbd159f3b31539429915840ad04b80bf3eb40cf44dc65f2f",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/railway-e8ebfdf4.png",
+      "/icons/dark/railway-71ef8772.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "Reflex": {
+    "source": "devicon",
+    "sourceVersion": "2.17.0",
+    "light": "https://cdn.jsdelivr.net/gh/devicons/devicon@2.17.0/icons/reflex/reflex-original.svg",
+    "lightSha256": "13373c3195dc7e12db973451dc9a9a23d5856dc08b83aee48bec190b882d646e",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; Devicon artwork (MIT)",
+    "files": [
+      "/icons/light/reflex-d0f804cf.png",
+      "/icons/dark/reflex-d0f804cf.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "Render": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/render_black.svg",
+    "lightSha256": "ee09996a19157a73dbaec1fef1d159a74de2d8e060525b6830c74f676bc6c411",
+    "dark": "https://svgl.app/library/render_white.svg",
+    "darkSha256": "f05692b3d37cd62acadcfacb2811095d64b4d581df1ed6c8756f87b122595daa",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/render-fbd599f6.png",
+      "/icons/dark/render-ce6df399.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "Rook": {
+    "source": "cncf",
+    "light": "https://raw.githubusercontent.com/cncf/artwork/main/projects/rook/icon/color/rook-icon-color.svg",
+    "lightSha256": "408c2e0bad826a0142618e06e909a47f36c588b0350ab298f1077fdc6ac2d76c",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; cncf/artwork, under the Linux Foundation trademark policy",
+    "files": [
+      "/icons/light/rook-b77bed44.png",
+      "/icons/dark/rook-b77bed44.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "Rspack": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/rspack.svg",
+    "lightSha256": "32aafbcd7125c504735db53c0bae7425f2ff4db3271629a283791a0ae07b4fdc",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/rspack-33700ab5.png",
+      "/icons/dark/rspack-4cb6bb4b.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "RxJS": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/rxjs.svg",
+    "lightSha256": "fdd8944b1616f359b9ce7d21b83a43be43c955d6848b60dfa8d8091acd0f23db",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/rxjs-08281f89.png",
+      "/icons/dark/rxjs-08281f89.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "SOPS": {
+    "source": "cncf",
+    "light": "https://raw.githubusercontent.com/cncf/artwork/main/projects/sops/icon/color/sops-icon-color.svg",
+    "lightSha256": "c66ce7dd7b0c311213090978cdfaafe1041dd7805a5b73bf5b3aca228594d68c",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; cncf/artwork, under the Linux Foundation trademark policy",
+    "files": [
+      "/icons/light/sops-2d9ffd0d.png",
+      "/icons/dark/sops-e9f38f10.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "SPIFFE": {
+    "source": "cncf",
+    "light": "https://raw.githubusercontent.com/cncf/artwork/main/projects/spiffe/icon/color/spiffe-icon-color.svg",
+    "lightSha256": "1d6758cd0f323565643c22d51ffdf2783c0a1aaa976a71a439f3b57e3d03f7c5",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; cncf/artwork, under the Linux Foundation trademark policy",
+    "files": [
+      "/icons/light/spiffe-4bfa6f61.png",
+      "/icons/dark/spiffe-4bfa6f61.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "SPIRE": {
+    "source": "cncf",
+    "light": "https://raw.githubusercontent.com/cncf/artwork/main/projects/spire/icon/color/spire-icon-color.svg",
+    "lightSha256": "08af3a72aac9f7d56757c1a427207925d85fb6a30a7f116e14c5ede7dfe2c5d6",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; cncf/artwork, under the Linux Foundation trademark policy",
+    "files": [
+      "/icons/light/spire-cc4aa654.png",
+      "/icons/dark/spire-cc4aa654.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "SST": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/sst.svg",
+    "lightSha256": "30951e0f3ad24c8f8b72337d068180139d39efefa6353f630935b643e79a5196",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/sst-6950e86d.png",
+      "/icons/dark/sst-6950e86d.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "Strimzi": {
+    "source": "cncf",
+    "light": "https://raw.githubusercontent.com/cncf/artwork/main/projects/strimzi/icon/color/strimzi-icon-color.svg",
+    "lightSha256": "e962d30b70422289a4292bf8dedc74cf055ec77dcd5df6482a62cf3b75214864",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; cncf/artwork, under the Linux Foundation trademark policy",
+    "files": [
+      "/icons/light/strimzi-6a961771.png",
+      "/icons/dark/strimzi-233f44ac.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "Teleport": {
+    "source": "devicon",
+    "sourceVersion": "2.17.0",
+    "light": "https://cdn.jsdelivr.net/gh/devicons/devicon@2.17.0/icons/teleport/teleport-original.svg",
+    "lightSha256": "5e3fb758277e38338a5f859b1027700beef6f3f71bd1967846a350bd6b9f51bb",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; Devicon artwork (MIT)",
+    "files": [
+      "/icons/light/teleport-0d1c9f39.png",
+      "/icons/dark/teleport-0d1c9f39.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "TiDB": {
+    "source": "simple-icons",
+    "sourceVersion": "16.35.0",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/tidb.svg",
+    "lightSha256": "dc15660c76044e939ad5acfc3d341225463200ddba95cd66b98675bf932bf379",
+    "dark": "derived (house dark rule)",
+    "fill": "#DC150B",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "guidelines": "https://www.pingcap.com/tidb-brand-guidelines/",
+    "origin": "https://www.pingcap.com/tidb-brand-guidelines/",
+    "files": [
+      "/icons/light/tidb-6f576859.png",
+      "/icons/dark/tidb-6f576859.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "Turbopack": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/turbopack-icon-light.svg",
+    "lightSha256": "4d93134e8ab93adcb4ccfeae66a768ff1f1abb39e1e7d9f497fa3ac919553ce2",
+    "dark": "https://svgl.app/library/turbopack-icon-dark.svg",
+    "darkSha256": "035b939b2e98f9c1b48a19d5a64d49d8b6d516e6a83ca14dc9a3c7fe4a49a75a",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "guidelines": "https://vercel.com/geist/brands",
+    "files": [
+      "/icons/light/turbopack-cf1648e7.png",
+      "/icons/dark/turbopack-0a198377.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "Turso": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/turso-light.svg",
+    "lightSha256": "2ced4ccd84ceef9008173fc1e988d222a50ee62825e3c05e3801d914713c9706",
+    "dark": "https://svgl.app/library/turso-dark.svg",
+    "darkSha256": "df2a5795079800728bd9a3823724de73c5d04aeb53900ebe2493a5c666c142d4",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/turso-d7a9e35a.png",
+      "/icons/dark/turso-801842d9.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "uv": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/uv.svg",
+    "lightSha256": "fc5aeabf925cbdaba99f4e86635eeef2d47a5ecd715d7994490ef9082fd12bfb",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/uv-95829feb.png",
+      "/icons/dark/uv-95829feb.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "Volcano": {
+    "source": "cncf",
+    "light": "https://raw.githubusercontent.com/cncf/artwork/main/projects/volcano/icon/color/volcano-icon-color.svg",
+    "lightSha256": "075eeffa31dd42f8b88b3d6a433eb860c5a0a67ca93d2779ce0edafd96086069",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; cncf/artwork, under the Linux Foundation trademark policy",
+    "files": [
+      "/icons/light/volcano-5f29d635.png",
+      "/icons/dark/volcano-5f29d635.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "wasmCloud": {
+    "source": "cncf",
+    "light": "https://raw.githubusercontent.com/cncf/artwork/main/projects/wasmcloud/icon/color/wasmcloud.icon_green.svg",
+    "lightSha256": "acfa8760b2fbf50c31009dfec02e640c8a1fbb15aacbc4dfd82563723390ae43",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; cncf/artwork, under the Linux Foundation trademark policy",
+    "files": [
+      "/icons/light/wasmcloud-a951b786.png",
+      "/icons/dark/wasmcloud-a951b786.png"
+    ],
+    "addedAt": "2026-10-11"
+  },
+  "YugabyteDB": {
+    "source": "devicon",
+    "sourceVersion": "2.17.0",
+    "light": "https://cdn.jsdelivr.net/gh/devicons/devicon@2.17.0/icons/yugabytedb/yugabytedb-original.svg",
+    "lightSha256": "fa9e6c2b5517432de409276c1a52e1b5f514cff4585c2219acb9d0420162a3e0",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; Devicon artwork (MIT)",
+    "files": [
+      "/icons/light/yugabytedb-305e6748.png",
+      "/icons/dark/yugabytedb-305e6748.png"
+    ],
+    "addedAt": "2026-10-11"
+  }
+}

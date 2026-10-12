@@ -1,0 +1,125 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: maplespire-postgres
+    environment:
+      POSTGRES_USER: maplespire
+      POSTGRES_PASSWORD: maplespire
+      POSTGRES_DB: maplespire
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U maplespire -d maplespire"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7.4-alpine
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --maxmemory
+      - ${REDIS_MAXMEMORY:-256mb}
+      - --maxmemory-policy
+      - noeviction
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis-render-cache:
+    image: redis:7.4-alpine
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --maxmemory
+      - ${REDIS_RENDER_CACHE_MAXMEMORY:-512mb}
+      - --maxmemory-policy
+      - allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  backend:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    container_name: maplespire-backend
+    environment:
+      DATABASE_URL: postgres://maplespire:maplespire@postgres:5432/maplespire
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      REDIS_REQUIRED: ${REDIS_REQUIRED:-on}
+      REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-maplespire}
+      REDIS_COMMAND_TIMEOUT_MS: ${REDIS_COMMAND_TIMEOUT_MS:-1500}
+      REDIS_RENDER_CACHE_URL: ${REDIS_RENDER_CACHE_URL:-redis://redis-render-cache:6379}
+      REDIS_RENDER_CACHE_KEY_PREFIX: ${REDIS_RENDER_CACHE_KEY_PREFIX:-maplespire:cache}
+      REDIS_RENDER_CACHE_COMMAND_TIMEOUT_MS: ${REDIS_RENDER_CACHE_COMMAND_TIMEOUT_MS:-1500}
+      REDIS_RENDER_CACHE_TTL_SECONDS: ${REDIS_RENDER_CACHE_TTL_SECONDS:-300}
+      REDIS_RENDER_CACHE_MAX_ENTRY_BYTES: ${REDIS_RENDER_CACHE_MAX_ENTRY_BYTES:-4194304}
+      AM_WS_BACKPRESSURE_WARN_BYTES: ${AM_WS_BACKPRESSURE_WARN_BYTES:-1048576}
+      AM_WS_BACKPRESSURE_CLOSE_BYTES: ${AM_WS_BACKPRESSURE_CLOSE_BYTES:-16777216}
+      AM_WS_MAX_PAYLOAD_BYTES: ${AM_WS_MAX_PAYLOAD_BYTES:-16777216}
+      AM_WS_TELEMETRY_INTERVAL_MS: ${AM_WS_TELEMETRY_INTERVAL_MS:-60000}
+      AM_WS_TELEMETRY_MAX_DOCUMENTS: ${AM_WS_TELEMETRY_MAX_DOCUMENTS:-2048}
+      SYNC_CELL_OWNERSHIP: ${SYNC_CELL_OWNERSHIP:-on}
+      AM_WORKSPACE_ROUTING: ${AM_WORKSPACE_ROUTING:-on}
+      SYNC_CELL_PARTITION_COUNT: ${SYNC_CELL_PARTITION_COUNT:-1}
+      SYNC_CELL_TOPOLOGY_GENERATION: ${SYNC_CELL_TOPOLOGY_GENERATION:-v1}
+      SYNC_CELL_LEASE_TTL_MS: ${SYNC_CELL_LEASE_TTL_MS:-15000}
+      SYNC_CELL_RENEW_INTERVAL_MS: ${SYNC_CELL_RENEW_INTERVAL_MS:-5000}
+      SYNC_CELL_RECONCILE_INTERVAL_MS: ${SYNC_CELL_RECONCILE_INTERVAL_MS:-5000}
+      SYNC_CELL_TELEMETRY_INTERVAL_MS: ${SYNC_CELL_TELEMETRY_INTERVAL_MS:-60000}
+      SYNC_CELL_OWNERSHIP_CONCURRENCY: ${SYNC_CELL_OWNERSHIP_CONCURRENCY:-16}
+      PORT: 3001
+      NODE_ENV: production
+      TECHNOLOGY_ASSET_DIR: /var/lib/maplespire/assets/technologies
+      TECHNOLOGY_ASSET_GLOBAL_MAX_ASSETS: ${TECHNOLOGY_ASSET_GLOBAL_MAX_ASSETS:-100000}
+      TECHNOLOGY_ASSET_GLOBAL_QUOTA_BYTES: ${TECHNOLOGY_ASSET_GLOBAL_QUOTA_BYTES:-5368709120}
+      TECHNOLOGY_ASSET_PENDING_TTL_HOURS: ${TECHNOLOGY_ASSET_PENDING_TTL_HOURS:-24}
+      TECHNOLOGY_ASSET_GC_BATCH_SIZE: ${TECHNOLOGY_ASSET_GC_BATCH_SIZE:-100}
+      AI_ALLOWED_BASE_URLS: ${AI_ALLOWED_BASE_URLS:-}
+      AI_KEY_SECRET: ${AI_KEY_SECRET:-}
+      AUTH_SECRET: ${AUTH_SECRET:-}
+    ports:
+      - "3001:3001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      redis-render-cache:
+        condition: service_healthy
+    volumes:
+      - technology_assets:/var/lib/maplespire/assets/technologies
+
+  icons:
+    build:
+      context: .
+      dockerfile: docker/nginx/Dockerfile
+    ports:
+      - "8080:80"
+    container_name: maplespire-icons
+    restart: unless-stopped
+    depends_on:
+      - backend
+    volumes:
+      - technology_assets:/var/lib/maplespire/assets/technologies:ro
+
+volumes:
+  postgres_data:
+  redis_data:
+  technology_assets:

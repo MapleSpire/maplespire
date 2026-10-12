@@ -1,0 +1,41 @@
+# Local bench override: apply only together with compose.maplespire.yml and a
+# dedicated compose project name.
+# Keep the delivered ownership/Redis settings and all local service roles.
+# The public Cloudflare tunnel is excluded from this local experiment.
+x-bench-environment: &bench-environment
+  APP_URL: http://127.0.0.1:${MAPLESPIRE_WEB_PORT:?Reserve the bench web port}
+  SERVER_URL: http://127.0.0.1:${MAPLESPIRE_WEB_PORT:?Reserve the bench web port}
+  AUTH_COOKIE_SECURE: "off"
+  EMAIL_PROVIDER: local
+  OUTBOX_DIR: /tmp/maplespire-b514-outbox
+  PLATFORM_ADMIN_BOOTSTRAP_EMAIL: b514-admin@maplespire.local
+
+services:
+  postgres:
+    ports:
+      - "127.0.0.1:${MAPLESPIRE_BENCH_POSTGRES_PORT:?Reserve the bench PostgreSQL port}:5432"
+  api:
+    image: ${MAPLESPIRE_BENCH_IMAGE_PREFIX:?Set a task-specific image prefix}-api:local
+    environment: *bench-environment
+    ports:
+      - "127.0.0.1:${MAPLESPIRE_BENCH_API_PORT:?Reserve the bench API port}:3001"
+  api-b:
+    image: ${MAPLESPIRE_BENCH_IMAGE_PREFIX:?Set a task-specific image prefix}-api:local
+    environment: *bench-environment
+    ports:
+      - "127.0.0.1:${MAPLESPIRE_BENCH_API_B_PORT:?Reserve the second bench API port}:3001"
+  sync-ws-router:
+    image: ${MAPLESPIRE_BENCH_IMAGE_PREFIX:?Set a task-specific image prefix}-api:local
+    ports:
+      - "127.0.0.1:${MAPLESPIRE_BENCH_ROUTER_PORT:?Reserve the bench router port}:3010"
+  web:
+    image: ${MAPLESPIRE_BENCH_IMAGE_PREFIX:?Set a task-specific image prefix}-web:local
+  backup-drill:
+    image: ${MAPLESPIRE_BENCH_IMAGE_PREFIX:?Set a task-specific image prefix}-drill:local
+  prometheus:
+    # Compose merges mounts by their container target, retaining the shipped
+    # configs and isolated named data volume while replacing only this secret.
+    volumes:
+      - ${MAPLESPIRE_BENCH_METRICS_FILE:?Set the ignored task token file}:/etc/prometheus/metrics-token:ro
+  cloudflared:
+    profiles: [external-tunnel-excluded]

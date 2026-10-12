@@ -1,0 +1,375 @@
+{
+  "platform": {
+    "impersonationBanner": {
+      "viewingAs": "Viewing as {{email}} — read-only",
+      "thisUser": "this user",
+      "exiting": "Exiting…",
+      "exit": "Exit",
+      "exitFailed": "Failed to exit impersonation"
+    },
+    "shell": {
+      "title": "Platform",
+      "subtitle": "All organizations",
+      "badge": "Platform",
+      "footer": "Platform admin console · operator, cross-organization access",
+      "loadFailed": "Failed to load platform console",
+      "loadingConsole": "Loading platform console…",
+      "nav": {
+        "overview": "Overview",
+        "organizations": "Organizations",
+        "users": "Users",
+        "technologies": "Technologies",
+        "settings": "Settings",
+        "access": "Access",
+        "audit": "Audit",
+        "accessDebug": "Access debug",
+        "referenceIntegrity": "Reference integrity"
+      },
+      "forbidden": {
+        "title": "You need platform-admin access",
+        "description": "You're signed in, but you're not a platform administrator. This console operates across every organization — ask an existing platform admin to grant you access.",
+        "backToApp": "Back to the app"
+      },
+      "errorScreen": {
+        "title": "Couldn't load the platform console",
+        "retry": "Retry"
+      }
+    },
+    "overview": {
+      "title": "Overview",
+      "subtitle": "Cross-organization counters and live activity.",
+      "loadFailed": "Failed to load overview",
+      "loadImpersonationsFailed": "Failed to load impersonations",
+      "stats": {
+        "organizations": "Organizations",
+        "users": "Users",
+        "landscapes": "Landscapes",
+        "versions": "Versions",
+        "liveConnections": "Live connections"
+      },
+      "activeImpersonations": {
+        "title": "Active impersonations",
+        "subtitle": "Every \"view as\" session in progress, across every org.",
+        "viewingAs": "viewing as",
+        "started": "started {{time}}",
+        "forceStop": "Force stop",
+        "forceStopHint": "Force stop ends the session record; the target's impersonation cookie expires on its own (max 60 min).",
+        "empty": {
+          "title": "No active impersonations",
+          "description": "Sessions started via Users → Impersonate will appear here."
+        }
+      }
+    },
+    "technologies": {
+      "title": "Technologies",
+      "subtitle": "Manage the public catalog and review organization or platform submissions before publication.",
+      "governanceBadge": "Public catalog governance",
+      "pending": "Pending reviews",
+      "loadFailed": "Failed to load technology reviews",
+      "loadingMore": "Loading…",
+      "loadMore": "Load more",
+      "selectedCount": "{{count}} selected",
+      "selectLoadedReviews": "Select loaded eligible reviews",
+      "selectReview": "Select {{name}}",
+      "publishSelected": "Publish selected",
+      "clearSelection": "Clear",
+      "bulkPublishFailed": "{{count}} reviews could not be published. They remain selected.",
+      "review": "Review",
+      "emptyTitle": "No technology awaiting review",
+      "emptyDescription": "Organization submissions will appear here after private approval.",
+      "uncategorized": "Uncategorized",
+      "reviewTitle": "Review {{name}}",
+      "noDescription": "No description supplied.",
+      "category": "Category",
+      "role": "Default role",
+      "shapes": "Recommended shapes",
+      "publisher": "Publisher",
+      "lightPreview": "Light artwork",
+      "darkPreview": "Dark artwork",
+      "publishTitle": "Publish as new technology",
+      "publishDescription": "Creates a new approved public identity and redirects the submitted private identity to it.",
+      "publish": "Approve and publish",
+      "mergeTitle": "Merge with existing",
+      "mergePlaceholder": "Public technology ID",
+      "merge": "Merge submission",
+      "compareFields": "Compare fields",
+      "mergeSameTechnology": "A technology cannot be merged into itself.",
+      "mergeComparator": "Field-by-field merge",
+      "mergeComparatorDescription": "Compare the {{proposal}} proposal with the canonical {{public}} record. This decision creates a new audited public revision.",
+      "mergeAndCreateRevision": "Merge and create revision",
+      "field": "Field",
+      "publicValue": "Public value",
+      "proposalValue": "Proposal value",
+      "decision": "Decision",
+      "mergeChoices": {
+        "keep_public": "Keep public",
+        "take_proposal": "Take proposal",
+        "edit": "Edit"
+      },
+      "mergeFields": {
+        "name": "Name",
+        "description": "Description",
+        "websiteUrl": "Website",
+        "documentationUrl": "Documentation",
+        "aliases": "Aliases",
+        "category": "Category",
+        "iconLightPath": "Light icon",
+        "iconDarkPath": "Dark icon",
+        "recommendedShapeTypes": "Recommended shapes",
+        "defaultRole": "Default role"
+      },
+      "feedbackTitle": "Return to the organization",
+      "reasonPlaceholder": "Explain the required changes or rejection…",
+      "requestChanges": "Request changes",
+      "reject": "Reject",
+      "actionFailed": "Failed to apply the review decision",
+      "catalogTab": "Public catalog",
+      "reviewsTab": "Review queue",
+      "catalogSearch": "Search the public catalog…",
+      "reviewStatus": "Review status",
+      "allStatuses": "All statuses",
+      "addPublic": "Add public technology",
+      "catalogEmpty": "No public technologies found",
+      "catalogEmptyDescription": "Try another search or create a public draft.",
+      "submitReview": "Submit for review",
+      "awaitingReviewer": "Awaiting another admin",
+      "newRevision": "New revision",
+      "createRevision": "Create revision",
+      "createDraft": "Create public draft",
+      "searchBeforeCreate": "Search public catalog",
+      "catalogIconHint": "Choose the light and dark immutable artwork from the shared icon catalog.",
+      "iconOrgRequiredTitle": "Organization context required for uploads",
+      "iconOrgRequiredDescription": "Select an organization context for this platform-admin session before uploading governed light and dark icon assets.",
+      "aiDescription": "Uses the name and every non-empty field as context. Empty fields are completed automatically; suggested changes to existing values stay reviewable.",
+      "aiResearching": "Researching…",
+      "aiOrgRequired": "AI Assist requires a platform administrator session pinned to an organization.",
+      "aiNotConfiguredDescription": "Configure AI Assist for your current organization before researching public technology metadata.",
+      "applyAiImprovements": "Apply {{count}} suggested improvements",
+      "aiImprovementHint": "Existing values are never overwritten automatically. Review this action before applying the suggested changes.",
+      "matchesFound": "Probable public matches",
+      "noMatchesFound": "No probable public match",
+      "otherReviewerRequired": "A different platform administrator must make this review decision.",
+      "platformPublishDescription": "Approves this public revision and makes it available to organizations.",
+      "columns": {
+        "technology": "Technology",
+        "organization": "Organization",
+        "guidance": "Governance guidance",
+        "action": "Action"
+      }
+    },
+    "orgs": {
+      "title": "Organizations",
+      "subtitle": "Every organization on the platform.",
+      "createOrg": "Create org",
+      "searchPlaceholder": "Search by name or slug…",
+      "loadFailed": "Failed to load organizations",
+      "loadMoreFailed": "Failed to load more organizations",
+      "loadingMore": "Loading…",
+      "loadMore": "Load more",
+      "statusActive": "Active",
+      "statusSuspended": "Suspended",
+      "suspend": "Suspend",
+      "unsuspend": "Unsuspend",
+      "empty": {
+        "title": "No organizations found",
+        "tryDifferentSearch": "Try a different search.",
+        "createFirst": "Create the first org to get started."
+      },
+      "columns": {
+        "organization": "Organization",
+        "status": "Status",
+        "members": "Members",
+        "created": "Created"
+      },
+      "create": {
+        "title": "Create organization",
+        "name": "Name",
+        "slug": "Slug",
+        "slugHint": "Lowercase letters, numbers and hyphens only — this becomes part of URLs and can't be changed later.",
+        "slugInvalid": "Only lowercase letters, numbers and single hyphens are allowed.",
+        "slugTaken": "That slug is already taken — try a different one.",
+        "createFailed": "Failed to create organization",
+        "creating": "Creating…",
+        "submit": "Create organization"
+      },
+      "suspendModal": {
+        "suspendTitle": "Suspend organization",
+        "unsuspendTitle": "Unsuspend organization",
+        "suspendDescription": "Suspending <strong>{{name}}</strong> drops every live session in this org immediately and blocks all sign-ins until it's unsuspended. Members will see a suspended-org message.",
+        "unsuspendDescription": "This restores access for <strong>{{name}}</strong> — members will be able to sign in again.",
+        "suspendFailed": "Failed to suspend organization",
+        "unsuspendFailed": "Failed to unsuspend organization"
+      }
+    },
+    "users": {
+      "title": "Users",
+      "subtitle": "Every user account on the platform, across every organization.",
+      "searchPlaceholder": "Search by name or email…",
+      "loadFailed": "Failed to load users",
+      "loadMoreFailed": "Failed to load more users",
+      "loadingMore": "Loading…",
+      "loadMore": "Load more",
+      "startImpersonationFailed": "Failed to start impersonation",
+      "platformAdminBadge": "Platform admin",
+      "statusActive": "active",
+      "statusDeactivated": "deactivated",
+      "viewAsThisUser": "View as this user",
+      "starting": "Starting…",
+      "impersonate": "Impersonate",
+      "deactivate": "Deactivate",
+      "reactivate": "Reactivate",
+      "revokePlatformAdmin": "Revoke platform admin",
+      "grantPlatformAdmin": "Grant platform admin",
+      "empty": {
+        "title": "No users found",
+        "tryDifferentSearch": "Try a different search.",
+        "willAppear": "Users will appear here once they sign in."
+      },
+      "columns": {
+        "user": "User",
+        "status": "Status",
+        "organizations": "Organizations"
+      },
+      "deactivateModal": {
+        "deactivateTitle": "Deactivate user",
+        "reactivateTitle": "Reactivate user",
+        "deactivateDescription": "Deactivating <strong>{{email}}</strong> signs them out everywhere and blocks further sign-ins, across every organization they belong to.",
+        "reactivateDescription": "This restores sign-in access for <strong>{{email}}</strong>.",
+        "deactivateFailed": "Failed to deactivate user",
+        "reactivateFailed": "Failed to reactivate user"
+      },
+      "adminModal": {
+        "grantTitle": "Grant platform admin",
+        "revokeTitle": "Revoke platform admin",
+        "grantDescription": "<strong>{{email}}</strong> will get full operator access — every organization, every user, impersonation, and platform-level settings.",
+        "revokeDescription": "<strong>{{email}}</strong> will lose operator access. They keep their normal org memberships.",
+        "grant": "Grant",
+        "revoke": "Revoke",
+        "grantFailed": "Failed to grant platform admin",
+        "revokeFailed": "Failed to revoke platform admin",
+        "lastPlatformAdmin": "This is the last platform admin — grant admin to someone else before revoking this one."
+      }
+    },
+    "access": {
+      "title": "Access",
+      "subtitle": "The org-admin grant matrix, filtered by organization — pick an org to view and edit its access.",
+      "loadFailed": "Failed to load organizations",
+      "organization": "Organization",
+      "selectOrganization": "Select an organization…",
+      "suspended": "suspended",
+      "empty": {
+        "title": "No organizations",
+        "description": "Create one under Organizations first."
+      }
+    },
+    "settings": {
+      "title": "Settings",
+      "subtitle": "Configure global governance behavior for every platform administrator.",
+      "loadFailed": "Failed to load platform settings",
+      "saveFailed": "Failed to save platform settings",
+      "saving": "Saving…",
+      "activeAdmins": "{{count}} active platform administrator(s)",
+      "governance": {
+        "title": "Governance",
+        "description": "Controls for platform-level review and approval workflows."
+      },
+      "independentReview": {
+        "title": "Require independent technology review",
+        "description": "When enabled, the administrator who creates or submits a public technology revision cannot approve, reject, or request changes on that same revision.",
+        "soleAdminTitle": "Independent review is bypassed",
+        "soleAdminDescription": "There is only one active platform administrator. That administrator can decide their own public technology reviews until another active administrator is added.",
+        "effectiveTitle": "Independent review is active",
+        "effectiveDescription": "A different platform administrator must decide public technology revisions created or submitted by another administrator.",
+        "disabledTitle": "Self-review is allowed by platform policy",
+        "disabledDescription": "Any platform administrator can decide a public technology review, including one they created or submitted."
+      }
+    },
+    "audit": {
+      "title": "Audit",
+      "subtitle": "Every mutation across every organization, plus platform-level events.",
+      "filterByOrgId": "Filter by org id…",
+      "filterByAction": "Filter by action…",
+      "loadFailed": "Failed to load audit log",
+      "loadMoreFailed": "Failed to load more entries",
+      "loadingMore": "Loading…",
+      "loadMore": "Load more",
+      "by": "by {{who}}",
+      "empty": {
+        "title": "No audit entries found",
+        "description": "Try clearing the filters, or check back after some activity."
+      },
+      "columns": {
+        "when": "When",
+        "action": "Action",
+        "target": "Target",
+        "actor": "Actor",
+        "org": "Org"
+      }
+    },
+    "debug": {
+      "title": "Access debug",
+      "subtitle": "Check exactly what a user can do on a scope, and why — the RLS decision trace, cross-org.",
+      "user": "User",
+      "searchPlaceholder": "Search by name or email…",
+      "scopeId": "Scope ID",
+      "scopeIdPlaceholder": "scope id (landscape / version / domain)…",
+      "running": "Running…",
+      "run": "Run",
+      "runFailed": "Failed to run access debug",
+      "result": "Result",
+      "edit": "Edit",
+      "view": "View",
+      "noAccess": "No access",
+      "for": "for {{email}}",
+      "via": "via {{via}}",
+      "grantedAtScope": "granted at scope {{scopeId}}",
+      "rawResponse": "Raw response"
+    },
+    "referenceIntegrity": {
+      "title": "Reference integrity",
+      "description": "Cross-entity references whose target no longer exists. Scanning is read-only; repair is opt-in, defaults to a dry run, and is always scoped to one workspace.",
+      "landscapeId": "Landscape ID",
+      "versionId": "Version ID",
+      "allWorkspaces": "All workspaces",
+      "scan": "Scan",
+      "scanFailed": "The scan failed.",
+      "repairFailed": "The repair failed.",
+      "walkDocuments": "Also walk the Automerge documents.",
+      "walkDocumentsHint": "Opens one document per diagram — slower, and the only way to see group parents, layout keys and flow-step references.",
+      "walkDocumentsNeedsWorkspace": "Needs a landscape and version: the walk is per-workspace.",
+      "columns": {
+        "severity": "Severity",
+        "reference": "Reference",
+        "source": "Source",
+        "target": "Target"
+      },
+      "severity": {
+        "dangling": "Dangling",
+        "orphaned": "Orphaned",
+        "unreadable": "Unreadable",
+        "expected": "By design"
+      },
+      "empty": {
+        "title": "No dangling references found",
+        "description": "Every reference this scan can check resolves. See the coverage note below for what it did not look at."
+      },
+      "coverage": {
+        "title": "What this scan did not check",
+        "unchecked": "Never checked, deliberately: {{kinds}}. Skins are client plugins the server cannot resolve, and a comment lives inside its diagram document so it cannot dangle.",
+        "documentsNotWalked": "The Automerge documents were not walked, so group parents, layout keys and flow-step references were not checked.",
+        "diagramsSkipped": "{{count}} diagram document(s) were not opened because the walk hit its cap.",
+        "truncated": "The result was cut short by a cap, so these counts are lower bounds."
+      },
+      "repair": {
+        "title": "Repair",
+        "dryRun": "Dry run",
+        "apply": "Apply {{count}} repair(s)",
+        "description": "A dry run reports what would change and writes nothing. Apply is only offered for findings the server judged safe.",
+        "needsWorkspace": "Repair needs a landscape and version — it is never fleet-wide.",
+        "wouldRepair": "Would repair {{count}} finding(s).",
+        "applied": "Repaired {{count}} finding(s).",
+        "declinedNoReason": "declined by the server"
+      }
+    }
+  }
+}

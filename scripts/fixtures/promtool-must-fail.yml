@@ -1,0 +1,29 @@
+# The CONTROL arm for the promtool gate in scripts/monitoring.test.mjs.
+#
+# This file MUST be rejected. It is what distinguishes "promtool ran" from
+# "promtool agreed" — a container with the wrong entrypoint, or a bind mount
+# that landed empty, would otherwise report SUCCESS on nothing and the gate
+# would be inert while looking green.
+#
+# Do not "fix" the errors below. They are the point.
+groups:
+  - name: control
+    rules:
+      # 1. a syntax error in the expression
+      - alert: UnbalancedParen
+        expr: absent(up{job="x"}
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: must not parse
+
+      # 2. a misspelled function — the shape that would have shipped if
+      #    `changes()` had been typed wrong in the crash-loop rule
+      - alert: UnknownFunction
+        expr: chagnes(some_metric[30m]) > 2
+        for: 2m
+        labels:
+          severity: ticket
+        annotations:
+          summary: must not parse

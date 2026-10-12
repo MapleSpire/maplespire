@@ -1,0 +1,80 @@
+{
+  "decisionRecords": {
+    "status": {
+      "inProgress": "En cours",
+      "approved": "Approuvée",
+      "rejected": "Rejetée"
+    },
+    "list": {
+      "windowLimit": "2 000 fiches chargées. Affinez la recherche pour continuer.",
+      "empty": "Aucune fiche de décision trouvée",
+      "ariaLabel": "Fiches de décision"
+    },
+    "detail": {
+      "selectPrompt": "Sélectionnez une fiche de décision pour voir les détails",
+      "titlePlaceholder": "Titre de la fiche de décision",
+      "summaryPlaceholder": "Bref résumé de la décision…",
+      "noSummary": "Aucun résumé fourni.",
+      "status": "Statut",
+      "related": "Éléments liés",
+      "edit": "Modifier",
+      "noContent": "Aucun contenu fourni.",
+      "delete": "Supprimer",
+      "deleteConfirmTitle": "Supprimer cette décision d’architecture ?",
+      "deleteConfirmBody": "« {{title}} » sera retirée de ce paysage. Les décisions approuvées ne peuvent pas être supprimées — passez plutôt leur statut à rejetée pour les retirer."
+    },
+    "relatedLinks": {
+      "type": {
+        "url": "Lien",
+        "adr": "Fiche de décision",
+        "diagram": "Diagramme",
+        "draft": "Brouillon"
+      },
+      "removeLink": "Retirer le lien",
+      "addItem": "Ajouter un élément lié",
+      "typeLabel": "Type",
+      "urlLabel": "URL",
+      "selectLabel": "Sélectionner",
+      "choose": "Choisir...",
+      "labelLabel": "Libellé",
+      "displayNamePlaceholder": "Nom affiché",
+      "add": "Ajouter",
+      "deletedTarget": "Cible supprimée — ce lien ne mène nulle part",
+      "unsupportedType": "Ce type de lien n'est pas pris en charge par cette version",
+      "invalidUrl": "Adresse web non valide",
+      "untitled": "Lien sans titre"
+    },
+    "editor": {
+      "preview": "Aperçu",
+      "markdown": "Markdown",
+      "done": "Terminé",
+      "markdownPlaceholder": "## Contexte&#10;&#10;Décrivez le problème ou le contexte à l'origine de cette décision…&#10;&#10;## Décision&#10;&#10;Formulez la décision clairement…",
+      "tool": {
+        "heading": "Titre",
+        "bold": "Gras",
+        "italic": "Italique",
+        "bulletedList": "Liste à puces",
+        "quote": "Citation",
+        "link": "Lien",
+        "linkPlaceholder": "lien",
+        "code": "Code",
+        "codePlaceholder": "code"
+      }
+    },
+    "timeline": {
+      "noHistory": "Aucun historique"
+    },
+    "view": {
+      "newRecordTitle": "Nouvelle fiche de décision",
+      "defaultAuthor": "Vous",
+      "panelTitle": "Fiche de décision",
+      "author": "Auteur",
+      "updated": "Mise à jour",
+      "timeline": "Historique",
+      "searchPlaceholder": "Rechercher des fiches",
+      "newRecord": "Nouvelle fiche",
+      "aiAssist": "Assistant IA",
+      "records": "Fiches"
+    }
+  }
+}

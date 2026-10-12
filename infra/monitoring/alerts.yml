@@ -1,0 +1,1194 @@
+# Alert rules for the signals MapleSpire emits on /metrics.
+#
+# Each rule turns a detector that would otherwise live only in an admin dialog
+# or a log line into something that reaches an operator. The thresholds are
+# the ones documented in
+# the sponsor kit's read-model projector health and backup-drill guides — kept here as
+# something a process loads rather than as prose.
+#
+# Two conventions:
+#   - `severity: page` means a human is expected to act now; `ticket` means it
+#     goes on the list. Nothing is `info` — a rule nobody would act on is not a
+#     rule, it is a dashboard panel.
+#   - Every `for:` is at least 4× the 30s scrape interval, so a single failed
+#     scrape or one projector restart cannot page anybody.
+
+groups:
+  - name: maplespire-placement-proposer
+    rules:
+      - alert: PlacementProposerSignalUnknown
+        expr: >-
+          (maplespire_placement_proposer_unknown_age_seconds{job="placement-proposer"} > 900)
+          and on(job, instance) (maplespire_placement_proposer_signal_unknown{job="placement-proposer"} == 1)
+          and on(job, instance) (maplespire_placement_proposer_enabled{job="placement-proposer"} == 1)
+          and on(job, instance) (up{job="placement-proposer"} == 1)
+        # The process already measures the continuous episode. A second for:
+        # would delay this beyond fifteen minutes. Evaluated at the next tick.
+        labels:
+          severity: ticket
+        annotations:
+          summary: "The placement proposer has lacked a known signal for over fifteen minutes"
+          description: >-
+            Inspect proposer-health JSON, retained observation time, last success
+            and history coverage. Scraping does not renew the observation. This
+            is a local rule; external delivery remains deferred and unqualified.
+            See https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/placement-proposer.md#health-and-local-alerts.
+
+      - alert: PlacementProposerDown
+        expr: up{job="placement-proposer"} == 0
+        for: 2m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "A configured placement proposer metrics target is unreachable"
+          description: >-
+            Target failure is not the disabled state. Check the opted-in process,
+            listener, token and scrape address. No target is configured by default.
+            See https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/placement-proposer.md#health-and-local-alerts.
+
+      - alert: PlacementProposerMetricsMissing
+        expr: >-
+          (up{job="placement-proposer"} == 1) unless on(job, instance)
+          (maplespire_placement_proposer_enabled{job="placement-proposer"}
+           and on(job, instance) maplespire_placement_proposer_signal_unknown{job="placement-proposer"}
+           and on(job, instance) maplespire_placement_proposer_unknown_age_seconds{job="placement-proposer"})
+        for: 2m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "A reachable placement proposer target lacks its health metrics"
+          description: >-
+            A successful HTTP scrape alone cannot establish disabled or healthy.
+            Verify that the configured endpoint serves the dedicated proposer.
+            See https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/placement-proposer.md#health-and-local-alerts.
+
+  - name: maplespire-cell-ownership
+    rules:
+      - alert: SyncCellCoverageGap
+        expr: >-
+          (maplespire_sync_cell_owned_workspaces{job="maplespire-api"}
+            < maplespire_sync_cell_expected_workspaces{job="maplespire-api"})
+          and ignoring(cell_id) (maplespire_sync_cell_ownership_enabled{job="maplespire-api"} == 1)
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "A sync cell is missing known workspace ownership"
+          description: >-
+            Owned workspaces have remained below this cell's known assignment for
+            two minutes. A healthy standby with zero expected workspaces stays
+            silent. Check partition authority and acquisition errors. See
+            https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/sync-cell-ownership.md#cell-ownership-alerts.
+
+      - alert: SyncCellPartitionLoss
+        expr: >-
+          (increase(maplespire_sync_cell_partition_loss_total{job="maplespire-api"}[15m]) > 0)
+          and ignoring(cell_id) (maplespire_sync_cell_ownership_enabled{job="maplespire-api"} == 1)
+        for: 2m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "A sync cell lost partition ownership"
+          description: >-
+            A partition loss occurred in the last fifteen minutes. Correlate with
+            Redis availability and planned handovers; this counter is distinct
+            from workspace losses. See
+            https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/sync-cell-ownership.md#cell-ownership-alerts.
+
+      - alert: SyncCellWorkspaceLoss
+        expr: >-
+          (sum without(reason) (increase(maplespire_sync_cell_workspace_losses_by_reason_total{job="maplespire-api"}[15m])) > 0)
+          and (maplespire_sync_cell_ownership_enabled{job="maplespire-api"} == 1)
+        for: 2m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "A sync cell lost workspace ownership"
+          description: >-
+            Workspace losses increased in the last fifteen minutes. Inspect the
+            closed reason breakdown and correlate planned moves or retirement
+            before treating the loss as an incident. See
+            https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/sync-cell-ownership.md#cell-ownership-alerts.
+
+      - alert: SyncCellFenceRejections
+        expr: >-
+          (rate(maplespire_sync_cell_fence_rejections_total{job="maplespire-api"}[5m]) > 1)
+          and ignoring(cell_id) (maplespire_sync_cell_ownership_enabled{job="maplespire-api"} == 1)
+        for: 2m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "A sync cell has sustained storage fencing refusals"
+          description: >-
+            The five-minute average exceeded one refusal per second for two
+            minutes. This initial operational threshold excludes coalesced retries
+            and does not count lost documents. Investigate ownership handovers
+            and durable fencing; never page on the raw counter. See
+            https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/sync-cell-ownership.md#cell-ownership-alerts.
+
+      - alert: SyncCellForeignProjector
+        expr: >-
+          (maplespire_sync_cell_foreign_resident_projectors{job="maplespire-api"} > 0)
+          and ignoring(cell_id) (maplespire_sync_cell_ownership_enabled{job="maplespire-api"} == 1)
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "A sync cell retains projectors outside its ownership"
+          description: >-
+            Foreign resident projectors persisted for two minutes. Inspect
+            ownership loss and projector eviction. An unavailable fleet reading
+            is NaN, not evidence that the fleet is empty. See
+            https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/sync-cell-ownership.md#cell-ownership-alerts.
+
+      - alert: RedisMemoryNearLimit
+        expr: >-
+          (redis_memory_used_bytes{job="redis"} / redis_memory_max_bytes{job="redis"} > 0.8)
+          and (redis_memory_max_bytes{job="redis"} > 0)
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "The critical Redis is nearing its configured memory limit"
+          description: >-
+            Used memory exceeded 80 percent of the configured limit for five
+            minutes. With noeviction, exhaustion can refuse lease acquisition.
+            Check capacity and key growth. A zero maximum means unlimited and
+            is excluded. This job monitors the critical Redis, not the optional
+            render cache. See
+            https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/sync-cell-ownership.md#cell-ownership-alerts.
+
+  - name: maplespire-sync-router
+    rules:
+      - alert: SyncRouterDown
+        expr: up{job="sync-ws-router"} == 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "The public WebSocket router cannot be scraped"
+          description: >-
+            Check the router process, its internal metrics listener and METRICS_TOKEN.
+            An API scrape does not establish router health. See
+            https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/sync-cell-ownership.md#router-observability.
+
+      - alert: SyncRouterNotScraped
+        expr: absent(up{job="sync-ws-router"})
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "Prometheus has no WebSocket router target"
+          description: >-
+            Restore the sync-ws-router scrape job and its target. A missing target
+            cannot fire SyncRouterDown. See
+            https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/sync-cell-ownership.md#router-observability.
+
+      - alert: SyncRouterTopologyPending
+        expr: maplespire_sync_router_topology_state{job="sync-ws-router"} == 0
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "The WebSocket router has not confirmed its topology"
+          description: >-
+            No topology contract has been confirmed for five minutes. Check cell
+            startup and the router's Redis endpoint and key prefix. This warning
+            does not assert a mismatch. See
+            https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/sync-cell-ownership.md#router-observability.
+
+  # The rule that is not an alert: it fires ALWAYS, by construction, and the
+  # thing anybody acts on is its ABSENCE.
+  #
+  # An alert that EXISTS and an alert that REACHED someone are different facts:
+  # without an `alerting:` block in prometheus.yml, rules fire into
+  # `activeAlertmanagers: []` and nobody is woken.
+  #
+  # Page alerts reach SES SMTP through Alertmanager. Watchdog feeds the
+  # SNS/CloudWatch observer on a separate topic without email subscribers. An absent ALERTS
+  # sample can also be a startup/configuration issue; inspect evaluation state
+  # before attributing a cause. None of these metrics proves human receipt.
+  #
+  # `severity: watchdog` and the missing `for:` both break the conventions the
+  # rest of this file follows, so scripts/monitoring.test.mjs carves this rule
+  # out BY NAME rather than loosening the check for every rule:
+  #   - no `for:`, because a watchdog has to be firing at the first evaluation
+  #     after a restart. A `for` window is a period during which the dashboard
+  #     would report the engine dead while it is merely young — a false alarm
+  #     on the one signal whose whole job is to be trusted.
+  #   - `severity: watchdog`, because it is neither `page` nor `ticket`: nobody
+  #     acts on its ARRIVAL. Routing it as either pages on every restart, and an
+  #     alert channel that cries wolf stops being read.
+  - name: maplespire-meta
+    # Prometheus resend-delay=15s gives this alert a 60s validity lease.
+    # A dead rule engine must not leave Alertmanager publishing for four minutes.
+    interval: 15s
+    rules:
+      - alert: Watchdog
+        expr: vector(1)
+        labels:
+          severity: watchdog
+        annotations:
+          summary: The rule engine is evaluating
+          description: >-
+            This alert always fires; its ABSENCE calls for investigation of
+            rule evaluation, startup and configuration. It does not prove the
+            rest of the system is healthy. Alertmanager publishes it to the SNS
+            heartbeat topic; CloudWatch watches silence. Local counters do not
+            prove external health or human receipt.
+          runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/production-stack/docker-compose.md
+
+  - name: maplespire-alert-delivery
+    interval: 30s
+    rules:
+      - alert: AlertmanagerEmailDeliveryFailed
+        # Per-attempt failures: notifications_failed_total waits for retries to
+        # finish. The extra arms cover a positive first scrape, a collection gap
+        # and a restarted process whose new counter equals the old value.
+        expr: >-
+          (
+            (increase(alertmanager_notification_requests_failed_total{job="alertmanager", integration="email"}[2m]) > 0)
+            or (alertmanager_notification_requests_failed_total{job="alertmanager", integration="email"}
+                > alertmanager_notification_requests_failed_total{job="alertmanager", integration="email"} offset 2m)
+            or ((alertmanager_notification_requests_failed_total{job="alertmanager", integration="email"} > 0)
+                unless alertmanager_notification_requests_failed_total{job="alertmanager", integration="email"} offset 2m)
+            or ((alertmanager_notification_requests_failed_total{job="alertmanager", integration="email"} > 0)
+                and on(job, instance) (process_start_time_seconds{job="alertmanager"}
+                  != process_start_time_seconds{job="alertmanager"} offset 2m))
+          ) and on(job, instance) (up{job="alertmanager"} == 1)
+        # No second grace period after an explicit failure has been observed.
+        labels:
+          severity: page
+        annotations:
+          summary: An SMTP delivery failure was observed
+          description: >-
+            Alertmanager reported an email attempt error. This notification uses
+            SNS directly. A first positive sample can represent an older error;
+            the counter is not the number of recent failures. With continuous
+            collection it clears within two minutes plus one evaluation after
+            the counter stabilizes. A hung SMTP attempt may not return an error.
+            Check delivery and receiver logs; neither this alert nor an SNS
+            acceptance proves receipt on the operator device.
+          runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/alerting-sns.md
+
+  - name: maplespire-backup
+    rules:
+      # The one that matters most, and the reason age is exported rather than a
+      # pass/fail boolean: a drill that stopped being SCHEDULED produces no
+      # failures at all, so a green last-run gauge would sit here for months
+      # looking exactly like a healthy one.
+      - alert: BackupDrillStale
+        # Default cadence is 24h; 36h tolerates one missed run plus slack.
+        expr: maplespire_backup_drill_last_success_age_seconds > 36 * 3600
+        for: 15m
+        labels:
+          severity: page
+        annotations:
+          summary: No successful backup/restore drill in over 36 hours
+          description: >-
+            Last success was {{ $value | humanizeDuration }} ago. Either the
+            drill container is not running or it has been failing. Check
+            `docker compose logs backup-drill` and the newest row in
+            `backup_drill_runs`.
+          runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/backup-drill.md
+
+      # NaN is the "never passed" signal, and NaN fails every `>` comparison —
+      # so the rule above is silent on a brand-new or long-broken installation.
+      # This is the one that catches it. Both are needed; neither covers the
+      # other.
+      - alert: BackupDrillNeverPassed
+        expr: absent(maplespire_backup_drill_last_success_age_seconds)
+          or maplespire_backup_drill_last_success_age_seconds != maplespire_backup_drill_last_success_age_seconds
+        for: 1h
+        labels:
+          severity: page
+        annotations:
+          summary: No backup/restore drill has ever passed on this deployment
+          description: >-
+            The gauge is NaN or absent. A restore has never been proven to work
+            here — treat existing backups as unverified until a drill passes.
+          runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/backup-drill.md
+
+      # LIVENESS. The two rules above read a row the drill writes when a run
+      # ENDS, so a dead container would take 36 hours to become a signal.
+      #
+      # `up` is generated by Prometheus, not by the drill, so it is the one
+      # series in this group the subject cannot flatter. That is also its limit,
+      # and the limit is why the rule after it exists.
+      - alert: BackupDrillContainerDown
+        # 15m, where ApiDown uses 2m, and the difference is not caution: this
+        # container declares `stop_grace_period: 420s` so an aborting drill can
+        # unwind, and a rolling deploy legitimately removes the target for that
+        # plus a build. `scripts/maplespire-compose.test.mjs` asserts this
+        # window still exceeds the grace.
+        expr: up{job="backup-drill"} == 0
+        for: 15m
+        labels:
+          severity: page
+        annotations:
+          summary: The backup drill container is not answering scrapes
+          description: >-
+            No successful scrape of backup-drill:9464 for fifteen minutes. Three
+            causes reach here identically, so check them in this order:
+            `docker compose ps backup-drill` (dead or restarting),
+            `docker compose logs backup-drill | grep drill_scheduler_started`
+            (a boot line reporting metricsTokenSet=false means METRICS_TOKEN is
+            unset and the endpoint 404s), and metricsPort in that same line
+            against the target above. A drill that is merely FAILING keeps
+            answering — that is BackupDrillFailing, not this.
+          runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/backup-drill.md
+
+      # Catches the rule above going silent because its target is gone.
+      #
+      # `up == 0` needs a target to be about. Delete the job from
+      # prometheus.yml, typo the service name, and `BackupDrillContainerDown`
+      # goes quiet in the same direction a healthy deployment does. Same
+      # asymmetry as BackupDrillNeverPassed beside BackupDrillStale: the
+      # threshold cannot see "never".
+      #
+      # 15m, where the file's other two `absent()` rules use 1h. Deliberate, and
+      # the difference is what the series MEASURES: a drill success needs a
+      # whole run, so an hour there is honest latency, while `up` reappears
+      # within one scrape interval of a Prometheus restart. An hour here would
+      # be an hour of not knowing the monitoring is misconfigured.
+      - alert: BackupDrillNotScraped
+        expr: absent(up{job="backup-drill"})
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: Prometheus has no backup-drill target at all
+          description: >-
+            The `backup-drill` job produces no `up` series, so the container
+            liveness rule cannot fire either way. This is a monitoring fault,
+            not a backup fault — check the scrape_configs in prometheus.yml and
+            that the config was reloaded.
+          runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/backup-drill.md
+
+      # And the half `up` CANNOT see: a wedged scheduler. With the loop awaiting
+      # a promise that never settles (e.g. a leaked pool client), the listener
+      # in the same process keeps answering every scrape with 200 while the
+      # phase age climbs. `up` stays 1 throughout.
+      #
+      # The threshold is a SERIES, not a number: each phase's budget is derived
+      # from BACKUP_DRILL_INTERVAL_HOURS, _DEADLINE_HOURS and
+      # _ABORT_GRACE_SECONDS by the process that is running them, so raising the
+      # cadence cannot leave a stale literal here.
+      #
+      # Both operands come from the subject, so this rule AGREES with whatever
+      # the configuration says. What bounds it is not in this
+      # expression and has to be named: `intervalMs` refuses anything outside
+      # 0.25-720 h and THROWS rather than clamping (drillSchedule.ts), and
+      # `BackupDrillStale` above is an absolute 36 h that no configuration
+      # moves. This rule is the early, specific detector; that one is the
+      # backstop.
+      #
+      # `stopping` is NOT covered here, and the arithmetic is why rather than an
+      # oversight: its budget is the abort grace (300 s) plus the slack (300 s),
+      # and 600 s + this rule's 900 s window is 1 500 s — while
+      # `stop_grace_period` is 420 s, so Docker SIGKILLs the container long
+      # before the phase could reach it. The legitimate worst case in `stopping`
+      # is ~332 s (grace + the 30 s lock-pool ceiling + the 2 s listener close),
+      # so nothing is lost; the gauge is there for a human curling the endpoint
+      # during a teardown, and a teardown that hangs surfaces as the SIGKILL and
+      # then as BackupDrillRestarting. `maplespire-compose.test.mjs` asserts the
+      # relation between these numbers.
+      - alert: BackupDrillSchedulerWedged
+        expr: maplespire_backup_drill_scheduler_phase_age_seconds
+          > maplespire_backup_drill_scheduler_phase_budget_seconds
+        for: 15m
+        labels:
+          severity: page
+        annotations:
+          summary: The backup drill scheduler is stuck in {{ $labels.phase }}
+          description: >-
+            The loop has spent {{ $value | humanizeDuration }} in
+            `{{ $labels.phase }}`, past the longest that phase can legitimately
+            last under this deployment's own configuration. `running` past its
+            budget means the per-tick deadline and abort grace BOTH failed to
+            end the process, so a `pg_dump` may still hold the advisory lock;
+            `sleeping` means the timer never fired; `starting` means `mkdir` on
+            the bundle volume never returned; `boot_sweep` means the orphan
+            sweep outlived its own ceiling. There is deliberately no `stopping`
+            case — see the comment above. Restarting the container is safe: the
+            advisory lock is session-scoped and dies with the backend.
+          runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/backup-drill.md
+
+      # The crash loop that BOTH rules above are blind to.
+      #
+      # A container that dies and restarts is up for most of every scrape
+      # interval, so `BackupDrillContainerDown` never accumulates its fifteen
+      # minutes — while no drill ever finishes, because a run takes minutes and
+      # the process does not live that long.
+      #
+      # `changes()` OVER A RANGE, and this is not a stylistic choice — an uptime
+      # threshold behind a `for:` window cannot fire here. A `for:` window
+      # requires the expression to return a sample at every evaluation, and
+      # Prometheus marks all of a target's series STALE on a failed scrape; a
+      # container under `restart: always` is down across at least one 30 s
+      # scrape per cycle, since Docker's restart delay doubles up to a minute.
+      # Each failed scrape would reset the window. `changes()` is computed from
+      # the samples actually present in the range and is immune to the gaps.
+      #
+      # Cadence-independent, unlike every threshold below it: three distinct
+      # start times in thirty minutes is a loop whatever
+      # BACKUP_DRILL_INTERVAL_HOURS says. `> 2` rather than `> 0` so a single
+      # rolling deploy, which is one change, says nothing.
+      - alert: BackupDrillRestarting
+        expr: changes(maplespire_backup_drill_scheduler_start_time_seconds[30m]) > 2
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: The backup drill container keeps restarting
+          description: >-
+            The scheduler process started {{ $value }} more times in the last
+            thirty minutes, so no run can complete. `main()` exits non-zero only
+            for configuration it cannot fix — a missing DATABASE_URL, or
+            BACKUP_DIRECTORY set without BACKUP_BUNDLE_ROOT, which is the pair
+            that once made the committed compose file unable to start this
+            container at all. Read the first lines of
+            `docker compose logs backup-drill`.
+          runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/backup-drill.md
+
+      # `up == 1` and the gauges are not in the body.
+      #
+      # The two rules above need a target; `BackupDrillContainerDown` needs the
+      # scrape to fail. Neither covers a scrape that SUCCEEDS and returns an
+      # exposition without the heartbeat in it — a collect closure that stops
+      # returning them, or a refactor that drops the call. Both remaining rules
+      # are then structurally unable to fire and every panel is green.
+      #
+      # Same pairing `BackupDrillNeverPassed` makes with `BackupDrillStale`, and
+      # the same reason: a threshold cannot see "never".
+      #
+      # `and on()` with an empty label list because `absent()` returns a vector
+      # carrying only the selector's own matchers — it has no `job` or
+      # `instance`, so a plain `and` would match nothing and the rule would be
+      # the very thing it is written to catch.
+      - alert: BackupDrillHeartbeatMissing
+        expr: absent(maplespire_backup_drill_scheduler_start_time_seconds)
+          and on() (up{job="backup-drill"} == 1)
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: The backup drill answers scrapes but emits no heartbeat
+          description: >-
+            The scrape succeeds, so the process is alive and the token is right,
+            but the scheduler gauges are missing from the body. The wedge and
+            restart rules cannot fire in this state. Curl the endpoint from the
+            prometheus container and compare against
+            `backup.drill_metrics_request_failed` in the drill's log.
+          runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/backup-drill.md
+
+      - alert: BackupDrillFailing
+        expr: maplespire_backup_drill_failures_since_success > 0
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $value }} backup drill(s) failed since the last success"
+          description: >-
+            The stored report for each failed run carries the reason. A cold-API
+            failure means the restore is not servable; a probe failure names the
+            workspaces to repair or retire.
+          runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/backup-drill.md
+
+      # Not a correctness signal — a capacity one. RTO is the number quoted in a
+      # recovery plan, and it drifts upward quietly as the model grows.
+      - alert: BackupDrillRtoDegraded
+        expr: maplespire_backup_drill_last_success_rto_seconds > 900
+        for: 1h
+        labels:
+          severity: ticket
+        annotations:
+          summary: Backup drill RTO exceeded 15 minutes
+          description: >-
+            Last passing drill took {{ $value | humanizeDuration }} end to end.
+            Recovery time has grown; revisit the documented RTO before an
+            incident does it for you.
+          runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/backup-drill.md
+
+      # The CONSEQUENCE check. Every other rule in this group watches the
+      # exclusion MACHINERY report on itself; this one watches two durable
+      # columns no code on the lock path writes, and fires when two drills
+      # actually ran at the same time. Two concurrent `pg_dump` runs race on one
+      # `latest-report.json` and sweep one bundle root — the state the advisory
+      # lock exists to make impossible, so a firing here means it failed.
+      #
+      # `< 604800` rather than a count `> 0`: the count only falls when
+      # retention prunes, so an overlap from last spring would hold the alert
+      # open forever and get silenced. This self-clears a week after the last
+      # occurrence.
+      #
+      # NaN means never observed, and every comparison against NaN is false —
+      # the same property `BackupDrillStale` relies on above. Note the
+      # asymmetry, because it explains a MISSING rule: staleness needed
+      # `BackupDrillNeverPassed` beside it, since there "never" is the bad news
+      # the threshold cannot see. Here "never" is the good news, so silence is
+      # the correct output and no companion rule belongs.
+      #
+      # This expression is PARSED by `monitoring.test.mjs` (promtool inside
+      # `prom/prometheus:v3.1.0`, the image this stack deploys), but it is NOT
+      # among the rules `alerts.test.yml` evaluates against fixture series.
+      #
+      # The detector underneath this one is proven able to fire against a real
+      # cluster in `drillOverlap.integration.test.ts`.
+      - alert: BackupDrillExclusionFailed
+        expr: maplespire_backup_drill_last_overlap_age_seconds < 604800
+        for: 15m
+        labels:
+          severity: page
+        annotations:
+          summary: Two backup drills overlapped — the exclusion failed
+          description: >-
+            {{ $value | humanizeDuration }} ago a drill started while another was
+            still running. Two schedulers may have dumped, written
+            latest-report.json and swept the bundle root concurrently. Check
+            backup_drill_runs for the overlapping windows and
+            db.advisory_lock_* / backup.drill_ran_without_exclusion in the drill
+            container's log.
+          runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/backup-drill.md
+
+      # The overlap count is blind past a run whose recorded window is not its
+      # real one. Saying so is the difference between `clean` and `incomplete`:
+      # a green exclusion check computed over truncated windows proves nothing.
+      # AGE-scoped, not `sum(...) > 0`: a count over retained history only
+      # falls when retention prunes, so ONE abandoned run would hold this
+      # ticket open until the row aged out and get it silenced.
+      - alert: BackupDrillWindowUnreliable
+        expr: maplespire_backup_drill_last_unreliable_window_age_seconds < 604800
+        for: 1h
+        labels:
+          severity: ticket
+        annotations:
+          summary: A drill run in the last week has an untrustworthy time window
+          description: >-
+            Abandoned runs record when the scheduler gave up, not when the drill
+            stopped; backwards and implausible rows mean a clock that jumped and
+            are excluded from the overlap scan entirely. Either way the
+            exclusion check cannot see past them, so treat a clean
+            BackupDrillExclusionFailed as INCOMPLETE while this is firing.
+            Break it down by kind with
+            maplespire_backup_drill_runs_with_unreliable_window.
+          runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/backup-drill.md
+
+      # The orphan sweep, watched from OUTSIDE itself.
+      #
+      # A starved sweep can report `completed: true` with `dropped: 0` on every
+      # boot while restore databases pile up, and every number it publishes
+      # about itself agrees. So neither rule reads anything the sweep
+      # produces. Both read `pg_database`, which the sweep does not write and
+      # cannot flatter.
+      #
+      # Note also WHERE the sweep runs: the `backup-drill` container, which
+      # prometheus.yml does not scrape and which serves no HTTP. A gauge
+      # exported from the sweep itself could not have reached here at all.
+      #
+      # AGE rather than a count, because the sweep converges at up to five drops
+      # per pass by design and a rule on the count would fire through every
+      # legitimate convergence and get silenced — the pattern
+      # BackupDrillWindowUnreliable's own comment rejects one rule up.
+      #
+      # SEVEN DAYS ASSUMES A CADENCE OF 24 h, which is the compose default and
+      # is asserted against the committed file in
+      # `scripts/maplespire-compose.test.mjs`. State it the way BackupDrillStale
+      # states its own; the number is not cadence-free, and a reader who raises
+      # MAPLESPIRE_DRILL_INTERVAL_HOURS has to revisit it. Simulated:
+      #
+      #   backlog     5   30   35   36   40  100     (24 h cadence, 5 drops/pass)
+      #   fires?      no   no   no  YES  YES  YES
+      #
+      # 35 is exact: the gauge tracks the OLDEST SURVIVOR, and oldest-first
+      # order means the clock advances a full cadence for everything left
+      # behind, so the worst reading is `gate + (passes - 1) x cadence`. That
+      # also makes the tolerance shrink as the cadence grows — 15 at 72 h — and
+      # past a SEVEN-DAY cadence a single healthy leftover reaches the threshold
+      # before the next sweep ever meets it:
+      #
+      #   cadence     24 h    72 h   168 h   336 h   720 h
+      #   one leftover reaches  1 d   3 d     7 d    14 d    30 d   before the sweep
+      #
+      # 336 h and 720 h are inside what `intervalMs` accepts, so on those the
+      # rule would fire on a perfectly healthy deployment. Deriving the
+      # threshold from an exported cadence gauge (Velero does this with
+      # `velero_schedule_expected_interval_seconds`) is the real fix and needs
+      # the API container to know the DRILL container's interval, which it does
+      # not today.
+      #
+      # What the threshold cannot be reached by is a live drill: its lifetime is
+      # capped at BACKUP_DRILL_DEADLINE_HOURS + BACKUP_DRILL_ABORT_GRACE_SECONDS
+      # (6h05m on the shipped compose file).
+      - alert: BackupRestoreDatabasesNotReclaimed
+        expr: maplespire_backup_restore_oldest_reclaimable_age_seconds > 604800
+        for: 1h
+        labels:
+          severity: ticket
+        annotations:
+          summary: A restore database has gone unreclaimed for over a week
+          description: >-
+            Oldest is {{ $value | humanizeDuration }} old. The sweep is behind or
+            starved: a permanently-undroppable database at the head of the
+            oldest-first list absorbs the failure cap and blocks the rest. Grep
+            the backup-drill container's log for `backup.drill_boot_sweep` and
+            read its `stoppedBy` — `failures` or `cluster` means the breaker
+            tripped, `budget` means drops are slow. The drill's own teardown
+            sweep reports the same thing as `orphanSweepStoppedBy`. Break the
+            pile down with maplespire_backup_restore_databases, and size it with
+            `SELECT datname, pg_size_pretty(pg_database_size(datname)),
+            pg_get_userbyid(datdba) FROM pg_database` — the owner is the usual
+            reason a drop keeps failing.
+          runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/backup-drill.md
+
+      # A census that THREW makes both gauges absent, and `> 0` and `> 604800`
+      # are both silent on an absent series — so a permanently-failing count
+      # would look exactly like a permanently clean cluster. That is the disease
+      # ReadModelDivergenceCheckBroken exists to cure, in this same file: a
+      # checker that errored is not a clean system.
+      #
+      # `absent()` on the labelled gauge covers three faults at once — the query
+      # failing, the metric being renamed out from under these rules, and the
+      # API not emitting it at all — which is why it is the labelled one and not
+      # the age gauge, whose NaN is a legitimate healthy value.
+      - alert: BackupRestoreCensusMissing
+        expr: absent(maplespire_backup_restore_databases)
+        for: 1h
+        labels:
+          severity: ticket
+        annotations:
+          summary: The restore-database census is not reporting
+          description: >-
+            /metrics is answering but carries no maplespire_backup_restore_databases
+            series, so the two rules above cannot fire and their silence means
+            nothing. Either the census query is failing — look for
+            `[metrics] the restore-database census failed` in the api container —
+            or the gauge was renamed and these rules now bind to a series nobody
+            emits.
+          runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/backup-drill.md
+
+      # NaN means "no reclaimable leftovers", so the rule above is silent on a
+      # clean cluster — which is correct here and needs no companion, unlike
+      # BackupDrillStale where "never" is the bad news. Same asymmetry
+      # BackupDrillExclusionFailed documents.
+      #
+      # This one is a different fault, not a smaller version of it: a name in
+      # the drill's own namespace that carries no readable stamp is refused by
+      # `restoreDatabaseAgeMs`, so no sweep will EVER select it. It does not age
+      # into the rule above and no amount of convergence removes it.
+      - alert: BackupRestoreDatabasesUnreclaimable
+        expr: maplespire_backup_restore_databases{state="unrecognised"} > 0
+        for: 1h
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $value }} restore database(s) no sweep can ever reclaim"
+          description: >-
+            These sit under the drill's restore-database prefix (see the query
+            below) with a malformed stamp, so the ownership rule refuses them and every sweep
+            skips them silently. They will never age out. List them with
+            `SELECT datname FROM pg_database WHERE datname LIKE 'maplespire\_restore\_%'`
+            and drop them by hand once you have confirmed no drill is using one.
+          runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/backup-drill.md
+
+  - name: maplespire-read-model
+    rules:
+      # `max()` AND NOT `sum()`, on every rule in this group and on
+      # `AutomergeDocumentsEmpty` below. These gauges are FLEET facts: the api
+      # publishes them from one fleet-wide database query, so every cell scraped
+      # reports the SAME number for the same world. With two cells in the
+      # `maplespire-api` job, `sum()` would make `{{ $value }}` read 2x the
+      # truth, and halve it during any window where one cell was rebuilding.
+      #
+      # `max()` is the fleet fact itself, and it degrades correctly: with one
+      # cell it equals `sum()`, and with a cell scraped mid-restart it
+      # reports the healthy cell's reading rather than an average of the two.
+      - alert: ReadModelWorkspacesDegraded
+        expr: max(maplespire_read_model_workspaces{status="degraded"}) > 0
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $value }} workspace(s) with a degraded read model"
+          description: >-
+            Users of these workspaces see stale or missing rows on Model
+            Objects, Model Connections and Dependencies. Check the projector
+            logs for document-resolution failures.
+          runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/read-model-projector-health.md
+
+      # `stale` is the weaker signal: a durable Automerge write that no projector
+      # has observed within READ_MODEL_STALE_GRACE_MS. One workspace briefly
+      # stale during a deploy is normal, which is what the 15m window is for.
+      - alert: ReadModelWorkspacesStale
+        expr: max(maplespire_read_model_workspaces{status="stale"}) > 0
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $value }} workspace(s) with unobserved durable writes"
+          description: >-
+            A write reached storage and no projector has picked it up. If this
+            clears on its own it was a handover; if it persists, the workspace
+            has no live projector.
+          runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/read-model-projector-health.md
+
+      # `catching_up` is healthy in small doses — it is what a projector doing
+      # its job looks like. Sustained, it means it cannot keep pace.
+      - alert: ReadModelCatchingUpSustained
+        expr: max(maplespire_read_model_workspaces{status="catching_up"}) > 0
+        for: 30m
+        labels:
+          severity: ticket
+        annotations:
+          summary: Read-model projection has been behind for 30 minutes
+          description: >-
+            Projection generation has trailed the observed generation
+            continuously. Expected briefly after a large import; not otherwise.
+          runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/read-model-projector-health.md
+
+  - name: maplespire-automerge
+    rules:
+      # Should be flat at zero forever. Any increase means a document was
+      # evicted while something was still listening to it.
+      - alert: AutomergeOrphanedListenerEviction
+        expr: increase(maplespire_automerge_orphaned_listener_evictions_total[1h]) > 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: A document was evicted with an unaccounted change listener attached
+          description: >-
+            This counter is expected to stay at zero. A non-zero increase means
+            a listener outlived its document, which historically presented as
+            silently missing sync updates.
+          runbook: docs/architecture-and-configuration.md
+
+      # A document mapped to a workspace with no data chunk is ADVERTISED and
+      # unopenable (it may even be listed in the UI via ro_diagrams). This is a
+      # correctness alarm, not capacity.
+      - alert: AutomergeEmptyDocuments
+        expr: max(maplespire_automerge_documents_empty) > 0
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: Documents are mapped to a workspace but hold no data
+          description: >-
+            {{ $value }} document(s) are indexed and referenced while holding no
+            snapshot or incremental chunk. Users see them listed and cannot open
+            them. The `sync-state-only` series is the subtler half: a lone
+            2-byte sync-state row satisfies every
+            `EXISTS(split_part(key,'/',1) = document_id)` predicate in the
+            codebase, so the backup drill SELECTS those and then fails on them,
+            while the `no-rows` ones are invisible to it entirely.
+          runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/backup-drill.md
+
+      # The docScope reference walk fires on every watched document's
+      # change, leaves included. Measured at 1,329 ms p99 on a 34-diagram
+      # workspace during ordinary editing, so it is a per-change server cost
+      # that grows with the workspace, not with the edit.
+      - alert: DocScopeWalkSlow
+        expr: maplespire_docscope_walk_duration_seconds{quantile="0.99"} > 0.5
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: The docScope reference walk p99 is above 500 ms
+          description: >-
+            p99 is {{ $value }}s. The walk re-derives the workspace's whole
+            document set and runs on leaf changes it cannot learn anything from,
+            so its cost grows with the workspace rather than with the edit.
+          runbook: docs/architecture-and-configuration.md
+
+      # The growth sampler is on a timer; if it stops, the two gauges above go
+      # quietly stale and keep reporting their last value. Age catches that.
+      - alert: DocumentGrowthSampleStale
+        expr: maplespire_automerge_document_growth_sample_age_seconds > 600
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: The document-growth sample has not refreshed in over 10 minutes
+          description: >-
+            Sample is {{ $value | humanizeDuration }} old, so
+            maplespire_automerge_documents_empty and
+            maplespire_automerge_document_bytes are stale rather than current.
+          runbook: docs/architecture-and-configuration.md
+
+      # ⚠️ THE `clean` STATE IS NOT ASSURANCE. It compares id presence only,
+      # and the CRDT side (crdtInventory.ts), though walked independently of
+      # the projector, shares its empty-shard and tombstone rules, so defects
+      # there are invisible. `clean` means "not measured".
+      #
+      # The read model disagreeing with the CRDT while claiming health.
+      # `health.ts` only detects LATENESS (write newer than projection, 60 s
+      # grace); it cannot see a projector that is caught up and wrong.
+      # RECORD-ONLY, not `page`: the detector false-positives on flows (it
+      # compares a flow registry against ro_connection_flows, a flow->connection
+      # posting table, so a flow with no message steps produces zero rows BY
+      # DESIGN) and on registrySummaryOnly roots. Restore `page` once those two
+      # are fixed.
+      - alert: ReadModelDiverged
+        expr: maplespire_read_model_divergence_state{state="diverged"} == 1
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: The read model disagrees with the CRDT
+          description: >-
+            {{ with query "maplespire_read_model_divergence_confirmed" }}{{ . | first | value }}{{ end }}
+            entities differed in BOTH passes at an unchanged projection
+            generation, so this is divergence and not catch-up lag. Users are
+            being served rows the model does not contain, or are missing rows it
+            does.
+          runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/read-model-projector-health.md
+
+      # A checker that errored is not a clean system. Without this the
+      # `diverged` rule above is silently disarmed by any failure in the checker.
+      - alert: ReadModelDivergenceCheckBroken
+        expr: maplespire_read_model_divergence_state{state="error"} == 1
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: The read-model divergence check is failing
+          description: >-
+            The comparison itself errored, so ReadModelDiverged cannot fire. An
+            unrun checker is reported as its own `never-run` state rather than
+            as clean.
+          runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/read-model-projector-health.md
+
+      - alert: ApiDown
+        expr: up{job="maplespire-api"} == 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: The API is not answering scrapes
+          description: >-
+            /metrics has been unreachable for two minutes. Note this fires for a
+            revoked METRICS_TOKEN as well as for a down process — check
+            `docker compose ps api` before assuming an outage.
+
+  # ===================================================================
+  # The coordination Redis
+  #
+  # `api` carries REDIS_REQUIRED and depends_on redis: service_healthy, so a
+  # Redis that cannot start keeps the API down while the SPA shell still
+  # serves 200 and the site looks up. These rules watch Redis directly via the
+  # exporter; prometheus deliberately has no `depends_on` (see
+  # compose.maplespire.yml) so it can run during exactly that outage.
+  #
+  # The compose file runs this Redis with no persistence at all, which removes
+  # the torn-AOF start failure rather than detecting it. These rules are for
+  # any other cause.
+  # ===================================================================
+  - name: maplespire-redis
+    rules:
+      - alert: RedisDown
+        # The exporter keeps answering when Redis does not — measured: 674
+        # metric lines with Redis up, 144 with it stopped, and `redis_up 0`
+        # present in both. So this is a signal about REDIS, not about the
+        # exporter; `RedisExporterDown` below covers the exporter.
+        expr: redis_up == 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: Redis is not answering the exporter
+          description: >-
+            The coordination Redis has been unreachable for two minutes. The API
+            cannot boot without it (REDIS_REQUIRED, and depends_on
+            redis: service_healthy), so expect ApiDown to follow — this rule is
+            the one that says WHY. Check `docker compose logs redis`: on
+            2026-08-30 it was a corrupt append-only file, which the current
+            configuration cannot produce because persistence is off.
+          runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/production-stack/docker-compose.md
+
+      - alert: RedisExporterDown
+        # Paired with RedisDown for the reason BackupDrillContainerDown is
+        # paired with BackupDrillStale: `redis_up` is emitted BY the exporter,
+        # so losing the exporter silences that rule in the same direction a
+        # healthy Redis silences it. `up` is generated by Prometheus and cannot
+        # be silenced that way.
+        expr: up{job="redis"} == 0
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: The Redis exporter is not answering scrapes
+          description: >-
+            `redis_up` has no publisher, so RedisDown cannot fire either way.
+            This is a lost signal rather than an outage — ApiDown still covers
+            the user-visible half. Check `docker compose ps redis-exporter`.
+          runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/production-stack/docker-compose.md
+
+      - alert: RedisNotScraped
+        # And the third case, which neither of the two above can see: the job
+        # deleted from prometheus.yml. Then `up{job="redis"}` does not exist,
+        # `== 0` matches nothing, and both rules above are valid and
+        # permanently inactive.
+        expr: absent(up{job="redis"})
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: Prometheus is not scraping Redis at all
+          description: >-
+            No `up{job="redis"}` series exists, so the two Redis rules cannot
+            fire whatever Redis is doing. Either the scrape job was removed from
+            prometheus.yml or its name was changed away from `redis`.
+          runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/production-stack/docker-compose.md
+
+      - alert: RedisPersistenceEnabled
+        # The decision made runnable rather than left in a comment.
+        #
+        # compose.maplespire.yml runs this Redis with `--save "" --appendonly
+        # no` because nothing it holds needs to survive a restart: the workspace
+        # fence is rebuilt from PostgreSQL by `ensureMinimumToken`, the topology
+        # key re-establishes itself, and every other key carries a TTL. Turning
+        # persistence back on re-arms the torn-AOF start-time failure, and a
+        # comment cannot notice an edit.
+        #
+        # Measured against oliver006/redis_exporter v1.67.0: `redis_aof_enabled`
+        # reads 0 under the committed flags and 1 with `--appendonly yes`, so
+        # the detector can move. It is ABSENT while Redis is down, which is why
+        # this cannot fire spuriously during an outage.
+        #
+        # It covers the AOF half only. There is no `maxmemory-policy` or save-
+        # point series in this exporter — checked, not assumed — so the RDB half
+        # and `noeviction` are asserted statically by
+        # scripts/maplespire-compose.test.mjs instead.
+        expr: redis_aof_enabled == 1
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: Redis persistence has been re-enabled
+          description: >-
+            The coordination Redis is running with the append-only file on. It
+            is meant to run with none, because nothing it holds is durable and a
+            torn AOF crash-loops the whole stack. If this was deliberate, say
+            what needs to survive a restart and change
+            scripts/maplespire-compose.test.mjs with it — that test will already
+            be failing.
+          runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/production-stack/docker-compose.md
+
+  # ===================================================================
+  # SYNC-CELL FENCE. The gauges come from `syncCellOwnershipMetricSamples()`.
+  # ===================================================================
+  - name: maplespire-sync-cell
+    rules:
+      # WHY BY CAUSE AND NOT ON THE TOTAL. The reassertion pass repairs two of
+      # the four causes — `absent` and `belowLive` — are REPAIRED inside the very
+      # pass that counts them, so a non-zero total is the ordinary reading of a
+      # cell that is fixing itself after a restore. A rule written on
+      # `maplespire_sync_cell_fence_divergences_seen` would page on a successful
+      # recovery and would say nothing new about the two causes that actually
+      # need a human.
+      #
+      # THE TWO THAT NEED ONE:
+      #  - `released`: `restore:reset-routing` released the claims and nobody
+      #    restarted the cells. Every mapped write from this cell is refused
+      #    with `fence-mismatch` until it restarts — the runbook says to stop
+      #    the cells FIRST, and this fires when that order was not followed.
+      #  - `aboveLive`: another cell acquired a NEWER token for a workspace this
+      #    one still believes it holds. This cell is the stale side and the
+      #    reassertion pass deliberately does not fight it: `persistLease` guards on
+      #    `fencing_token <= EXCLUDED` and would throw inside the pass.
+      # The remedy for both is the same — restart this cell so it re-acquires.
+      #
+      # `and on (instance, job) ..._enabled == 1` keeps a process with the
+      # feature off out of the rule. It is belt-and-braces rather than
+      # load-bearing: a disabled cell publishes NaN for these gauges and
+      # `NaN > 0` is false. It is written anyway because that NaN behaviour is a
+      # property of the exposition, and this rule should not silently depend on
+      # a TypeScript function continuing to have it.
+      #
+      # WHY `max_over_time` AND NOT A BARE `> 0`. The gauge is designed to be
+      # intermittently unknown: the cell withholds the reading (rendering NaN)
+      # whenever its lease set moved between the reassertion pass and the
+      # scrape. `NaN > 0` is false, so one such evaluation drops the sample out
+      # of the vector, Prometheus discards the PENDING alert, and the 15-minute
+      # clock restarts from zero. On a fleet that has just been restored — the
+      # scenario this rule exists for — lease churn is continuous and the page
+      # could be deferred indefinitely, silently. The 5-minute lookback bridges
+      # those gaps. Its cost is stated rather than hidden: after the condition
+      # genuinely clears, the rule can go on matching for up to five more
+      # minutes. `SyncCellFenceDetectorBlind` below covers the case where the
+      # reading is withheld for longer than the lookback.
+      - alert: SyncCellFenceUnrepairable
+        expr: >-
+          max_over_time(maplespire_sync_cell_fence_divergences_by_cause{cause=~"released|aboveLive"}[5m]) > 0
+          and on (instance, job) maplespire_sync_cell_ownership_enabled == 1
+        for: 15m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $value }} lease(s) wedged on this cell — cause {{ $labels.cause }}"
+          description: >-
+            This cell holds leases whose durable ownership row makes the mutation
+            gate refuse every write, and R1 does not repair this cause on
+            purpose. Restart the cell so it re-acquires. `released` means a
+            routing reset was run without stopping the cells first; `aboveLive`
+            means another cell holds a newer token and this one is the stale
+            side.
+          runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/backup-restore-runbook.md
+
+      # THE ONE WHOSE SYMPTOM IS NOT A REFUSAL, which is what makes it the worst
+      # of the five and the reason it is a separate rule at a shorter window.
+      # `valid_fence` admits on `fencing_token = $2 AND released_at IS NULL` and
+      # does NOT test `cell_id`, so a durable row naming another cell at OUR
+      # token lets the write THROUGH: two cells write the same workspace at the
+      # same token and nothing refuses anything. It is outside the divergence
+      # total for exactly that reason, so the rule above cannot see it.
+      - alert: SyncCellForeignFenceOwner
+        expr: >-
+          max_over_time(maplespire_sync_cell_fence_divergences_by_cause{cause="foreignCellAtSameToken"}[5m]) > 0
+          and on (instance, job) maplespire_sync_cell_ownership_enabled == 1
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $value }} workspace(s) claimed by another cell at this cell's own token"
+          description: >-
+            The durable ownership row names a different cell at the same fencing
+            token, and the mutation gate does not compare cell ids — so a write
+            from whoever holds that row is admitted alongside ours. Whether that
+            is actually happening depends on something this row cannot say: the
+            row proves somebody persisted it, not that they are still running.
+            FIRST STEP is therefore to check whether the cell named in the
+            `sync.cell.fence_foreign_cell` log line is alive; the runbook has the
+            two branches. That the gate ignores cell_id is decision D45, not an
+            oversight.
+          runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/sync-cell-ownership.md
+
+      # THE DETECTOR'S OWN BLINDNESS, and it is the rule the two above cannot do
+      # without. Both of them read a gauge that is designed to be
+      # INTERMITTENTLY UNKNOWN: `fenceDivergencesSeen` is withheld (rendered
+      # NaN) whenever the lease set moved between the reading and the scrape,
+      # and it is withheld indefinitely if the reassertion query throws or the
+      # reconcile pass wedges.
+      #
+      # `NaN > 0` is false. For a dashboard that is fine — the panel shows a
+      # gap. For an alert it means unknown and healthy are THE SAME FACT: a
+      # blind detector pages nobody.
+      #
+      # `ticket`, not `page`: a detector that cannot see is not itself an
+      # outage, and the two rules above are what page. But it must be LOUD,
+      # because while this is 0 neither of them can fire at all.
+      - alert: SyncCellFenceDetectorBlind
+        expr: >-
+          maplespire_sync_cell_fence_reading_current == 0
+          and on (instance, job) maplespire_sync_cell_ownership_enabled == 1
+        for: 30m
+        labels:
+          severity: ticket
+        annotations:
+          summary: This cell's fence divergence reading has not been current for 30 minutes
+          description: >-
+            `fenceDivergencesSeen` is being withheld, so
+            SyncCellFenceUnrepairable and SyncCellForeignFenceOwner cannot fire
+            on this cell whatever its actual state. Either the reassertion query
+            is failing (check `maplespire_sync_cell_ownership_errors_total` and
+            the `sync.cell.ownership` log line) or the reconcile pass is wedged
+            — it has no wall-clock bound, which is a known open task. A brief 0
+            during lease churn is normal; thirty minutes is not.
+          runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/sync-cell-ownership.md
+
+      # THE ONE WITH NO THRESHOLD TO TUNE.
+      #
+      # Every other rule in this group reads a number that is legitimately
+      # non-zero sometimes — leases churn, tokens diverge briefly, a reading
+      # goes stale for a pass. This one cannot be: a cell reaches this refusal
+      # only when a peer on a SUPERSEDED topology generation still holds the
+      # workspace, and a generation change that drained its old cells first
+      # cannot produce one, because a drained cell renews nothing.
+      #
+      # WHAT IT MEANS FOR THE PRODUCT, which the counter's name does not say:
+      # the partition key is generation-scoped and the workspace owner key is
+      # not, so the old cell keeps renewing a workspace that no router on the
+      # new generation will ever look for. The workspace is not down and is not
+      # contended — it is served by a process the fleet cannot address. It does
+      # NOT self-heal: the incumbent renews for as long as it runs.
+      #
+      # `increase(...) > 0` rather than the raw counter, so a cell that hit this
+      # once and was fixed stops paging after the window instead of holding the
+      # alert open until the process restarts. `for: 5m` is short on purpose —
+      # the refusal repeats every reconcile pass while it lasts, so a single
+      # transient evaluation is not what this fires on.
+      - alert: SyncCellCrossGenerationRefusal
+        expr: >-
+          increase(maplespire_sync_cell_cross_generation_refusals_total[10m]) > 0
+          and on (instance, job) maplespire_sync_cell_ownership_enabled == 1
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $value }} workspace acquisition(s) refused by a cell on a superseded topology generation"
+          description: >-
+            A cell running under an older SYNC_CELL_TOPOLOGY_GENERATION still
+            holds workspaces this cell expects to own, and keeps renewing them.
+            Those workspaces are reachable from neither generation's routing:
+            the old cell's partition key is invisible to the new fleet. This
+            does not converge on its own. FIRST STEP is the
+            `sync.cell.workspace_cross_generation_refused` log line, whose
+            `incumbent` field names the cell and the generation still holding
+            it; then drain that cell. A generation change performed as a drain
+            cannot produce this alert at all.
+          runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/sync-cell-ownership.md
+
+      # THE SAME INCIDENT SEEN FROM THE OTHER CELL, and it is the
+      # rule that covers the case the one above CANNOT.
+      #
+      # `SyncCellCrossGenerationRefusal` needs somebody to be refused, which
+      # needs a cell on the new generation to exist. The worst version of this
+      # incident is the one where none does: an operator rewrites the topology
+      # contract BEFORE deploying the new roster, so the whole fleet is running
+      # on a generation the contract has written out, nobody refuses anybody,
+      # that counter stays flat at zero, and nothing says a word. This is the
+      # only series that can see it.
+      #
+      # The cells keep serving, deliberately — standing down with no successor
+      # would hand the workspaces to nobody — so this is `ticket`, not `page`:
+      # nothing is broken yet. What is true is that the fleet cannot fail over,
+      # cannot scale, and will stall the moment a new-generation cell appears.
+      # `for: 15m` because a correctly-drained roll passes through this state
+      # briefly on any cell that has not been stopped yet.
+      #
+      # THE `stood_down == 0` HALF IS NOT DECORATION. After a successful
+      # hand-over the superseded gauge stays 1 for the life of the process — the
+      # contract does not come back — so a rule on that gauge alone opens a
+      # ticket per handed-over cell on every correctly-performed roll, telling
+      # the operator it is still serving when it is idle by design (both states
+      # read 1 on that gauge). The pair is what names
+      # the incident: written out of the contract, and nobody to hand over to.
+      - alert: SyncCellSupersededGeneration
+        expr: >-
+          maplespire_sync_cell_superseded_by_generation == 1
+          and on (instance, job) maplespire_sync_cell_stood_down == 0
+          and on (instance, job) maplespire_sync_cell_ownership_enabled == 1
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: This cell has been superseded — the fleet contract no longer matches its topology
+          description: >-
+            The topology contract in Redis does not match this cell's, so this
+            cell has been written out of the fleet it is serving, AND it has
+            nobody to hand over to. GENERATION OR PARTITION COUNT: the contract
+            holds `<generation>|<partitionCount>` and this fires on either half
+            changing, which the series name does not say — the log line's
+            `contract` field tells them apart. It goes on serving on purpose: it
+            releases only once a cell on the contract's current generation holds
+            its partition AND the counts agree, because releasing otherwise
+            hands the workspaces to nobody. Check
+            `sync.cell.topology_superseded_without_successor` for the contract
+            value this cell read. This does NOT fire on a cell that has already
+            handed over — that one reports `maplespire_sync_cell_stood_down` 1
+            and is idle by design. If it does not clear, either the roster was
+            never deployed or the contract was edited by mistake; and
+            `maplespire_sync_cell_cross_generation_refusals_total` staying at
+            zero is what distinguishes "no successor exists" from "a successor
+            exists and is being refused".
+          runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/sync-cell-ownership.md

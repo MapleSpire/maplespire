@@ -1,0 +1,126 @@
+{
+  "diagramChrome": {
+    "addShape": {
+      "searchPlaceholder": "Rechercher des objets",
+      "searchHint": "Saisissez au moins 2 caractères. Les branches ouvertes et la position seront restaurées après effacement.",
+      "expandHere": "Afficher ses formes dans celle-ci",
+      "noMatches": "Aucun objet ne correspond à votre recherche",
+      "loading": "Chargement des objets du modèle…",
+      "loadError": "Impossible de charger les objets du modèle.",
+      "retry": "Réessayer",
+      "partialOffline": "Hors connexion, les résultats sont limités au working set présent sur cet appareil.",
+      "expand": "Développer {{name}}",
+      "collapse": "Réduire {{name}}",
+      "inDiagram": "déjà dans le diagramme",
+      "copySuffix": "{{name}} (copie)",
+      "filter": {
+        "open": "Filtrer les objets du modèle",
+        "type": "Type",
+        "scope": "Portée",
+        "technology": "Technologie",
+        "technologyLoading": "Chargement des technologies…",
+        "technologyEmpty": "Aucune technologie sélectionnable",
+        "technologyUnavailable": "Catalogue de technologies indisponible",
+        "technologyNoOrg": "Sélectionnez une organisation pour filtrer par technologie",
+        "clear": "Effacer les filtres"
+      },
+      "type": {
+        "group": "Groupe",
+        "system": "Système",
+        "actor": "Acteur",
+        "app": "Application",
+        "store": "Stockage",
+        "component": "Composant"
+      },
+      "scope": {
+        "internal": "Interne",
+        "external": "Externe",
+        "any": "Toutes"
+      },
+      "tooltip": {
+        "alreadyInDiagram": "{{name}} (déjà dans le diagramme)",
+        "dragToAdd": "Glisser pour ajouter {{name}}"
+      },
+      "menu": {
+        "manage": "Gérer l'objet du modèle",
+        "viewDependencies": "Voir les dépendances",
+        "duplicate": "Dupliquer l'objet",
+        "getInsights": "Obtenir des insights"
+      }
+    },
+    "createPalette": {
+      "title": "Créer",
+      "shape": {
+        "system": "Système",
+        "actor": "Acteur",
+        "group": "Groupe",
+        "app": "Application",
+        "store": "Stockage"
+      },
+      "defaultName": {
+        "group": "Nouveau groupe",
+        "other": "Nouveau {{type}}"
+      }
+    },
+    "transition": {
+      "diagramOfType": "Diagramme {{type}}"
+    },
+    "toolPill": {
+      "tool": {
+        "select": "Sélection (V)",
+        "connection": "Connexion (C)",
+        "pan": "Déplacement (Espace)"
+      },
+      "undo": "Annuler (historique / retour dans le temps)",
+      "redo": "Rétablir (historique / retour dans le temps)",
+      "search": "Rechercher (Ctrl+K)",
+      "draftLabel": "Brouillon : {{label}}",
+      "exitDraft": "Quitter le brouillon (revenir au modèle actif)",
+      "reviewChanges": "Examiner les modifications du brouillon",
+      "changes": "Modifications",
+      "drafts": "Brouillons",
+      "themeShop": "Boutique de thèmes",
+      "settings": "Paramètres",
+      "help": "Aide",
+      "openShapesPanel": "Ouvrir le panneau des formes",
+      "add": "Ajouter",
+      "addMenu": {
+        "open": "Créer un brouillon ou un diagramme",
+        "title": "Créer",
+        "description": "Commencez un brouillon ou ajoutez un diagramme à ce paysage.",
+        "draftTitle": "Nouveau brouillon",
+        "draftSubtitle": "Explorez des changements sans modifier le modèle actif",
+        "draftFormHint": "Créez une branche sûre du modèle actif.",
+        "draftName": "Nom du brouillon",
+        "draftNamePlaceholder": "ex. Refonte des paiements",
+        "createDraft": "Créer le brouillon",
+        "creatingDraft": "Création…",
+        "diagramSection": "Nouveau diagramme",
+        "blankTitle": "Diagramme vierge",
+        "blankSubtitle": "Partez d’un canevas vide",
+        "blankDefaultName": "Nouveau diagramme de contexte",
+        "importTitle": "Importer un diagramme…",
+        "importSubtitle": "Depuis Structurizr DSL, JSON et plus",
+        "back": "Retour aux options de création",
+        "cancel": "Annuler"
+      },
+      "viewMode": "Vue du canevas",
+      "view2d": "Canevas à plat",
+      "view3d": "Vue en perspective (cliquer à nouveau pour réinitialiser la caméra)"
+    },
+    "expandMenu": {
+      "title": "Diagrammes associés",
+      "noneFound": "Aucun diagramme associé trouvé.",
+      "noMatches": "Aucun diagramme ne correspond à votre recherche",
+      "searchPlaceholder": "Rechercher des diagrammes…",
+      "createDiagram": "Créer un diagramme",
+      "create": "Créer",
+      "defaultDiagramName": "Diagramme {{name}}",
+      "section": {
+        "detail": "Diagrammes détaillés",
+        "reference": "Diagrammes de référence",
+        "parent": "Diagramme parent"
+      }
+    }
+  }
+}

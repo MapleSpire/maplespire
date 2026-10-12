@@ -1,0 +1,447 @@
+name: ${SYNC_FAILOVER_PROJECT:-maplespire-sync-failover}
+
+x-sync-environment: &sync-environment
+  DATABASE_URL: postgres://maplespire:maplespire@postgres:5432/maplespire
+  # Projection checkpoints must not queue behind the chunk-write burst from
+  # 100 reconnecting Automerge peers during a workspace takeover.
+  DB_READ_MODEL_POOL_MAX: "4"
+  # PASSED THROUGH, DEFAULTING TO THE PRODUCT DEFAULT, so an experiment can move
+  # it without editing this file. The bench's whole subject is what
+  # happens when the primary pool is contended, and answering "is this pool
+  # exhaustion at all?" needs exactly one run with the pool made large. An empty
+  # value is the same as unset: `positiveInteger` rejects it and returns 10.
+  DB_POOL_MAX: ${DB_POOL_MAX:-}
+  # Defaulted to the SAME value the shipped manifest sets in
+  # `compose.maplespire.yml`, where the derivation and the measured
+  # before/after table live. A harness that defaults to a different
+  # configuration from production measures a system nobody runs.
+  #
+  # Overridable on purpose: `UV_THREADPOOL_SIZE=` (empty, Node's default of 4)
+  # restores the DNS-lookup stall that 64 removes, which is the control arm for
+  # that measurement; keep it working.
+  UV_THREADPOOL_SIZE: ${UV_THREADPOOL_SIZE-64}
+  REDIS_URL: redis://redis:6379
+  REDIS_REQUIRED: "on"
+  REDIS_KEY_PREFIX: maplespire-sync-failover
+  REDIS_COMMAND_TIMEOUT_MS: "${SYNC_FAILOVER_REDIS_COMMAND_TIMEOUT_MS:-750}"
+  REDIS_RENDER_CACHE_URL: redis://redis-render-cache:6379
+  REDIS_RENDER_CACHE_KEY_PREFIX: maplespire-sync-failover:cache
+  # Same bound as the critical Redis: `/api/ready`
+  # probes BOTH runtimes in parallel and its latency is the larger bound, and
+  # the cell healthcheck below waits 2 s — with the 1 500 ms default here the
+  # door could take 1.5 s on an informational check and eat the margin the
+  # harness test pins (timeout >= 2 x the larger command timeout).
+  REDIS_RENDER_CACHE_COMMAND_TIMEOUT_MS: "${SYNC_FAILOVER_RENDER_CACHE_COMMAND_TIMEOUT_MS:-750}"
+  PORT: "3001"
+  # This is a destructive local transport harness. NODE_ENV=test permits its
+  # dev login while AUTH=on still exercises signed sessions end to end.
+  NODE_ENV: test
+  AUTH: "on"
+  AUTH_DEV_LOGIN: "on"
+  AUTH_COOKIE_SECURE: "off"
+  AUTH_SECRET: ${SYNC_FAILOVER_AUTH_SECRET:?Set SYNC_FAILOVER_AUTH_SECRET to a random local test value}
+  # A reconnect storm can outlive the 500 ms production default. Keep only
+  # successful admission checks long enough to cover one qualification burst;
+  # failures are never cached and live-session revocation remains independent.
+  WS_AUTH_TOKEN_BURST_CACHE_MS: "2000"
+  WS_AUTH_EPOCH_BURST_CACHE_MS: "2000"
+  APP_URL: ${SYNC_FAILOVER_APP_URL:-http://127.0.0.1:5197}
+  PLATFORM_ADMIN_BOOTSTRAP_EMAIL: ${SYNC_FAILOVER_LOGIN_EMAIL:-failover-admin@maplespire.local}
+  # WITHOUT THESE THE CELLS DO NOT BOOT. The drill scheduler refuses to start
+  # without `BACKUP_BUNDLE_ROOT` and sets `process.exitCode = 1` on purpose
+  # (`server/src/backup/drillScheduler.ts`), so every `sync-cell-*` would exit 1
+  # with `backup.drill_scheduler_failed`.
+  #
+  # Same pair as `compose.maplespire.yml`: the two names mean DIFFERENT things —
+  # `BACKUP_DIRECTORY` is ONE bundle for the one-shot CLI, `BACKUP_BUNDLE_ROOT`
+  # is the directory that HOLDS every bundle for the scheduler.
+  BACKUP_BUNDLE_ROOT: /var/lib/maplespire/backups
+  BACKUP_DIRECTORY: /var/lib/maplespire/backups
+  ORG_SEED: "on"
+  EMAIL_PROVIDER: local
+  READ_MODEL: "on"
+  AM_SELECTIVE_SYNC: "on"
+  # Persisted protocol progress is invalidated after the last connection for a
+  # client closes. This is required when transport backpressure can refuse the
+  # final frame after Automerge has already advanced its in-memory sync state.
+  AM_RESET_SYNC_STATE_ON_DISCONNECT: "on"
+  AM_PERSIST_SYNC_STATE: ${AM_PERSIST_SYNC_STATE:-off}
+  # Retained for upstream compatibility. The patched hot-hub fan-out now uses
+  # a single-flight event-loop scheduler instead of a timer between waves.
+  AM_SYNC_DEBOUNCE_MS: "100"
+  # A failover cell persists each cooperative inbound turn without an extra
+  # 100 ms coalescing window. Otherwise a paused owner can leave the durable
+  # peer behind several concurrent branches and force its replacement to apply
+  # one large client replay synchronously during takeover.
+  # A 10 ms trailing window preserves the durable last position while
+  # combining same-document micro-bursts before PostgreSQL persistence.
+  AM_SAVE_DEBOUNCE_MS: "10"
+  # Yield after every inbound Automerge frame. Join handshakes share this queue;
+  # batches of four still produced 124-187 ms stalls during 50-client takeover
+  # even though individual receive/generate p99 remained below 13 ms.
+  AM_INBOUND_FRAME_BATCH: "1"
+  # One peer per cooperative turn lets inbound branches accumulate before the
+  # next complete pass and kept both convergence and event-loop latency lower
+  # than batches of two or four under the 50-user divergent-branch profile.
+  AM_SYNC_FANOUT_BATCH: "1"
+  # Combine the burst of independent inbound branches before starting one
+  # O(peers) fan-out pass. This timer applies once when a drain is idle, never
+  # between peers inside a pass; ten milliseconds is small beside network RTT
+  # but avoids generating dozens of superseded frames during reconnect.
+  AM_SYNC_FANOUT_COALESCE_MS: ${SYNC_FAILOVER_FANOUT_COALESCE_MS:-10}
+  AM_STORAGE_FENCE_IDLE_TIMEOUT_MS: "1000"
+  AM_WORKSPACE_ROUTING: "on"
+  # Route lookups are also positive-only. The target cell still validates its
+  # current ownership and fencing token before accepting a write.
+  AM_WORKSPACE_ROUTE_BURST_CACHE_MS: "1000"
+  AM_CONCRETE_WORKSPACE_ROUTE_CACHE_MS: "30000"
+  SYNC_CELL_OWNERSHIP: "on"
+  SYNC_CELL_PARTITION_COUNT: ${SYNC_FAILOVER_PARTITION_COUNT:-1}
+  SYNC_CELL_PLACEMENT_MODE: "${SYNC_FAILOVER_PLACEMENT_MODE:-shadow}"
+  # The fleet set is identical on all cells and the router; roles stay local.
+  SYNC_CELL_RESERVED_PARTITIONS: "${SYNC_CELL_RESERVED_PARTITIONS:-}"
+  # This harness opts into multiple partitions explicitly.
+  # The declared mapping fingerprint is composed into the effective generation,
+  # so the shared topology contract rejects different declarations at boot.
+  # `syncCellPartitionConfig` refuses a count above one without this
+  # deliberate opt-in on every cell and router. See the ownership runbook in
+  # the maplespire-sponsor-kit repository
+  # (docs/operations/sync-cell-ownership.md) for coordinated changes.
+  #
+  # Set unconditionally rather than alongside the count: a harness run left at
+  # the default of one partition is unaffected, and a run that raises the count
+  # must not also have to remember a second variable.
+  SYNC_CELL_MULTI_PARTITION: "on"
+  SYNC_CELL_TOPOLOGY_GENERATION: ${SYNC_FAILOVER_TOPOLOGY_GENERATION:-failover-harness-v1}
+  # THE BENCH'S INSTRUMENT, AND NOTHING ELSE. It arms one header,
+  # `x-maplespire-sync-bench-unrouted`, on ONE surface — the AI tool door — so
+  # `b25a-redis-outage-bench.mjs` can reach the bootstrap fence directly: the
+  # router sits in front of every bootstrap door, and a refusal by the router
+  # says nothing about the fence. Without this variable a
+  # request carrying that header is REFUSED 400 rather than ignored, so a bench
+  # pointed at an unarmed cell fails loudly instead of measuring routing and
+  # calling it the fence. `routerDeployment.test.ts` asserts no shipped
+  # manifest sets this routing bypass.
+  SYNC_CELL_BENCH_UNROUTED: "on"
+  # Workspace leases keep enough main-thread margin for a heavy Automerge
+  # burst. They no longer determine failover latency: a new partition owner
+  # atomically replaces stale workspace leases using its partition proof.
+  SYNC_CELL_LEASE_TTL_MS: "15000"
+  SYNC_CELL_RENEW_INTERVAL_MS: "5000"
+  # Partition failure detection is independent of workspace lease renewal.
+  # The replacement proves the new partition token before atomically fencing
+  # stale workspace leases, so this faster cadence is O(cells), not O(workspaces).
+  SYNC_CELL_PARTITION_LEASE_TTL_MS: "${SYNC_FAILOVER_PARTITION_LEASE_TTL_MS:-750}"
+  SYNC_CELL_PARTITION_RENEW_INTERVAL_MS: "${SYNC_FAILOVER_PARTITION_RENEW_INTERVAL_MS:-200}"
+  SYNC_CELL_PARTITION_PROBE_INTERVAL_MS: "100"
+  # Renew the partition heartbeat on an isolated event loop so Automerge merge
+  # bursts cannot create a false owner loss. Container pause/crash still stops
+  # the worker and lets the 750 ms Redis lease expire normally.
+  SYNC_CELL_PARTITION_WORKER: "${SYNC_FAILOVER_PARTITION_WORKER:-on}"
+  SYNC_CELL_RECONCILE_INTERVAL_MS: "${SYNC_FAILOVER_RECONCILE_INTERVAL_MS:-1000}"
+  SYNC_CELL_TELEMETRY_INTERVAL_MS: "${SYNC_FAILOVER_TELEMETRY_INTERVAL_MS:-5000}"
+  # Partition takeover admits independent workspaces concurrently. Prewarming
+  # is bounded to static enterprise control chains, so eight admissions restore
+  # sub-2s partition readiness without decoding arbitrary model shards in a
+  # single event-loop turn. Lease renewals keep their separate concurrency.
+  SYNC_CELL_ADMISSION_CONCURRENCY: "${SYNC_FAILOVER_ADMISSION_CONCURRENCY:-8}"
+  SYNC_CELL_OWNERSHIP_CONCURRENCY: "${SYNC_FAILOVER_OWNERSHIP_CONCURRENCY:-8}"
+  TECHNOLOGY_ASSET_DIR: /var/lib/maplespire/assets/technologies
+
+x-sync-cell: &sync-cell
+  build:
+    context: ../../server
+    dockerfile: Dockerfile
+    # NOT optional. With no `target`, BuildKit builds the LAST stage of the
+    # Dockerfile, which is `drill` (`CMD ["node", "dist/backup/drillScheduler.js"]`),
+    # so every `sync-cell-*` would run the BACKUP DRILL SCHEDULER, not the
+    # server: `/api/ready` fails forever and `verify:sync-active-active` dies
+    # on ECONNREFUSED.
+    #
+    # The logs are misleading in that case: a
+    # `MapleSpire sync server running on http://localhost:<port>` line appears,
+    # prefixed `[backup-drill] cold server output:` — the drill's own
+    # short-lived child on a random port, not the cell on 3001.
+    #
+    # `compose.maplespire.yml` carries the same warning.
+    target: runtime
+    labels:
+      # Stamped by the bench runner from the tree it builds from
+      # (`SYNC_FAILOVER_IMAGE_REVISION`: `<sha>` or `<sha>-dirty`) and read back
+      # in its `[bench] image …` line, so a `--no-build` run shows WHICH source
+      # the cells run, not only when the image was made.
+      # Identical in the sync-ws-router block below: one tag, one label.
+      org.opencontainers.image.revision: "${SYNC_FAILOVER_IMAGE_REVISION:-unlabelled}"
+  image: maplespire-sync-failover-api:local
+  restart: "no"
+  stop_grace_period: 35s
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+    redis-render-cache:
+      condition: service_healthy
+  volumes:
+    - technology_assets:/var/lib/maplespire/assets/technologies
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: "no"
+    environment:
+      POSTGRES_USER: maplespire
+      POSTGRES_PASSWORD: maplespire
+      POSTGRES_DB: maplespire
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U maplespire -d maplespire"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    ports:
+      - "127.0.0.1:${SYNC_FAILOVER_POSTGRES_PORT:-55431}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7.4-alpine
+    restart: "no"
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --maxmemory
+      - 128mb
+      - --maxmemory-policy
+      - noeviction
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+    volumes:
+      - redis_data:/data
+
+  redis-render-cache:
+    image: redis:7.4-alpine
+    restart: "no"
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --maxmemory
+      - 128mb
+      - --maxmemory-policy
+      - allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  sync-cell-a:
+    <<: *sync-cell
+    environment:
+      <<: *sync-environment
+      SYNC_CELL_ID: failover-cell-a
+      SYNC_CELL_ROLE: "${SYNC_FAILOVER_CELL_A_ROLE:-pool}"
+      SYNC_CELL_ADVERTISE_URL: http://sync-cell-a:3001
+    ports:
+      - "${SYNC_FAILOVER_BIND:-127.0.0.1}:${SYNC_FAILOVER_CELL_A_PORT:-3311}:3001"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/api/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 2s
+      timeout: "${SYNC_FAILOVER_HEALTHCHECK_TIMEOUT:-2s}"
+      retries: 30
+  sync-cell-b:
+    <<: *sync-cell
+    environment:
+      <<: *sync-environment
+      SYNC_CELL_ID: failover-cell-b
+      SYNC_CELL_ROLE: "${SYNC_FAILOVER_CELL_B_ROLE:-pool}"
+      SYNC_CELL_ADVERTISE_URL: http://sync-cell-b:3001
+    ports:
+      - "${SYNC_FAILOVER_BIND:-127.0.0.1}:${SYNC_FAILOVER_CELL_B_PORT:-3312}:3001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      redis-render-cache:
+        condition: service_healthy
+      sync-cell-a:
+        condition: service_healthy
+
+  # A third process is a real standby for the two-partition load gate. It is
+  # profile-gated so the existing one-partition A/B failover harness keeps its
+  # exact topology. With two partitions, the verifier waits until any two cells
+  # own the slots and the third is a spare before injecting owner loss.
+  sync-cell-c:
+    <<: *sync-cell
+    profiles: ["load"]
+    environment:
+      <<: *sync-environment
+      SYNC_CELL_ID: failover-cell-c
+      SYNC_CELL_ROLE: "${SYNC_FAILOVER_CELL_C_ROLE:-pool}"
+      SYNC_CELL_ADVERTISE_URL: http://sync-cell-c:3001
+    ports:
+      - "${SYNC_FAILOVER_BIND:-127.0.0.1}:${SYNC_FAILOVER_CELL_C_PORT:-3313}:3001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      redis-render-cache:
+        condition: service_healthy
+      sync-cell-a:
+        condition: service_healthy
+      sync-cell-b:
+        condition: service_started
+
+  global-gc-worker:
+    <<: *sync-cell
+    profiles: ["maintenance"]
+    restart: "no"
+    command: ["node", "dist/maintenance/globalGcWorker.js"]
+    environment:
+      <<: *sync-environment
+      # Validation keeps the production 24h grace by default. The gate inserts
+      # one old and one young orphan to prove both sides of the admission rule.
+      GC_MINIMUM_AGE_MS: "86400000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Stateless public WebSocket routing tier. It owns no Automerge Repo: each
+  # upgrade is resolved from the canonical workspace to its Redis partition
+  # owner and tunneled directly there. Multiple replicas can sit behind the
+  # edge load balancer in production without shared in-process state.
+  sync-ws-router:
+    build:
+      context: ../../server
+      dockerfile: Dockerfile
+      # Same reason as `x-sync-cell`, plus one specific to this service: it tags
+      # the SAME image as the cells, so two build blocks disagreeing about the
+      # stage would race to define one tag. Overriding `command` is not enough on
+      # its own either — the `drill` stage also sets
+      # `ENTRYPOINT ["backup-drill-entrypoint"]`, which would wrap whatever
+      # command this service asks for.
+      target: runtime
+      labels:
+        org.opencontainers.image.revision: "${SYNC_FAILOVER_IMAGE_REVISION:-unlabelled}"
+    image: maplespire-sync-failover-api:local
+    restart: "no"
+    command: ["node", "dist/syncCells/routerMain.js"]
+    environment:
+      DATABASE_URL: postgres://maplespire:maplespire@postgres:5432/maplespire
+      REDIS_URL: redis://redis:6379
+      REDIS_REQUIRED: "on"
+      REDIS_KEY_PREFIX: maplespire-sync-failover
+      REDIS_COMMAND_TIMEOUT_MS: "${SYNC_FAILOVER_REDIS_COMMAND_TIMEOUT_MS:-750}"
+      PORT: "3010"
+      SYNC_CELL_PARTITION_COUNT: ${SYNC_FAILOVER_PARTITION_COUNT:-1}
+      SYNC_CELL_PLACEMENT_MODE: "${SYNC_FAILOVER_PLACEMENT_MODE:-shadow}"
+      SYNC_CELL_RESERVED_PARTITIONS: "${SYNC_CELL_RESERVED_PARTITIONS:-}"
+      SYNC_CELL_TOPOLOGY_GENERATION: ${SYNC_FAILOVER_TOPOLOGY_GENERATION:-failover-harness-v1}
+      # THE THIRD MEMBER OF THE PAIR ABOVE.
+      #
+      # This service does not merge `x-sync-environment` — it runs a different
+      # entrypoint and must not inherit the cells' secrets — so it copies the
+      # topology settings by hand. `routerMain.js` calls the same
+      # `syncCellPartitionConfig` the cells do, so without this, at
+      # `SYNC_FAILOVER_PARTITION_COUNT=2` the router exits 1 on
+      # `SYNC_CELL_PARTITION_COUNT is 2, which needs SYNC_CELL_MULTI_PARTITION=on`
+      # and `--wait` fails the whole bench.
+      #
+      # `routerDeployment.test.ts` compares normalized opt-in values.
+      # Unlike count and generation, absence on both sides compares equal.
+      # The resolved two-partition gate separately requires the opt-in on
+      # every cell and router (`scripts/deploy-startup-pairs.test.mjs`).
+      SYNC_CELL_MULTI_PARTITION: "on"
+      SYNC_WS_OWNER_RECHECK_MS: "100"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      sync-cell-a:
+        condition: service_started
+      sync-cell-b:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3010/api/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 2s
+      timeout: "${SYNC_FAILOVER_HEALTHCHECK_TIMEOUT:-2s}"
+      retries: 30
+
+  router:
+    image: nginx:1.27-alpine
+    restart: "no"
+    ports:
+      # `SYNC_FAILOVER_BIND` (default loopback) is set to 0.0.0.0 by the bench
+      # runner's `--host` for the two-host replay; PostgreSQL and the frontend
+      # stay on loopback in every case.
+      - "${SYNC_FAILOVER_BIND:-127.0.0.1}:${SYNC_FAILOVER_ROUTER_PORT:-3310}:8080"
+    volumes:
+      - ./sync-cell-router.nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      sync-ws-router:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ../..
+      dockerfile: docker/nginx/Dockerfile
+      args:
+        VITE_SYNC_API_URL: ""
+        VITE_AUTOMERGE_URL: ""
+        # The editable delta plane keeps the static baseline on the server while
+        # persisting model edits in bounded overlays and layout/comments in the
+        # active DiagramDoc. Keep this production path enabled here: disabling it
+        # makes a static performance workspace try to materialize base shards that
+        # are intentionally absent from its compact ModelMeta control document.
+        VITE_BOOT_FROM_SERVER: "true"
+        VITE_MODEL_SHARDING: "true"
+        VITE_SERVER_READ_MODEL: "true"
+    image: maplespire-sync-failover-web:local
+    restart: "no"
+    environment:
+      BACKEND_HOST: router
+      BACKEND_PORT: "8080"
+      # AND THE WEBSOCKET UPSTREAM. Without it nginx keeps the image's default
+      # (`SYNC_WS_HOST=backend`, docker/nginx/Dockerfile), finds no such host,
+      # and REFUSES TO START: `[emerg] host not found in upstream "backend"`.
+      # No `verify:sync-*` leg would notice: they drive the API and the router
+      # directly, and only a browser needs this service.
+      #
+      # `sync-ws-router`, not `router`, is the correct value and the reason is
+      # in `nginx.conf`'s own comment on that location: the `/automerge` upgrade
+      # must reach the OWNER-AWARE router, which resolves the partition owner in
+      # Redis and tunnels to that cell. Sending it to the plain HTTP router would
+      # land the upgrade on an arbitrary cell and make a paused intermediary
+      # stall unrelated healthy partitions.
+      SYNC_WS_HOST: sync-ws-router
+      # AND ITS PORT. The image's default port is 3001 (a CELL's port);
+      # `sync-ws-router` listens on 3010 (`PORT` below, its healthcheck, and
+      # `sync-cell-router.nginx.conf`'s upstream). With the wrong port every
+      # `/automerge` upgrade gets `connect() failed (111: Connection refused)`
+      # → 502 and the app shows « Document … is unavailable after 3
+      # attempt(s) », which looks like a data problem. The harness test pins
+      # the pair to the router service's own PORT.
+      SYNC_WS_PORT: "3010"
+    ports:
+      - "127.0.0.1:${SYNC_FAILOVER_FRONTEND_PORT:-5197}:80"
+    depends_on:
+      router:
+        condition: service_started
+    volumes:
+      - technology_assets:/var/lib/maplespire/assets/technologies:ro
+
+volumes:
+  postgres_data:
+  redis_data:
+  technology_assets:

@@ -1,0 +1,146 @@
+{
+  "modalsCore": {
+    "import": {
+      "title": "Importer des diagrammes",
+      "close": "Fermer",
+      "sourceLabel": "Source d'import",
+      "soonBadge": "Bientôt",
+      "pasteLabel": "Coller le contenu {{label}}",
+      "uploadFile": "Charger un fichier",
+      "loadSample": "Charger un exemple",
+      "hintDiagramsNoneCreated": "Aucun diagramme n'a pu être généré à partir de cette entrée. Rien ne sera créé — vérifiez que l'espace de travail définit des systèmes logiciels et des vues structurelles.",
+      "diagramsToCreate": "Diagrammes à créer",
+      "notes": "Notes",
+      "targetLabel": "Importer dans",
+      "target": {
+        "current": {
+          "label": "Paysage actuel",
+          "descReadOnly": "Lecture seule — vous ne pouvez pas modifier ce paysage",
+          "desc": "Ajoute de nouveaux diagrammes et entités ici"
+        },
+        "new": {
+          "label": "Nouveau paysage",
+          "desc": "Crée un paysage et y importe le contenu"
+        },
+        "draft": {
+          "label": "Brouillon de relecture",
+          "desc": "Importe dans un brouillon — à fusionner ou abandonner après relecture"
+        }
+      },
+      "mergePreviewWillCreate": "Créera",
+      "mergePreviewObjects": "objets",
+      "mergePreviewReuseNote": "(dont {{count}} réutilisés car déjà existants — leurs propriétés restent inchangées)",
+      "mergePreviewConnections": "connexions et",
+      "mergePreviewNewDiagram": "nouveau diagramme{{plural}}.",
+      "newLandscapeNameLabel": "Nom du paysage",
+      "newLandscapeNamePlaceholder": "Paysage importé",
+      "draftLandscapeLabel": "Paysage",
+      "draftNameLabel": "Nom du brouillon",
+      "draftNamePlaceholder": "Relecture de l'import",
+      "draftHint": "L'import atterrit dans un brouillon du paysage choisi. Passez en revue chaque changement depuis la page Brouillons, puis fusionnez ou abandonnez.",
+      "cancel": "Annuler",
+      "parsing": "Analyse en cours…",
+      "parseAndPreview": "Analyser & prévisualiser",
+      "importing": "Import en cours…",
+      "createLandscapeAndImport": "Créer le paysage & importer",
+      "createDraftAndImport": "Créer le brouillon & importer",
+      "importIntoLandscape": "Importer dans ce paysage",
+      "generateDiagrams": "Générer {{count}} diagramme{{plural}}",
+      "parsedPrefix": "Analysé :",
+      "parsedObjects": "objets,",
+      "parsedConnections": "connexions,",
+      "parsedGroups": "groupes →",
+      "parsedDiagramsSuffix": "diagrammes (L1 {{level1}} · L2 {{level2}} · L3 {{level3}}).",
+      "importedLandscapeName": "Import « {{name}} »",
+      "errors": {
+        "workspaceLoadFailed": "Échec du chargement de l'espace de travail : {{message}}",
+        "workspaceLoadFailedGeneric": "Échec du chargement de l'espace de travail.",
+        "workspaceLoadTimeout": "Délai dépassé en attendant le chargement de l'espace de travail — réessayez.",
+        "draftCreateFailed": "Impossible de créer le brouillon"
+      },
+      "typeBadge": {
+        "context": "L1 · Contexte",
+        "container": "L2 · Conteneur",
+        "component": "L3 · Composant"
+      },
+      "mintShortfall": "{{count}} des éléments importés n'ont pas pu réserver d'identifiant de synchronisation et ont été créés avec un identifiant temporaire. Ils sont bien là — gardez cet onglet ouvert quelques secondes, puis rechargez la page si l'un d'eux manque ensuite."
+    },
+    "search": {
+      "placeholder": "Rechercher des objets, connexions, technologies…",
+      "esc": "ÉCHAP",
+      "tooShort": "Saisissez au moins {{count}} caractères pour lancer la recherche",
+      "noResults": "Aucun résultat pour « {{query}} »",
+      "tryLabel": "Essayez de rechercher :",
+      "trySuggestions": ["Utilisateur", "Service API", "React", "PostgreSQL", "Connexion"],
+      "connectionFallbackLabel": "Connexion",
+      "resultCount": "{{count}} résultat{{plural}}"
+    },
+    "settings": {
+      "title": "Paramètres",
+      "closeAria": "Fermer les paramètres",
+      "appearance": {
+        "title": "Apparence",
+        "statusSystem": "Système · {{resolved}}",
+        "dark": "Sombre",
+        "light": "Clair",
+        "darkNow": "Sombre actuellement",
+        "lightNow": "Clair actuellement",
+        "systemHint": "Correspond à votre OS · {{resolvedHint}}",
+        "footnote": "Les diagrammes à thème basculent automatiquement vers leur variante claire ou sombre correspondante pour rester lisibles sur le canevas.",
+        "options": {
+          "light": { "label": "Clair", "description": "Lumineux et net" },
+          "dark": { "label": "Sombre", "description": "Reposant pour les yeux" },
+          "system": { "label": "Système", "description": "Correspond à votre OS" }
+        }
+      },
+      "diagrams": {
+        "title": "Diagrammes",
+        "body": "Les paramètres d'animation des connexions se configurent désormais par diagramme. Ouvrez le panneau Paramètres du diagramme dans la barre latérale droite pour personnaliser les animations du diagramme actuel."
+      },
+      "offline": {
+        "title": "Disponibilité hors connexion",
+        "versionTitle": "Cette version du landscape",
+        "description": "Conserve le modèle indexé complet dans ce navigateur. Le téléchargement est paginé, annulable et n'inclut jamais une autre organisation ou version.",
+        "states": {
+          "complete": "Disponible hors connexion",
+          "partial": "Éléments récents seulement",
+          "onlineOnly": "En ligne seulement",
+          "downloading": "Téléchargement en cours",
+          "paused": "Téléchargement en pause",
+          "interrupted": "Reprise disponible",
+          "quotaBlocked": "En pause — stockage plein",
+          "failed": "Téléchargement à vérifier"
+        },
+        "cachedSize": "{{size}} en cache · {{objects}} objets · {{connections}} connexions",
+        "makeAvailable": "Rendre disponible hors connexion",
+        "refresh": "Actualiser la copie hors connexion",
+        "pause": "Mettre en pause",
+        "resume": "Reprendre le téléchargement",
+        "abandon": "Abandonner le téléchargement",
+        "remove": "Retirer la copie hors connexion",
+        "persistenceWarning": "Le navigateur n'a pas accordé le stockage persistant. Cette copie fonctionne hors connexion, mais peut être évincée en cas de pression sur le stockage.",
+        "statusFailed": "Impossible de lire l'état hors connexion de ce navigateur.",
+        "downloadFailed": "La copie hors connexion n'a pas pu être terminée.",
+        "discardFailed": "Le téléchargement hors connexion incomplet n'a pas pu être abandonné.",
+        "removeFailed": "La copie hors connexion n'a pas pu être retirée.",
+        "cancelled": "Le téléchargement est en pause à sa dernière page durable.",
+        "busyElsewhere": "Un autre onglet télécharge déjà cette version.",
+        "quotaPaused": "La dernière copie complète reste disponible. Libérez du stockage dans le navigateur, puis reprenez à la dernière page durable.",
+        "insufficientStorage": "Ce navigateur ne peut pas stocker la version complète en toute sécurité. Requis : {{required}}; budget sûr : {{available}}.",
+        "phases": {
+          "preparing": "Vérification du quota et préparation",
+          "objects": "Mise en cache des objets et de l'index de recherche",
+          "connections": "Mise en cache des connexions",
+          "diagrams": "Mise en cache de la composition des diagrammes",
+          "verifying": "Vérification de la cohérence de la projection",
+          "complete": "Copie hors connexion prête"
+        }
+      },
+      "ai": {
+        "title": "Assistant IA",
+        "loadFailed": "Impossible de joindre le serveur pour charger les paramètres IA.",
+        "loading": "Chargement…"
+      }
+    }
+  }
+}

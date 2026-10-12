@@ -1,0 +1,81 @@
+{
+  "id" : 0,
+  "name" : "One hand-arranged view and one that was never laid out",
+  "description" : "The case the import path splits the view set for: relationship 30 is drawn on BOTH views, hand-routed with two bends on the arranged one and left to the layout engine on the other. A connection carries its bends globally, so the auto half used to overwrite the hand-drawn half.",
+  "model" : {
+    "people" : [ {
+      "id" : "1",
+      "name" : "Customer",
+      "tags" : "Element,Person",
+      "relationships" : [ {
+        "id" : "30",
+        "tags" : "Relationship",
+        "sourceId" : "1",
+        "destinationId" : "2",
+        "description" : "Banks with"
+      } ]
+    } ],
+    "softwareSystems" : [ {
+      "id" : "2",
+      "name" : "Internet Banking",
+      "tags" : "Element,Software System",
+      "containers" : [ {
+        "id" : "3",
+        "name" : "Web Application",
+        "technology" : "Java",
+        "tags" : "Element,Container",
+        "relationships" : [ {
+          "id" : "31",
+          "tags" : "Relationship",
+          "sourceId" : "3",
+          "destinationId" : "1",
+          "description" : "Emails"
+        } ]
+      } ]
+    } ]
+  },
+  "views" : {
+    "systemLandscapeViews" : [ {
+      "key" : "Arranged",
+      "title" : "Hand-arranged landscape",
+      "elements" : [ {
+        "id" : "1",
+        "x" : 200,
+        "y" : 200
+      }, {
+        "id" : "2",
+        "x" : 1600,
+        "y" : 200
+      } ],
+      "relationships" : [ {
+        "id" : "30",
+        "routing" : "Orthogonal",
+        "position" : 30,
+        "vertices" : [ {
+          "x" : 900,
+          "y" : 800
+        }, {
+          "x" : 1300,
+          "y" : 800
+        } ]
+      } ]
+    } ],
+    "systemContextViews" : [ {
+      "key" : "NeverLaidOut",
+      "title" : "Context, never laid out",
+      "softwareSystemId" : "2",
+      "elements" : [ {
+        "id" : "1",
+        "x" : 0,
+        "y" : 0
+      }, {
+        "id" : "2",
+        "x" : 0,
+        "y" : 0
+      } ],
+      "relationships" : [ {
+        "id" : "30"
+      } ]
+    } ]
+  }
+}

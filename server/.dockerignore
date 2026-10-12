@@ -1,0 +1,9 @@
+# The server Dockerfile COPYs package*.json, the automerge patch script,
+# tsconfig.json and src. node_modules is reinstalled inside the image, so
+# shipping the local copy into the build context only costs transfer time.
+node_modules
+dist
+data
+reports
+.env
+.env.*

@@ -1,0 +1,48 @@
+{
+  "dataViewsA": {
+    "connectionsTable": {
+      "columnName": "Name",
+      "columnSender": "Sender",
+      "columnReceiver": "Receiver",
+      "columnDiagrams": "In diagrams",
+      "columnFlows": "In flows",
+      "unnamedConnection": "Unnamed connection"
+    },
+    "connectionsView": {
+      "domain": "Domain",
+      "noDomains": "No domains in this model.",
+      "searchPlaceholder": "Search connections",
+      "totalConnections": "Total connections"
+    },
+    "dependenciesView": {
+      "domain": "Domain",
+      "noDomains": "No domains in this model.",
+      "searchPlaceholder": "Search dependencies",
+      "incoming": "Incoming",
+      "outgoing": "Outgoing",
+      "incomingCount": "Incoming · {{count}}",
+      "outgoingCount": "Outgoing · {{count}}",
+      "emptyTitle": "Pick an object of focus",
+      "emptyBody": "Choose any object or group to explore its dependencies",
+      "goToDiagram": "or go to a diagram",
+      "selectConnection": "Select connection",
+      "noPeers": "No dependencies",
+      "showAll": "Show all {{count}}",
+      "directCount_one": "{{count}} direct connection",
+      "directCount_other": "{{count}} direct connections",
+      "lowerCount_one": "{{count}} lower-level connection",
+      "lowerCount_other": "{{count}} lower-level connections",
+      "unknown": "Unknown",
+      "group": "Group",
+      "more": "+{{count}} more",
+      "refineWithSearch": "refine with search"
+    },
+    "focusPicker": {
+      "selectObject": "Select object…",
+      "objectOfFocus": "Object of focus",
+      "searchPlaceholder": "Search objects",
+      "noMatches": "No matches",
+      "group": "group"
+    }
+  }
+}

@@ -1,0 +1,1539 @@
+# Unit tests for the alert rules, evaluated against fixture series.
+#
+# `promtool check rules` parses an expression. It cannot tell a rule that is
+# VALID from one that is valid and MATCHES NOTHING: a rule present, valid,
+# listed in the Prometheus UI and inactive forever. This file closes that. The real rule
+# engine loads `alerts.yml` and runs it against synthetic series, so an
+# assertion here is about what an alert DOES.
+#
+# Run by `scripts/monitoring.test.mjs` inside `prom/prometheus:v3.1.0`, the same
+# image the compose stack deploys, against a control file that must fail.
+#
+# ## Two format facts, both measured rather than assumed
+#
+# **`alert_rule_test` compares ANNOTATIONS exactly.** Giving `exp_alerts` means
+# copying every description into this file verbatim, so a wording edit breaks a
+# test that was never about wording. Positive cases therefore assert on the
+# `ALERTS` series through `promql_expr_test` instead — same rule engine, same
+# `for:` handling, labels only. `alert_rule_test` is kept only where the
+# expectation is EMPTY, which needs no annotations.
+#
+# **A NaN value cannot be asserted.** promtool compares expected against actual
+# with `==`, and `NaN == NaN` is false, so a `value: .nan` expectation fails
+# against a NaN result — verified, "exp: … NaN got: … NaN". The NaN claims below
+# are therefore asserted through `ALERTS` (whose value is 1) and through the
+# ABSENCE of samples, never by pinning the NaN itself.
+#
+# `rule_files` resolves relative to THIS file, which is why the runner mounts
+# the two files into one directory rather than mounting `infra/monitoring`:
+# that directory also holds `metrics-token`, and a scrape credential has no
+# business inside a throwaway container.
+
+rule_files:
+  - alerts.yml
+
+evaluation_interval: 15s
+
+tests:
+
+  - interval: 30s
+    name: SMTP zero stays silent and first failure fires without grace then clears on a plateau
+    input_series:
+      - series: 'alertmanager_notification_requests_failed_total{job="alertmanager", instance="am:9093", integration="email"}'
+        values: '0 0 1+0x12'
+      - series: 'process_start_time_seconds{job="alertmanager", instance="am:9093"}'
+        values: '100+0x14'
+      - series: 'up{job="alertmanager", instance="am:9093"}'
+        values: '1+0x14'
+    promql_expr_test:
+      - expr: 'count(ALERTS{alertname="AlertmanagerEmailDeliveryFailed", alertstate="firing"})'
+        eval_time: 0s
+        exp_samples: []
+      - expr: 'count(ALERTS{alertname="AlertmanagerEmailDeliveryFailed", alertstate="firing"})'
+        eval_time: 30s
+        exp_samples: []
+      - expr: 'count(ALERTS{alertname="AlertmanagerEmailDeliveryFailed", alertstate="firing"})'
+        eval_time: 1m
+        exp_samples:
+          - labels: '{}'
+            value: 1
+      - expr: 'count(ALERTS{alertname="AlertmanagerEmailDeliveryFailed", alertstate="firing"})'
+        eval_time: 2m30s
+        exp_samples:
+          - labels: '{}'
+            value: 1
+      - expr: 'count(ALERTS{alertname="AlertmanagerEmailDeliveryFailed", alertstate="firing"})'
+        eval_time: 3m30s
+        exp_samples: []
+      - expr: 'count(ALERTS{alertname="AlertmanagerEmailDeliveryFailed", alertstate="firing"})'
+        eval_time: 6m
+        exp_samples: []
+  - interval: 30s
+    name: SMTP first positive sample fires conservatively then expires
+    input_series:
+      - series: 'alertmanager_notification_requests_failed_total{job="alertmanager", instance="am:9093", integration="email"}'
+        values: '1+0x12'
+      - series: 'process_start_time_seconds{job="alertmanager", instance="am:9093"}'
+        values: '100+0x12'
+      - series: 'up{job="alertmanager", instance="am:9093"}'
+        values: '1+0x12'
+    promql_expr_test:
+      - expr: 'count(ALERTS{alertname="AlertmanagerEmailDeliveryFailed", alertstate="firing"})'
+        eval_time: 0s
+        exp_samples:
+          - labels: '{}'
+            value: 1
+      - expr: 'count(ALERTS{alertname="AlertmanagerEmailDeliveryFailed", alertstate="firing"})'
+        eval_time: 1m30s
+        exp_samples:
+          - labels: '{}'
+            value: 1
+      - expr: 'count(ALERTS{alertname="AlertmanagerEmailDeliveryFailed", alertstate="firing"})'
+        eval_time: 2m30s
+        exp_samples: []
+      - expr: 'count(ALERTS{alertname="AlertmanagerEmailDeliveryFailed", alertstate="firing"})'
+        eval_time: 6m
+        exp_samples: []
+  - interval: 30s
+    name: SMTP healthy reset to zero does not invent an error
+    input_series:
+      - series: 'alertmanager_notification_requests_failed_total{job="alertmanager", instance="am:9093", integration="email"}'
+        values: '1+0x6 0+0x12'
+      - series: 'process_start_time_seconds{job="alertmanager", instance="am:9093"}'
+        values: '100+0x6 200+0x12'
+      - series: 'up{job="alertmanager", instance="am:9093"}'
+        values: '1+0x19'
+    promql_expr_test:
+      - expr: 'count(ALERTS{alertname="AlertmanagerEmailDeliveryFailed", alertstate="firing"})'
+        eval_time: 3m
+        exp_samples: []
+      - expr: 'count(ALERTS{alertname="AlertmanagerEmailDeliveryFailed", alertstate="firing"})'
+        eval_time: 3m30s
+        exp_samples: []
+      - expr: 'count(ALERTS{alertname="AlertmanagerEmailDeliveryFailed", alertstate="firing"})'
+        eval_time: 4m30s
+        exp_samples: []
+      - expr: 'count(ALERTS{alertname="AlertmanagerEmailDeliveryFailed", alertstate="firing"})'
+        eval_time: 8m
+        exp_samples: []
+  - interval: 30s
+    name: SMTP positive reset detects first new error below previous counter
+    input_series:
+      - series: 'alertmanager_notification_requests_failed_total{job="alertmanager", instance="am:9093", integration="email"}'
+        values: '9+0x6 1+0x12'
+      - series: 'process_start_time_seconds{job="alertmanager", instance="am:9093"}'
+        values: '100+0x6 200+0x12'
+      - series: 'up{job="alertmanager", instance="am:9093"}'
+        values: '1+0x19'
+    promql_expr_test:
+      - expr: 'count(ALERTS{alertname="AlertmanagerEmailDeliveryFailed", alertstate="firing"})'
+        eval_time: 3m
+        exp_samples: []
+      - expr: 'count(ALERTS{alertname="AlertmanagerEmailDeliveryFailed", alertstate="firing"})'
+        eval_time: 3m30s
+        exp_samples:
+          - labels: '{}'
+            value: 1
+      - expr: 'count(ALERTS{alertname="AlertmanagerEmailDeliveryFailed", alertstate="firing"})'
+        eval_time: 4m30s
+        exp_samples:
+          - labels: '{}'
+            value: 1
+      - expr: 'count(ALERTS{alertname="AlertmanagerEmailDeliveryFailed", alertstate="firing"})'
+        eval_time: 6m
+        exp_samples: []
+  - interval: 30s
+    name: SMTP gap without stale and same-value restart detects epoch at the same offset
+    input_series:
+      - series: 'alertmanager_notification_requests_failed_total{job="alertmanager", instance="am:9093", integration="email"}'
+        values: '1+0x6 _ _ _ _ _ 1+0x10'
+      - series: 'process_start_time_seconds{job="alertmanager", instance="am:9093"}'
+        values: '100+0x6 _ _ _ _ _ 200+0x10'
+      - series: 'up{job="alertmanager", instance="am:9093"}'
+        values: '1+0x6 0+0x4 1+0x10'
+    promql_expr_test:
+      - expr: 'count(ALERTS{alertname="AlertmanagerEmailDeliveryFailed", alertstate="firing"})'
+        eval_time: 3m
+        exp_samples: []
+      - expr: 'count(ALERTS{alertname="AlertmanagerEmailDeliveryFailed", alertstate="firing"})'
+        eval_time: 5m30s
+        exp_samples: []
+      - expr: 'count(ALERTS{alertname="AlertmanagerEmailDeliveryFailed", alertstate="firing"})'
+        eval_time: 6m
+        exp_samples:
+          - labels: '{}'
+            value: 1
+      - expr: 'count(ALERTS{alertname="AlertmanagerEmailDeliveryFailed", alertstate="firing"})'
+        eval_time: 7m30s
+        exp_samples:
+          - labels: '{}'
+            value: 1
+      - expr: 'count(ALERTS{alertname="AlertmanagerEmailDeliveryFailed", alertstate="firing"})'
+        eval_time: 8m30s
+        exp_samples: []
+  - interval: 30s
+    name: SMTP increase during gap without restart is observed once collection returns
+    input_series:
+      - series: 'alertmanager_notification_requests_failed_total{job="alertmanager", instance="am:9093", integration="email"}'
+        values: '1+0x6 _ _ _ _ _ 2+0x10'
+      - series: 'process_start_time_seconds{job="alertmanager", instance="am:9093"}'
+        values: '100+0x22'
+      - series: 'up{job="alertmanager", instance="am:9093"}'
+        values: '1+0x6 0+0x4 1+0x10'
+    promql_expr_test:
+      - expr: 'count(ALERTS{alertname="AlertmanagerEmailDeliveryFailed", alertstate="firing"})'
+        eval_time: 3m
+        exp_samples: []
+      - expr: 'count(ALERTS{alertname="AlertmanagerEmailDeliveryFailed", alertstate="firing"})'
+        eval_time: 5m30s
+        exp_samples: []
+      - expr: 'count(ALERTS{alertname="AlertmanagerEmailDeliveryFailed", alertstate="firing"})'
+        eval_time: 6m
+        exp_samples:
+          - labels: '{}'
+            value: 1
+      - expr: 'count(ALERTS{alertname="AlertmanagerEmailDeliveryFailed", alertstate="firing"})'
+        eval_time: 7m30s
+        exp_samples:
+          - labels: '{}'
+            value: 1
+      - expr: 'count(ALERTS{alertname="AlertmanagerEmailDeliveryFailed", alertstate="firing"})'
+        eval_time: 8m30s
+        exp_samples: []
+  - interval: 30s
+    name: SMTP up guard excludes stale values and another instance scrape
+    input_series:
+      - series: 'alertmanager_notification_requests_failed_total{job="alertmanager", instance="am:9093", integration="email"}'
+        values: '0 1+0x12'
+      - series: 'process_start_time_seconds{job="alertmanager", instance="am:9093"}'
+        values: '100+0x14'
+      - series: 'up{job="alertmanager", instance="am:9093"}'
+        values: '0+0x14'
+      - series: 'up{job="alertmanager", instance="other:9093"}'
+        values: '1+0x14'
+    promql_expr_test:
+      - expr: 'count(ALERTS{alertname="AlertmanagerEmailDeliveryFailed", alertstate="firing"})'
+        eval_time: 30s
+        exp_samples: []
+      - expr: 'count(ALERTS{alertname="AlertmanagerEmailDeliveryFailed", alertstate="firing"})'
+        eval_time: 1m
+        exp_samples: []
+      - expr: 'count(ALERTS{alertname="AlertmanagerEmailDeliveryFailed", alertstate="firing"})'
+        eval_time: 3m
+        exp_samples: []
+  - interval: 30s
+    name: SMTP later incident fires after closure with stable process epoch
+    input_series:
+      - series: 'alertmanager_notification_requests_failed_total{job="alertmanager", instance="am:9093", integration="email"}'
+        values: '0 1+0x6 2+0x10'
+      - series: 'process_start_time_seconds{job="alertmanager", instance="am:9093"}'
+        values: '100+0x18'
+      - series: 'up{job="alertmanager", instance="am:9093"}'
+        values: '1+0x18'
+    promql_expr_test:
+      - expr: 'count(ALERTS{alertname="AlertmanagerEmailDeliveryFailed", alertstate="firing"})'
+        eval_time: 30s
+        exp_samples:
+          - labels: '{}'
+            value: 1
+      - expr: 'count(ALERTS{alertname="AlertmanagerEmailDeliveryFailed", alertstate="firing"})'
+        eval_time: 3m
+        exp_samples: []
+      - expr: 'count(ALERTS{alertname="AlertmanagerEmailDeliveryFailed", alertstate="firing"})'
+        eval_time: 4m
+        exp_samples:
+          - labels: '{}'
+            value: 1
+      - expr: 'count(ALERTS{alertname="AlertmanagerEmailDeliveryFailed", alertstate="firing"})'
+        eval_time: 5m30s
+        exp_samples:
+          - labels: '{}'
+            value: 1
+      - expr: 'count(ALERTS{alertname="AlertmanagerEmailDeliveryFailed", alertstate="firing"})'
+        eval_time: 6m30s
+        exp_samples: []
+  - interval: 30s
+    name: SMTP missing and non-email integration counters are not SMTP failures
+    input_series:
+      - series: 'process_start_time_seconds{job="alertmanager", instance="am:9093"}'
+        values: '100+0x14'
+      - series: 'up{job="alertmanager", instance="am:9093"}'
+        values: '1+0x14'
+      - series: 'alertmanager_notification_requests_failed_total{job="alertmanager", instance="am:9093", integration="sns"}'
+        values: '0+1x14'
+    promql_expr_test:
+      - expr: 'count(ALERTS{alertname="AlertmanagerEmailDeliveryFailed", alertstate="firing"})'
+        eval_time: 0s
+        exp_samples: []
+      - expr: 'count(ALERTS{alertname="AlertmanagerEmailDeliveryFailed", alertstate="firing"})'
+        eval_time: 30s
+        exp_samples: []
+      - expr: 'count(ALERTS{alertname="AlertmanagerEmailDeliveryFailed", alertstate="firing"})'
+        eval_time: 3m
+        exp_samples: []
+  - interval: 1m
+    name: proposer unknown strictly over 900 seconds and recovery without a second delay
+    input_series:
+      - series: 'up{job="placement-proposer", instance="proposer:9465"}'
+        values: '1+0x20'
+      - series: 'maplespire_placement_proposer_enabled{job="placement-proposer", instance="proposer:9465"}'
+        values: '1+0x20'
+      - series: 'maplespire_placement_proposer_signal_unknown{job="placement-proposer", instance="proposer:9465"}'
+        values: '1+0x17 0+0x3'
+      - series: 'maplespire_placement_proposer_unknown_age_seconds{job="placement-proposer", instance="proposer:9465"}'
+        values: '0+60x15 901 902 NaN NaN NaN'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: PlacementProposerSignalUnknown
+        exp_alerts: []
+      - eval_time: 18m
+        alertname: PlacementProposerSignalUnknown
+        exp_alerts: []
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="PlacementProposerSignalUnknown", alertstate="firing"}'
+        eval_time: 16m
+        exp_samples:
+          - labels: 'ALERTS{alertname="PlacementProposerSignalUnknown", alertstate="firing", job="placement-proposer", instance="proposer:9465", severity="ticket"}'
+            value: 1
+
+  - interval: 1m
+    name: proposer disabled no-candidate and another instance cannot qualify an unknown alert
+    input_series:
+      - series: 'up{job="placement-proposer", instance="disabled"}'
+        values: '1+0x20'
+      - series: 'maplespire_placement_proposer_enabled{job="placement-proposer", instance="disabled"}'
+        values: '0+0x20'
+      - series: 'maplespire_placement_proposer_signal_unknown{job="placement-proposer", instance="disabled"}'
+        values: '1+0x20'
+      - series: 'maplespire_placement_proposer_unknown_age_seconds{job="placement-proposer", instance="disabled"}'
+        values: '9999+0x20'
+      - series: 'up{job="placement-proposer", instance="no-candidate"}'
+        values: '1+0x20'
+      - series: 'maplespire_placement_proposer_enabled{job="placement-proposer", instance="no-candidate"}'
+        values: '1+0x20'
+      - series: 'maplespire_placement_proposer_signal_unknown{job="placement-proposer", instance="no-candidate"}'
+        values: '0+0x20'
+      - series: 'maplespire_placement_proposer_unknown_age_seconds{job="placement-proposer", instance="no-candidate"}'
+        values: '9999+0x20'
+      - series: 'up{job="placement-proposer", instance="no-signal-metric"}'
+        values: '1+0x20'
+      - series: 'maplespire_placement_proposer_enabled{job="placement-proposer", instance="no-signal-metric"}'
+        values: '1+0x20'
+      - series: 'maplespire_placement_proposer_unknown_age_seconds{job="placement-proposer", instance="no-signal-metric"}'
+        values: '9999+0x20'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: PlacementProposerSignalUnknown
+        exp_alerts: []
+
+  - interval: 1m
+    name: configured proposer target down differs from disabled and recovers
+    input_series:
+      - series: 'up{job="placement-proposer", instance="proposer:9465"}'
+        values: '0+0x3 1+0x3'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: PlacementProposerDown
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: PlacementProposerDown
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: PlacementProposerSignalUnknown
+        exp_alerts: []
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="PlacementProposerDown", alertstate="firing"}'
+        eval_time: 2m
+        exp_samples:
+          - labels: 'ALERTS{alertname="PlacementProposerDown", alertstate="firing", job="placement-proposer", instance="proposer:9465", severity="ticket"}'
+            value: 1
+
+  - interval: 1m
+    name: successful scrape missing one proposer health metric is not healthy or disabled
+    input_series:
+      - series: 'up{job="placement-proposer", instance="proposer:9465"}'
+        values: '1+0x6'
+      - series: 'maplespire_placement_proposer_enabled{job="placement-proposer", instance="proposer:9465"}'
+        values: '1+0x6'
+      - series: 'maplespire_placement_proposer_unknown_age_seconds{job="placement-proposer", instance="proposer:9465"}'
+        values: 'NaN+0x6'
+      - series: 'maplespire_placement_proposer_signal_unknown{job="placement-proposer", instance="proposer:9465"}'
+        values: '_ _ _ _ 0+0x2'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: PlacementProposerMetricsMissing
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: PlacementProposerMetricsMissing
+        exp_alerts: []
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="PlacementProposerMetricsMissing", alertstate="firing"}'
+        eval_time: 2m
+        exp_samples:
+          - labels: 'ALERTS{alertname="PlacementProposerMetricsMissing", alertstate="firing", job="placement-proposer", instance="proposer:9465", severity="ticket"}'
+            value: 1
+
+  - interval: 1m
+    name: unconfigured optional proposer emits no alert and supplies no disabled evidence
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: PlacementProposerSignalUnknown
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: PlacementProposerDown
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: PlacementProposerMetricsMissing
+        exp_alerts: []
+
+  - interval: 1m
+    name: cell coverage pages per instance without borrowing another cell or alerting on a standby
+    input_series:
+      - series: 'maplespire_sync_cell_owned_workspaces{job="maplespire-api", instance="api-a:3001", cell_id="cell-a"}'
+        values: '0+0x4 2+0x10'
+      - series: 'maplespire_sync_cell_expected_workspaces{job="maplespire-api", instance="api-a:3001", cell_id="cell-a"}'
+        values: '2+0x15'
+      - series: 'maplespire_sync_cell_ownership_enabled{job="maplespire-api", instance="api-a:3001"}'
+        values: '1+0x30'
+      - series: 'maplespire_sync_cell_owned_workspaces{job="maplespire-api", instance="api-b:3001", cell_id="cell-b"}'
+        values: '7+0x15'
+      - series: 'maplespire_sync_cell_expected_workspaces{job="maplespire-api", instance="api-b:3001", cell_id="cell-b"}'
+        values: '2+0x15'
+      - series: 'maplespire_sync_cell_ownership_enabled{job="maplespire-api", instance="api-b:3001"}'
+        values: '1+0x30'
+      - series: 'maplespire_sync_cell_owned_workspaces{job="maplespire-api", instance="api-off:3001", cell_id="cell-off"}'
+        values: '0+0x15'
+      - series: 'maplespire_sync_cell_expected_workspaces{job="maplespire-api", instance="api-off:3001", cell_id="cell-off"}'
+        values: '2+0x15'
+      - series: 'maplespire_sync_cell_ownership_enabled{job="maplespire-api", instance="api-off:3001"}'
+        values: '0+0x30'
+      - series: 'maplespire_sync_cell_owned_workspaces{job="maplespire-api", instance="api-standby:3001", cell_id="cell-standby"}'
+        values: '0+0x15'
+      - series: 'maplespire_sync_cell_expected_workspaces{job="maplespire-api", instance="api-standby:3001", cell_id="cell-standby"}'
+        values: '0+0x15'
+      - series: 'maplespire_sync_cell_ownership_enabled{job="maplespire-api", instance="api-standby:3001"}'
+        values: '1+0x30'
+      - series: 'maplespire_sync_cell_owned_workspaces{job="maplespire-api", instance="api-unknown:3001", cell_id="cell-unknown"}'
+        values: 'NaN+0x15'
+      - series: 'maplespire_sync_cell_expected_workspaces{job="maplespire-api", instance="api-unknown:3001", cell_id="cell-unknown"}'
+        values: '2+0x15'
+      - series: 'maplespire_sync_cell_ownership_enabled{job="maplespire-api", instance="api-unknown:3001"}'
+        values: '1+0x30'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: SyncCellCoverageGap
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: SyncCellCoverageGap
+        exp_alerts: []
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="SyncCellCoverageGap", alertstate="firing"}'
+        eval_time: 2m
+        exp_samples:
+          - labels: 'ALERTS{alertname="SyncCellCoverageGap", alertstate="firing", job="maplespire-api", instance="api-a:3001", cell_id="cell-a", severity="page"}'
+            value: 1
+
+  - interval: 1m
+    name: partition loss warns on a rise and clears when the fifteen minute window expires
+    input_series:
+      - series: 'maplespire_sync_cell_partition_loss_total{job="maplespire-api", instance="api-a:3001", cell_id="cell-a"}'
+        values: '10 11+0x29'
+      - series: 'maplespire_sync_cell_ownership_enabled{job="maplespire-api", instance="api-a:3001"}'
+        values: '1+0x30'
+      - series: 'maplespire_sync_cell_partition_loss_total{job="maplespire-api", instance="api-b:3001", cell_id="cell-b"}'
+        values: '100+0x30'
+      - series: 'maplespire_sync_cell_ownership_enabled{job="maplespire-api", instance="api-b:3001"}'
+        values: '1+0x30'
+      - series: 'maplespire_sync_cell_partition_loss_total{job="maplespire-api", instance="api-reset:3001", cell_id="cell-reset"}'
+        values: '100 100 0+0x28'
+      - series: 'maplespire_sync_cell_ownership_enabled{job="maplespire-api", instance="api-reset:3001"}'
+        values: '1+0x30'
+      - series: 'maplespire_sync_cell_partition_loss_total{job="maplespire-api", instance="api-off:3001", cell_id="cell-off"}'
+        values: '0+1x30'
+      - series: 'maplespire_sync_cell_ownership_enabled{job="maplespire-api", instance="api-off:3001"}'
+        values: '0+0x30'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: SyncCellPartitionLoss
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: SyncCellPartitionLoss
+        exp_alerts: []
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="SyncCellPartitionLoss", alertstate="firing"}'
+        eval_time: 3m
+        exp_samples:
+          - labels: 'ALERTS{alertname="SyncCellPartitionLoss", alertstate="firing", job="maplespire-api", instance="api-a:3001", cell_id="cell-a", severity="ticket"}'
+            value: 1
+
+  - interval: 1m
+    name: workspace loss reuses the reason counter without aggregating different cells
+    input_series:
+      - series: 'maplespire_sync_cell_workspace_losses_by_reason_total{job="maplespire-api", instance="api-a:3001", reason="workspace-moved"}'
+        values: '2 3+0x29'
+      - series: 'maplespire_sync_cell_workspace_losses_by_reason_total{job="maplespire-api", instance="api-a:3001", reason="partition-unavailable"}'
+        values: '5+0x30'
+      - series: 'maplespire_sync_cell_ownership_enabled{job="maplespire-api", instance="api-a:3001"}'
+        values: '1+0x30'
+      - series: 'maplespire_sync_cell_workspace_losses_by_reason_total{job="maplespire-api", instance="api-b:3001", reason="workspace-moved"}'
+        values: '17+0x30'
+      - series: 'maplespire_sync_cell_ownership_enabled{job="maplespire-api", instance="api-b:3001"}'
+        values: '1+0x30'
+      - series: 'maplespire_sync_cell_workspace_losses_by_reason_total{job="maplespire-api", instance="api-off:3001", reason="workspace-moved"}'
+        values: '0+1x30'
+      - series: 'maplespire_sync_cell_ownership_enabled{job="maplespire-api", instance="api-off:3001"}'
+        values: '0+0x30'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: SyncCellWorkspaceLoss
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: SyncCellWorkspaceLoss
+        exp_alerts: []
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="SyncCellWorkspaceLoss", alertstate="firing"}'
+        eval_time: 3m
+        exp_samples:
+          - labels: 'ALERTS{alertname="SyncCellWorkspaceLoss", alertstate="firing", job="maplespire-api", instance="api-a:3001", severity="ticket"}'
+            value: 1
+
+  - interval: 1m
+    name: fencing warns only above one refusal per second averaged over five minutes
+    input_series:
+      - series: 'maplespire_sync_cell_fence_rejections_total{job="maplespire-api", instance="api-a:3001", cell_id="cell-a"}'
+        values: '0+120x8 960+0x20'
+      - series: 'maplespire_sync_cell_ownership_enabled{job="maplespire-api", instance="api-a:3001"}'
+        values: '1+0x30'
+      - series: 'maplespire_sync_cell_fence_rejections_total{job="maplespire-api", instance="api-boundary:3001", cell_id="cell-boundary"}'
+        values: '0+60x30'
+      - series: 'maplespire_sync_cell_ownership_enabled{job="maplespire-api", instance="api-boundary:3001"}'
+        values: '1+0x30'
+      - series: 'maplespire_sync_cell_fence_rejections_total{job="maplespire-api", instance="api-low:3001", cell_id="cell-low"}'
+        values: '0+30x30'
+      - series: 'maplespire_sync_cell_ownership_enabled{job="maplespire-api", instance="api-low:3001"}'
+        values: '1+0x30'
+      - series: 'maplespire_sync_cell_fence_rejections_total{job="maplespire-api", instance="api-flat:3001", cell_id="cell-flat"}'
+        values: '1000000+0x30'
+      - series: 'maplespire_sync_cell_ownership_enabled{job="maplespire-api", instance="api-flat:3001"}'
+        values: '1+0x30'
+      - series: 'maplespire_sync_cell_fence_rejections_total{job="maplespire-api", instance="api-reset:3001", cell_id="cell-reset"}'
+        values: '1000000 1000000 0+0x28'
+      - series: 'maplespire_sync_cell_ownership_enabled{job="maplespire-api", instance="api-reset:3001"}'
+        values: '1+0x30'
+      - series: 'maplespire_sync_cell_fence_rejections_total{job="maplespire-api", instance="api-off:3001", cell_id="cell-off"}'
+        values: '0+120x30'
+      - series: 'maplespire_sync_cell_ownership_enabled{job="maplespire-api", instance="api-off:3001"}'
+        values: '0+0x30'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: SyncCellFenceRejections
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: SyncCellFenceRejections
+        exp_alerts: []
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="SyncCellFenceRejections", alertstate="firing"}'
+        eval_time: 7m
+        exp_samples:
+          - labels: 'ALERTS{alertname="SyncCellFenceRejections", alertstate="firing", job="maplespire-api", instance="api-a:3001", cell_id="cell-a", severity="ticket"}'
+            value: 1
+
+  - interval: 1m
+    name: foreign residents page per cell and clear after eviction while unknown stays unknown
+    input_series:
+      - series: 'maplespire_sync_cell_foreign_resident_projectors{job="maplespire-api", instance="api-a:3001", cell_id="cell-a"}'
+        values: '1+0x4 0+0x20'
+      - series: 'maplespire_sync_cell_ownership_enabled{job="maplespire-api", instance="api-a:3001"}'
+        values: '1+0x30'
+      - series: 'maplespire_sync_cell_foreign_resident_projectors{job="maplespire-api", instance="api-b:3001", cell_id="cell-b"}'
+        values: '0+0x30'
+      - series: 'maplespire_sync_cell_ownership_enabled{job="maplespire-api", instance="api-b:3001"}'
+        values: '1+0x30'
+      - series: 'maplespire_sync_cell_foreign_resident_projectors{job="maplespire-api", instance="api-unknown:3001", cell_id="cell-unknown"}'
+        values: 'NaN+0x30'
+      - series: 'maplespire_sync_cell_ownership_enabled{job="maplespire-api", instance="api-unknown:3001"}'
+        values: '1+0x30'
+      - series: 'maplespire_sync_cell_foreign_resident_projectors{job="maplespire-api", instance="api-off:3001", cell_id="cell-off"}'
+        values: '5+0x30'
+      - series: 'maplespire_sync_cell_ownership_enabled{job="maplespire-api", instance="api-off:3001"}'
+        values: '0+0x30'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: SyncCellForeignProjector
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: SyncCellForeignProjector
+        exp_alerts: []
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="SyncCellForeignProjector", alertstate="firing"}'
+        eval_time: 2m
+        exp_samples:
+          - labels: 'ALERTS{alertname="SyncCellForeignProjector", alertstate="firing", job="maplespire-api", instance="api-a:3001", cell_id="cell-a", severity="page"}'
+            value: 1
+
+  - interval: 1m
+    name: critical Redis memory needs five minutes above eighty percent and a positive limit
+    input_series:
+      - series: 'redis_memory_used_bytes{job="redis", instance="redis-high:9121"}'
+        values: '81+0x6 79+0x20'
+      - series: 'redis_memory_max_bytes{job="redis", instance="redis-high:9121"}'
+        values: '100+0x30'
+      - series: 'redis_memory_used_bytes{job="redis", instance="redis-boundary:9121"}'
+        values: '80+0x30'
+      - series: 'redis_memory_max_bytes{job="redis", instance="redis-boundary:9121"}'
+        values: '100+0x30'
+      - series: 'redis_memory_used_bytes{job="redis", instance="redis-low:9121"}'
+        values: '79+0x30'
+      - series: 'redis_memory_max_bytes{job="redis", instance="redis-low:9121"}'
+        values: '100+0x30'
+      - series: 'redis_memory_used_bytes{job="redis", instance="redis-unlimited:9121"}'
+        values: '100000+0x30'
+      - series: 'redis_memory_max_bytes{job="redis", instance="redis-unlimited:9121"}'
+        values: '0+0x30'
+      - series: 'redis_memory_used_bytes{job="redis", instance="redis-brief:9121"}'
+        values: '81+0x3 79+0x20'
+      - series: 'redis_memory_max_bytes{job="redis", instance="redis-brief:9121"}'
+        values: '100+0x30'
+      - series: 'redis_memory_used_bytes{job="redis", instance="redis-unknown:9121"}'
+        values: 'NaN+0x30'
+      - series: 'redis_memory_max_bytes{job="redis", instance="redis-unknown:9121"}'
+        values: '100+0x30'
+      - series: 'redis_memory_used_bytes{job="render-cache", instance="cache:9121"}'
+        values: '99+0x30'
+      - series: 'redis_memory_max_bytes{job="render-cache", instance="cache:9121"}'
+        values: '100+0x30'
+      - series: 'redis_memory_used_bytes{job="redis", instance="missing-limit:9121"}'
+        values: '10000+0x30'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: RedisMemoryNearLimit
+        exp_alerts: []
+      - eval_time: 8m
+        alertname: RedisMemoryNearLimit
+        exp_alerts: []
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="RedisMemoryNearLimit", alertstate="firing"}'
+        eval_time: 5m
+        exp_samples:
+          - labels: 'ALERTS{alertname="RedisMemoryNearLimit", alertstate="firing", job="redis", instance="redis-high:9121", severity="page"}'
+            value: 1
+
+  - interval: 1m
+    name: absent cell collectors and absent Redis limits do not fabricate a healthy zero or an incident
+    input_series:
+      - series: 'maplespire_sync_cell_ownership_enabled{job="maplespire-api", instance="api-a:3001"}'
+        values: '1+0x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: SyncCellCoverageGap
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: SyncCellPartitionLoss
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: SyncCellWorkspaceLoss
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: SyncCellFenceRejections
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: SyncCellForeignProjector
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: RedisMemoryNearLimit
+        exp_alerts: []
+
+  - interval: 1m
+    name: a failed router scrape pages after two minutes
+    input_series:
+      - series: 'up{job="sync-ws-router", instance="sync-ws-router:9464"}'
+        values: '0+0x10'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: SyncRouterDown
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: SyncRouterNotScraped
+        exp_alerts: []
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="SyncRouterDown", alertstate="firing"}'
+        eval_time: 2m
+        exp_samples:
+          - labels: 'ALERTS{alertname="SyncRouterDown", alertstate="firing", instance="sync-ws-router:9464", job="sync-ws-router", severity="page"}'
+            value: 1
+
+  - interval: 1m
+    name: a healthy confirmed router keeps the triad silent
+    input_series:
+      - series: 'up{job="sync-ws-router", instance="sync-ws-router:9464"}'
+        values: '1+0x20'
+      - series: 'maplespire_sync_router_topology_state{job="sync-ws-router", instance="sync-ws-router:9464"}'
+        values: '1+0x20'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: SyncRouterDown
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: SyncRouterNotScraped
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: SyncRouterTopologyPending
+        exp_alerts: []
+
+  - interval: 1m
+    name: an absent router job pages without borrowing another job's up
+    input_series:
+      - series: 'up{job="maplespire-api", instance="api:3001"}'
+        values: '1+0x10'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: SyncRouterNotScraped
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: SyncRouterDown
+        exp_alerts: []
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="SyncRouterNotScraped", alertstate="firing"}'
+        eval_time: 2m
+        exp_samples:
+          - labels: 'ALERTS{alertname="SyncRouterNotScraped", alertstate="firing", job="sync-ws-router", severity="page"}'
+            value: 1
+
+  - interval: 1m
+    name: pending router topology warns at five minutes and clears on confirmation
+    input_series:
+      - series: 'maplespire_sync_router_topology_state{job="sync-ws-router", instance="sync-ws-router:9464"}'
+        values: '0 0 0 0 0 0 1 1 1'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: SyncRouterTopologyPending
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: SyncRouterTopologyPending
+        exp_alerts: []
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="SyncRouterTopologyPending", alertstate="firing"}'
+        eval_time: 5m
+        exp_samples:
+          - labels: 'ALERTS{alertname="SyncRouterTopologyPending", alertstate="firing", instance="sync-ws-router:9464", job="sync-ws-router", severity="ticket"}'
+            value: 1
+
+  - interval: 1m
+    name: mismatch and absent topology do not impersonate pending
+    input_series:
+      - series: 'maplespire_sync_router_topology_state{job="sync-ws-router", instance="sync-ws-router:9464"}'
+        values: '2 2 2 2 2 2 stale _ _ _ _ _ _'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: SyncRouterTopologyPending
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: SyncRouterTopologyPending
+        exp_alerts: []
+
+  # ===================================================================
+  # BackupDrillContainerDown — up == 0, for: 15m
+  # ===================================================================
+  - interval: 1m
+    name: a container that stops answering pages, but not before its window
+    input_series:
+      - series: 'up{job="backup-drill", instance="backup-drill:9464"}'
+        values: '0+0x30'
+    alert_rule_test:
+      # Fourteen minutes in it is still only pending. The window exists so a
+      # single failed scrape cannot page anybody.
+      - eval_time: 14m
+        alertname: BackupDrillContainerDown
+        exp_alerts: []
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="BackupDrillContainerDown", alertstate="firing"}'
+        eval_time: 16m
+        exp_samples:
+          - labels: 'ALERTS{alertname="BackupDrillContainerDown", alertstate="firing", instance="backup-drill:9464", job="backup-drill", severity="page"}'
+            value: 1
+
+  - interval: 1m
+    name: a healthy container never pages
+    input_series:
+      - series: 'up{job="backup-drill", instance="backup-drill:9464"}'
+        values: '1+0x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: BackupDrillContainerDown
+        exp_alerts: []
+
+  # THE CRASH LOOP, from `up`'s side. This is the case that makes
+  # BackupDrillRestarting necessary: the container is down across a
+  # scrape, then back, so the `for:` window restarts and never completes. The
+  # rule is CORRECT to stay silent here — a flapping target is not a hard-down
+  # one — and the test exists to pin that it really is silent, because the
+  # whole argument for the restart rule below rests on it.
+  - interval: 1m
+    name: a flapping container does NOT reach the container-down window
+    input_series:
+      - series: 'up{job="backup-drill", instance="backup-drill:9464"}'
+        values: '1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0'
+    alert_rule_test:
+      - eval_time: 39m
+        alertname: BackupDrillContainerDown
+        exp_alerts: []
+
+  # ===================================================================
+  # BackupDrillRestarting — changes(start_time[30m]) > 2, for: 2m
+  # ===================================================================
+  #
+  # The headline. A crash loop is made of FAILED SCRAPES, and Prometheus marks
+  # a target's series stale on one — so the gaps below are the whole point. An
+  # uptime threshold behind a `for:` window could not survive them: an empty
+  # vector ends the pending period and restarts the clock. `changes()` reads
+  # the samples that are present.
+  - interval: 1m
+    name: three restarts across stale gaps still fire
+    input_series:
+      # Four distinct process start times, each surviving a few scrapes, with
+      # the scrapes in between MISSING — exactly what a restarting container
+      # produces.
+      - series: 'maplespire_backup_drill_scheduler_start_time_seconds{job="backup-drill", instance="backup-drill:9464"}'
+        values: '1000 1000 1000 _ _ 1010 1010 1010 _ _ 1020 1020 1020 _ _ 1030 1030 1030 1030 1030'
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="BackupDrillRestarting", alertstate="firing"}'
+        eval_time: 19m
+        exp_samples:
+          - labels: 'ALERTS{alertname="BackupDrillRestarting", alertstate="firing", instance="backup-drill:9464", job="backup-drill", severity="page"}'
+            value: 1
+      # And the count itself, so a threshold change is visible as a number
+      # rather than only as a missing alert.
+      - expr: 'changes(maplespire_backup_drill_scheduler_start_time_seconds[30m])'
+        eval_time: 19m
+        exp_samples:
+          - labels: '{job="backup-drill", instance="backup-drill:9464"}'
+            value: 3
+
+  - interval: 1m
+    name: ONE restart is a rolling deploy and must not page
+    input_series:
+      - series: 'maplespire_backup_drill_scheduler_start_time_seconds{job="backup-drill", instance="backup-drill:9464"}'
+        values: '1000+0x9 _ _ 1010+0x9'
+    alert_rule_test:
+      - eval_time: 21m
+        alertname: BackupDrillRestarting
+        exp_alerts: []
+
+  - interval: 1m
+    name: a process that never restarts never pages
+    input_series:
+      - series: 'maplespire_backup_drill_scheduler_start_time_seconds{job="backup-drill", instance="backup-drill:9464"}'
+        values: '1000+0x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: BackupDrillRestarting
+        exp_alerts: []
+
+  # ===================================================================
+  # BackupDrillHeartbeatMissing — absent(start_time) and on() (up == 1)
+  # ===================================================================
+  #
+  # `and on()` is the load-bearing operator and the rule's own comment says so:
+  # `absent()` returns a vector carrying only its selector's matchers, so it has
+  # no `job` and no `instance`, and a bare `and` — which joins on the full label
+  # set — would match nothing. Both spellings PARSE, so `check rules` cannot
+  # tell them apart. This can.
+  - interval: 1m
+    name: a scrape that succeeds but carries no heartbeat is caught
+    input_series:
+      - series: 'up{job="backup-drill", instance="backup-drill:9464"}'
+        values: '1+0x30'
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="BackupDrillHeartbeatMissing", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="BackupDrillHeartbeatMissing", alertstate="firing", severity="ticket"}'
+            value: 1
+
+  - interval: 1m
+    name: a DEAD container is not a missing heartbeat
+    # up == 0, so this is BackupDrillContainerDown's business and this rule must
+    # stay quiet — otherwise one outage pages twice with two different remedies.
+    input_series:
+      - series: 'up{job="backup-drill", instance="backup-drill:9464"}'
+        values: '0+0x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: BackupDrillHeartbeatMissing
+        exp_alerts: []
+
+  - interval: 1m
+    name: a healthy heartbeat is not a missing one
+    input_series:
+      - series: 'up{job="backup-drill", instance="backup-drill:9464"}'
+        values: '1+0x30'
+      - series: 'maplespire_backup_drill_scheduler_start_time_seconds{job="backup-drill", instance="backup-drill:9464"}'
+        values: '1000+0x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: BackupDrillHeartbeatMissing
+        exp_alerts: []
+
+  # ===================================================================
+  # BackupDrillSchedulerWedged — phase_age > phase_budget
+  # ===================================================================
+  - interval: 1m
+    name: a wedged running phase pages, and names the phase
+    input_series:
+      - series: 'maplespire_backup_drill_scheduler_phase_age_seconds{job="backup-drill", instance="backup-drill:9464", phase="running"}'
+        values: '30000+0x30'
+      - series: 'maplespire_backup_drill_scheduler_phase_budget_seconds{job="backup-drill", instance="backup-drill:9464", phase="running"}'
+        values: '22200+0x30'
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="BackupDrillSchedulerWedged", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="BackupDrillSchedulerWedged", alertstate="firing", instance="backup-drill:9464", job="backup-drill", phase="running", severity="page"}'
+            value: 1
+
+  - interval: 1m
+    name: a long but legitimate sleep does not page
+    # 20 000 s asleep against an 86 700 s budget: a 24 h cadence, six hours in.
+    input_series:
+      - series: 'maplespire_backup_drill_scheduler_phase_age_seconds{job="backup-drill", instance="backup-drill:9464", phase="sleeping"}'
+        values: '20000+0x30'
+      - series: 'maplespire_backup_drill_scheduler_phase_budget_seconds{job="backup-drill", instance="backup-drill:9464", phase="sleeping"}'
+        values: '86700+0x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: BackupDrillSchedulerWedged
+        exp_alerts: []
+
+  # THE JOIN, which is the failure mode `schedulerHeartbeat.ts` warns about:
+  # "Different `phase` values on the two series makes `age > budget` match
+  # nothing at all — a rule that is present, valid, and permanently inactive."
+  # Here the age is far past ANY budget, but the two series disagree on `phase`,
+  # so nothing matches. If the heartbeat ever labelled the budget with a fixed
+  # phase, this is the shape it would take.
+  - interval: 1m
+    name: an age and a budget on DIFFERENT phases match nothing at all
+    input_series:
+      - series: 'maplespire_backup_drill_scheduler_phase_age_seconds{job="backup-drill", instance="backup-drill:9464", phase="running"}'
+        values: '999999+0x30'
+      - series: 'maplespire_backup_drill_scheduler_phase_budget_seconds{job="backup-drill", instance="backup-drill:9464", phase="sleeping"}'
+        values: '86700+0x30'
+    promql_expr_test:
+      - expr: 'maplespire_backup_drill_scheduler_phase_age_seconds > maplespire_backup_drill_scheduler_phase_budget_seconds'
+        eval_time: 20m
+        exp_samples: []
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: BackupDrillSchedulerWedged
+        exp_alerts: []
+
+  # ===================================================================
+  # BackupDrillNotScraped — absent(up{job="backup-drill"})
+  # ===================================================================
+  - interval: 1m
+    name: no target at all is a monitoring fault, and it is caught
+    input_series:
+      # Deliberately the API's `up`, never the drill's: the scrape config has
+      # lost the backup-drill job entirely, which is exactly the state where
+      # `up == 0` cannot fire because there is no series to be 0.
+      - series: 'up{job="maplespire-api", instance="api:3001"}'
+        values: '1+0x30'
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="BackupDrillNotScraped", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="BackupDrillNotScraped", alertstate="firing", job="backup-drill", severity="ticket"}'
+            value: 1
+      # ...and the container-down rule is SILENT in the same window, which is
+      # why the two must ship together.
+      - expr: 'ALERTS{alertname="BackupDrillContainerDown"}'
+        eval_time: 20m
+        exp_samples: []
+
+  - interval: 1m
+    name: a scraped target is not an absent one
+    input_series:
+      - series: 'up{job="backup-drill", instance="backup-drill:9464"}'
+        values: '1+0x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: BackupDrillNotScraped
+        exp_alerts: []
+
+  # ===================================================================
+  # The NaN pair — BackupDrillStale / BackupDrillNeverPassed
+  # ===================================================================
+  #
+  # Executes the claim in the rules' own comment: "NaN fails every `>`
+  # comparison, so the threshold rule is SILENT on a deployment whose drill has
+  # never passed. Both are needed; neither covers the other."
+  - interval: 1m
+    name: a drill that has NEVER passed is caught by the companion, not the threshold
+    input_series:
+      - series: 'maplespire_backup_drill_last_success_age_seconds'
+        values: 'NaN+0x70'
+    promql_expr_test:
+      # The threshold sees nothing. This is the silence the companion exists for.
+      - expr: 'maplespire_backup_drill_last_success_age_seconds > 36 * 3600'
+        eval_time: 70m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="BackupDrillStale"}'
+        eval_time: 70m
+        exp_samples: []
+      # ...and the companion fires.
+      - expr: 'ALERTS{alertname="BackupDrillNeverPassed", alertstate="firing"}'
+        eval_time: 70m
+        exp_samples:
+          - labels: 'ALERTS{alertname="BackupDrillNeverPassed", alertstate="firing", severity="page"}'
+            value: 1
+
+  - interval: 1m
+    name: a stale-but-real age fires the threshold and not the companion
+    input_series:
+      # 40 hours, past the 36 h bound.
+      - series: 'maplespire_backup_drill_last_success_age_seconds'
+        values: '144000+0x70'
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="BackupDrillStale", alertstate="firing"}'
+        eval_time: 70m
+        exp_samples:
+          - labels: 'ALERTS{alertname="BackupDrillStale", alertstate="firing", severity="page"}'
+            value: 1
+      - expr: 'ALERTS{alertname="BackupDrillNeverPassed"}'
+        eval_time: 70m
+        exp_samples: []
+
+  # ===================================================================
+  # The Redis group.
+  #
+  # The shape being defended: a rule that is present, valid, listed in the UI,
+  # and matches nothing. Each
+  # case below therefore has a companion asserting what does NOT fire, because
+  # three of these four rules cover each other's silences.
+  # ===================================================================
+  - interval: 1m
+    name: redis down fires RedisDown at two minutes and not before
+    input_series:
+      - series: 'redis_up{job="redis", instance="redis-exporter:9121"}'
+        values: '0+0x20'
+      # The exporter is still answering — measured: it serves redis_up 0 rather
+      # than disappearing — so the exporter rule must stay quiet.
+      - series: 'up{job="redis", instance="redis-exporter:9121"}'
+        values: '1+0x20'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: RedisDown
+        exp_alerts: []
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="RedisDown", alertstate="firing"}'
+        eval_time: 3m
+        exp_samples:
+          - labels: 'ALERTS{alertname="RedisDown", alertstate="firing", instance="redis-exporter:9121", job="redis", severity="page"}'
+            value: 1
+      # The companion stays silent: this is an outage, not a lost signal.
+      - expr: 'ALERTS{alertname="RedisExporterDown"}'
+        eval_time: 20m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="RedisNotScraped"}'
+        eval_time: 20m
+        exp_samples: []
+
+  - interval: 1m
+    name: a healthy redis fires nothing in the group
+    input_series:
+      - series: 'redis_up{job="redis", instance="redis-exporter:9121"}'
+        values: '1+0x40'
+      - series: 'up{job="redis", instance="redis-exporter:9121"}'
+        values: '1+0x40'
+      # The committed configuration: persistence off.
+      - series: 'redis_aof_enabled{job="redis", instance="redis-exporter:9121"}'
+        values: '0+0x40'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: RedisDown
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: RedisExporterDown
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: RedisNotScraped
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: RedisPersistenceEnabled
+        exp_alerts: []
+
+  - interval: 1m
+    name: the exporter dying is a lost signal, and RedisDown cannot say so
+    input_series:
+      # `redis_up` is published BY the exporter, so it stops existing. This is
+      # the case that makes RedisExporterDown necessary rather than redundant.
+      - series: 'up{job="redis", instance="redis-exporter:9121"}'
+        values: '0+0x40'
+    promql_expr_test:
+      # The point of the pairing: nothing in RedisDown can fire here.
+      - expr: 'ALERTS{alertname="RedisDown"}'
+        eval_time: 20m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="RedisExporterDown", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="RedisExporterDown", alertstate="firing", instance="redis-exporter:9121", job="redis", severity="ticket"}'
+            value: 1
+      # A target that exists, even at 0, is a target: not-scraped must stay quiet.
+      - expr: 'ALERTS{alertname="RedisNotScraped"}'
+        eval_time: 20m
+        exp_samples: []
+
+  - interval: 1m
+    name: deleting the scrape job silences both rules, and RedisNotScraped catches it
+    # No input_series at all — this is prometheus.yml with the redis job removed,
+    # or renamed away from `redis`. Both rules above select on a series that no
+    # longer exists, so both are silent for a reason that looks exactly like
+    # health.
+    input_series:
+      - series: 'up{job="maplespire-api", instance="api:3001"}'
+        values: '1+0x40'
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="RedisDown"}'
+        eval_time: 20m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="RedisExporterDown"}'
+        eval_time: 20m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="RedisNotScraped", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="RedisNotScraped", alertstate="firing", job="redis", severity="ticket"}'
+            value: 1
+
+  - interval: 1m
+    name: re-enabling the append-only file is caught
+    input_series:
+      - series: 'redis_up{job="redis", instance="redis-exporter:9121"}'
+        values: '1+0x40'
+      - series: 'up{job="redis", instance="redis-exporter:9121"}'
+        values: '1+0x40'
+      # Measured against oliver006/redis_exporter v1.67.0: this reads 1 under
+      # `--appendonly yes` and 0 under the committed flags.
+      - series: 'redis_aof_enabled{job="redis", instance="redis-exporter:9121"}'
+        values: '1+0x40'
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="RedisPersistenceEnabled", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="RedisPersistenceEnabled", alertstate="firing", instance="redis-exporter:9121", job="redis", severity="ticket"}'
+            value: 1
+      # It is a configuration finding, not an outage: nothing else may fire.
+      - expr: 'ALERTS{alertname="RedisDown"}'
+        eval_time: 20m
+        exp_samples: []
+
+  - interval: 1m
+    name: persistence is not reported while redis is down
+    # Measured: with redis stopped the exporter drops `redis_aof_enabled`
+    # entirely (674 metric lines become 144) while keeping `redis_up 0`. So the
+    # persistence rule cannot add noise to an outage — asserted here rather than
+    # assumed, because the opposite would page twice for one cause.
+    input_series:
+      - series: 'redis_up{job="redis", instance="redis-exporter:9121"}'
+        values: '0+0x40'
+      - series: 'up{job="redis", instance="redis-exporter:9121"}'
+        values: '1+0x40'
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="RedisPersistenceEnabled"}'
+        eval_time: 20m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="RedisDown", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="RedisDown", alertstate="firing", instance="redis-exporter:9121", job="redis", severity="page"}'
+            value: 1
+
+  # ===================================================================
+  # SyncCellFenceUnrepairable — by CAUSE, for: 15m
+  # ===================================================================
+  - interval: 1m
+    name: a routing reset that nobody followed with a restart pages after its window
+    input_series:
+      - series: 'maplespire_sync_cell_fence_divergences_by_cause{cause="released", instance="api:3001", job="maplespire-api"}'
+        values: '2+0x30'
+      - series: 'maplespire_sync_cell_ownership_enabled{instance="api:3001", job="maplespire-api"}'
+        values: '1+0x30'
+    alert_rule_test:
+      - eval_time: 14m
+        alertname: SyncCellFenceUnrepairable
+        exp_alerts: []
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="SyncCellFenceUnrepairable", alertstate="firing"}'
+        eval_time: 16m
+        exp_samples:
+          - labels: 'ALERTS{alertname="SyncCellFenceUnrepairable", alertstate="firing", cause="released", instance="api:3001", job="maplespire-api", severity="page"}'
+            value: 1
+
+  # THE CONTROL ARM, and it is the one this rule exists for. A cell recovering
+  # from a restore reports a NON-ZERO total: the reassertion pass repairs `absent` and `belowLive`
+  # inside the pass that counts them, so those two ARE what a healthy recovery
+  # looks like. A rule written on `maplespire_sync_cell_fence_divergences_seen`
+  # would page here — which is precisely the alert that teaches an on-call to
+  # stop reading the channel.
+  - interval: 1m
+    name: a cell repairing itself after a restore never pages, however large the total
+    input_series:
+      - series: 'maplespire_sync_cell_fence_divergences_seen{instance="api:3001", job="maplespire-api"}'
+        values: '40+0x60'
+      - series: 'maplespire_sync_cell_fence_divergences_by_cause{cause="belowLive", instance="api:3001", job="maplespire-api"}'
+        values: '30+0x60'
+      - series: 'maplespire_sync_cell_fence_divergences_by_cause{cause="absent", instance="api:3001", job="maplespire-api"}'
+        values: '10+0x60'
+      - series: 'maplespire_sync_cell_fence_divergences_by_cause{cause="released", instance="api:3001", job="maplespire-api"}'
+        values: '0+0x60'
+      - series: 'maplespire_sync_cell_fence_divergences_by_cause{cause="aboveLive", instance="api:3001", job="maplespire-api"}'
+        values: '0+0x60'
+      # PRESENT AT ZERO, not omitted, and that is the discrimination. A real cell
+      # publishes all five causes on every scrape, zeros included. Omitting this
+      # one would let a `> 0` -> `>= 0` mutant (paging on every healthy cell)
+      # select nothing here and pass.
+      - series: 'maplespire_sync_cell_fence_divergences_by_cause{cause="foreignCellAtSameToken", instance="api:3001", job="maplespire-api"}'
+        values: '0+0x60'
+      - series: 'maplespire_sync_cell_fence_reading_current{instance="api:3001", job="maplespire-api"}'
+        values: '1+0x60'
+      - series: 'maplespire_sync_cell_ownership_enabled{instance="api:3001", job="maplespire-api"}'
+        values: '1+0x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: SyncCellFenceUnrepairable
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: SyncCellForeignFenceOwner
+        exp_alerts: []
+
+  # A process with the feature OFF is not a wedged cell. Without the `enabled`
+  # join, this rule would depend entirely on the exposition rendering an unknown
+  # reading as NaN — a property of a TypeScript function rather than of the rule.
+  - interval: 1m
+    name: a cell with sync-cell ownership disabled never pages
+    input_series:
+      - series: 'maplespire_sync_cell_fence_divergences_by_cause{cause="released", instance="api:3001", job="maplespire-api"}'
+        values: '5+0x60'
+      - series: 'maplespire_sync_cell_ownership_enabled{instance="api:3001", job="maplespire-api"}'
+        values: '0+0x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: SyncCellFenceUnrepairable
+        exp_alerts: []
+
+  # ===================================================================
+  # SyncCellForeignFenceOwner — for: 10m
+  # ===================================================================
+  - interval: 1m
+    name: two cells at the same token page, even though every write is being admitted
+    input_series:
+      - series: 'maplespire_sync_cell_fence_divergences_by_cause{cause="foreignCellAtSameToken", instance="api:3001", job="maplespire-api"}'
+        values: '1+0x30'
+      # ZERO, deliberately: the gate admits these writes, so nothing is refused
+      # and the divergence total reads as a healthy cell. A rule on the total
+      # would be silent through the whole incident.
+      - series: 'maplespire_sync_cell_fence_divergences_seen{instance="api:3001", job="maplespire-api"}'
+        values: '0+0x30'
+      - series: 'maplespire_sync_cell_ownership_enabled{instance="api:3001", job="maplespire-api"}'
+        values: '1+0x30'
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: SyncCellForeignFenceOwner
+        exp_alerts: []
+      # ...and the OTHER rule stays silent throughout, which is what keeps the
+      # two separable: folding this cause into the first rule's regex would make
+      # this expectation fail.
+      - eval_time: 20m
+        alertname: SyncCellFenceUnrepairable
+        exp_alerts: []
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="SyncCellForeignFenceOwner", alertstate="firing"}'
+        eval_time: 11m
+        exp_samples:
+          - labels: 'ALERTS{alertname="SyncCellForeignFenceOwner", alertstate="firing", cause="foreignCellAtSameToken", instance="api:3001", job="maplespire-api", severity="page"}'
+            value: 1
+
+  # ===================================================================
+  # Arms that kill mutants the cases above would let survive.
+  # ===================================================================
+
+  # `aboveLive` needs its own fixture: without it, narrowing the selector to
+  # `cause=~"released"` would pass every case in this file.
+  - interval: 1m
+    name: a foreign cell holding a NEWER token pages, exactly as a stale reset does
+    input_series:
+      - series: 'maplespire_sync_cell_fence_divergences_by_cause{cause="aboveLive", instance="api:3001", job="maplespire-api"}'
+        values: '1+0x30'
+      - series: 'maplespire_sync_cell_fence_divergences_by_cause{cause="released", instance="api:3001", job="maplespire-api"}'
+        values: '0+0x30'
+      - series: 'maplespire_sync_cell_ownership_enabled{instance="api:3001", job="maplespire-api"}'
+        values: '1+0x30'
+      - series: 'maplespire_sync_cell_fence_reading_current{instance="api:3001", job="maplespire-api"}'
+        values: '1+0x30'
+    alert_rule_test:
+      - eval_time: 14m
+        alertname: SyncCellFenceUnrepairable
+        exp_alerts: []
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="SyncCellFenceUnrepairable", alertstate="firing"}'
+        eval_time: 16m
+        exp_samples:
+          - labels: 'ALERTS{alertname="SyncCellFenceUnrepairable", alertstate="firing", cause="aboveLive", instance="api:3001", job="maplespire-api", severity="page"}'
+            value: 1
+
+  # A WITHHELD READING mid-window, which is the whole reason both rules read
+  # through `max_over_time`. The cell renders the gauge NaN whenever its lease
+  # set moved between the reassertion pass and the scrape — and a fleet that has
+  # just been restored, the scenario these rules exist for, churns leases
+  # continuously. `NaN > 0` is false, so without the lookback the pending alert
+  # is discarded and the 15-minute clock restarts from zero, indefinitely.
+  #
+  # NaN AND NOT `_`, and the difference is the whole discrimination. With
+  # MISSING samples, a mutant that deleted the lookback would pass:
+  # Prometheus's own 5-minute lookback delta bridges a short gap in samples
+  # with or without `max_over_time`. A withheld reading is not a missing
+  # sample — the series is scraped, carrying NaN. Probed against promtool in
+  # the deployed image: at a NaN instant a bare `> 0` selects nothing while
+  # `max_over_time(...[5m]) > 0` selects 1.
+  - interval: 1m
+    name: a withheld (NaN) reading mid-window does not restart the clock
+    input_series:
+      - series: 'maplespire_sync_cell_fence_divergences_by_cause{cause="released", instance="api:3001", job="maplespire-api"}'
+        values: '1x9 NaN NaN NaN NaN 1x20'
+      - series: 'maplespire_sync_cell_ownership_enabled{instance="api:3001", job="maplespire-api"}'
+        values: '1+0x40'
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="SyncCellFenceUnrepairable", alertstate="firing"}'
+        eval_time: 16m
+        exp_samples:
+          - labels: 'ALERTS{alertname="SyncCellFenceUnrepairable", alertstate="firing", cause="released", instance="api:3001", job="maplespire-api", severity="page"}'
+            value: 1
+
+  # ===================================================================
+  # SyncCellFenceDetectorBlind — for: 30m
+  # ===================================================================
+  - interval: 1m
+    name: a detector that cannot see is reported, because while it cannot see nothing else can fire
+    input_series:
+      - series: 'maplespire_sync_cell_fence_reading_current{instance="api:3001", job="maplespire-api"}'
+        values: '0+0x60'
+      - series: 'maplespire_sync_cell_ownership_enabled{instance="api:3001", job="maplespire-api"}'
+        values: '1+0x60'
+      # The fence gauges are ABSENT throughout, which is what a withheld reading
+      # looks like on the wire. Neither page-severity rule can fire here — that
+      # is the point of this one.
+    alert_rule_test:
+      - eval_time: 29m
+        alertname: SyncCellFenceDetectorBlind
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: SyncCellFenceUnrepairable
+        exp_alerts: []
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="SyncCellFenceDetectorBlind", alertstate="firing"}'
+        eval_time: 31m
+        exp_samples:
+          - labels: 'ALERTS{alertname="SyncCellFenceDetectorBlind", alertstate="firing", instance="api:3001", job="maplespire-api", severity="ticket"}'
+            value: 1
+
+  # THE STANDBY ARM. Every other fixture in this file uses
+  # `instance="api:3001"` — a single cell that owns its partition.
+  #
+  # `performReconcileWithinDeadline` returns early when the cell holds no
+  # partition, BEFORE the only code that writes `fenceDivergenceObservedLeases`.
+  # That field starts at the sentinel -1, and `fenceReadingIsCurrent` compares
+  # it to `leases.size`, so unless that early path publishes a real reading of
+  # zero over zero leases, a standby reports `fence_reading_current = 0` for
+  # ever and this ticket opens on a healthy fleet. This arm pins it: a standby,
+  # scraped for a full hour, must never be reported blind.
+  - interval: 1m
+    name: a STANDBY cell holding no partition is not reported blind
+    input_series:
+      - series: 'maplespire_sync_cell_fence_reading_current{instance="api-b:3001", job="maplespire-api"}'
+        values: '1+0x60'
+      - series: 'maplespire_sync_cell_ownership_enabled{instance="api-b:3001", job="maplespire-api"}'
+        values: '1+0x60'
+    alert_rule_test:
+      - eval_time: 31m
+        alertname: SyncCellFenceDetectorBlind
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: SyncCellFenceDetectorBlind
+        exp_alerts: []
+
+  - interval: 1m
+    name: a cell whose reading IS current is never reported blind
+    input_series:
+      - series: 'maplespire_sync_cell_fence_reading_current{instance="api:3001", job="maplespire-api"}'
+        values: '1+0x60'
+      - series: 'maplespire_sync_cell_ownership_enabled{instance="api:3001", job="maplespire-api"}'
+        values: '1+0x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: SyncCellFenceDetectorBlind
+        exp_alerts: []
+
+  # ...and a DISABLED cell is not a blind one. Without the join, every process
+  # with the feature off reports a broken detector for ever.
+  - interval: 1m
+    name: a disabled cell is not a blind detector
+    input_series:
+      - series: 'maplespire_sync_cell_fence_reading_current{instance="api:3001", job="maplespire-api"}'
+        values: '0+0x60'
+      - series: 'maplespire_sync_cell_ownership_enabled{instance="api:3001", job="maplespire-api"}'
+        values: '0+0x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: SyncCellFenceDetectorBlind
+        exp_alerts: []
+
+  # The disabled arm for the FOREIGN rule. Without it, dropping the `enabled`
+  # join from `SyncCellForeignFenceOwner` alone would pass every other case.
+  - interval: 1m
+    name: a disabled cell does not page on a foreign owner either
+    input_series:
+      - series: 'maplespire_sync_cell_fence_divergences_by_cause{cause="foreignCellAtSameToken", instance="api:3001", job="maplespire-api"}'
+        values: '3+0x60'
+      - series: 'maplespire_sync_cell_ownership_enabled{instance="api:3001", job="maplespire-api"}'
+        values: '0+0x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: SyncCellForeignFenceOwner
+        exp_alerts: []
+
+  # ===================================================================
+  # SyncCellCrossGenerationRefusal — for: 5m
+  # ===================================================================
+  - interval: 1m
+    name: a cell on a superseded generation still holding workspaces pages, and stops paging once it is drained
+    input_series:
+      # FLAT, then RISING, then FLAT again — the three states the rule has to
+      # tell apart, in one series. A counter that only ever rises would not show
+      # that the alert RESOLVES, and "it fired" without "it stopped" is how a
+      # `> 0` on a raw counter looks right and pages until the process restarts.
+      # Rises for 10 minutes from t=20m, then holds.
+      - series: 'maplespire_sync_cell_cross_generation_refusals_total{instance="api:3001", job="maplespire-api"}'
+        values: '0+0x20 1+1x10 11+0x40'
+      - series: 'maplespire_sync_cell_ownership_enabled{instance="api:3001", job="maplespire-api"}'
+        values: '1+0x60'
+    alert_rule_test:
+      # SILENT while the counter has never moved. A rule reading the raw counter
+      # instead of `increase()` would also be silent here — the discriminating
+      # arm is the last one, not this one.
+      - eval_time: 15m
+        alertname: SyncCellCrossGenerationRefusal
+        exp_alerts: []
+      # SILENT still: the counter started rising at t=20m and `for: 5m` has not
+      # elapsed. This is what stops a single evaluation from paging.
+      - eval_time: 23m
+        alertname: SyncCellCrossGenerationRefusal
+        exp_alerts: []
+      # DRAINED. The counter stopped moving at t=30m, so by t=45m the 10-minute
+      # `increase()` window contains no rise. THIS is the arm that fails against
+      # a rule written as `maplespire_sync_cell_cross_generation_refusals_total
+      # > 0`, which would still be firing here and for ever after.
+      - eval_time: 45m
+        alertname: SyncCellCrossGenerationRefusal
+        exp_alerts: []
+    promql_expr_test:
+      # FIRING, with the label set spelled out: `severity: page` is part of what
+      # is being asserted, because a rule that fires at `ticket` does not wake
+      # anybody and this one has no threshold to tune.
+      - expr: 'ALERTS{alertname="SyncCellCrossGenerationRefusal", alertstate="firing"}'
+        eval_time: 28m
+        exp_samples:
+          - labels: 'ALERTS{alertname="SyncCellCrossGenerationRefusal", alertstate="firing", instance="api:3001", job="maplespire-api", severity="page"}'
+            value: 1
+
+  # The disabled arm. Every rule in this group joins on
+  # `maplespire_sync_cell_ownership_enabled == 1`, and every one of them has to
+  # prove it separately: one rule's disabled arm does not cover another's join.
+  - interval: 1m
+    name: a cell with ownership disabled does not page on a cross-generation refusal
+    input_series:
+      - series: 'maplespire_sync_cell_cross_generation_refusals_total{instance="api:3001", job="maplespire-api"}'
+        values: '0+1x60'
+      - series: 'maplespire_sync_cell_ownership_enabled{instance="api:3001", job="maplespire-api"}'
+        values: '0+0x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: SyncCellCrossGenerationRefusal
+        exp_alerts: []
+
+  # ===================================================================
+  # SyncCellSupersededGeneration — for: 15m
+  # ===================================================================
+  - interval: 1m
+    name: a fleet running on a contract that has written it out is reported, even though nobody is refused
+    input_series:
+      # SUPERSEDED FROM t=0, AND RESTORED AT t=40m — a gauge, so it must be able
+      # to go back down. A rule reading a counter, or one without a resolving
+      # arm, would hold this open for the life of the process.
+      - series: 'maplespire_sync_cell_superseded_by_generation{instance="api:3001", job="maplespire-api"}'
+        values: '1+0x39 0+0x25'
+      # NEVER HANDED OVER — this is the incident, not a roll in progress.
+      - series: 'maplespire_sync_cell_stood_down{instance="api:3001", job="maplespire-api"}'
+        values: '0+0x60'
+      - series: 'maplespire_sync_cell_ownership_enabled{instance="api:3001", job="maplespire-api"}'
+        values: '1+0x60'
+      # FLAT AT ZERO THROUGHOUT, and that is the whole point of this fixture:
+      # no cell on the new generation exists, so nobody is refused. The
+      # page-severity rule beside this one cannot fire on this series set, which
+      # is exactly why this rule has to.
+      - series: 'maplespire_sync_cell_cross_generation_refusals_total{instance="api:3001", job="maplespire-api"}'
+        values: '0+0x60'
+    alert_rule_test:
+      # SILENT during a correctly-drained roll: a cell passes through this state
+      # between the contract moving and its own hand-over.
+      - eval_time: 10m
+        alertname: SyncCellSupersededGeneration
+        exp_alerts: []
+      # AND THE PAGE-SEVERITY RULE NEVER FIRES ON THIS SET. If it could, this
+      # rule would be redundant and the fixture would be proving nothing.
+      - eval_time: 60m
+        alertname: SyncCellCrossGenerationRefusal
+        exp_alerts: []
+      # RESOLVED once the contract names this cell again.
+      - eval_time: 60m
+        alertname: SyncCellSupersededGeneration
+        exp_alerts: []
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="SyncCellSupersededGeneration", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="SyncCellSupersededGeneration", alertstate="firing", instance="api:3001", job="maplespire-api", severity="ticket"}'
+            value: 1
+
+  # THE ARM THAT SEPARATES THE INCIDENT FROM THE SUCCESS. After a
+  # correct hand-over the superseded gauge stays 1 for the life of the process,
+  # so a rule reading it alone opens a ticket on every properly-performed roll
+  # — telling the operator the cell is still serving when it is idle by design.
+  - interval: 1m
+    name: a cell that has HANDED OVER is not reported, even though it is still superseded
+    input_series:
+      - series: 'maplespire_sync_cell_superseded_by_generation{instance="api:3001", job="maplespire-api"}'
+        values: '1+0x60'
+      # Handed over at t=0 and stays that way, which is what a completed roll
+      # looks like from this cell for the rest of its life.
+      - series: 'maplespire_sync_cell_stood_down{instance="api:3001", job="maplespire-api"}'
+        values: '1+0x60'
+      - series: 'maplespire_sync_cell_ownership_enabled{instance="api:3001", job="maplespire-api"}'
+        values: '1+0x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: SyncCellSupersededGeneration
+        exp_alerts: []
+
+  - interval: 1m
+    name: a cell with ownership disabled is not reported as superseded
+    input_series:
+      - series: 'maplespire_sync_cell_superseded_by_generation{instance="api:3001", job="maplespire-api"}'
+        values: '1+0x60'
+      - series: 'maplespire_sync_cell_stood_down{instance="api:3001", job="maplespire-api"}'
+        values: '0+0x60'
+      - series: 'maplespire_sync_cell_ownership_enabled{instance="api:3001", job="maplespire-api"}'
+        values: '0+0x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: SyncCellSupersededGeneration
+        exp_alerts: []

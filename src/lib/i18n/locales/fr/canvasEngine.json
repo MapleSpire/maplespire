@@ -1,0 +1,17 @@
+{
+  "canvasEngine": {
+    "copySize": "Copier la taille",
+    "copyStyle": "Copier le style",
+    "copyToShapes": "{{label}} → {{n}} formes",
+    "back": "Retour",
+    "view": "Voir",
+    "shapeTypeBadge": {
+      "actor": "Personne",
+      "system": "Système",
+      "app": "App",
+      "store": "Stockage",
+      "component": "Composant"
+    },
+    "copyChainHint": "Maintenez Maj pour enchaîner"
+  }
+}

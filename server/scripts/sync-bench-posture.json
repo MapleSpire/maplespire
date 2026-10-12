@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "scope": "Ownership/Redis configuration of the shipped anchor on the local transport harness. Not a complete production deployment. Expected values below are independent assertions; the runner reads the real configuration functions instead.",
+  "deltas": [
+    {"variable":"SYNC_CELL_PARTITION_WORKER","benchDefault":"on","shippedDefault":"off","reason":"The bench isolates renewal from Automerge main-thread stalls; T-POST measures the shipped main-thread mode."},
+    {"variable":"SYNC_CELL_PARTITION_LEASE_TTL_MS","benchDefault":750,"shippedDefault":1500,"reason":"Historical failover bench detector window; shipped mode must use the actual shipped default."},
+    {"variable":"SYNC_CELL_PARTITION_RENEW_INTERVAL_MS","benchDefault":200,"shippedDefault":400,"reason":"Renewal cadence is paired with the partition TTL, not copied independently during qualification."},
+    {"variable":"REDIS_COMMAND_TIMEOUT_MS","benchDefault":750,"shippedDefault":1500,"reason":"General Redis/readiness budget. The separate lease command budget is derived275/550, not this value."},
+    {"variable":"SYNC_CELL_RECONCILE_INTERVAL_MS","benchDefault":1000,"shippedDefault":5000,"reason":"The bench reconciles more frequently; shipped qualification restores the actual cadence."},
+    {"variable":"SYNC_CELL_TELEMETRY_INTERVAL_MS","benchDefault":5000,"shippedDefault":60000,"reason":"Bench diagnostics log more frequently; shipped qualification restores this scheduling cost too."},
+    {"variable":"REDIS_RENDER_CACHE_COMMAND_TIMEOUT_MS","benchDefault":750,"shippedDefault":1500,"reason":"Parallel readiness also waits on informational cache Redis; shipped budget and healthcheck margin must agree."},
+    {"variable":"SYNC_CELL_ADMISSION_CONCURRENCY","benchDefault":8,"shippedDefault":4,"reason":"Admission concurrency affects the cold takeover and load; use the shipped limit in shipped posture."},
+    {"variable":"SYNC_CELL_OWNERSHIP_CONCURRENCY","benchDefault":8,"shippedDefault":16,"reason":"Workspace renewal concurrency affects scheduling and must follow shipped configuration in shipped posture."}
+  ],
+  "retainedTimingDeltas": [
+    {"variable":"AM_SAVE_DEBOUNCE_MS","benchDefault":10,"shippedDefault":100,"reason":"Transport harness retains its established short save-coalescing window; this is outside ownership/Redis posture."},
+    {"variable":"AM_SYNC_FANOUT_COALESCE_MS","benchDefault":10,"shippedDefault":0,"reason":"Harness batches the beginning of a fanout burst; production fanout defaults remain a declared difference."},
+    {"variable":"WS_AUTH_TOKEN_BURST_CACHE_MS","benchDefault":2000,"shippedDefault":500,"reason":"Established harness admission-cache budget for a reconnect burst; no claim of complete production parity."},
+    {"variable":"WS_AUTH_EPOCH_BURST_CACHE_MS","benchDefault":2000,"shippedDefault":500,"reason":"Established harness epoch-cache budget for a reconnect burst; no claim of complete production parity."},
+    {"variable":"AM_WORKSPACE_ROUTE_BURST_CACHE_MS","benchDefault":1000,"shippedDefault":500,"reason":"Established harness route-cache budget; target ownership/fencing checks remain authoritative."}
+  ],
+  "equalTimingVariables": ["AM_CONCRETE_WORKSPACE_ROUTE_CACHE_MS", "AM_STORAGE_FENCE_IDLE_TIMEOUT_MS", "AM_SYNC_DEBOUNCE_MS", "SYNC_CELL_LEASE_TTL_MS", "SYNC_CELL_PARTITION_PROBE_INTERVAL_MS", "SYNC_CELL_RENEW_INTERVAL_MS", "SYNC_WS_OWNER_RECHECK_MS"],
+  "instrumentDelta": "Cell/router readiness healthchecks use at least twice the larger Redis command budget: default bench2s, current shipped3s. This bounds the probe process, not the lease. The load harness keeps two hot partitions and three cells; production topology is not transplanted.",
+  "decisionD50": "The pre-engaged response names Redis command275 explicitly in T-POST exit5. That is not the current benchmark general command750. If triggered, record that distinction and apply the decision, not a silent reinterpretation of this inventory."
+}

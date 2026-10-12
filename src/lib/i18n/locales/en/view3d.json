@@ -1,0 +1,46 @@
+{
+  "view3d": {
+    "showcase": {
+      "toggle": "Auto-orbit (pauses while you interact)"
+    },
+    "webglFallback": {
+      "title": "3D view unavailable",
+      "body": "Your browser couldn't start WebGL, which powers the perspective view. The flat canvas keeps working normally.",
+      "backTo2d": "Back to flat canvas"
+    },
+    "decor": {
+      "button": "Decorate",
+      "title": "Scene decoration",
+      "pack": {
+        "none": "None",
+        "maquette-people": "Maquette people",
+        "datacenter": "Data center",
+        "greenery": "Greenery",
+        "canadiana": "Canadiana"
+      },
+      "density": {
+        "sparse": "Sparse",
+        "normal": "Normal",
+        "rich": "Rich"
+      },
+      "shuffle": "Shuffle layout",
+      "densityLabel": "Density",
+      "boardLabel": "Tray",
+      "board": {
+        "default": "Auto",
+        "paper-grid": "Grid paper",
+        "wood": "Wood",
+        "museum": "Museum white",
+        "clay": "Clay"
+      },
+      "bgLabel": "Background",
+      "bg": {
+        "default": "Auto",
+        "workbench": "Workbench",
+        "city": "City",
+        "studio": "Studio",
+        "void": "Void"
+      }
+    }
+  }
+}

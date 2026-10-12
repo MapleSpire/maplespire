@@ -1,0 +1,126 @@
+{
+  "diagramChrome": {
+    "addShape": {
+      "searchPlaceholder": "Search objects",
+      "searchHint": "Type at least 2 characters to search. Your open branches and position will be restored when you clear it.",
+      "expandHere": "Draw its shapes inside this one",
+      "noMatches": "No objects match your search",
+      "loading": "Loading model objects…",
+      "loadError": "Model objects could not be loaded.",
+      "retry": "Retry",
+      "partialOffline": "Offline results are limited to this device's current working set.",
+      "expand": "Expand {{name}}",
+      "collapse": "Collapse {{name}}",
+      "inDiagram": "in diagram",
+      "copySuffix": "{{name}} (copy)",
+      "filter": {
+        "open": "Filter model objects",
+        "type": "Type",
+        "scope": "Scope",
+        "technology": "Technology",
+        "technologyLoading": "Loading technologies…",
+        "technologyEmpty": "No selectable technologies",
+        "technologyUnavailable": "Technology catalog unavailable",
+        "technologyNoOrg": "Select an organization to filter by technology",
+        "clear": "Clear filters"
+      },
+      "type": {
+        "group": "Group",
+        "system": "System",
+        "actor": "Actor",
+        "app": "App",
+        "store": "Store",
+        "component": "Component"
+      },
+      "scope": {
+        "internal": "Internal",
+        "external": "External",
+        "any": "Any"
+      },
+      "tooltip": {
+        "alreadyInDiagram": "{{name}} (already in diagram)",
+        "dragToAdd": "Drag to add {{name}}"
+      },
+      "menu": {
+        "manage": "Manage model object",
+        "viewDependencies": "View dependencies",
+        "duplicate": "Duplicate object",
+        "getInsights": "Get insights"
+      }
+    },
+    "createPalette": {
+      "title": "Create",
+      "shape": {
+        "system": "System",
+        "actor": "Actor",
+        "group": "Group",
+        "app": "App",
+        "store": "Store"
+      },
+      "defaultName": {
+        "group": "New group",
+        "other": "New {{type}}"
+      }
+    },
+    "transition": {
+      "diagramOfType": "{{type}} diagram"
+    },
+    "toolPill": {
+      "tool": {
+        "select": "Select (V)",
+        "connection": "Connection (C)",
+        "pan": "Pan (Space)"
+      },
+      "undo": "Undo (history / time-travel)",
+      "redo": "Redo (history / time-travel)",
+      "search": "Search (Ctrl+K)",
+      "draftLabel": "Draft: {{label}}",
+      "exitDraft": "Exit draft (back to the live model)",
+      "reviewChanges": "Review draft changes",
+      "changes": "Changes",
+      "drafts": "Drafts",
+      "themeShop": "Theme shop",
+      "settings": "Settings",
+      "help": "Help",
+      "openShapesPanel": "Open the shapes panel",
+      "add": "Add",
+      "addMenu": {
+        "open": "Create a draft or diagram",
+        "title": "Create",
+        "description": "Start a draft or add a diagram to this landscape.",
+        "draftTitle": "New draft",
+        "draftSubtitle": "Explore changes without touching the live model",
+        "draftFormHint": "Branch safely from the live model.",
+        "draftName": "Draft name",
+        "draftNamePlaceholder": "e.g. Payments redesign",
+        "createDraft": "Create draft",
+        "creatingDraft": "Creating…",
+        "diagramSection": "New diagram",
+        "blankTitle": "Blank diagram",
+        "blankSubtitle": "Start from an empty canvas",
+        "blankDefaultName": "New context diagram",
+        "importTitle": "Import diagram…",
+        "importSubtitle": "From Structurizr DSL, JSON and more",
+        "back": "Back to create options",
+        "cancel": "Cancel"
+      },
+      "viewMode": "Canvas view",
+      "view2d": "Flat canvas",
+      "view3d": "Perspective view (click again to reset the camera)"
+    },
+    "expandMenu": {
+      "title": "Related diagrams",
+      "noneFound": "No related diagrams found.",
+      "noMatches": "No diagrams match your search",
+      "searchPlaceholder": "Search diagrams…",
+      "createDiagram": "Create diagram",
+      "create": "Create",
+      "defaultDiagramName": "{{name}} Diagram",
+      "section": {
+        "detail": "Detail diagrams",
+        "reference": "Reference diagrams",
+        "parent": "Parent diagram"
+      }
+    }
+  }
+}

@@ -1,0 +1,1192 @@
+{
+  "uid": "maplespire-sante",
+  "title": "MapleSpire — santé",
+  "description": "Santé MapleSpire, transport SMTP et SNS. Les compteurs locaux ne prouvent ni l’état du veilleur CloudWatch ni la réception humaine.",
+  "tags": ["maplespire"],
+  "timezone": "browser",
+  "editable": false,
+  "schemaVersion": 39,
+  "version": 3,
+  "refresh": "30s",
+  "time": { "from": "now-24h", "to": "now" },
+  "graphTooltip": 1,
+  "panels": [
+    {
+      "id": 1,
+      "type": "text",
+      "title": "",
+      "transparent": true,
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 0 },
+      "options": {
+        "mode": "markdown",
+        "content": "### Santé du service et livraison des alertes\n\nLes alertes **page** passent par **SES SMTP** ; les **ticket** restent visibles ici. **Watchdog** alimente un sujet **SNS** sans abonnés : CloudWatch surveille son silence. Un échec SMTP observé emprunte le sujet SNS des notifications.\n\nLes panneaux de transport sont des **observations locales**. Vérifier séparément [le veilleur CloudWatch](https://ca-central-1.console.aws.amazon.com/cloudwatch/home?region=ca-central-1#alarmsV2:alarm/MapleSpireWatchdogMissing) et la réception sur appareil. Un compteur nul, un scrape réussi ou un Watchdog actif ne prouvent pas la livraison. Guides : [SMTP](https://github.com/OlivierAlbertini/dag/blob/codex/refresh-agent-guidance/maplespire-sponsor-kit/docs/operations/alerting-smtp.md) · [SNS et réglages à adapter](https://github.com/OlivierAlbertini/dag/blob/codex/refresh-agent-guidance/maplespire-sponsor-kit/docs/operations/alerting-sns.md)."
+      }
+    },
+
+    { "id": 2, "type": "row", "title": "Ce tableau de bord dit-il la vérité ?", "collapsed": false, "gridPos": { "h": 1, "w": 24, "x": 0, "y": 6 }, "panels": [] },
+
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Watchdog — le moteur de règles évalue",
+      "description": "La règle Watchdog utilise vector(1). Une valeur 1 indique qu’un échantillon firing est disponible dans Prometheus ; elle ne prouve ni l’envoi SMTP ni la réception humaine. Une absence peut venir du démarrage, d’une règle retirée ou d’une évaluation interrompue. Consulter les règles et leurs erreurs ; la dernière valeur peut rester visible pendant le délai de fraîcheur de Prometheus. Seul le témoin CloudWatch extérieur à cette pile peut observer la disparition des publications SNS.",
+      "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 7 },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" }, "expr": "sum(ALERTS{alertname=\"Watchdog\", alertstate=\"firing\"}) or vector(0)", "instant": true, "legendFormat": "Watchdog" }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "value"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "AUCUNE ÉVALUATION", "index": 0 }, "1": { "text": "Règles évaluées", "index": 1 } } },
+            { "type": "special", "options": { "match": "null", "result": { "text": "PROMETHEUS INJOIGNABLE", "index": 2 } } }
+          ],
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "green", "value": 1 } ] }
+        },
+        "overrides": []
+      }
+    },
+
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "L'API répond au scrape",
+      "description": "`up{job=\"maplespire-api\"}`. Tire aussi sur un METRICS_TOKEN révoqué, pas seulement sur un processus mort — vérifier `docker compose ps api` avant de conclure à une panne.",
+      "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" },
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 7 },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" }, "expr": "sum(up{job=\"maplespire-api\"}) or vector(0)", "instant": true, "legendFormat": "api" }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "value"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "mappings": [ { "type": "value", "options": { "0": { "text": "MUETTE", "index": 0 }, "1": { "text": "Scrapée", "index": 1 } } } ],
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "green", "value": 1 } ] }
+        },
+        "overrides": []
+      }
+    },
+
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Cibles Prometheus en panne",
+      "description": "Toutes cibles confondues, y compris l'auto-scrape de Prometheus. Une cible RETIRÉE de la configuration sort de ce compte sans jamais apparaître ici — c'est `ApiDown` qui couvre ce cas, pas ce panneau.",
+      "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 7 },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" }, "expr": "count(up == 0) or vector(0)", "instant": true, "legendFormat": "cibles muettes" }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "value"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] }
+        },
+        "overrides": []
+      }
+    },
+
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Âge de l'échantillon de croissance",
+      "description": "L'échantillonneur tourne sur minuterie. S'il s'arrête, `maplespire_automerge_documents_empty` et `maplespire_automerge_document_bytes` continuent de rendre leur DERNIÈRE valeur, indéfiniment. Ce panneau est la seule chose qui distingue « à jour » de « figé ».",
+      "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" },
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 7 },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" }, "expr": "maplespire_automerge_document_growth_sample_age_seconds", "instant": true, "legendFormat": "âge" }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["last"], "fields": "", "values": false },
+        "textMode": "value"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "mappings": [ { "type": "special", "options": { "match": "null+nan", "result": { "text": "JAMAIS ÉCHANTILLONNÉ", "color": "red", "index": 0 } } } ],
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 600 } ] }
+        },
+        "overrides": []
+      }
+    },
+
+    {
+      "id": 31,
+      "type": "row",
+      "title": "Transport des alertes — compteurs SMTP depuis le démarrage",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 11
+      },
+      "panels": []
+    },
+
+    {
+      "id": 32,
+      "type": "stat",
+      "title": "Cibles Alertmanager",
+      "description": "Prometheus doit découvrir exactement une cible Alertmanager sur ce Compose. Une cible découverte n’est pas une preuve de connexion ni de livraison. Sans auto-scrape Prometheus valide, le panneau reste non mesuré au lieu de réutiliser une ancienne valeur rassurante.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "maplespire-prometheus"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 0,
+        "y": 12
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maplespire-prometheus"
+          },
+          "expr": "max(prometheus_notifications_alertmanagers_discovered{job=\"prometheus\"}) and on() (min(up{job=\"prometheus\"}) == 1)",
+          "instant": true
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "last"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "decimals": 0,
+          "noValue": "NON MESURÉ",
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "NON MESURÉ",
+                  "color": "gray",
+                  "index": 9
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              },
+              {
+                "color": "orange",
+                "value": 2
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+
+    {
+      "id": 33,
+      "type": "stat",
+      "title": "Scrape Alertmanager",
+      "description": "Le job alertmanager sonde /metrics sur alertmanager:9093. Un zéro signifie cible absente ou scrape en échec ; consulter les targets Prometheus pour les distinguer. Un succès prouve seulement l’accès aux métriques, jamais l’accès à SES ni la réception du courriel.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "maplespire-prometheus"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 6,
+        "y": 12
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maplespire-prometheus"
+          },
+          "expr": "min(up{job=\"alertmanager\"}) or vector(0)",
+          "instant": true
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "last"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "decimals": 0,
+          "noValue": "NON MESURÉ",
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "ABSENT / ÉCHEC",
+                  "index": 0
+                },
+                "1": {
+                  "text": "Scrapé",
+                  "index": 1
+                }
+              }
+            },
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "NON MESURÉ",
+                  "color": "gray",
+                  "index": 9
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+
+    {
+      "id": 34,
+      "type": "stat",
+      "title": "Tentatives SMTP",
+      "description": "Compteur des tentatives de notification email d’Alertmanager, groupements et résolutions inclus ; il peut repartir de zéro au redémarrage. Zéro signifie aucune tentative enregistrée, pas livraison réussie. Sans scrape valide ou métrique, le panneau reste non mesuré. Une tentative ne prouve pas la réception humaine.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "maplespire-prometheus"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 12,
+        "y": 12
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maplespire-prometheus"
+          },
+          "expr": "sum(alertmanager_notifications_total{job=\"alertmanager\",integration=\"email\"}) and on() (min(up{job=\"alertmanager\"}) == 1)",
+          "instant": true
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "last"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "decimals": 0,
+          "noValue": "NON MESURÉ",
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "NON MESURÉ",
+                  "color": "gray",
+                  "index": 9
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+
+    {
+      "id": 35,
+      "type": "stat",
+      "title": "Échecs SMTP après retries",
+      "description": "Échecs finaux des notifications SMTP après abandon des tentatives. Ce compteur peut rester nul pendant les retries ; le panneau « Erreurs de tentative SMTP » porte le signal utilisé pour notifier par SNS. Les compteurs repartent de zéro au redémarrage. Zéro ne prouve pas la réception.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "maplespire-prometheus"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 18,
+        "y": 12
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maplespire-prometheus"
+          },
+          "expr": "sum(alertmanager_notifications_failed_total{job=\"alertmanager\",integration=\"email\"}) and on() (min(up{job=\"alertmanager\"}) == 1)",
+          "instant": true
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "last"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "decimals": 0,
+          "noValue": "NON MESURÉ",
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "NON MESURÉ",
+                  "color": "gray",
+                  "index": 9
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 36,
+      "type": "row",
+      "title": "Veilleur externe — compteurs locaux, état AWS à vérifier",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 17
+      },
+      "panels": []
+    },
+    {
+      "id": 37,
+      "type": "stat",
+      "title": "Tentatives SNS",
+      "description": "Tentatives SNS cumulées des DEUX receivers : Watchdog et échecs SMTP. Ces métriques existent même sans receiver configuré ; zéro ne prouve rien. Elles ne distinguent pas les sujets et ne prouvent ni un état CloudWatch OK ni une réception sur appareil.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "maplespire-prometheus"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 8,
+        "x": 0,
+        "y": 18
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maplespire-prometheus"
+          },
+          "expr": "sum(alertmanager_notification_requests_total{job=\"alertmanager\",integration=\"sns\"}) and on() (min(up{job=\"alertmanager\"}) == 1)",
+          "instant": true
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "last"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "decimals": 0,
+          "noValue": "NON MESURÉ",
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "NON MESURÉ",
+                  "color": "gray",
+                  "index": 9
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 38,
+      "type": "stat",
+      "title": "Erreurs de tentative SNS",
+      "description": "Erreurs retournées par les tentatives SNS, tous receivers confondus. Un compteur peut rester nul pendant une tentative suspendue. Une valeur positive peut être ancienne ; vérifier la chronologie et CloudWatch.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "maplespire-prometheus"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 8,
+        "x": 8,
+        "y": 18
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maplespire-prometheus"
+          },
+          "expr": "sum(alertmanager_notification_requests_failed_total{job=\"alertmanager\",integration=\"sns\"}) and on() (min(up{job=\"alertmanager\"}) == 1)",
+          "instant": true
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "last"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "decimals": 0,
+          "noValue": "NON MESURÉ",
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "NON MESURÉ",
+                  "color": "gray",
+                  "index": 9
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 39,
+      "type": "stat",
+      "title": "Erreurs de tentative SMTP",
+      "description": "Erreurs SMTP retournées avant la fin des retries : c’est le compteur surveillé par AlertmanagerEmailDeliveryFailed. Une connexion SMTP muette peut ne renvoyer aucune erreur alors que Watchdog continue. Un compteur stable ne prouve pas une réparation.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "maplespire-prometheus"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 8,
+        "x": 16,
+        "y": 18
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maplespire-prometheus"
+          },
+          "expr": "sum(alertmanager_notification_requests_failed_total{job=\"alertmanager\",integration=\"email\"}) and on() (min(up{job=\"alertmanager\"}) == 1)",
+          "instant": true
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "last"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "decimals": 0,
+          "noValue": "NON MESURÉ",
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "NON MESURÉ",
+                  "color": "gray",
+                  "index": 9
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+
+    { "id": 7, "type": "row", "title": "Alertes qui tirent en ce moment", "collapsed": false, "gridPos": { "h": 1, "w": 24, "x": 0, "y": 23 }, "panels": [] },
+
+    {
+      "id": 8,
+      "type": "table",
+      "title": "Alertes actives, et depuis combien de temps",
+      "description": "La durée mesure la persistance de la condition observée par la règle. Une alerte ancienne appelle une investigation, même si des courriels ont déjà été reçus. Sa durée ne prouve pas une panne de livraison : consulter séparément les compteurs SMTP et la réception sur l’appareil de l’opérateur.",
+      "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" },
+      "gridPos": { "h": 8, "w": 14, "x": 0, "y": 24 },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" }, "expr": "time() - ALERTS_FOR_STATE", "instant": true, "format": "table" }
+      ],
+      "transformations": [
+        { "id": "organize", "options": { "excludeByName": { "Time": true, "instance": true, "job": true }, "indexByName": {}, "renameByName": { "alertname": "Alerte", "severity": "Gravité", "Value": "Tire depuis" } } },
+        { "id": "sortBy", "options": { "fields": {}, "sort": [ { "field": "Tire depuis", "desc": true } ] } }
+      ],
+      "options": { "showHeader": true, "cellHeight": "sm", "footer": { "show": false, "reducer": ["sum"], "countRows": false, "fields": "" } },
+      "fieldConfig": {
+        "defaults": { "custom": { "align": "auto", "cellOptions": { "type": "auto" }, "inspect": false }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "text", "value": null } ] } },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Tire depuis" },
+            "properties": [
+              { "id": "unit", "value": "s" },
+              { "id": "custom.cellOptions", "value": { "type": "color-text" } },
+              { "id": "thresholds", "value": { "mode": "absolute", "steps": [ { "color": "yellow", "value": null }, { "color": "orange", "value": 3600 }, { "color": "red", "value": 86400 } ] } }
+            ]
+          },
+          { "matcher": { "id": "byName", "options": "Gravité" }, "properties": [ { "id": "custom.width", "value": 110 } ] }
+        ]
+      }
+    },
+
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Alertes actives par gravité",
+      "description": "Un plateau indique que des conditions d’alerte persistent. Il ne permet pas de déduire si un courriel a été reçu ou si une intervention est en cours. Watchdog est exclu car il tire toujours ; page est routé vers SES SMTP, ticket reste visible dans ce tableau de bord.",
+      "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" },
+      "gridPos": { "h": 8, "w": 10, "x": 14, "y": 24 },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" }, "expr": "count by (severity) (ALERTS{alertstate=\"firing\", severity!=\"watchdog\"})", "legendFormat": "{{severity}}" }
+      ],
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true, "calcs": [] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "min": 0,
+          "custom": { "drawStyle": "line", "lineInterpolation": "stepAfter", "lineWidth": 2, "fillOpacity": 25, "showPoints": "never", "spanNulls": false, "stacking": { "mode": "normal", "group": "A" }, "axisPlacement": "auto" },
+          "mappings": []
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "page" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } } ] },
+          { "matcher": { "id": "byName", "options": "ticket" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } } ] }
+        ]
+      }
+    },
+
+    { "id": 10, "type": "row", "title": "Sauvegarde et restauration — #56", "collapsed": false, "gridPos": { "h": 1, "w": 24, "x": 0, "y": 32 }, "panels": [] },
+
+    {
+      "id": 11,
+      "type": "stat",
+      "title": "Depuis le dernier drill RÉUSSI",
+      "description": "L'âge du dernier SUCCÈS, pas l'issue du dernier run : un drill qui a cessé d'être planifié ne produit aucun échec, et une jauge « dernier run vert » resterait ici des mois en ayant l'air saine. NaN veut dire jamais — et NaN échoue toute comparaison `>`, ce qui est précisément pourquoi la règle `BackupDrillNeverPassed` existe à côté de `BackupDrillStale`.",
+      "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" },
+      "gridPos": { "h": 5, "w": 8, "x": 0, "y": 33 },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" }, "expr": "maplespire_backup_drill_last_success_age_seconds", "instant": true, "legendFormat": "âge" }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["last"], "fields": "", "values": false },
+        "textMode": "value"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "mappings": [ { "type": "special", "options": { "match": "null+nan", "result": { "text": "AUCUN DRILL N'A JAMAIS PASSÉ", "color": "red", "index": 0 } } } ],
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 86400 }, { "color": "red", "value": 129600 } ] }
+        },
+        "overrides": []
+      }
+    },
+
+    {
+      "id": 12,
+      "type": "stat",
+      "title": "Échecs depuis le dernier succès",
+      "description": "Le rapport stocké de chaque run raté en porte la raison. Un échec cold-API veut dire que la restauration n'est pas servable ; un échec de sonde nomme les espaces à réparer ou à retirer.",
+      "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" },
+      "gridPos": { "h": 5, "w": 8, "x": 8, "y": 33 },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" }, "expr": "maplespire_backup_drill_failures_since_success", "instant": true, "legendFormat": "échecs" }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "value"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 1 }, { "color": "red", "value": 3 } ] }
+        },
+        "overrides": []
+      }
+    },
+
+    {
+      "id": 13,
+      "type": "stat",
+      "title": "RTO du dernier succès",
+      "description": "Le chiffre qu'on cite dans un plan de reprise. Il dérive vers le haut en silence à mesure que le modèle grossit — ce n'est pas un signal de correction mais de capacité.",
+      "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" },
+      "gridPos": { "h": 5, "w": 8, "x": 16, "y": 33 },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" }, "expr": "maplespire_backup_drill_last_success_rto_seconds", "instant": true, "legendFormat": "RTO" }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["last"], "fields": "", "values": false },
+        "textMode": "value"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "mappings": [ { "type": "special", "options": { "match": "null+nan", "result": { "text": "JAMAIS MESURÉ", "color": "red", "index": 0 } } } ],
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 900 } ] }
+        },
+        "overrides": []
+      }
+    },
+
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Âge du dernier drill réussi, dans le temps",
+      "description": "En marche normale c'est une dent de scie : la courbe monte pendant 24 h puis retombe à zéro quand un drill passe. Une droite qui monte sans jamais retomber est la signature d'une pile sans sauvegarde vérifiée — et une courbe ABSENTE est la même chose en pire, parce que la jauge vaut alors NaN.",
+      "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" },
+      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 38 },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" }, "expr": "maplespire_backup_drill_last_success_age_seconds", "legendFormat": "âge du dernier succès" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" }, "expr": "vector(129600)", "legendFormat": "seuil BackupDrillStale (36 h)" }
+      ],
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true, "calcs": [] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "min": 0, "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never", "spanNulls": false, "axisPlacement": "auto" }, "mappings": [] },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "seuil BackupDrillStale (36 h)" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }, { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } }, { "id": "custom.fillOpacity", "value": 0 } ] }
+        ]
+      }
+    },
+
+    {
+      "id": 29,
+      "type": "stat",
+      "title": "Deux drills se sont-ils CHEVAUCHÉS ?",
+      "description": "Le seul contrôle de cette rangée qui ne dérive pas du mécanisme qu'il juge. Tout le reste demande à la machinerie d'exclusion si elle a fonctionné ; celui-ci lit deux colonnes durables qu'aucun code du chemin de verrouillage n'écrit, et répond à la question réelle : deux `pg_dump` ont-ils tourné en même temps. Si oui, #53 ou #54 est faux.\n\nNaN veut dire que l'exclusion n'a JAMAIS été prise en défaut — d'où le compteur de runs à côté, sans lequel un déploiement où le drill n'a jamais tourné afficherait le même vert qu'un déploiement où l'exclusion marche.\n\nBout-à-bout n'est PAS un chevauchement : l'ordonnanceur enchaîne immédiatement quand un drill déborde son intervalle.",
+      "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" },
+      "gridPos": { "h": 5, "w": 12, "x": 0, "y": 45 },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" }, "expr": "maplespire_backup_drill_last_overlap_age_seconds", "instant": true, "legendFormat": "dernier chevauchement" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" }, "expr": "maplespire_backup_drill_runs_considered", "instant": true, "legendFormat": "runs examinés" }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "horizontal",
+        "reduceOptions": { "calcs": ["last"], "fields": "", "values": false },
+        "textMode": "value_and_name"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "special", "options": { "match": "null+nan", "result": { "text": "JAMAIS", "color": "green", "index": 0 } } }
+          ],
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "orange", "value": 604800 }, { "color": "green", "value": 2592000 } ] }
+        },
+        "overrides": [
+          { "matcher": { "id": "byFrameRefID", "options": "A" }, "properties": [ { "id": "unit", "value": "s" } ] },
+          { "matcher": { "id": "byFrameRefID", "options": "B" }, "properties": [ { "id": "unit", "value": "short" }, { "id": "thresholds", "value": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "green", "value": 1 } ] } } ] }
+        ]
+      }
+    },
+
+    {
+      "id": 30,
+      "type": "stat",
+      "title": "Fenêtres dont on sait qu'elles mentent",
+      "description": "Le compteur qui empêche le panneau de gauche de mentir par omission. Un run ABANDONNÉ (#54) enregistre l'instant où l'ordonnanceur a renoncé, pas celui où le drill s'est arrêté — personne ne le sait — donc sa fenêtre est plus courte que la réalité et un chevauchement commencé après est invisible. Une ligne À L'ENVERS (`fin < début`) signale une dérive d'horloge entre conteneurs.\n\nZéro chevauchement à côté d'un compteur non nul ici, ce n'est pas « propre » : c'est INCOMPLET. C'est la distinction que #56 a payée.",
+      "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" },
+      "gridPos": { "h": 5, "w": 12, "x": 12, "y": 45 },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" }, "expr": "sum by (kind) (maplespire_backup_drill_runs_with_unreliable_window)", "instant": true, "legendFormat": "{{kind}}" }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "horizontal",
+        "reduceOptions": { "calcs": ["last"], "fields": "", "values": false },
+        "textMode": "value_and_name"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 1 } ] }
+        },
+        "overrides": []
+      }
+    },
+
+    { "id": 15, "type": "row", "title": "Documents inouvrables — le déclencheur de #56", "collapsed": false, "gridPos": { "h": 1, "w": 24, "x": 0, "y": 50 }, "panels": [] },
+
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "Documents mappés SANS contenu",
+      "description": "Les deux moitiés du défaut, séparées parce qu'elles se comportent à l'opposé. `sync-state-only` : une ligne de 2 octets de comptabilité de pair satisfait tout prédicat `EXISTS(split_part(key,'/',1) = id)` du dépôt, donc ces documents-là sont SÉLECTIONNÉS puis échouent au chargement. `no-rows` : aucune ligne du tout, donc invisibles de ce même prédicat. Un prédicat qui admet le déchet et exempte l'absence réelle.",
+      "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 51 },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" }, "expr": "maplespire_automerge_documents_empty", "legendFormat": "{{kind}}" }
+      ],
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true, "calcs": ["lastNotNull"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "fieldConfig": {
+        "defaults": { "unit": "none", "min": 0, "custom": { "drawStyle": "line", "lineInterpolation": "stepAfter", "lineWidth": 2, "fillOpacity": 20, "showPoints": "never", "spanNulls": false, "stacking": { "mode": "normal", "group": "A" }, "axisPlacement": "auto" }, "mappings": [] },
+        "overrides": []
+      }
+    },
+
+    {
+      "id": 17,
+      "type": "stat",
+      "title": "Documents illisibles par le projecteur",
+      "description": "Le signal que le détecteur de divergence ne peut PAS produire : un document qui échoue au chargement est absent des DEUX côtés de toute comparaison, donc seul le lecteur peut le rapporter. Chacun est de la donnée manquante du modèle de lecture, sans erreur nulle part.",
+      "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" },
+      "gridPos": { "h": 7, "w": 6, "x": 12, "y": 51 },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" }, "expr": "maplespire_read_model_unreadable_documents", "instant": true, "legendFormat": "{{scope}}" }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "vertical",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "value_and_name"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] }
+        },
+        "overrides": []
+      }
+    },
+
+    {
+      "id": 18,
+      "type": "stat",
+      "title": "Projections refusées",
+      "description": "Projections plein-écran déclinées parce que le document source ne portait aucune carte d'entités. Non nul veut dire qu'une suppression de lignes a été REFUSÉE sur une preuve qui n'avait pas chargé — le refus est le bon comportement, c'est sa fréquence qui est le signal.",
+      "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" },
+      "gridPos": { "h": 7, "w": 6, "x": 18, "y": 51 },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" }, "expr": "maplespire_read_model_refused_projections_total", "instant": true, "legendFormat": "refusées" }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "value"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 1 } ] }
+        },
+        "overrides": []
+      }
+    },
+
+    { "id": 19, "type": "row", "title": "Modèle de lecture", "collapsed": false, "gridPos": { "h": 1, "w": 24, "x": 0, "y": 58 }, "panels": [] },
+
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "Espaces de travail par état de projection",
+      "description": "`degraded` : le projecteur a enregistré une faute qu'il n'a pas pu lever — les pages Objets, Connexions et Dépendances rendent des lignes périmées ou manquantes. `stale` : une écriture durable qu'aucun projecteur n'a observée. `catching_up` est sain à petite dose : c'est à quoi ressemble un projecteur qui travaille.",
+      "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 59 },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" }, "expr": "maplespire_read_model_workspaces", "legendFormat": "{{status}}" }
+      ],
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true, "calcs": ["lastNotNull"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "fieldConfig": {
+        "defaults": { "unit": "none", "min": 0, "custom": { "drawStyle": "line", "lineInterpolation": "stepAfter", "lineWidth": 1, "fillOpacity": 60, "showPoints": "never", "spanNulls": false, "stacking": { "mode": "normal", "group": "A" }, "axisPlacement": "auto" }, "mappings": [] },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "healthy" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } } ] },
+          { "matcher": { "id": "byName", "options": "catching_up" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "blue" } } ] },
+          { "matcher": { "id": "byName", "options": "stale" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } } ] },
+          { "matcher": { "id": "byName", "options": "degraded" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } } ] }
+        ]
+      }
+    },
+
+    {
+      "id": 21,
+      "type": "stat",
+      "title": "Détecteur de divergence",
+      "description": "⚠️ `clean` NE VEUT PAS DIRE SAIN — il veut dire NON MESURÉ, et il est donc en bleu ici, jamais en vert. Une revue a prouvé le détecteur aveugle à tout défaut interne à l'extracteur du projecteur (il fournit les DEUX opérandes) et aveugle aux flux entièrement. `diverged` qui tire reste un vrai positif.",
+      "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" },
+      "gridPos": { "h": 7, "w": 6, "x": 12, "y": 59 },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" }, "expr": "maplespire_read_model_divergence_state == 1", "instant": true, "legendFormat": "{{state}}" }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "name"
+      },
+      "fieldConfig": {
+        "defaults": { "unit": "none", "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "text", "value": null } ] } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "clean" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "blue" } } ] },
+          { "matcher": { "id": "byName", "options": "never-run" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } } ] },
+          { "matcher": { "id": "byName", "options": "inconclusive" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } } ] },
+          { "matcher": { "id": "byName", "options": "diverged" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } } ] },
+          { "matcher": { "id": "byName", "options": "error" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } } ] }
+        ]
+      }
+    },
+
+    {
+      "id": 22,
+      "type": "stat",
+      "title": "Ce que le détecteur a pu regarder",
+      "description": "Les deux compteurs qui disent si l'état ci-contre porte sur quelque chose. `éligibles au balayage` à zéro veut dire que le détecteur n'a RIEN examiné, ce qui n'est pas la même chose que propre — d'où le seuil inversé, rouge à 0. `jamais examinés` compte les espaces sans aucun relevé de défauts, ce qui n'est pas zéro défaut.",
+      "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" },
+      "gridPos": { "h": 7, "w": 6, "x": 18, "y": 59 },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" }, "expr": "maplespire_read_model_workspaces_never_examined", "instant": true, "legendFormat": "jamais examinés" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" }, "expr": "maplespire_read_model_divergence_sweep{scope=\"eligible\"}", "instant": true, "legendFormat": "éligibles au balayage" }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "vertical",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "value_and_name"
+      },
+      "fieldConfig": {
+        "defaults": { "unit": "none", "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "text", "value": null } ] } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "jamais examinés" }, "properties": [ { "id": "thresholds", "value": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 1 } ] } } ] },
+          { "matcher": { "id": "byName", "options": "éligibles au balayage" }, "properties": [ { "id": "thresholds", "value": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "green", "value": 1 } ] } } ] }
+        ]
+      }
+    },
+
+    { "id": 23, "type": "row", "title": "Automerge — résidence, service, marche docScope", "collapsed": false, "gridPos": { "h": 1, "w": 24, "x": 0, "y": 66 }, "panels": [] },
+
+    {
+      "id": 24,
+      "type": "timeseries",
+      "title": "Documents résidents par état de bail",
+      "description": "`handles` vient du CACHE de documents, pas du getter `repo.handles` — celui-là réalloue un Record entier à chaque lecture (3,4 ms à 10 000 documents). Une divergence durable entre `handles` et `leased` veut dire que le balayage d'inactivité n'évince plus.",
+      "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" },
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 67 },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" }, "expr": "maplespire_automerge_resident_documents", "legendFormat": "{{state}}" }
+      ],
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true, "calcs": ["lastNotNull"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "fieldConfig": {
+        "defaults": { "unit": "none", "min": 0, "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never", "spanNulls": false, "axisPlacement": "auto" }, "mappings": [] },
+        "overrides": []
+      }
+    },
+
+    {
+      "id": 25,
+      "type": "timeseries",
+      "title": "Latence de service, par pair et par document",
+      "description": "`pending_oldest` est la lecture qui BOUGE EN PREMIER : à comparer au `BOOT_RESOLVE_MAX_MS` du client (120 000 ms par défaut). Un document en attente au-delà est un boot qui va échouer, vu avant que le moindre utilisateur ne le voie.\n\n« No data » ici veut probablement dire que l'image `api` déployée est ANTÉRIEURE à cette métrique, pas qu'aucun pair n'est servi : vérifier avec `wget -qO- http://prometheus:9090/api/v1/label/__name__/values`. Mesuré le 20/08/2026 : 23 des 27 métriques de la source étaient vivantes, celle-ci absente, l'image datant du 14/08.",
+      "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" },
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 67 },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" }, "expr": "maplespire_automerge_service_latency_ms", "legendFormat": "{{quantile}}" }
+      ],
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true, "calcs": ["max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "fieldConfig": {
+        "defaults": { "unit": "ms", "min": 0, "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 0, "showPoints": "never", "spanNulls": false, "axisPlacement": "auto" }, "mappings": [] },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "pending_oldest" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }, { "id": "custom.lineWidth", "value": 3 } ] }
+        ]
+      }
+    },
+
+    {
+      "id": 26,
+      "type": "stat",
+      "title": "Évictions — orphelines, et observées du tout",
+      "description": "Le compteur d'orphelines ne peut parler qu'AU MOMENT d'une éviction. Un zéro plat veut donc dire soit « aucune orpheline », soit « aucune éviction, jamais » — et sur un espace actif avec AM_IDLE_MS à ses 5 minutes par défaut, la seconde est courante. Les deux chiffres côte à côte font la différence : zéro éviction observée met le second au ROUGE, parce qu'un détecteur qui n'a pas tourné n'est pas un détecteur propre.",
+      "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" },
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 67 },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" }, "expr": "maplespire_automerge_orphaned_listener_evictions_total", "instant": true, "legendFormat": "orphelines" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" }, "expr": "sum(maplespire_automerge_evictions_total{outcome=\"evicted\"}) or vector(0)", "instant": true, "legendFormat": "évictions observées" }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "vertical",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "value_and_name"
+      },
+      "fieldConfig": {
+        "defaults": { "unit": "none", "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "text", "value": null } ] } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "orphelines" }, "properties": [ { "id": "thresholds", "value": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } } ] },
+          { "matcher": { "id": "byName", "options": "évictions observées" }, "properties": [ { "id": "thresholds", "value": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "green", "value": 1 } ] } } ] }
+        ]
+      }
+    },
+
+    {
+      "id": 27,
+      "type": "timeseries",
+      "title": "Durée de la marche de références docScope",
+      "description": "La marche re-dérive tout l'ensemble de documents de l'espace et se déclenche sur des changements de FEUILLES dont elle ne peut rien apprendre : c'est un coût serveur par changement qui croît avec l'espace, pas avec l'édition. NaN avant toute marche — une donnée absente ne doit pas se lire comme un zéro.",
+      "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 74 },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" }, "expr": "maplespire_docscope_walk_duration_seconds", "legendFormat": "{{quantile}}" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" }, "expr": "vector(0.5)", "legendFormat": "seuil DocScopeWalkSlow" }
+      ],
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true, "calcs": ["max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "min": 0, "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 0, "showPoints": "never", "spanNulls": false, "axisPlacement": "auto" }, "mappings": [] },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "seuil DocScopeWalkSlow" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }, { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } } ] }
+        ]
+      }
+    },
+
+    {
+      "id": 28,
+      "type": "timeseries",
+      "title": "Mémoire du processus API",
+      "description": "`external` porte la mémoire WASM d'Automerge, c'est-à-dire les documents résidents. C'est la courbe à lire à côté du panneau de résidence : l'échec par mémoire WASM se produit entre 9 000 et 10 000 documents et il n'apparaît PAS dans `heap_used`.",
+      "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 74 },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" }, "expr": "maplespire_process_memory_bytes", "legendFormat": "{{kind}}" }
+      ],
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true, "calcs": ["lastNotNull"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "fieldConfig": {
+        "defaults": { "unit": "bytes", "min": 0, "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never", "spanNulls": false, "axisPlacement": "auto" }, "mappings": [] },
+        "overrides": []
+      }
+    }
+  ]
+}

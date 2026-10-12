@@ -1,0 +1,46 @@
+{
+  "view3d": {
+    "showcase": {
+      "toggle": "Orbite automatique (se met en pause pendant vos interactions)"
+    },
+    "webglFallback": {
+      "title": "Vue 3D indisponible",
+      "body": "Votre navigateur n'a pas pu démarrer WebGL, qui alimente la vue en perspective. Le canevas plat continue de fonctionner normalement.",
+      "backTo2d": "Revenir au canevas plat"
+    },
+    "decor": {
+      "button": "Décorer",
+      "title": "Décoration de la scène",
+      "pack": {
+        "none": "Aucune",
+        "maquette-people": "Personnages de maquette",
+        "datacenter": "Centre de données",
+        "greenery": "Verdure",
+        "canadiana": "Canadiana"
+      },
+      "density": {
+        "sparse": "Épars",
+        "normal": "Normal",
+        "rich": "Riche"
+      },
+      "shuffle": "Réorganiser",
+      "densityLabel": "Densité",
+      "boardLabel": "Plateau",
+      "board": {
+        "default": "Auto",
+        "paper-grid": "Papier quadrillé",
+        "wood": "Bois",
+        "museum": "Musée blanc",
+        "clay": "Argile"
+      },
+      "bgLabel": "Arrière-plan",
+      "bg": {
+        "default": "Auto",
+        "workbench": "Établi",
+        "city": "Ville",
+        "studio": "Studio",
+        "void": "Vide"
+      }
+    }
+  }
+}

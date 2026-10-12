@@ -1,0 +1,56 @@
+{
+  "comments": {
+    "type": {
+      "question": "Question",
+      "inaccuracy": "Inaccuracy",
+      "idea": "Idea"
+    },
+    "toolbar": {
+      "aiAssist": "AI assist",
+      "movePan": "Move / pan",
+      "autoLayout": "Auto-layout",
+      "clickToAddComment": "Click on canvas to add comment",
+      "addComment": "Add comment",
+      "diagramHistory": "Diagram history",
+      "addShapes": "Add shapes"
+    },
+    "composer": {
+      "askQuestion": "Ask question",
+      "markAsInaccurate": "Mark as inaccurate",
+      "addIdea": "Add idea",
+      "placeholder": "Type your comment…"
+    },
+    "detail": {
+      "pin": "Pin",
+      "unpin": "Unpin",
+      "resolve": "Resolve",
+      "unresolve": "Unresolve",
+      "edit": "Edit",
+      "delete": "Delete",
+      "replyPlaceholder": "Reply…"
+    },
+    "dropdown": {
+      "title": "Comments",
+      "tabYours": "Your comments",
+      "tabMentions": "Mentions",
+      "tabAll": "All",
+      "empty": "No comments yet",
+      "resolvedComments": "Resolved comments ({{count}})",
+      "viewAll": "View all comments",
+      "noText": "No text"
+    },
+    "panel": {
+      "filterAll": "All",
+      "filterUnresolved": "Unresolved",
+      "filterResolved": "Resolved",
+      "emptyAll": "No comments yet",
+      "emptyUnresolved": "No unresolved comments",
+      "emptyResolved": "No resolved comments",
+      "pinned": "Pinned",
+      "justNow": "just now",
+      "minutesAgo": "{{count}}m ago",
+      "hoursAgo": "{{count}}h ago",
+      "daysAgo": "{{count}}d ago"
+    }
+  }
+}

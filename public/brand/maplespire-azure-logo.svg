@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192" role="img" aria-labelledby="title description">
+  <title id="title">MapleSpire application icon</title>
+  <desc id="description">A minimal MapleSpire tree and diagram spire on charcoal.</desc>
+  <rect width="192" height="192" rx="34" fill="#1E1D1B"/>
+  <g transform="scale(.75)">
+    <g fill="#D0A08A">
+      <path d="M123 64h10v70h-10z"/>
+      <path d="m83 93 9-5 40 78-9 5z"/>
+    </g>
+    <path fill="#B67C65" d="m164 88 9 5-40 78-9-5z"/>
+    <g fill="#E8E2DA">
+      <path d="M123 134h10v62h-10z"/>
+      <path d="m78 132 8-8 47 47-8 8z"/>
+      <path d="m170 124 8 8-47 47-8-8z"/>
+    </g>
+  </g>
+</svg>

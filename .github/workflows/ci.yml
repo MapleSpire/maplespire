@@ -1,0 +1,229 @@
+name: CI
+
+# Many server tests are gated on TEST_DATABASE_URL / TEST_REDIS_URL and skip
+# silently when those services are absent, which would let a run go green for
+# having done less work. Hence the services below, and hence
+# `check-test-skips.mjs`: a run that skips something it did not declare fails,
+# and so does a declaration that no longer skips.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  static:
+    name: Lint, typecheck, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            server/package-lock.json
+
+      - name: Install
+        run: |
+          npm ci
+          npm --prefix server ci
+
+      # `npm run lint` is eslint + the AGPL header verifier.
+      - name: Lint
+        run: npm run lint
+
+      # `npm run build` is `tsc -b && vite build` — typecheck and bundle in one.
+      # Deliberately built WITHOUT VITE_SYNC_API_URL so the same-origin check
+      # below is meaningful: with it set, a baked localhost endpoint cannot occur
+      # and the check would pass for the wrong reason.
+      - name: Build frontend
+        run: npm run build
+
+      - name: Verify same-origin bundle
+        run: npm run verify:same-origin-dist
+
+      - name: Typecheck server
+        run: npm --prefix server run build
+
+      # The step above is the BUILD config, and it sees `src/**` only
+      # (`tsconfig.json`: `rootDir: ./src`), so `scripts/**` and `qa/**` need
+      # this second program. Both steps are kept: `build`
+      # catches emit-only errors that `noEmit` hides, this one catches the
+      # files `build` cannot see.
+      - name: Typecheck server scripts and QA harnesses
+        run: npm --prefix server run typecheck:all
+
+      # Same idea for the frontend: `tsc -b` in the build step sees `src/**`
+      # plus `vite.config.ts` only, and Playwright transpiles without
+      # typechecking. This program covers `e2e/**`, the `playwright*.config.ts`
+      # files and `vitest.config.ts`, so probe declarations and
+      # `@ts-expect-error`s in specs are actually checked.
+      - name: Typecheck e2e specs and Playwright configs
+        run: npm run typecheck:e2e
+
+      # Every `node --test` suite in the repo, from ONE list
+      # (`scripts/run-harness-suites.mjs`), which `npm run ci:local` calls too.
+      # vitest does not collect these `.test.mjs` files. The runner also fails on a SKIP, because `node --test` exits 0 with
+      # `# skipped 3` and `check-test-skips.mjs` only reads vitest reports.
+      - name: Harness self-tests
+        run: npm run test:harness-suites
+
+  test:
+    name: Tests (Postgres + Redis)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: maplespire
+          POSTGRES_PASSWORD: maplespire
+          POSTGRES_DB: maplespire_ci
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U maplespire -d maplespire_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7.4-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgres://maplespire:maplespire@localhost:5432/maplespire_ci
+      TEST_DATABASE_URL: postgres://maplespire:maplespire@localhost:5432/maplespire_ci
+      TEST_REDIS_URL: redis://localhost:6379
+      # The intent declaration. `serviceGates.test.ts` fails fast and by name if
+      # a service named here is not actually reachable, instead of letting the
+      # suites that need it skip themselves into a green run.
+      REQUIRE_DB_TESTS: '1'
+      REQUIRE_REDIS_TESTS: '1'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            server/package-lock.json
+
+      - name: Install
+        run: |
+          npm ci
+          npm --prefix server ci
+
+      # The backup/restore drill shells out to pg_dump/pg_restore. Rather than
+      # depend on whatever client version the runner image happens to ship —
+      # pg_dump refuses to talk to a server newer than itself — it borrows the
+      # binaries from the Postgres service container over `docker exec`, which is
+      # the same DockerPgTools path `npm run ci:local` exercises.
+      #
+      # The runner names service containers itself, so the name has to be
+      # discovered. If discovery finds nothing the variable stays empty and the
+      # drill falls back to the runner's own pg_dump — a fallback that either
+      # works or fails loudly with ENOENT, never silently.
+      - name: Locate the Postgres service container
+        run: |
+          # An EMPTY export satisfies `requiresEnv` exactly as a missing step
+          # does: check-test-skips' `mustRun` asks `Boolean(process.env[v])`, so
+          # BACKUP_RESTORE_TEST_DATABASE_URL='' permits the drill suite to skip
+          # and the skip gate agrees. Fail HERE, where it is one line and loud,
+          # rather than three files away as a green deploy that tested nothing.
+          [ -n "$DATABASE_URL" ] || { echo "DATABASE_URL is unset; the backup drill would silently skip"; exit 1; }
+          names=$(docker ps --filter "ancestor=postgres:16-alpine" --format '{{.Names}}')
+          count=$(printf '%s' "$names" | grep -c . || true)
+          # A runner has exactly one. More than one means this is not the runner
+          # we think it is, and picking the first would dump the wrong database.
+          if [ "$count" -gt 1 ]; then
+            echo "Expected one postgres:16-alpine container, found $count:"
+            echo "$names"
+            exit 1
+          fi
+          echo "Postgres service container: ${names:-<not found>}"
+          echo "BACKUP_RESTORE_TEST_PG_CONTAINER=$names" >> "$GITHUB_ENV"
+          echo "BACKUP_RESTORE_TEST_DATABASE_URL=$DATABASE_URL" >> "$GITHUB_ENV"
+
+      # The DB-needing half of the harness CHECKS list. The other half runs in
+      # the `static` job, which has no `services:` — so a check that needs a
+      # database is DEFERRED there and executed here, and the runner prints
+      # which of the two it did on every run. Split rather than duplicated: one
+      # CHECKS list, two callers, each selecting explicitly.
+      - name: Harness self-tests (database half)
+        run: npm run test:harness-suites -- --with-database
+
+      # `--reporter=junit` alongside the JSON one: the JSON report records a
+      # file-level failure but leaves `message` empty whenever the throwing hook
+      # sits in a nested `describe`. The JUnit reporter surfaces
+      # beforeAll/afterAll errors with the message and the line.
+      - name: Frontend tests
+        run: npx vitest run --reporter=default --reporter=json --outputFile.json=reports/vitest-frontend.json --reporter=junit --outputFile.junit=reports/vitest-frontend.junit.xml
+
+      # `working-directory`, not `npm --prefix`: --prefix moves package
+      # resolution, not the process cwd, and vitest resolves its config and its
+      # `src/**/*.test.ts` include from the cwd.
+      #
+      # `if: always()`: without it a red frontend step SKIPS this one, no server
+      # report is ever written, and the skip check below — which does run always
+      # — dies on a missing file, replacing the real cause with an ENOENT.
+      - name: Server tests
+        if: always()
+        working-directory: server
+        run: npx vitest run --reporter=default --reporter=json --outputFile.json=../reports/vitest-server.json --reporter=junit --outputFile.junit=../reports/vitest-server.junit.xml
+
+      # Both reports together, once: an allowlist entry is "stale" only if it
+      # appears in NO report, so checking per-job would flag every frontend entry
+      # while looking at the server run.
+      - name: Every skip is declared
+        if: always()
+        run: node scripts/check-test-skips.mjs --report reports/vitest-frontend.json --report reports/vitest-server.json
+
+      # The only step that runs a `qa/` GATE rather than a gate's oracle.
+      #
+      # It boots two real servers (ports 3041/3042, its own, never this job's
+      # services), disables the idle sweep's peer check in one, and requires
+      # `qa/eviction-peeraware.mjs` to report `failed` against that one and
+      # `passed` against the untouched one. Everything else covering that gate
+      # is evidence about its ORACLE (given these snapshots, is the verdict
+      # right?); this drill proves the gate itself can both fail and pass.
+      #
+      # It lives HERE and not only in `scripts/ci-local.mjs`, because a step
+      # that runs on developers' laptops and in no workflow inverts the one
+      # claim that runner exists to make ("CI would be GREEN"): it could print
+      # RED for something CI does not run. `ci-local-parity.test.mjs` guards
+      # that relationship.
+      #
+      # `TEST_DATABASE_URL` is the job's Postgres service — a throwaway
+      # database, which is what the drill requires and refuses to run without.
+      - name: Eviction gate fire drill (two arms, real servers)
+        if: always()
+        working-directory: server
+        run: npm run qa:eviction-fire-drill
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vitest-reports
+          path: reports/
+          retention-days: 14

@@ -1,0 +1,56 @@
+{
+  "exportEngine": {
+    "docTitle": "{{landscape}} — résumé du modèle",
+    "scope": {
+      "landscape": "l'ensemble du landscape",
+      "domain": "le domaine « {{name}} »",
+      "object": "l'objet « {{name}} »",
+      "diagram": "le diagramme « {{name}} »",
+      "unknown": "inconnu"
+    },
+    "meta": {
+      "markdown": "Couvre {{scope}} — {{objects}} objets · {{connections}} connexions · {{flows}} flux. Généré le {{date}} par MapleSpire.",
+      "htmlOrPdf": "Couvre {{scope}} — {{objects}} objets · {{connections}} connexions · {{flows}} flux · généré le {{date}} par MapleSpire"
+    },
+    "llmsBlurb": "Un modèle d'architecture C4 de {{landscape}}, couvrant {{scope}} : objets du modèle, connexions, flux et étiquettes.",
+    "sections": {
+      "domains": "Domaines",
+      "modelObjects": "Objets du modèle",
+      "connections": "Connexions",
+      "flows": "Flux",
+      "tags": "Étiquettes"
+    },
+    "flowStep": {
+      "message": "{{from}} → {{to}} : {{title}}",
+      "process": "Sur {{obj}} : {{title}}"
+    },
+    "describe": {
+      "external": "externe",
+      "domain": "domaine : {{name}}",
+      "inside": "à l'intérieur de : {{name}}",
+      "tags": "étiquettes : {{names}}"
+    },
+    "objectCount": "{{count}} objets",
+    "legend": {
+      "title": "Légende",
+      "external": "Externe",
+      "boundary": "Limite",
+      "group": "Groupe",
+      "connection": "Connexion",
+      "dashedConnection": "Connexion en tirets",
+      "dottedConnection": "Connexion en pointillés",
+      "crossLevelConnection": "Connexion inter-niveaux"
+    },
+    "errors": {
+      "noDiagramToExport": "Aucun diagramme à exporter",
+      "openADiagramForImage": "Ouvrez un diagramme pour exporter une image",
+      "no3dView": "Ouvrez la vue 3D avant de l'exporter",
+      "couldNotRasteriseLegend": "Impossible de rastériser la légende",
+      "couldNotRasteriseDiagram": "Impossible de rastériser le diagramme",
+      "modelIncomplete": "Le landscape complet n'a pas pu être lu : cet export omettrait {{objects}} objets et {{connections}} connexions utilisés par ses diagrammes. Reconnectez-vous ou rechargez la page, ou exportez uniquement le diagramme courant."
+    },
+    "warnings": {
+      "missingReferences": "{{objects}} objets et {{connections}} connexions référencés par les diagrammes exportés sont absents du modèle et ont été omis."
+    }
+  }
+}

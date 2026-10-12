@@ -1,0 +1,55 @@
+{
+  "shareDialog": {
+    "header": {
+      "ariaLabel": "Partager cette vue",
+      "title": "Partager cette vue",
+      "manageSubtitle": "Activez ou désactivez chaque lien individuellement",
+      "exportSubtitle": "Téléchargez les données de votre modèle sous forme de fichier",
+      "shareSubtitle": "Liens interactifs en lecture seule",
+      "manageSharing": "Gérer le partage",
+      "closeShare": "Fermer le partage"
+    },
+    "tabs": {
+      "share": "Partager",
+      "export": "Exporter"
+    },
+    "mainView": {
+      "enableShareLink": "Activer le lien de partage ({{version}})",
+      "readOnly": "Lecture seule",
+      "limitToThisDiagram": "Limiter à ce diagramme",
+      "limitToThisDiagramHelp": "Activé : partage uniquement ce diagramme. Désactivé : partage l'ensemble du paysage — les visiteurs peuvent naviguer entre les diagrammes.",
+      "allow3d": "Autoriser la vue 3D",
+      "allow3dHelp": "Activé : les visiteurs peuvent basculer entre le canevas à plat et la vue 3D (mêmes données en lecture seule, perspective différente). Désactivé : le lien reste strictement en 2D.",
+      "updatingToCurrentVersion": "Mise à jour vers la version actuelle…",
+      "alwaysReflectsCurrentVersion": "Reflète toujours la version actuelle.",
+      "pinnedTo": "Épinglé à « {{label}} » — cet instantané ne changera pas.",
+      "largeShareWarning": "Ce partage est volumineux ({{size}} Mo) et pourrait se charger lentement — envisagez de le limiter à ce diagramme.",
+      "versionLinkOff": "Le lien de cette version est désactivé. Activez-le pour la partager.",
+      "openDiagramToCreate": "Ouvrez un diagramme pour créer un lien de partage.",
+      "openDiagramToShare": "Ouvrez un diagramme pour le partager.",
+      "viewOnlyNote": "Vous avez un accès en lecture seule à cet espace de travail : vous ne pouvez donc pas créer ni modifier de liens de partage ici.",
+      "somethingWentWrong": "Une erreur est survenue",
+      "currentVersionLower": "version actuelle",
+      "thisVersion": "cette version"
+    },
+    "audience": {
+      "label": "Qui peut ouvrir ce lien",
+      "public": "Tout le monde",
+      "org": "Mon organisation",
+      "domain": "Domaine e-mail",
+      "authNote": "Les liens restreints exigent que le visiteur soit connecté (appliqué lorsque l'authentification est activée)."
+    },
+    "linkRow": {
+      "copied": "Copié !",
+      "copyLink": "Copier le lien"
+    },
+    "versionPicker": {
+      "versionLabel": "Version",
+      "currentVersion": "Version actuelle",
+      "pinnedVersion": "Version épinglée",
+      "alwaysLatest": "(toujours la plus récente)",
+      "versionNamePlaceholder": "Nom de la version",
+      "saveCurrentAsVersion": "Enregistrer l'état actuel comme version"
+    }
+  }
+}

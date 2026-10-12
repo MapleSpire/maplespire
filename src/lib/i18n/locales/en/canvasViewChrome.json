@@ -1,0 +1,78 @@
+{
+  "canvasViewChrome": {
+    "bootFailed": {
+      "title": "This landscape didn’t finish loading",
+      "body": "The workspace was still syncing when the load gave up. Nothing was lost — try again, or reload the page.",
+      "action": "Try again"
+    },
+    "diagramNotFound": {
+      "title": "Diagram not found",
+      "body": "This diagram doesn’t exist — it may have been deleted, or this link is from an older version of the workspace.",
+      "action": "Go to a diagram"
+    },
+    "noDiagrams": {
+      "title": "No diagrams yet",
+      "body": "This landscape doesn’t have any diagrams. Create one to start placing shapes.",
+      "action": "Create a Context diagram"
+    },
+    "comment": {
+      "placeHint": "Click on canvas to place a comment"
+    },
+    "zoom": {
+      "zoomOut": "Zoom out",
+      "zoomToFit": "Zoom to fit",
+      "zoomIn": "Zoom in",
+      "hideGrid": "Hide grid",
+      "showGrid": "Show grid",
+      "fitToScreen": "Fit to screen"
+    },
+    "camera": {
+      "label": "3D style",
+      "preset": {
+        "tilt": "Tilt",
+        "iso": "Iso"
+      },
+      "presetTitle": "{{name}} perspective",
+      "reset": "Reset view (back to the preset angle)",
+      "orbitHint": "Alt+drag to orbit",
+      "align": "Align with 2D",
+      "alignTitle": "Align 3D with the 2D placements — drops this diagram's separate 3D adjustments",
+      "alignConfirm": "Reset the 3D placements of this diagram?\n\nAll 3D-only adjustments (positions, connection routing) will be dropped and the 3D view will mirror the 2D arrangement again. The 2D layout is not affected."
+    },
+    "toolMode": {
+      "connection": "Connection mode — Click two objects to connect",
+      "pan": "Pan mode"
+    },
+    "contextMenu": {
+      "connectionHeader": "Connection",
+      "unlockFromAnchors": "Unlock from anchors",
+      "lockToAnchors": "Lock to anchors",
+      "copySize": "Copy size",
+      "copyStyle": "Copy style",
+      "groups": "Groups",
+      "removeFrom": "Remove from",
+      "addTo": "Add to",
+      "noGroupsAvailable": "No groups available",
+      "shapesSelected": "{{count}} shape selected",
+      "shapesSelected_other": "{{count}} shapes selected",
+      "removeFromDiagram": "Remove from this diagram",
+      "deleteFromModel": "Delete from the model",
+      "removeGroupFromDiagram": "Remove the group from this diagram",
+      "deleteGroupFromModel": "Delete the group from the model",
+      "removeShapesFromDiagram": "Remove {{count}} shape from this diagram",
+      "removeShapesFromDiagram_other": "Remove {{count}} shapes from this diagram",
+      "deleteShapesFromModel": "Delete {{count}} shape from the model",
+      "deleteShapesFromModel_other": "Delete {{count}} shapes from the model"
+    },
+    "inlineEdit": {
+      "object": {
+        "title": "Edit the shape name",
+        "description": "Edit the shape description"
+      },
+      "group": {
+        "title": "Edit the group name",
+        "description": "Edit the group description"
+      }
+    }
+  }
+}
