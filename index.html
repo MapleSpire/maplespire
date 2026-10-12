@@ -105,6 +105,11 @@
       })();
     </script>
     <div id="root"></div>
+    <!-- CLASSIC (not type="module"): a parser-blocking script runs before every
+         module script, so the legacy shared databases are deleted before the
+         app starts (public/legacy-db-cleanup.js). Vite merges module scripts
+         into one entry, so a module would run in bundle order instead. -->
+    <script src="/legacy-db-cleanup.js"></script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

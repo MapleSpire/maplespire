@@ -15,6 +15,7 @@
 import { create } from 'zustand'
 import { immer } from 'zustand/middleware/immer'
 import type { C4Type } from '../types'
+import { accountStorageKey } from '../lib/auth/accountNamespace'
 
 // AI Assist panel width — resizable (drag handle on the panel's right edge),
 // persisted like every other manually-persisted setting ('maplespire:' key,
@@ -56,7 +57,8 @@ export type CanvasCameraPreset = 'tilt' | 'iso'
 
 // Per-diagram memory of the 2D/3D view (a per-user VIEW preference — kept in
 // localStorage, deliberately NOT synced into the shared diagram doc).
-const view3dKey = (diagramId: string) => `maplespire:view3d:${diagramId}`
+// Per user (accountNamespace.ts): names one account's diagrams.
+const view3dKey = (diagramId: string) => accountStorageKey(`maplespire:view3d:${diagramId}`)
 
 function readView3d(diagramId: string): { mode: CanvasViewMode; preset: CanvasCameraPreset } | null {
   try {

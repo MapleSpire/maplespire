@@ -18,19 +18,37 @@ import { WORKSPACE_PLACEMENT_CHANNEL } from './workspacePlacement.js'
 /** One dedicated LISTEN connection. The reconciliation timer calls connect()
  * to retry a lost connection; this object never creates overlapping checkouts.
  * Notifications only invalidate: the generation-scoped SELECT is authority.
- * The callback is synchronous and must schedule, not await, its refresh. */
+ * The callback is synchronous and must schedule, not await, its refresh.
+ *
+ * `channel` defaults to the placement channel (placed mode). Hash-mode cells
+ * listen on `workspace_version_created` with the same object, so a workspace
+ * created on another cell reaches its owner's reconciliation at commit time
+ * instead of at the next timer tick (2026-10-11). */
 export class PlacementInvalidationListener {
   private client: PoolClient | null = null
   private connecting: Promise<void> | null = null
   private stopping = false
   private stopFlight: Promise<void> | null = null
   private readonly released = new WeakSet<PoolClient>()
+  private readonly channel: string
+  private readonly invalidateOnConnect: boolean
 
   constructor(
     private readonly pool: Pool,
     private readonly onInvalidate: () => void,
     private readonly onError: (error: unknown) => void,
+    options: {
+      channel?: string
+      /** Invalidate once after each (re)connect, to cover commits made while
+       * disconnected. The version-created listener turns it off: its
+       * connect() runs at the start of a reconciliation pass whose own SELECT
+       * follows the LISTEN, so there is no blind interval, and the extra pass
+       * would only shift every pass-counting assertion by one. */
+      invalidateOnConnect?: boolean
+    } = {},
   ) {
+    this.channel = options.channel ?? WORKSPACE_PLACEMENT_CHANNEL
+    this.invalidateOnConnect = options.invalidateOnConnect ?? true
     // LISTEN keeps one checkout until stop. Leave capacity for the SELECT
     // that consumes its invalidation; pg normalizes max on a real Pool.
     const maximum = pool.options?.max
@@ -79,7 +97,7 @@ export class PlacementInvalidationListener {
     this.client = client
     // Install error/notification handlers before the first LISTEN await.
     client.on('notification', (message: Notification) => {
-      if (this.client === client && message.channel === WORKSPACE_PLACEMENT_CHANNEL) this.invalidate()
+      if (this.client === client && message.channel === this.channel) this.invalidate()
     })
     client.on('error', (error: Error) => {
       this.destroy(client, error)
@@ -92,11 +110,11 @@ export class PlacementInvalidationListener {
       if (!this.stopping) this.report(error)
     })
     try {
-      await client.query(`LISTEN ${WORKSPACE_PLACEMENT_CHANNEL}`)
+      await client.query(`LISTEN ${this.channel}`)
       if (this.stopping || this.client !== client) return
       // Also invalidate after reconnect: commits during the disconnected
       // interval had no listener. The next SELECT covers that blind interval.
-      this.invalidate()
+      if (this.invalidateOnConnect) this.invalidate()
     } catch (error) {
       this.destroy(client, error instanceof Error ? error : new Error(String(error)))
       throw error

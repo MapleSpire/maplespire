@@ -14,6 +14,7 @@
 
 import type { C4Object, Group } from '../../types'
 import type { KvStore } from './kvStore'
+import { accountDatabaseName } from '../auth/accountNamespace'
 
 /** Crash marker stored with the flat model index. Cross-database writes cannot be
  * one browser transaction, so a warm boot rebuilds postings if a delta stopped
@@ -103,7 +104,7 @@ let databasePromise: Promise<IDBDatabase> | null = null
 function openDatabase(): Promise<IDBDatabase> {
   if (databasePromise) return databasePromise
   databasePromise = new Promise((resolve, reject) => {
-    const request = indexedDB.open(DB_NAME, DB_VERSION)
+    const request = indexedDB.open(accountDatabaseName(DB_NAME), DB_VERSION)
     request.onupgradeneeded = () => {
       const db = request.result
       const postings = db.createObjectStore(POSTINGS, {

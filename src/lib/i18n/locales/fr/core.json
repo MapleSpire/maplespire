@@ -37,6 +37,7 @@
     "signInSubtitle": "Accéder à vos organisations",
     "signInTooltip": "Se connecter",
     "signOut": "Se déconnecter",
+    "signOutFailed": "La déconnexion a échoué. Vérifiez votre connexion et réessayez.",
     "settings": "Paramètres du compte",
     "organizations": "Organisations",
     "newOrg": "Nouvelle organisation",

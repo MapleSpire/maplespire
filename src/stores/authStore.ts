@@ -15,6 +15,7 @@
 import { create } from 'zustand'
 import * as api from '../lib/auth/api'
 import { applyServerLocale } from '../lib/i18n'
+import { enterAccountNamespace, leaveAccountNamespace } from '../lib/auth/accountNamespace'
 
 /**
  * Auth state (client phase). `config` is fetched once on boot (via the root route's
@@ -49,6 +50,11 @@ interface AuthStoreState {
   setUser: (user: api.AuthUser) => void
 }
 
+/** Pending for ever: the page is reloading, and a caller that continued —
+ * AuthCompletePage consuming the stashed post-login destination, a route
+ * navigating — would act on a document about to be discarded. */
+const RELOADING: Promise<never> = new Promise<never>(() => {})
+
 function extractImpersonation(claims: api.SessionClaimsInfo | undefined): ImpersonationClaim | null {
   const by = claims?.imp?.by
   return by === undefined ? null : { by }
@@ -78,6 +84,27 @@ export const useAuthStore = create<AuthStoreState>((set) => ({
     }
     try {
       const result = await api.me()
+      // This page opened ANOTHER user's local storage (or nobody's) — however
+      // the previous session ended. Reload into this user's own
+      // (accountNamespace.ts); `loading` stays true, so the bridge never boots
+      // on the wrong storage, and `load()` never resolves (see RELOADING). The
+      // reloaded page's frozen namespace is this user, so it answers 'current'.
+      if (result?.user) {
+        let target: 'current' | 'reload'
+        try {
+          target = enterAccountNamespace(result.user.id)
+        } catch (error) {
+          // The page sits on ANOTHER user's storage and cannot switch: booting
+          // this user there is the original defect. Fail closed — signed out.
+          console.error('[account] cannot open this user\'s local storage; not signing in on another user\'s', error)
+          set({ config, user: null, orgId: null, loading: false, impersonation: null })
+          return
+        }
+        if (target === 'reload') {
+          window.location.reload()
+          return RELOADING
+        }
+      }
       // Cross-device language: a signed-in user's server-stored locale overrides
       // browser detection once the session resolves (no-op when unset).
       applyServerLocale(result?.user?.locale)
@@ -106,7 +133,23 @@ export const useAuthStore = create<AuthStoreState>((set) => ({
 
   logout: async () => {
     await api.logout()
+    // Ends the session LOCALLY too. Clearing the three fields below alone left
+    // the previous account's model, socket and caches alive for whoever signed
+    // in next on this browser (2026-10-11). The account's data is not deleted
+    // — it stays in its own storage, unsynced edits included — but the next
+    // page opens nobody's, and the other tabs reload on the namespace change
+    // (installAccountNamespaceListener).
+    try {
+      leaveAccountNamespace()
+    } catch (error) {
+      // The next sign-in still switches storage (authStore.load); only the
+      // signed-out login page keeps this account's namespace open.
+      console.warn('[account] could not leave the local account namespace', error)
+    }
     set({ user: null, orgId: null, impersonation: null })
+    // A full document load, like sign-in and org switch: no module singleton
+    // of the previous session survives.
+    window.location.replace('/login')
   },
 
   setUser: (user) => set({ user }),

@@ -14,6 +14,7 @@
 
 import type { C4Object, Group } from '../../types'
 import type { KvStore } from './kvStore'
+import { accountDatabaseName } from '../auth/accountNamespace'
 
 export const TAG_POSTINGS_DIRTY_KEY = '__meta:tag-postings-dirty'
 
@@ -79,7 +80,7 @@ let databasePromise: Promise<IDBDatabase> | null = null
 function openDatabase(): Promise<IDBDatabase> {
   if (databasePromise) return databasePromise
   databasePromise = new Promise((resolve, reject) => {
-    const request = indexedDB.open(DB_NAME, DB_VERSION)
+    const request = indexedDB.open(accountDatabaseName(DB_NAME), DB_VERSION)
     request.onupgradeneeded = () => {
       const db = request.result
       const postings = db.createObjectStore(POSTINGS, {

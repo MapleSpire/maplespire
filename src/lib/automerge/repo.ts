@@ -55,7 +55,8 @@ import { serializeAutomergeDocumentMessages } from './serializeMessages'
 import { AdaptiveWebSocketClientAdapter } from './adaptiveWebSocketClientAdapter'
 import { repoPeerAwareness } from './peerAwareness'
 import { createWaiverAllocation, type WaiverAllocation } from './waiverBudget'
-import { mayUseCachedRootAfter, resolveRootUrlWithRetry, WorkspaceRootHttpError } from './rootFetchPolicy'
+import { mayUseCachedRootAfter, resolveRootUrlWithRetry, workspaceRootHttpError } from './rootFetchPolicy'
+import { accountDatabaseName, accountStorageKey } from '../auth/accountNamespace'
 
 import { API_BASE } from '../api/base'
 const WS_URL = import.meta.env.VITE_AUTOMERGE_URL || (typeof window === 'undefined'
@@ -79,7 +80,7 @@ export const repo = new Repo({
   // is known. IndexedDB remains available immediately for offline boot.
   network: [],
   ...(typeof indexedDB !== 'undefined'
-    ? { storage: new IndexedDBStorageAdapter('maplespire-automerge') }
+    ? { storage: new IndexedDBStorageAdapter(accountDatabaseName('maplespire-automerge')) }
     : {}),
   shareConfig: activeDocumentShare.shareConfig,
 })
@@ -292,7 +293,9 @@ const ROOT_URL_CACHE_KEY = 'maplespire:rootUrl'
  * legacy key so warm OFFLINE boot for existing installs is byte-identical; other
  * workspaces get a per-ref key. */
 function rootUrlCacheKey(ref: WorkspaceRef): string {
-  return isDefaultWorkspaceRef(ref) ? ROOT_URL_CACHE_KEY : `${ROOT_URL_CACHE_KEY}:${workspaceRefKey(ref)}`
+  // Per user (accountNamespace.ts): a root materialized in one account's
+  // database is not in the next account's.
+  return accountStorageKey(isDefaultWorkspaceRef(ref) ? ROOT_URL_CACHE_KEY : `${ROOT_URL_CACHE_KEY}:${workspaceRefKey(ref)}`)
 }
 
 function readCachedRootUrl(ref: WorkspaceRef): AutomergeUrl | null {
@@ -400,7 +403,7 @@ async function fetchRootUrl(ref: WorkspaceRef = DEFAULT_WORKSPACE_REF): Promise<
       // No caller passes a signal of its own into this fetch, so there is
       // nothing to compose (use AbortSignal.any if one ever does).
       const res = await rootUrlFetch(endpoint, { signal: AbortSignal.timeout(BOOT_HTTP_TIMEOUT_MS) })
-      if (!res.ok) throw new WorkspaceRootHttpError(res.status)
+      if (!res.ok) throw await workspaceRootHttpError(res)
       const body = (await res.json()) as {
         url: string
         landscapeId?: string | null

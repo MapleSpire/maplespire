@@ -13,6 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import { createHash, randomBytes } from 'node:crypto'
+import { EventEmitter } from 'node:events'
 import type { Pool } from 'pg'
 import { createClient } from 'redis'
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
@@ -159,6 +160,13 @@ describe('T-13d reserved successor options (pure)', () => {
       },
     } as unknown as RedisRuntime
     const pool = {
+      // A hash-mode cell holds one LISTEN checkout (workspace_version_created).
+      async connect() {
+        return Object.assign(new EventEmitter(), {
+          async query() { return { rows: [], rowCount: 0 } },
+          release() {},
+        })
+      },
       async query(sql: string, params?: unknown[]) {
         if (sql === 'SELECT value FROM sync_topology_contract WHERE singleton = TRUE') {
           return { rows: mirror === null ? [] : [{ value: mirror }], rowCount: mirror === null ? 0 : 1 }

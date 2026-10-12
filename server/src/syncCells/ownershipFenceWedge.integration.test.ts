@@ -102,6 +102,10 @@ describe.skipIf(!TEST_DATABASE_URL || !TEST_REDIS_URL)('sync-cell durable/live f
     leaseCommandTimeoutMs: 5_000,
     partitionProbeIntervalMs: 1_000,
     partitionWorker: false,
+    // No NOTIFY-triggered pass either: this suite's own INSERT INTO versions —
+    // and any parallel suite's, NOTIFY being per database — would add a pass
+    // after the one each arm measures (measured in ci:local, 2026-10-11).
+    versionCreationNotify: false,
     // Long enough that no background pass can move the durable row between two
     // arms. Every reconcile this suite observes is one it asked for by name.
     reconcileIntervalMs: 600_000,

@@ -15,6 +15,7 @@
 import type { TechnologyRole, TechnologyShapeType } from '../../types'
 import { registerTechnologyCanonicalIds } from './canonicalIds'
 import { compareTechnologyMatches } from './ranking'
+import { accountDatabaseName } from '../auth/accountNamespace'
 
 export interface CatalogTechnologyRevision {
   revision: number
@@ -107,7 +108,7 @@ function boundCachedTechnologies(technologies: readonly CatalogTechnology[]): Ca
 
 function openCache(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open(DB_NAME, 1)
+    const request = indexedDB.open(accountDatabaseName(DB_NAME), 1)
     request.onupgradeneeded = () => {
       if (!request.result.objectStoreNames.contains(STORE_NAME)) {
         request.result.createObjectStore(STORE_NAME, { keyPath: 'orgId' })

@@ -16,12 +16,32 @@ import { isRetryableDocumentResolutionError } from './documentResolution'
 
 export class WorkspaceRootHttpError extends Error {
   readonly status: number
+  /** The SERVER said "try again": a `Retry-After` header or a
+   * `{retryable: true}` body. Every server-side warm-up refusal sets one
+   * (the root route's own 503, the cell router's `warming-up` and `workspace
+   * owner unavailable`); a reverse proxy's 502/504 for a dead backend sets
+   * neither, and must reach the offline fallback without the retry budget. */
+  readonly retryable: boolean
 
-  constructor(status: number) {
+  constructor(status: number, options: { retryable?: boolean } = {}) {
     super(`Failed to fetch root url: HTTP ${status}`)
     this.name = 'WorkspaceRootHttpError'
     this.status = status
+    this.retryable = options.retryable ?? false
   }
+}
+
+/** Read the server's retry signal off a non-ok root response. */
+export async function workspaceRootHttpError(res: Response): Promise<WorkspaceRootHttpError> {
+  let retryable = res.headers.get('Retry-After') !== null
+  if (!retryable) {
+    try {
+      retryable = ((await res.json()) as { retryable?: unknown } | null)?.retryable === true
+    } catch {
+      // Not JSON (a proxy's HTML error page) — no retry signal.
+    }
+  }
+  return new WorkspaceRootHttpError(res.status, { retryable })
 }
 
 /**
@@ -37,15 +57,19 @@ export function mayUseCachedRootAfter(error: unknown): boolean {
 }
 
 /**
- * Only an HTTP 5xx is worth a short in-boot retry: it is the server answering
- * "not ready yet" (a read-model projector cold-building after a set-default
- * repoint 503s for a few seconds, then 200s). A transport failure
- * (server unreachable) deliberately does NOT retry — it is the OFFLINE boot's
- * hot path, and every added round trip there only delays the IndexedDB
- * fallback; a 4xx is authoritative and must not be waited out.
+ * Only a 5xx THE SERVER MARKED RETRYABLE is worth a short in-boot retry: the
+ * server answering "not ready yet" (a read-model projector cold-building after
+ * a set-default repoint 503s for a few seconds, then 200s; a new account's
+ * workspace 503s until its owner cell admits it). A transport failure (server
+ * unreachable) deliberately does NOT retry — it is the OFFLINE boot's hot
+ * path, and every added round trip there only delays the IndexedDB fallback.
+ * Behind the same-origin nginx proxy a dead backend is not a transport failure
+ * but a fast unmarked 502, which is why the mark is required: without it the
+ * offline boot would wait out the whole budget.
+ * A 4xx is authoritative and must not be waited out.
  */
 export function isTransientRootFetchError(error: unknown): boolean {
-  return error instanceof WorkspaceRootHttpError && error.status >= 500
+  return error instanceof WorkspaceRootHttpError && error.status >= 500 && error.retryable
 }
 
 /**
@@ -53,14 +77,22 @@ export function isTransientRootFetchError(error: unknown): boolean {
  * attempted up to `attempts` times; only transient (5xx) failures re-enter the
  * loop, everything else propagates to the caller's existing policy
  * (`mayUseCachedRootAfter` → cached root, or throw). The budget is deliberately
- * small — the caller still has the offline fallback behind it, so this only
- * needs to bridge a few-second warm-up window, not survive an outage.
+ * bounded — the caller still has the offline fallback behind it, so this only
+ * needs to bridge a warm-up window, not survive an outage.
+ *
+ * Not raised to cover the cross-cell admission window of a new account's
+ * workspace (503 until its owner's reconcile tick): that window is closed on
+ * the server instead (ownership.ts, the `workspace_version_created`
+ * listener), and more attempts would hold a warm OFFLINE boot longer during a
+ * Redis outage, whose `owner-route-unavailable` 503s are marked retryable.
  */
+export const DEFAULT_ROOT_FETCH_ATTEMPTS = 3
+
 export async function resolveRootUrlWithRetry<T>(
   fetchOnce: () => Promise<T>,
   options: { attempts?: number; backoffMs?: number; sleep?: (ms: number) => Promise<void> } = {},
 ): Promise<T> {
-  const attempts = Math.max(1, options.attempts ?? 3)
+  const attempts = Math.max(1, options.attempts ?? DEFAULT_ROOT_FETCH_ATTEMPTS)
   const backoffMs = Math.max(0, options.backoffMs ?? 500)
   const sleep = options.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)))
   let lastError: unknown

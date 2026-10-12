@@ -25,6 +25,7 @@ import {
 import type { RedisRuntime } from '../runtime/redis.js'
 import type { MetricSample } from '../runtime/metrics.js'
 import { observeWorkspaceCreation, type WorkspaceKey } from '../rbac/docScope.js'
+import { WORKSPACE_VERSION_CREATED_CHANNEL } from '../rbac/workspaceCacheInvalidation.js'
 import {
   MAPPING_FINGERPRINT,
   partitionProbeOrder,
@@ -57,6 +58,16 @@ import { ensureWorkspaceRouteInvalidationSchema } from './workspaceRouteInvalida
 
 export interface SyncCellOwnershipConfig extends SyncCellPartitionConfig {
   enabled: boolean
+  /** Hash mode: request a reconciliation pass on each `workspace_version_created`
+   * NOTIFY (see the constructor). Omitted = `SYNC_CELL_VERSION_CREATED_NOTIFY`
+   * is not `off`, i.e. ON in production. The server test harness sets that
+   * variable to `off` (vitest.setup.ts): NOTIFY is per DATABASE, so in the
+   * shared test database every hash-mode coordinator of every parallel suite
+   * ran extra passes on every other suite's version inserts, and timing-bound
+   * topology suites failed at random — measured 2026-10-11, three parallel
+   * `src/syncCells` runs red on different tests with the listener, three green
+   * without it. Suites that test the listener pass `true`. */
+  versionCreationNotify?: boolean
   /** Omitted only by legacy hand-built configs; production defaults to the map. */
   routeMap?: OwnerRouteMapConfig
   role: SyncCellRole
@@ -1997,7 +2008,6 @@ export class SyncCellOwnershipCoordinator implements SyncCellOwnership {
   private lossCount = 0
   private readonly lossByReason: Partial<Record<SyncCellOwnershipLossReason, number>> = {}
   private readonly releaseFlights = new Set<Promise<void>>()
-  private readonly creationAdmissionFlights = new Set<Promise<void>>()
   // A failed Redis release outlives the local lease. Retain its exact owner
   // incarnation until a later CAS completes, or a live partition could keep
   // the persistent placed authority blocking the next owner indefinitely.
@@ -2054,6 +2064,8 @@ export class SyncCellOwnershipCoordinator implements SyncCellOwnership {
   private readonly placement: PlacementResolver
   private readonly storedPlacement: StoredPlacementResolver
   private readonly placementInvalidation: PlacementInvalidationListener | null
+  /** Hash mode's cross-cell creation signal — see the constructor. */
+  private readonly versionCreation: PlacementInvalidationListener | null
 
   /** Slowest NON-CANCELLED statement since the last telemetry emit, in ms.
    *
@@ -2146,6 +2158,39 @@ export class SyncCellOwnershipCoordinator implements SyncCellOwnership {
         () => { void this.reconcileNow().catch(error => this.recordError('placement-notify', error)) },
         error => this.recordError('placement-listener', error))
       : null
+    // A workspace created on ANOTHER cell. `observeWorkspaceCreation` (start())
+    // is in-process, so in hash mode the cell holding the new workspace's
+    // partition learned of it only at its next timer tick. Measured live
+    // 2026-10-11 (app.maplespire.ca, two cells, one partition): a new
+    // account's landscape was provisioned on the non-owner, and every request
+    // for it was refused `route-loop` 503 for 4.2 s until the owner's tick.
+    // `trg_workspace_version_created` (above) already notifies every cell on
+    // each INSERT INTO versions; this hands that notification to the same
+    // serialized reconciliation placed mode uses for its own channel — so the
+    // owner REQUESTS a pass at commit time (queued behind any pass in flight,
+    // whose length M2 measures), and the request path stays free of
+    // reconciliation work. A lost LISTEN reconnects at the next pass; until
+    // then admission is back to the timer, which stays the truth. Placed mode is excluded: its creations reach every
+    // cell through the placement channel.
+    this.versionCreation = config.enabled && config.placementMode !== 'placed'
+      && (config.versionCreationNotify ?? process.env.SYNC_CELL_VERSION_CREATED_NOTIFY !== 'off')
+      ? this.createVersionCreationListener(pool)
+      : null
+  }
+
+  /** A LISTEN needs its own checkout; a pool too small for one (max < 2) is a
+   * configuration this cell survived before the listener existed, so it
+   * degrades to timer-only admission and says so instead of failing to boot. */
+  private createVersionCreationListener(pool: Pool): PlacementInvalidationListener | null {
+    try {
+      return new PlacementInvalidationListener(pool,
+        () => { void this.reconcileNow().catch(error => this.recordError('version-created-notify', error)) },
+        error => this.recordError('version-created-listener', error),
+        { channel: WORKSPACE_VERSION_CREATED_CHANNEL, invalidateOnConnect: false })
+    } catch (error) {
+      console.error('[sync-cell] workspace_version_created listener disabled; new workspaces wait for the reconcile timer', error)
+      return null
+    }
   }
 
   /**
@@ -2239,20 +2284,16 @@ export class SyncCellOwnershipCoordinator implements SyncCellOwnership {
     // the method for why this is the one moment worth asking the question.
     await this.reportDurableFencesWithoutSequence()
     if (this.stopping) return
-    this.unsubscribeWorkspace = observeWorkspaceCreation(({ landscapeId, versionId }) => {
-      if (this.config.placementMode === 'placed') {
-        // A newly committed placement must be read before admission. Keep
-        // this work on the same queue as notifications and timer refreshes.
-        void this.reconcileNow().catch(error => this.recordError('new-workspace-reconcile', error))
-        return
-      }
-      const workspace = { landscapeId, versionId }
-      if (!this.ownsPartition(workspace)) return
-      this.expected.set(workspaceKey(workspace), workspace)
-      const running = Promise.resolve().then(() => this.acquireMissing([workspace]))
-        .catch(error => this.recordError('new-workspace-acquire', error))
-        .finally(() => this.creationAdmissionFlights.delete(running))
-      this.creationAdmissionFlights.add(running)
+    this.unsubscribeWorkspace = observeWorkspaceCreation(() => {
+      // Every mode admits a new workspace through the ONE serialized queue
+      // (timer, NOTIFY, this). With the `workspace_version_created` listener
+      // (see the constructor) the owner's NOTIFY-triggered pass starts within
+      // milliseconds of the same COMMIT, and `acquireMissing` has no in-flight
+      // de-duplication — each acquisition mints a NEW fencing token, so two
+      // racing admissions could leave the lower token in memory while Redis
+      // holds the higher one. A pass also reads the committed row, so placed
+      // and hash mode do not differ here.
+      void this.reconcileNow().catch(error => this.recordError('new-workspace-reconcile', error))
     })
     // Before the first pass, so that a cell running unbounded says so at the
     // moment it becomes able to freeze rather than after it has.
@@ -2453,6 +2494,7 @@ export class SyncCellOwnershipCoordinator implements SyncCellOwnership {
     // LISTEN first, then read: a commit during the initial SELECT marks this
     // flight dirty. A disconnected listener retries on the existing interval.
     await this.placementInvalidation?.connect().catch(error => this.recordError('placement-listen', error))
+    await this.versionCreation?.connect().catch(error => this.recordError('version-created-listen', error))
     if (this.stopping) return
     await this.retryPendingAuthorityReleases()
     if (this.stopping) return
@@ -2801,14 +2843,12 @@ export class SyncCellOwnershipCoordinator implements SyncCellOwnership {
     this.reconcileAgain = false
     await this.ownerRouteMap.stop()
     await this.placementInvalidation?.stop()
+    await this.versionCreation?.stop()
     // Reconciliation now owns expiry in every mode. Join it and both renew
     // flights before returning leases or allowing the owning pools to close.
     await this.reconcileFlight?.catch(error => this.recordError('stop-reconcile', error))
     await this.workspaceRenewFlight?.catch(error => this.recordError('stop-workspace-renew', error))
     await this.partitionRenewFlight?.catch(error => this.recordError('stop-partition-renew', error))
-    // Shadow-mode creation admits outside reconciliation. Keep its persistence
-    // and exact-token cleanup inside the lifetime of the owning pools too.
-    await Promise.allSettled([...this.creationAdmissionFlights])
     // Topology confirmation may own a durable publication, possibly already
     // waiting inside pg.
     // stopping prevents its continuation, not its commit. Join the real work

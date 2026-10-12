@@ -12,6 +12,7 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU Affero General Public License for more details.
 
+import { EventEmitter } from 'node:events'
 import type { Pool } from 'pg'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { RedisRuntime } from '../runtime/redis.js'
@@ -66,6 +67,13 @@ function databaseFixture(initialMirror: string | null = null) {
   let mirror = initialMirror
   const published: string[] = []
   const db = {
+    // A hash-mode cell holds one LISTEN checkout (workspace_version_created).
+    async connect() {
+      return Object.assign(new EventEmitter(), {
+        async query() { return { rows: [], rowCount: 0 } },
+        release() {},
+      })
+    },
     async query(sql: string, params?: unknown[]) {
       if (sql.includes('SELECT value FROM sync_topology_contract')) {
         return { rows: mirror === null ? [] : [{ value: mirror }], rowCount: mirror === null ? 0 : 1 }

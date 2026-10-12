@@ -14,6 +14,7 @@
 
 import type { TagSnapshot } from '../../types'
 import { registerTagCanonicalIds } from './canonicalIds'
+import { accountDatabaseName } from '../auth/accountNamespace'
 
 export type CatalogTagLifecycle = 'active' | 'archived' | 'merged'
 export type CatalogTagGroupLifecycle = 'active' | 'archived'
@@ -282,7 +283,7 @@ function publicOutboxItem(entry: OutboxEntry): TagCatalogOutboxItem {
 
 function openCache(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open(DB_NAME, DB_VERSION)
+    const request = indexedDB.open(accountDatabaseName(DB_NAME), DB_VERSION)
     request.onupgradeneeded = () => {
       if (!request.result.objectStoreNames.contains(STORE_NAME)) {
         request.result.createObjectStore(STORE_NAME, { keyPath: 'orgId' })

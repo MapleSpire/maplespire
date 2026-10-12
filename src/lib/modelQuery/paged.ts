@@ -24,7 +24,7 @@ import { warnWholeModelRead } from './wholeModelGuard'
 import type { Diagram } from '../../types'
 import type { ModelQuery } from './types'
 import { isServerReadModelEnabled } from './tierFlag'
-import { serverModelQuery } from './server'
+import { isAuthoritativeReadModelRefusal, serverModelQuery } from './server'
 import { residentObjectSearchPage, residentObjectTreePage } from './objectExplorerFallback'
 import { workerObjectSearchPage, workerObjectTreePage } from './objectExplorerWorker'
 import { workerConnectionPage } from './connectionExplorerWorker'
@@ -63,6 +63,27 @@ import type { RelatedDiagramsOptions, RelatedDiagramsResult } from './types'
  *    diagrams registry (`relatedDiagramsFromRegistry`), never to the index's
  *    diagram postings; see that function for why.
  */
+/** A rung's failure that must END the ladder instead of falling to the next
+ * (local) rung: a cancelled request, or the server REFUSING access. A refusal
+ * answered from the local caches would serve another account's data — see
+ * `isAuthoritativeReadModelRefusal`.
+ *
+ * Applied to the PAGE ladders only (tree, search, connections, dependencies,
+ * viewer), whose callers render a rejection as an error with a retry. The
+ * point lookups (`object`, `group`, `lookupMany`, `relatedDiagrams*`) keep
+ * their offline fallback on purpose: review found callers that leave their
+ * rejection unhandled — a drag that never finishes, a focus stuck resolving —
+ * and the cross-account case they would have guarded is closed at the source
+ * instead: every local store is per user (src/lib/auth/accountNamespace.ts),
+ * so another account's cache is never opened. NOT covered: the SAME user whose
+ * access to a workspace was revoked is still answered from their own cache by
+ * these lookups until it is evicted. */
+function stopsFallback(error: unknown, signal: AbortSignal | undefined): boolean {
+  return Boolean(signal?.aborted)
+    || (error instanceof DOMException && error.name === 'AbortError')
+    || isAuthoritativeReadModelRefusal(error)
+}
+
 let storeOverride: KvStore | null = null
 const store = (): KvStore => storeOverride ?? workspaceKvStore()
 
@@ -140,7 +161,7 @@ export const pagedModelQuery: ModelQuery = {
       try {
         return await serverModelQuery.objectTreePage(opts, signal)
       } catch (error) {
-        if (signal?.aborted || (error instanceof DOMException && error.name === 'AbortError')) throw error
+        if (stopsFallback(error, signal)) throw error
       }
     }
     try {
@@ -157,7 +178,7 @@ export const pagedModelQuery: ModelQuery = {
       try {
         return await serverModelQuery.objectSearchPage(opts, signal)
       } catch (error) {
-        if (signal?.aborted || (error instanceof DOMException && error.name === 'AbortError')) throw error
+        if (stopsFallback(error, signal)) throw error
       }
     }
     const filtered = Boolean(
@@ -171,7 +192,7 @@ export const pagedModelQuery: ModelQuery = {
         const page = await workerObjectSearchPage(opts, signal)
         if (page.coverage === 'full' || page.projectionGeneration > 0 || page.items.length > 0) return page
       } catch (error) {
-        if (signal?.aborted || (error instanceof DOMException && error.name === 'AbortError')) throw error
+        if (stopsFallback(error, signal)) throw error
       }
     }
     const page = await residentObjectSearchPage(opts)
@@ -182,7 +203,7 @@ export const pagedModelQuery: ModelQuery = {
       try {
         return await serverModelQuery.connectionPage(opts, signal)
       } catch (error) {
-        if (signal?.aborted || (error instanceof DOMException && error.name === 'AbortError')) throw error
+        if (stopsFallback(error, signal)) throw error
       }
     }
     try {
@@ -213,7 +234,7 @@ export const pagedModelQuery: ModelQuery = {
       try {
         return await serverModelQuery.dependencyPage(opts, signal)
       } catch (error) {
-        if (signal?.aborted || (error instanceof DOMException && error.name === 'AbortError')) throw error
+        if (stopsFallback(error, signal)) throw error
       }
     }
     try {
@@ -243,7 +264,7 @@ export const pagedModelQuery: ModelQuery = {
       try {
         return await serverModelQuery.viewerLevel(opts, signal)
       } catch (error) {
-        if (signal?.aborted || (error instanceof DOMException && error.name === 'AbortError')) throw error
+        if (stopsFallback(error, signal)) throw error
       }
     }
     try {

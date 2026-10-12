@@ -163,7 +163,9 @@ async function runColdLinks(
     const staleVersionId = versionId === 'current' ? draftId : 'current'
     const diagramId = attempt % 4 < 2 ? 'perf-dg-000000' : 'perf-dg-012000'
     const destination = `/app/landscape/${landscapeId}/version/${versionId}/diagram/${diagramId}`
-    const storageKey = `maplespire:workspaceRef:${session.claims.orgId}`
+    // Per-user key under AUTH=on (src/lib/auth/accountNamespace.ts): seeding
+    // the bare org key would leave nothing stale for the URL to win against.
+    const storageKey = `maplespire:workspaceRef:${session.claims.orgId}@${session.user.id}`
     let reauthenticatedIntoTarget = false
     if (attempt === Math.floor(attemptsPerProfile / 2)) {
       expectedVersion = versionId

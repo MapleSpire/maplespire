@@ -138,7 +138,11 @@ export function syncCellDatabasePoolConfig(
   env: DatabaseEnvironment = process.env,
 ): PoolConfig {
   return {
-    ...databasePoolConfig({ ...env, DB_POOL_MAX: env.SYNC_CELL_DB_POOL_MAX ?? '4' }),
+    // 5 = the 4 working connections every measurement of this pool used (M2,
+    // TB4q) + the one LISTEN checkout each ownership coordinator now pins for
+    // its whole life (placed mode: placement changes; hash mode, since
+    // 2026-10-11: workspace_version_created — ownership.ts `versionCreation`).
+    ...databasePoolConfig({ ...env, DB_POOL_MAX: env.SYNC_CELL_DB_POOL_MAX ?? '5' }),
     statement_timeout: positiveInteger(env.SYNC_CELL_STATEMENT_TIMEOUT_MS, 30_000),
     lock_timeout: positiveInteger(env.SYNC_CELL_LOCK_TIMEOUT_MS, 2_000),
   }

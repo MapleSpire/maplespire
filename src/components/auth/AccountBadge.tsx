@@ -120,6 +120,8 @@ export function AccountBadge({ variant = 'icon' }: { variant?: 'icon' | 'row' })
   const [newOrgOpen, setNewOrgOpen] = useState(false)
   const [orgs, setOrgs] = useState<api.OrgMembership[] | null>(null)
   const [switching, setSwitching] = useState<string | null>(null)
+  const [signingOut, setSigningOut] = useState(false)
+  const [signOutError, setSignOutError] = useState(false)
   const ref = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -201,8 +203,16 @@ export function AccountBadge({ variant = 'icon' }: { variant?: 'icon' | 'row' })
 
   // ── Signed in ────────────────────────────────────────────────────────────────
   const handleSignOut = async () => {
-    await runLogout()
-    setOpen(false)
+    if (signingOut) return
+    setSigningOut(true)
+    setSignOutError(false)
+    try {
+      await runLogout() // hard-loads /login on success
+    } catch {
+      // The server did not end the session: say so instead of looking done.
+      setSigningOut(false)
+      setSignOutError(true)
+    }
   }
   const displayName =
     [user.givenName, user.familyName].filter(Boolean).join(' ') || user.name || user.email.split('@')[0]
@@ -319,10 +329,15 @@ export function AccountBadge({ variant = 'icon' }: { variant?: 'icon' | 'row' })
         {t('account.privacy')}
       </a>
       {sep}
-      <button data-testid="account-signout" onClick={handleSignOut} className={item}>
+      <button data-testid="account-signout" onClick={handleSignOut} disabled={signingOut} className={item}>
         <LogOut className="h-3.5 w-3.5" />
         {t('account.signOut')}
       </button>
+      {signOutError && (
+        <p data-testid="account-signout-error" role="alert" className="px-2.5 py-1 text-[11.5px] text-error-text">
+          {t('account.signOutFailed')}
+        </p>
+      )}
     </>
   )
 

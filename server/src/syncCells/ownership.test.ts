@@ -212,7 +212,9 @@ function fakePool(
       const client = new EventEmitter()
       return Object.assign(client, {
         async query(text: string) {
-          expect(text).toBe('LISTEN workspace_placement_changed')
+          // Placed mode listens for placement changes; hash mode for version
+          // creation (a workspace created on another cell).
+          expect(['LISTEN workspace_placement_changed', 'LISTEN workspace_version_created']).toContain(text)
           return { rows: [], rowCount: 0 }
         },
         release() { client.removeAllListeners() },
@@ -1649,13 +1651,18 @@ describe('SyncCellOwnershipCoordinator', () => {
     const entered = deferred()
     const resume = deferred()
     const redis = new FakeRedis()
-    const db = fakePool([], [], async () => { entered.resolve(); await resume.promise })
+    const rows: Array<{ landscape_id: string; id: string }> = []
+    const db = fakePool([], rows, async () => { entered.resolve(); await resume.promise })
     const query = vi.spyOn(db, 'query')
     const coordinator = new SyncCellOwnershipCoordinator(db, redis as unknown as RedisRuntime, config('cell-a'))
     let stopped: Promise<void> | undefined
     try {
       await coordinator.start()
       const workspace = { landscapeId: 'new-landscape', versionId: 'new-version' }
+      // The version row is committed BEFORE the creation is announced
+      // (provisioning.ts, landscapes.ts); creation admission is a
+      // reconciliation pass, which reads that row (2026-10-11).
+      rows.push({ landscape_id: workspace.landscapeId, id: workspace.versionId })
       notifyWorkspaceCreated({ ...workspace, rootUrl: 'unused-by-ownership' })
       await entered.promise
       expect(redis.workspaceOwner(workspace)).not.toBeNull()
@@ -1749,6 +1756,248 @@ describe('a failed partition worker client is replaced', () => {
     } finally {
       await coordinator.stop()
       warn.mockRestore()
+    }
+  })
+})
+
+/**
+ * Regression (two cells, one partition): a new account's landscape was
+ * provisioned on the cell that does NOT hold the partition. Creation is
+ * announced in-process only, so the owner learned of it at its next timer tick,
+ * and until then every request for it was refused `route-loop` 503. `trg_workspace_version_created` notifies every
+ * cell; the owner now hands that notification to its reconciliation. These
+ * arms commit a version row "elsewhere" (pushed into the fake table after
+ * start(), no in-process `notifyWorkspaceCreated`), with a 300 s timer, so only
+ * the notification can admit it.
+ */
+describe('SyncCellOwnershipCoordinator — workspace_version_created (hash mode)', () => {
+  const CREATED_ELSEWHERE = { landscapeId: 'new-account-landscape', versionId: 'v1' }
+
+  function harness(overrides: Partial<SyncCellOwnershipConfig> = {}) {
+    const rows = [{ landscape_id: 'landscape-1', id: 'current' }]
+    const pool = fakePool([], rows)
+    const listens: string[] = []
+    let listener: EventEmitter | null = null
+    const realConnect = pool.connect.bind(pool) as () => Promise<EventEmitter & { query(text: string): Promise<unknown> }>
+    ;(pool as unknown as { connect: typeof realConnect }).connect = async () => {
+      const client = await realConnect()
+      const query = client.query.bind(client)
+      client.query = async (text: string) => {
+        listens.push(text)
+        if (text === 'LISTEN workspace_version_created') listener = client
+        return query(text)
+      }
+      return client
+    }
+    const coordinator = new SyncCellOwnershipCoordinator(
+      pool, new FakeRedis() as unknown as RedisRuntime, config('cell-b', { versionCreationNotify: true, ...overrides }),
+    )
+    return {
+      coordinator,
+      listens,
+      commitElsewhere: () => rows.push({ landscape_id: CREATED_ELSEWHERE.landscapeId, id: CREATED_ELSEWHERE.versionId }),
+      notify: (channel = 'workspace_version_created') => listener?.emit('notification', { channel, payload: CREATED_ELSEWHERE.landscapeId }),
+    }
+  }
+
+  it('the owner admits a workspace committed by another cell when the creation is notified', async () => {
+    const { coordinator, commitElsewhere, notify } = harness()
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+    try {
+      await coordinator.start()
+      commitElsewhere()
+      // Control: nothing else admits it — the defect as shipped.
+      await coordinator.renewNow()
+      expect(coordinator.owns(CREATED_ELSEWHERE)).toBe(false)
+
+      notify()
+
+      await expect.poll(() => coordinator.owns(CREATED_ELSEWHERE)).toBe(true)
+    } finally {
+      log.mockRestore()
+      await coordinator.stop()
+    }
+  })
+
+  it('a notification on another channel admits nothing', async () => {
+    const { coordinator, commitElsewhere, notify } = harness()
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+    try {
+      await coordinator.start()
+      commitElsewhere()
+      notify('workspace_coverage_changed')
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      expect(coordinator.owns(CREATED_ELSEWHERE)).toBe(false)
+    } finally {
+      log.mockRestore()
+      await coordinator.stop()
+    }
+  })
+
+  it('PRODUCTION default: with the variable unset and the field omitted, the listener is on', async () => {
+    // The harness sets SYNC_CELL_VERSION_CREATED_NOTIFY=off (vitest.setup.ts);
+    // production does not set it. This pins that "unset" means ON — the fix.
+    const saved = process.env.SYNC_CELL_VERSION_CREATED_NOTIFY
+    delete process.env.SYNC_CELL_VERSION_CREATED_NOTIFY
+    const { coordinator, listens } = harness({ versionCreationNotify: undefined })
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+    try {
+      await coordinator.start()
+      expect(listens).toContain('LISTEN workspace_version_created')
+    } finally {
+      log.mockRestore()
+      await coordinator.stop()
+      if (saved === undefined) delete process.env.SYNC_CELL_VERSION_CREATED_NOTIFY
+      else process.env.SYNC_CELL_VERSION_CREATED_NOTIFY = saved
+    }
+  })
+
+  it('the test harness default is off (the shared test database must not couple suites)', async () => {
+    expect(process.env.SYNC_CELL_VERSION_CREATED_NOTIFY).toBe('off')
+    const { coordinator, listens } = harness({ versionCreationNotify: undefined })
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+    try {
+      await coordinator.start()
+      expect(listens).not.toContain('LISTEN workspace_version_created')
+    } finally {
+      log.mockRestore()
+      await coordinator.stop()
+    }
+  })
+
+  it('placed mode keeps its own channel only', async () => {
+    const partition = syncCellPartitionConfig({
+      SYNC_CELL_PARTITION_COUNT: '1', SYNC_CELL_MULTI_PARTITION: 'on', SYNC_CELL_PLACEMENT_MODE: 'placed',
+    })
+    const { coordinator, listens } = harness(partition)
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+    try {
+      await coordinator.start()
+      expect(listens).toContain('LISTEN workspace_placement_changed')
+      expect(listens).not.toContain('LISTEN workspace_version_created')
+    } finally {
+      log.mockRestore()
+      await coordinator.stop()
+    }
+  })
+})
+
+/**
+ * The hash-mode `workspace_version_created` listener. Three properties the
+ * arms above leave unpinned:
+ *  - stop() must give the LISTEN checkout back (else `pool.end()` never
+ *    resolves);
+ *  - a pool too small for a LISTEN must degrade, not fail the cell's boot;
+ *  - the creation observer and the NOTIFY of the SAME commit must not both
+ *    admit the workspace (each admission mints a new fencing token).
+ */
+describe('SyncCellOwnershipCoordinator — workspace_version_created lifetime and admission (QA)', () => {
+  function trackedPool(rows: Array<{ landscape_id: string; id: string }>, afterPersist?: (token: string) => Promise<void>) {
+    const pool = fakePool([], rows, afterPersist)
+    const checkouts: Array<{ text: string[]; released: boolean; client: EventEmitter }> = []
+    const realConnect = pool.connect.bind(pool) as () => Promise<EventEmitter & {
+      query(text: string): Promise<unknown>
+      release(error?: Error): void
+    }>
+    ;(pool as unknown as { connect: typeof realConnect }).connect = async () => {
+      const client = await realConnect()
+      const entry = { text: [] as string[], released: false, client: client as EventEmitter }
+      checkouts.push(entry)
+      const query = client.query.bind(client)
+      client.query = async (text: string) => { entry.text.push(text); return query(text) }
+      const release = client.release.bind(client)
+      client.release = (error?: Error) => { entry.released = true; release(error) }
+      return client
+    }
+    const versionListener = () => checkouts.find(c => c.text.includes('LISTEN workspace_version_created') && !c.released)
+    return { pool, checkouts, versionListener }
+  }
+
+  it('stop() releases the version-created LISTEN checkout (no leaked pool client)', async () => {
+    const { pool, checkouts } = trackedPool([{ landscape_id: 'landscape-1', id: 'current' }])
+    const coordinator = new SyncCellOwnershipCoordinator(pool, new FakeRedis() as unknown as RedisRuntime, config('cell-a', { versionCreationNotify: true }))
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+    try {
+      await coordinator.start()
+      // Vacuity guard: the hash-mode cell did check one out for this channel.
+      expect(checkouts.some(c => c.text.includes('LISTEN workspace_version_created'))).toBe(true)
+    } finally {
+      await coordinator.stop()
+      log.mockRestore()
+    }
+    expect(checkouts.filter(c => !c.released)).toEqual([])
+  })
+
+  it('a pool whose max cannot hold a LISTEN (max 1) still boots and admits by reconciliation', async () => {
+    const rows = [{ landscape_id: 'landscape-1', id: 'current' }]
+    const pool = Object.assign(fakePool([], rows), { options: { max: 1 } })
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+    let coordinator: SyncCellOwnershipCoordinator | undefined
+    try {
+      coordinator = new SyncCellOwnershipCoordinator(pool, new FakeRedis() as unknown as RedisRuntime, config('cell-a', { versionCreationNotify: true }))
+      await coordinator.start()
+      expect(coordinator.owns({ landscapeId: 'landscape-1', versionId: 'current' })).toBe(true)
+      // It says so, rather than degrading silently.
+      expect(errors.mock.calls.some(([message]) => String(message).includes('workspace_version_created'))).toBe(true)
+    } finally {
+      await coordinator?.stop()
+      errors.mockRestore()
+      log.mockRestore()
+    }
+  })
+
+  it('one COMMIT announced twice (in-process creation + its NOTIFY) mints ONE fencing token', async () => {
+    const created = { landscapeId: 'raced-landscape', versionId: 'v1' }
+    const rows = [{ landscape_id: 'landscape-1', id: 'current' }]
+    // Park the FIRST persist of the raced workspace, so a second admission —
+    // if one exists — has the whole window to start.
+    const gate = deferred()
+    let parked = false
+    const { pool, versionListener } = trackedPool(rows, async () => {
+      if (!parked && rows.some(r => r.landscape_id === created.landscapeId)) {
+        parked = true
+        await gate.promise
+      }
+    })
+    const query = vi.spyOn(pool, 'query')
+    const redis = new FakeRedis()
+    const coordinator = new SyncCellOwnershipCoordinator(pool, redis as unknown as RedisRuntime, config('cell-a', { versionCreationNotify: true }))
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+    try {
+      await coordinator.start()
+      const listener = versionListener()
+      expect(listener).toBeDefined()
+
+      rows.push({ landscape_id: created.landscapeId, id: created.versionId })
+      // provisioning.ts announces in-process after COMMIT; the trigger's NOTIFY
+      // for the same COMMIT reaches this cell's LISTEN within milliseconds.
+      notifyWorkspaceCreated({ ...created, rootUrl: 'unused-by-ownership' })
+      listener!.client.emit('notification', { channel: 'workspace_version_created', payload: created.landscapeId })
+
+      await expect.poll(() => parked).toBe(true)
+      await new Promise(resolve => setTimeout(resolve, 100))
+      gate.resolve()
+      await expect.poll(() => coordinator.owns(created)).toBe(true)
+      await coordinator.reconcileNow()
+
+      const minted = new Set(query.mock.calls
+        .filter(([text, values]) => typeof text === 'string' && text.includes('INSERT INTO sync_workspace_ownership')
+          && (values as unknown[] | undefined)?.[0] === created.landscapeId)
+        .map(([, values]) => String((values as unknown[])[3])))
+      // One admission, one token. (Its VALUE is not asserted: this fixture
+      // answers the durable-fence SELECT with the last token of ANY workspace.)
+      expect(minted.size).toBe(1)
+      const [token] = [...minted]
+      // And what this cell holds in memory is what Redis holds: it survives a renewal.
+      await coordinator.renewNow()
+      expect(coordinator.owns(created)).toBe(true)
+      expect(redis.workspaceOwner(created)?.split('|')[1]).toBe(token)
+    } finally {
+      gate.resolve()
+      await coordinator.stop()
+      query.mockRestore()
+      log.mockRestore()
     }
   })
 })

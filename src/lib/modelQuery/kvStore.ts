@@ -14,6 +14,7 @@
 
 import { get, getMany, set, setMany, del, delMany, entries, clear, createStore, update, type UseStore } from 'idb-keyval'
 import { currentWorkspaceRef, workspaceRefKey } from '../automerge/workspace'
+import { accountDatabaseName } from '../auth/accountNamespace'
 import { recordModelQueryOperation } from '../observability/modelQueryDiagnostics'
 
 /**
@@ -47,7 +48,7 @@ export interface KvStore {
 
 let store: UseStore | undefined
 function idb(): UseStore {
-  if (!store) store = createStore('maplespire-model-index', 'idx')
+  if (!store) store = createStore(accountDatabaseName('maplespire-model-index'), 'idx')
   return store
 }
 

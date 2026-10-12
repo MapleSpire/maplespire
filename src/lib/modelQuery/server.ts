@@ -58,9 +58,35 @@ export function __setServerFetchForTest(f: Fetcher | null): void {
   fetcher = f ?? ((url, init) => workspaceApiFetch(url, init))
 }
 
+/** A read-model request the server ANSWERED with a non-2xx status. Distinct from
+ * a transport failure (fetch rejects) so callers can tell "the server said no"
+ * from "the server is unreachable" — see `isAuthoritativeReadModelRefusal`. */
+export class ReadModelHttpError extends Error {
+  readonly status: number
+
+  constructor(path: string, status: number) {
+    super(`read-model API ${path} → HTTP ${status}`)
+    this.name = 'ReadModelHttpError'
+    this.status = status
+  }
+}
+
+/**
+ * 401/403 are ACCESS decisions, not outages, and an outage fallback must not
+ * answer them. Reproduced 2026-10-11 (live, then on a local AUTH=on stack): a
+ * new account booted with the previous account's persisted landscape, the
+ * server answered 403, and the explorer filled with the previous account's
+ * objects from the local caches under the "offline results" banner. Those
+ * caches are per user since (src/lib/auth/accountNamespace.ts); this check
+ * remains so a refused workspace renders as refused, not as offline.
+ */
+export function isAuthoritativeReadModelRefusal(error: unknown): boolean {
+  return error instanceof ReadModelHttpError && (error.status === 401 || error.status === 403)
+}
+
 async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
   const res = await fetcher(`${API_BASE}${path}`, { signal })
-  if (!res.ok) throw new Error(`read-model API ${path} → HTTP ${res.status}`)
+  if (!res.ok) throw new ReadModelHttpError(path, res.status)
   return (await res.json()) as T
 }
 
@@ -71,7 +97,7 @@ async function postJson<T>(path: string, body: unknown, signal?: AbortSignal): P
     body: JSON.stringify(body),
     signal,
   })
-  if (!res.ok) throw new Error(`read-model API ${path} → HTTP ${res.status}`)
+  if (!res.ok) throw new ReadModelHttpError(path, res.status)
   return (await res.json()) as T
 }
 
@@ -79,7 +105,7 @@ async function postJson<T>(path: string, body: unknown, signal?: AbortSignal): P
 async function getJsonOr404<T>(path: string): Promise<T | undefined> {
   const res = await fetcher(`${API_BASE}${path}`)
   if (res.status === 404) return undefined
-  if (!res.ok) throw new Error(`read-model API ${path} → HTTP ${res.status}`)
+  if (!res.ok) throw new ReadModelHttpError(path, res.status)
   return (await res.json()) as T
 }
 

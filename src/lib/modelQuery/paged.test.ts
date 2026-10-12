@@ -133,6 +133,56 @@ describe('pagedModelQuery — served from the index, equals resident', () => {
     expect(result?.name).toBe('Double-entry Ledger / 10')
   })
 
+  describe('an access refusal is final — never answered from this browser\'s caches', () => {
+    // Regression, 2026-10-11 (app.maplespire.ca): after signing out and creating
+    // a new account in the same browser, the app booted with the previous
+    // account's persisted landscape. The server answered 403, the ladder fell to
+    // the local rungs, and the shape explorer listed the PREVIOUS account's
+    // objects under "Offline results are limited to this device's working set".
+    // The local caches are keyed by workspace, not by user, so a refusal must
+    // end the ladder. The 503 arm is the control: an outage still falls back.
+    function serverAnswers(status: number) {
+      vi.stubGlobal('localStorage', {
+        getItem: (key: string) => key === 'maplespire:serverReadModel' ? 'true' : null,
+      })
+      vi.stubGlobal('navigator', { onLine: true })
+      __setServerFetchForTest(async () => new Response(JSON.stringify({ error: 'x' }), {
+        status,
+        headers: { 'content-type': 'application/json' },
+      }))
+    }
+
+    for (const status of [401, 403]) {
+      it(`HTTP ${status}: every page ladder rejects instead of serving local data`, async () => {
+        serverAnswers(status)
+        await expect(pagedModelQuery.objectTreePage({ limit: 50 })).rejects.toMatchObject({ status })
+        await expect(pagedModelQuery.objectSearchPage({ query: 'abc', limit: 50 })).rejects.toMatchObject({ status })
+        await expect(pagedModelQuery.connectionPage({ limit: 50 })).rejects.toMatchObject({ status })
+        await expect(pagedModelQuery.dependencyPage({ focusId: 'A', direction: 'incoming', limit: 50 }))
+          .rejects.toMatchObject({ status })
+        await expect(pagedModelQuery.viewerLevel({ limit: 50 })).rejects.toMatchObject({ status })
+      })
+    }
+
+    it('point lookups keep their offline fallback on a refusal (callers do not handle a rejection)', async () => {
+      // Deliberate: see `stopsFallback`. The cross-account case is closed at
+      // the source by the data-owner purge, not here.
+      serverAnswers(403)
+      expect((await pagedModelQuery.object('A'))?.id).toBe('A')
+      expect((await pagedModelQuery.group('G1'))?.id).toBe('G1')
+      expect((await pagedModelQuery.lookupMany(['A'])).has('A')).toBe(true)
+    })
+
+    it('HTTP 503 (control): an outage still falls back to the local working set', async () => {
+      serverAnswers(503)
+      const page = await pagedModelQuery.objectTreePage({ limit: 50 })
+      expect(page.coverage).toBe('working-set')
+      expect(page.items.length).toBeGreaterThan(0)
+      expect((await pagedModelQuery.object('A'))?.id).toBe('A')
+      expect((await pagedModelQuery.lookupMany(['A'])).has('A')).toBe(true)
+    })
+  })
+
   it('descendants agrees with resident', async () => {
     for (const focus of ['A', 'B', 'C', 'D']) {
       expect((await pagedModelQuery.descendants(focus)).sort()).toEqual(

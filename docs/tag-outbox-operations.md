@@ -30,8 +30,11 @@ aggregates only.
 ## Durable delivery and deduplication
 
 Events share the `maplespire-tag-catalog-v1` IndexedDB database in the
-`operations` object store. They survive reloads and are deleted locally only
-after a successful batch response. Batches contain at most 100 events and are
+`operations` object store — `maplespire-tag-catalog-v1@<userId>` for a signed-in
+user, so one account never flushes another account's queued events
+(`src/lib/auth/accountNamespace.ts`). They survive reloads and are deleted locally only
+after a successful batch response. The pre-namespacing shared database is left
+on disk untouched, never deleted, but no namespaced page opens it again. Batches contain at most 100 events and are
 serialized per organization. If a response is lost, resending is safe because
 `tag_operation_events.id` is unique and ingestion uses `ON CONFLICT DO NOTHING`.
 

@@ -49,3 +49,10 @@ afterAll(() => durableHeadsDecoder.close())
 if (!process.env.AUTH_SECRET) {
   process.env.AUTH_SECRET = 'vitest-harness-auth-secret'
 }
+
+// Sync-cell coordinators do NOT react to `workspace_version_created` here
+// unless a suite asks (`versionCreationNotify: true`): NOTIFY is per database,
+// and the suites share one, so every hash-mode coordinator ran extra passes on
+// every other suite's version inserts and timing-bound suites failed at random
+// (ownership.ts `versionCreationNotify`, 2026-10-11). Production default: on.
+process.env.SYNC_CELL_VERSION_CREATED_NOTIFY ??= 'off'

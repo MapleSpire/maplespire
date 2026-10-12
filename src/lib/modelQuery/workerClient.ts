@@ -29,6 +29,7 @@ import type {
   ModelCacheWorkspaceMeta,
 } from './idbSchema'
 import { recordModelQueryOperation } from '../observability/modelQueryDiagnostics'
+import { accountWorkerName } from '../auth/accountNamespace'
 
 interface PendingRequest {
   operation: string
@@ -56,7 +57,12 @@ export class ModelReadCacheWorkerClient implements ModelReadCacheApi {
     if (worker) {
       this.worker = worker
     } else if (typeof Worker !== 'undefined') {
-      this.worker = new Worker(new URL('../../workers/modelReadCache.worker.ts', import.meta.url), { type: 'module' })
+      // The Worker opens the account's read cache; it has no localStorage, so
+      // the namespace travels as its name (accountNamespace.ts).
+      this.worker = new Worker(new URL('../../workers/modelReadCache.worker.ts', import.meta.url), {
+        type: 'module',
+        name: accountWorkerName(),
+      })
     } else {
       throw new Error('Model read cache Worker is unavailable in this environment')
     }

@@ -18,6 +18,7 @@ import {
   resolveRootUrlWithRetry,
   shouldFallBackToCachedRoot,
   WorkspaceRootHttpError,
+  workspaceRootHttpError,
 } from './rootFetchPolicy'
 import { DocumentTemporarilyUnavailableError } from './documentResolution'
 
@@ -45,7 +46,7 @@ describe('root url fetch retry (transient 503 at boot)', () => {
     // Kills the no-retry mutant: without the retry loop, the first 503
     // propagates and this resolves() never happens.
     const fetchOnce = vi.fn()
-      .mockRejectedValueOnce(new WorkspaceRootHttpError(503))
+      .mockRejectedValueOnce(new WorkspaceRootHttpError(503, { retryable: true }))
       .mockResolvedValueOnce('automerge:fresh-root')
     const sleep = vi.fn(async () => undefined)
 
@@ -56,13 +57,46 @@ describe('root url fetch retry (transient 503 at boot)', () => {
 
   it('the retry is bounded: a persistent 503 surfaces after the budget, never loops', async () => {
     // Kills the unbounded-retry mutant: the call count is asserted exactly.
-    const fetchOnce = vi.fn().mockRejectedValue(new WorkspaceRootHttpError(503))
+    const fetchOnce = vi.fn().mockRejectedValue(new WorkspaceRootHttpError(503, { retryable: true }))
     const sleep = vi.fn(async () => undefined)
 
     await expect(resolveRootUrlWithRetry(fetchOnce, { attempts: 3, sleep }))
       .rejects.toBeInstanceOf(WorkspaceRootHttpError)
     expect(fetchOnce).toHaveBeenCalledTimes(3)
     expect(sleep).toHaveBeenCalledTimes(2)
+  })
+
+  it('the default budget stays 1.5 s of backoff: an outage must reach the offline root quickly', async () => {
+    // A literal, not the constant (a test that reads the constant cannot
+    // notice it being raised): a Redis outage answers
+    // marked-retryable 503s, and every extra attempt delays the warm OFFLINE
+    // boot's cached root.
+    const fetchForever = vi.fn().mockRejectedValue(new WorkspaceRootHttpError(503, { retryable: true }))
+    const waited: number[] = []
+    await expect(resolveRootUrlWithRetry(fetchForever, { sleep: async (ms) => { waited.push(ms) } }))
+      .rejects.toBeInstanceOf(WorkspaceRootHttpError)
+    expect(waited.reduce((a, b) => a + b, 0)).toBe(1_500)
+  })
+
+  it.each([502, 503, 504])('an UNMARKED %i (a proxy in front of a dead backend) goes straight to the offline path', async (status) => {
+    // Behind the same-origin nginx, a stopped API answers a fast 502 with an
+    // HTML page — not a transport failure. Retrying it would hold a warm
+    // OFFLINE boot for the whole 7.5 s budget before the cached root.
+    const fetchOnce = vi.fn().mockRejectedValue(new WorkspaceRootHttpError(status))
+    const sleep = vi.fn(async () => undefined)
+
+    await expect(resolveRootUrlWithRetry(fetchOnce, { sleep })).rejects.toMatchObject({ status })
+    expect(fetchOnce).toHaveBeenCalledTimes(1)
+    expect(sleep).not.toHaveBeenCalled()
+  })
+
+  it('reads the server\'s retry signal from Retry-After or a {retryable:true} body, never from a proxy page', async () => {
+    const owner = await workspaceRootHttpError(new Response(
+      JSON.stringify({ error: 'workspace owner unavailable', retryable: true }), { status: 503 },
+    ))
+    const rootRoute = await workspaceRootHttpError(new Response('{}', { status: 503, headers: { 'Retry-After': '1' } }))
+    const proxy = await workspaceRootHttpError(new Response('<html>502 Bad Gateway</html>', { status: 502 }))
+    expect([owner.retryable, rootRoute.retryable, proxy.retryable]).toEqual([true, true, false])
   })
 
   it('an authoritative 4xx is never retried', async () => {

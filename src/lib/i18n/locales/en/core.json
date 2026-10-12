@@ -37,6 +37,7 @@
     "signInSubtitle": "Access your organizations",
     "signInTooltip": "Sign in",
     "signOut": "Sign out",
+    "signOutFailed": "Sign-out failed. Check your connection and try again.",
     "settings": "Account settings",
     "organizations": "Organizations",
     "newOrg": "New organization",

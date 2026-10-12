@@ -13,6 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import type { C4Object, Connection, Group } from '../../types'
+import { accountDatabaseName } from '../auth/accountNamespace'
 
 export const MODEL_READ_CACHE_DB = 'maplespire-model-read-cache'
 export const MODEL_READ_CACHE_VERSION = 7
@@ -289,7 +290,9 @@ let databasePromise: Promise<IDBDatabase> | null = null
 export function openModelReadCache(): Promise<IDBDatabase> {
   if (databasePromise) return databasePromise
   databasePromise = new Promise<IDBDatabase>((resolve, reject) => {
-    const request = indexedDB.open(MODEL_READ_CACHE_DB, MODEL_READ_CACHE_VERSION)
+    // Opened inside the read-cache Worker: the namespace arrives as the
+    // Worker's name (workerClient.ts, accountWorkerName).
+    const request = indexedDB.open(accountDatabaseName(MODEL_READ_CACHE_DB), MODEL_READ_CACHE_VERSION)
     request.onerror = () => {
       databasePromise = null
       reject(request.error ?? new Error('Unable to open model read cache'))

@@ -26,6 +26,7 @@ import './stores/themeStore'
 import { exposeBootHealth, installClientDiagnostics } from './lib/observability/installClientDiagnostics'
 import { installModelReadCacheChangeFeed } from './lib/modelQuery/modelReadCacheChangeFeed'
 import { primeBootWorkspaceRef } from './lib/automerge/bootRef'
+import { installAccountNamespaceListener } from './lib/auth/accountNamespace'
 import { useModelStore } from './stores/modelStore'
 import { useWorkspaceStore } from './stores/workspaceStore'
 
@@ -53,6 +54,10 @@ exposeBootHealth()
 installClientDiagnostics()
 const stopModelReadCacheChangeFeed = installModelReadCacheChangeFeed()
 if (import.meta.hot) import.meta.hot.dispose(stopModelReadCacheChangeFeed)
+// Another tab signing out or in as someone else reloads this one into the
+// right account's storage (accountNamespace.ts).
+const stopAccountNamespaceListener = installAccountNamespaceListener()
+if (import.meta.hot) import.meta.hot.dispose(stopAccountNamespaceListener)
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>

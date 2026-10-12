@@ -12,6 +12,8 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU Affero General Public License for more details.
 
+import { accountStorageKey } from '../auth/accountNamespace'
+
 /**
  * WorkspaceRef — the compound addressing key for a single editable workspace.
  *
@@ -70,7 +72,9 @@ const ACTIVE_REF_KEY = 'maplespire:workspaceRef'
 let orgScope: string | null = null
 
 function activeRefKey(): string {
-  return orgScope ? `${ACTIVE_REF_KEY}:${orgScope}` : ACTIVE_REF_KEY
+  // Per user too (accountNamespace.ts): two members of one org on a browser,
+  // or a signed-out page, must not hand each other a last-open landscape.
+  return accountStorageKey(orgScope ? `${ACTIVE_REF_KEY}:${orgScope}` : ACTIVE_REF_KEY)
 }
 
 function readPersistedRef(): WorkspaceRef {

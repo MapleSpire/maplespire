@@ -87,7 +87,7 @@ async function readCrashPrecondition(page: Page, priorIds: string[]): Promise<Cr
     const objects = w.__modelStore?.getState().objects ?? []
     const created = objects.find((o) => /^New system/i.test(o.name) && !prior.includes(o.id))
     const journalOnDisk = await new Promise<boolean>((resolve) => {
-      const open = indexedDB.open('maplespire-model-index')
+      const open = indexedDB.open(((ns) => (ns ? `maplespire-model-index@${ns}` : 'maplespire-model-index'))(localStorage.getItem('maplespire:accountNamespace')))
       open.onerror = () => resolve(false)
       open.onsuccess = () => {
         const db = open.result
@@ -233,7 +233,7 @@ test.describe('entity-intent journal — crash before flush', () => {
     // key is the normal post-adoption shape, not an undrained journal.
     const drained = await reopened.evaluate(async () => {
       return await new Promise<boolean>((resolve) => {
-        const open = indexedDB.open('maplespire-model-index')
+        const open = indexedDB.open(((ns) => (ns ? `maplespire-model-index@${ns}` : 'maplespire-model-index'))(localStorage.getItem('maplespire:accountNamespace')))
         open.onerror = () => resolve(false)
         open.onsuccess = () => {
           const db = open.result
@@ -314,7 +314,7 @@ test.describe('entity-intent journal — crash before flush', () => {
         ? state?.groups.find((g) => pattern.test(g.name) && !args.prior.includes(g.id))
         : state?.decisionRecords.find((r) => pattern.test(r.title) && !args.prior.includes(r.id))
       const journalOnDisk = await new Promise<boolean>((resolve) => {
-        const open = indexedDB.open('maplespire-model-index')
+        const open = indexedDB.open(((ns) => (ns ? `maplespire-model-index@${ns}` : 'maplespire-model-index'))(localStorage.getItem('maplespire:accountNamespace')))
         open.onerror = () => resolve(false)
         open.onsuccess = () => {
           const db = open.result
@@ -636,7 +636,7 @@ test.describe('entity-intent journal — crash before flush', () => {
         : args.kind === 'flow' ? state?.flows : state?.diagrams
       const created = (slice ?? []).find((item) => !args.prior.includes(item.id))
       const journalOnDisk = await new Promise<boolean>((resolve) => {
-        const open = indexedDB.open('maplespire-model-index')
+        const open = indexedDB.open(((ns) => (ns ? `maplespire-model-index@${ns}` : 'maplespire-model-index'))(localStorage.getItem('maplespire:accountNamespace')))
         open.onerror = () => resolve(false)
         open.onsuccess = () => {
           const db = open.result

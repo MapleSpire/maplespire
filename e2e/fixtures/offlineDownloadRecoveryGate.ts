@@ -18,6 +18,7 @@ import {
   downloadWorkspaceForOffline,
 } from '../../src/lib/modelQuery/modelReadCacheBootstrap'
 import { MODEL_READ_CACHE_DB, type ModelCacheWorkspaceMeta } from '../../src/lib/modelQuery/idbSchema'
+import { accountDatabaseName } from '../../src/lib/auth/accountNamespace'
 import {
   disposeModelReadCacheWorker,
   getModelReadCacheWorker,
@@ -45,7 +46,9 @@ declare global {
 
 function deleteCacheDatabase(): Promise<void> {
   return new Promise((resolve, reject) => {
-    const request = indexedDB.deleteDatabase(MODEL_READ_CACHE_DB)
+    // The name the Worker actually opened (per user under AUTH=on): deleting
+    // the bare legacy name would report a reset that reset nothing.
+    const request = indexedDB.deleteDatabase(accountDatabaseName(MODEL_READ_CACHE_DB))
     request.onsuccess = () => resolve()
     request.onerror = () => reject(request.error ?? new Error('Unable to delete model cache'))
     request.onblocked = () => reject(new Error('Model cache deletion was blocked'))

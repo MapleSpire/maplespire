@@ -105,7 +105,8 @@ async function waitBridgeReady(page: Page): Promise<void> {
  *  list; `persistOverlayBatchJournal` DELETES the key once nothing is pending. */
 async function journalOnDisk(page: Page): Promise<JournalEntry[]> {
   return page.evaluate(async (suffix: string) => new Promise<JournalEntry[]>((resolve) => {
-    const open = indexedDB.open('maplespire-model-index')
+    // Per-user database name under AUTH=on (src/lib/auth/accountNamespace.ts).
+    const open = indexedDB.open(((ns) => (ns ? `maplespire-model-index@${ns}` : 'maplespire-model-index'))(localStorage.getItem('maplespire:accountNamespace')))
     open.onerror = () => resolve([])
     open.onsuccess = () => {
       const db = open.result

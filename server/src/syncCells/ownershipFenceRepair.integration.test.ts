@@ -79,6 +79,10 @@ describe.skipIf(!TEST_DATABASE_URL || !TEST_REDIS_URL)('R1 repair — absent row
     leaseCommandTimeoutMs: 5_000,
     partitionProbeIntervalMs: 1_000,
     partitionWorker: false,
+    // No NOTIFY-triggered pass either: a version insert anywhere in this
+    // database — NOTIFY is per database, not per schema — would add a pass the
+    // arms do not count (measured in ci:local, 2026-10-11).
+    versionCreationNotify: false,
     // Every reconcile this suite observes is one it asked for by name.
     reconcileIntervalMs: 600_000,
     telemetryIntervalMs: 600_000,
