@@ -21,7 +21,7 @@ import compression from 'compression'
 import type { Repo } from '@automerge/automerge-repo'
 import { lifecycleApplyPool, pool, readModelPool, syncCellPool } from './db.js'
 import { envNumber } from './envNumber.js'
-import { runMigrations } from './db/migrations.js'
+import { runMigrations, withMigrationLock } from './db/migrations.js'
 import { poolMeterSnapshots } from './db/poolMeter.js'
 import { schemaMigrations } from './db/schemaMigrations.js'
 import { listThemes, getTheme, publishTheme, incrementInstalls, reportTheme, validateThemePayload } from './themes.js'
@@ -2662,7 +2662,11 @@ async function main() {
   // the complete catalog through their default `all` policy. The seed is
   // deterministic and idempotent, so it also upgrades older deployments when
   // a new catalog revision is shipped. Data, not schema — so it stays here.
-  await ensureManagedTechnologyCatalog(pool, defaultOrgId)
+  //
+  // Its schema half is DDL, and so are the RBAC and epoch-trigger steps below:
+  // each runs under the migration key so a backup in flight is waited for on
+  // the key, not queued behind on a table lock (see withMigrationLock).
+  await withMigrationLock(pool, () => ensureManagedTechnologyCatalog(pool, defaultOrgId))
   maintenanceCoordinator = new MaintenanceCoordinator(pool)
   const maintenanceScheduleStops: Array<() => void> = []
   let stopReadModelOwnershipListener: (() => void) | null = null
@@ -2723,12 +2727,12 @@ async function main() {
   // RBAC substrate: teams, scopes closure table, grants, trigger-denormalized
   // effective permissions + rbac_effective_access(). No RLS policies are
   // enforced at the database level.
-  await ensureRbacSchema(pool)
+  await withMigrationLock(pool, () => ensureRbacSchema(pool))
   // Scope rows for every pre-existing workspace (the Default-Org backfill —
   // the WS access gate resolves docs to these scopes) + the epoch-bump triggers
   // that revoke live sessions/sockets when membership or grants change.
   await ensureScopesForExistingWorkspaces(pool)
-  await ensureEpochTriggers(pool)
+  await withMigrationLock(pool, () => ensureEpochTriggers(pool))
   const tagMaintenanceTz = process.env.TAG_MAINTENANCE_TZ ?? 'America/Toronto'
   maintenanceScheduleStops.push(scheduleDailyAt(3, 15, tagMaintenanceTz, async () => {
     const outcome = await maintenanceCoordinator!.run('tag_operational_gc', () => gcTagOperationalState(pool))

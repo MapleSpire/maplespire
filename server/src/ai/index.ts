@@ -16,6 +16,7 @@ import type { Express } from 'express'
 import type { Repo } from '@automerge/automerge-repo'
 import type { Pool } from 'pg'
 import { ensureAiSchema } from './core/schema.js'
+import { withMigrationLock } from '../db/migrations.js'
 import { registerAiHttpRoutes } from './adapters/httpRoutes.js'
 import type { SyncCellOwnership } from '../syncCells/ownership.js'
 import { registerMcpHttpRoutes } from './adapters/mcp/http.js'
@@ -43,7 +44,8 @@ export async function registerAiFeature(
     ownershipRequired?: () => boolean
   }
 ): Promise<void> {
-  await ensureAiSchema(deps.pool)
+  // DDL at boot: under the migration key, see withMigrationLock.
+  await withMigrationLock(deps.pool, () => ensureAiSchema(deps.pool))
   registerAiHttpRoutes(app, {
     repo: deps.repo,
     rootUrl: deps.rootUrl,

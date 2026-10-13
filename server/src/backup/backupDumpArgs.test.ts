@@ -13,7 +13,12 @@
 // GNU Affero General Public License for more details.
 
 import { describe, expect, it } from 'vitest'
-import { NativePgTools, pgDumpArgs } from './backupRestore.js'
+import {
+  NativePgTools,
+  PG_COMMAND_TIMEOUT_MS,
+  PG_DUMP_LOCK_WAIT_TIMEOUT_MS,
+  pgDumpArgs,
+} from './backupRestore.js'
 
 /**
  * The dump is NEVER filtered, and this is the thing that says so.
@@ -96,6 +101,23 @@ describe('the dump is never narrowed — R4 / B4-5', () => {
     // …and it is the SAME argv the builder produces, so the gate above is not
     // asserting one thing while production runs another.
     expect(recorded[0]!.args).toEqual(pgDumpArgs({ snapshotId: 'snap-4', outputFile: '/tmp/native.dump' }))
+    // …including the lock-wait seam, which the DB-gated suites only ever
+    // exercise through DockerPgTools.
+    await tools.dump({ connection: CONNECTION, snapshotId: 'snap-5', outputFile: '/tmp/n.dump', lockWaitTimeoutMs: 1_500 })
+    expect(recorded[1]!.args).toContain('--lock-wait-timeout=1500')
+  })
+
+  it('both transports bound pg_dump\'s table-lock wait', () => {
+    // Without it, DDL queued behind the snapshot transaction holds pg_dump —
+    // and every reader of that table — for PG_COMMAND_TIMEOUT_MS; see
+    // backupMigrationExclusion.integration.test.ts for the cycle.
+    const flag = `--lock-wait-timeout=${PG_DUMP_LOCK_WAIT_TIMEOUT_MS}`
+    expect(pgDumpArgs({ snapshotId: 's', outputFile: '/tmp/o' })).toContain(flag)
+    expect(pgDumpArgs({ snapshotId: 's', outputFile: '/tmp/o', connection: CONNECTION })).toContain(flag)
+    expect(pgDumpArgs({ snapshotId: 's', outputFile: '/tmp/o', lockWaitTimeoutMs: 1_500 }))
+      .toContain('--lock-wait-timeout=1500')
+    // Shorter than the command ceiling, or it bounds nothing.
+    expect(PG_DUMP_LOCK_WAIT_TIMEOUT_MS).toBeLessThan(PG_COMMAND_TIMEOUT_MS)
   })
 
   it('the detector can actually fire', () => {

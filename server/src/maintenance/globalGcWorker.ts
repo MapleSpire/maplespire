@@ -19,14 +19,20 @@ import { initSchema, pool } from '../db.js'
 import { gcOrphanedDocs } from '../gc.js'
 import { MaintenanceCoordinator } from './coordinator.js'
 import { ensureMaintenanceSchema } from './schema.js'
+import { withMigrationLock } from '../db/migrations.js'
 
 /** One-shot global GC worker for ECS RunTask / Kubernetes CronJob. It owns no
  * WebSockets or workspace projectors; its Repo is a read-only graph walker over
  * shared PostgreSQL storage. Every destructive batch verifies the fencing token
  * acquired under the cluster advisory lock. */
 async function main(): Promise<void> {
-  await initSchema()
-  await ensureMaintenanceSchema(pool)
+  // DDL (initSchema re-runs the ADD COLUMN IF NOT EXISTS of the baseline) from
+  // a cron job that can start mid-backup: under the migration key, see
+  // withMigrationLock.
+  await withMigrationLock(pool, async () => {
+    await initSchema()
+    await ensureMaintenanceSchema(pool)
+  })
   const coordinator = new MaintenanceCoordinator(pool, `global-gc-${process.pid}`)
   const repo = new Repo({
     network: [],

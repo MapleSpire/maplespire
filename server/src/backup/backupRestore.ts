@@ -16,6 +16,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import { mkdir, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { spawn } from 'node:child_process'
+import { setTimeout as sleep } from 'node:timers/promises'
 import * as Automerge from '@automerge/automerge'
 import {
   Repo,
@@ -26,6 +27,7 @@ import {
 } from '@automerge/automerge-repo'
 import { Pool, type PoolClient, type QueryResult, type QueryResultRow } from 'pg'
 import { guardIdleClientErrors } from '../db/poolErrorGuard.js'
+import { MIGRATION_ADVISORY_LOCK_KEY } from '../db/migrations.js'
 import { findReadyDocument } from '../automergeRepoCompat.js'
 import { technologyAssetDirectory } from '../technologies/assets.js'
 import { BUNDLE_OWNER_FILE, writeBundleOwner } from './bundleOwner.js'
@@ -210,6 +212,8 @@ export type PgTools = {
      *  the tick RELEASES the key. `DockerPgTools` therefore kills the remote
      *  process by pid. */
     signal?: AbortSignal
+    /** Passed to `pgDumpArgs`; see `PG_DUMP_LOCK_WAIT_TIMEOUT_MS`. */
+    lockWaitTimeoutMs?: number
   }): Promise<void>
   restore(options: {
     connection: DatabaseConnection
@@ -227,7 +231,8 @@ export type BackupCreationOptions = {
   /** The technology-icon volume. Defaults to the one the server serves from, so
    * archiving is the behaviour a caller has to opt OUT of rather than remember. */
   assetDirectory?: string
-  /** Stop the dump. Reaches `pgTools.dump` and nothing else — see the note on
+  /** Stop the dump. Reaches `pgTools.dump` and the wait for a running
+   *  migration (`holdMigrationExclusion`), nothing else — see the note on
    *  `BackupDrillOptions.signal` for what that does and does not bound. */
   signal?: AbortSignal
   /**
@@ -239,6 +244,8 @@ export type BackupCreationOptions = {
    * round for a field nothing enforces.
    */
   ownerKind?: string
+  /** Test seam: `pg_dump`'s lock wait, default `PG_DUMP_LOCK_WAIT_TIMEOUT_MS`. */
+  dumpLockWaitTimeoutMs?: number
 }
 
 export type RestoreVerification = {
@@ -432,6 +439,32 @@ export function assertSafeRestoreTarget(
  */
 export const PG_COMMAND_TIMEOUT_MS = 3_600_000
 
+/**
+ * How long `pg_dump` waits for its `LOCK TABLE … IN ACCESS SHARE MODE` before
+ * giving up, i.e. how long a backup may stand in a lock cycle Postgres cannot
+ * see. The cycle: the snapshot transaction holds ACCESS SHARE on every table
+ * (the inventory counts rows) and waits on its CLIENT for `pg_dump`; DDL from
+ * some other session queues ACCESS EXCLUSIVE behind it; `pg_dump`'s lock then
+ * queues behind the DDL. One edge runs through this process, so the deadlock
+ * detector never fires — on the demo stack (2026-10-12) a boot migration sat
+ * in it with every reader of `theme_plugins` queued behind, and only the hour
+ * of `PG_COMMAND_TIMEOUT_MS` would have ended it.
+ *
+ * Migrations and boot-time DDL no longer enter that cycle (see
+ * `holdMigrationExclusion` and `withMigrationLock`); this bounds it for DDL
+ * that takes no migration key, such as `ensureShareSchema` on the first share
+ * request of a process. An arbitrage, not a measurement: while it runs,
+ * readers of the contested table are queued, and when it expires the backup
+ * fails — nothing retries it; the next scheduled drill tick is the next
+ * attempt. The cost of too
+ * short is one failed backup whenever a legitimate DDL holds a table longer
+ * than this; nobody has measured the longest such hold.
+ */
+export const PG_DUMP_LOCK_WAIT_TIMEOUT_MS = 30_000
+
+/** Poll interval while a backup waits for a running migration to finish. */
+const MIGRATION_EXCLUSION_POLL_MS = 250
+
 /** Grace between `SIGTERM` and `SIGKILL` for a child that will not stop.
  *  Without the escalation the ceiling is a request rather than a bound. */
 const KILL_ESCALATION_MS = 10_000
@@ -606,6 +639,8 @@ export function pgDumpArgs(options: {
   outputFile: string
   /** Present for the container transport, which addresses the server itself. */
   connection?: DatabaseConnection
+  /** Defaults to `PG_DUMP_LOCK_WAIT_TIMEOUT_MS`; a test seam, not a knob. */
+  lockWaitTimeoutMs?: number
 }): string[] {
   const addressing = options.connection
     ? [
@@ -622,6 +657,7 @@ export function pgDumpArgs(options: {
     '--no-owner',
     '--no-acl',
     '--snapshot', options.snapshotId,
+    `--lock-wait-timeout=${options.lockWaitTimeoutMs ?? PG_DUMP_LOCK_WAIT_TIMEOUT_MS}`,
     '--file', options.outputFile,
   ]
 }
@@ -646,10 +682,15 @@ export class NativePgTools implements PgTools {
     snapshotId: string
     outputFile: string
     signal?: AbortSignal
+    lockWaitTimeoutMs?: number
   }): Promise<void> {
     await this.run(
       this.pgDumpBinary,
-      pgDumpArgs({ snapshotId: options.snapshotId, outputFile: options.outputFile }),
+      pgDumpArgs({
+        snapshotId: options.snapshotId,
+        outputFile: options.outputFile,
+        lockWaitTimeoutMs: options.lockWaitTimeoutMs,
+      }),
       connectionEnv(options.connection),
       { timeoutMs: this.commandTimeoutMs, signal: options.signal },
     )
@@ -823,12 +864,18 @@ export class DockerPgTools implements PgTools {
     snapshotId: string
     outputFile: string
     signal?: AbortSignal
+    lockWaitTimeoutMs?: number
   }): Promise<void> {
     const connection = this.containerConnection(options.connection)
     const remote = `/tmp/maplespire-backup-${randomBytes(12).toString('hex')}.dump`
     try {
       await this.execKillable(
-        ['pg_dump', ...pgDumpArgs({ snapshotId: options.snapshotId, outputFile: remote, connection })],
+        ['pg_dump', ...pgDumpArgs({
+          snapshotId: options.snapshotId,
+          outputFile: remote,
+          connection,
+          lockWaitTimeoutMs: options.lockWaitTimeoutMs,
+        })],
         connection,
         options.signal,
         { passPassword: true },
@@ -1468,6 +1515,38 @@ async function ensureNewBundleDirectory(bundleDirectory: string): Promise<void> 
   await mkdir(dirname(target), { recursive: true })
 }
 
+/**
+ * Hold the migration advisory key SHARED on the snapshot's session, so a boot
+ * migration and a backup never overlap: whichever arrives second waits on the
+ * KEY, before it has taken a single table lock. Without it the two can enter
+ * the cycle described at `PG_DUMP_LOCK_WAIT_TIMEOUT_MS` on every boot, because
+ * the baseline migration is repeatable and re-runs its `ADD COLUMN IF NOT
+ * EXISTS` DDL each time.
+ *
+ * The price is on the migration side: a server booting mid-backup waits for
+ * the dump to finish. It waits on the key, so nothing else queues behind it.
+ *
+ * Polled rather than blocking so the drill's stop signal can interrupt the
+ * wait; `pg_advisory_lock_shared` would only return when the migration ends.
+ * Polling does not starve a migration that is already queued: measured on
+ * Postgres 16 (2026-10-12), `pg_try_advisory_lock_shared` returns false while
+ * an exclusive request on the key is waiting behind a shared holder, and true
+ * with the same shared holder and no waiter (the control).
+ */
+async function holdMigrationExclusion(client: PoolClient, signal?: AbortSignal): Promise<void> {
+  for (;;) {
+    signal?.throwIfAborted()
+    const { rows } = await client.query<{ held: boolean }>(
+      'SELECT pg_try_advisory_lock_shared($1) AS held',
+      [MIGRATION_ADVISORY_LOCK_KEY],
+    )
+    if (rows[0]?.held === true) return
+    // An abort ends the sleep early; the check at the top of the loop then
+    // throws the caller's reason rather than the timer's AbortError.
+    await sleep(MIGRATION_EXCLUSION_POLL_MS, undefined, { signal }).catch(() => undefined)
+  }
+}
+
 export async function createDatabaseBackup(options: BackupCreationOptions): Promise<BackupManifest> {
   const target = resolve(options.bundleDirectory)
   await ensureNewBundleDirectory(target)
@@ -1487,6 +1566,10 @@ export async function createDatabaseBackup(options: BackupCreationOptions): Prom
   const client = await pool.connect()
   let transactionOpen = false
   try {
+    // BEFORE the transaction: a repeatable-read snapshot is taken by its first
+    // statement, so a key acquired inside it would let a migration commit
+    // after the snapshot and before the dump.
+    await holdMigrationExclusion(client, options.signal)
     await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY')
     transactionOpen = true
     const snapshot = await client.query<{ snapshot_id: string }>('SELECT pg_export_snapshot() AS snapshot_id')
@@ -1525,9 +1608,15 @@ export async function createDatabaseBackup(options: BackupCreationOptions): Prom
       snapshotId: snapshot.rows[0]!.snapshot_id,
       outputFile: dumpFile,
       signal: options.signal,
+      lockWaitTimeoutMs: options.dumpLockWaitTimeoutMs,
     })
     await client.query('COMMIT')
     transactionOpen = false
+    // Let a booting server migrate while the assets are archived. Ignoring the
+    // result is safe ONLY because `pool` is this function's own and ends in the
+    // `finally`: ending the session is what releases the key on every other
+    // path, and would release it here too.
+    await client.query('SELECT pg_advisory_unlock_shared($1)', [MIGRATION_ADVISORY_LOCK_KEY]).catch(() => undefined)
     const assets = await archiveAssets({
       inventory: assetInventory,
       sourceDirectory: options.assetDirectory ?? technologyAssetDirectory(),

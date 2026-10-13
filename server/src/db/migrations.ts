@@ -35,7 +35,8 @@ import type { Pool, PoolClient } from 'pg'
  */
 
 /**
- * Stable, arbitrary. Changing it would let two versions migrate concurrently.
+ * Stable, arbitrary. Changing it would let two versions migrate concurrently,
+ * and would silently stop backups excluding boot DDL (`withMigrationLock`).
  *
  * Exported so a test can assert the lock is FREE from another connection: a
  * session-level advisory lock is re-entrant, so a leak checked from the same
@@ -112,64 +113,92 @@ export async function runMigrations(
     throw new Error(`duplicate migration id: ${duplicate.id}`)
   }
 
-  const client = await pool.connect()
   const applied: string[] = []
   const alreadyApplied: string[] = []
   const repeated: string[] = []
+  return withMigrationLock(pool, async (client) => {
+    await ensureLedger(client)
+    const { rows } = await client.query<{ id: string }>('SELECT id FROM schema_migrations')
+    const recorded = new Set(rows.map((row) => row.id))
+    const known = new Set(migrations.map((migration) => migration.id))
+    const unknown = [...recorded].filter((id) => !known.has(id)).sort()
+    if (unknown.length > 0) {
+      log(`[migrations] database has ${unknown.length} migration(s) this build does not know: ${unknown.join(', ')}`)
+    }
+
+    for (const migration of migrations) {
+      const seen = recorded.has(migration.id)
+      if (seen && !migration.repeatable) {
+        alreadyApplied.push(migration.id)
+        continue
+      }
+      const startedAt = Date.now()
+      const record = `INSERT INTO schema_migrations (id, duration_ms, applied_by) VALUES ($1, $2, $3)
+           ON CONFLICT (id) DO UPDATE SET applied_at = now(), duration_ms = EXCLUDED.duration_ms,
+                                          applied_by = EXCLUDED.applied_by`
+      if (migration.transactional !== false) {
+        // The migration and its ledger row commit together, so the ledger can
+        // never claim a migration that rolled back.
+        await client.query('BEGIN')
+        try {
+          await migration.run(client)
+          await client.query(record, [migration.id, Date.now() - startedAt, options.appliedBy ?? null])
+          await client.query('COMMIT')
+        } catch (error) {
+          await client.query('ROLLBACK').catch(() => {})
+          throw new Error(`migration ${migration.id} failed`, { cause: error })
+        }
+      } else {
+        try {
+          await migration.run(client)
+        } catch (error) {
+          throw new Error(`migration ${migration.id} failed`, { cause: error })
+        }
+        await client.query(record, [migration.id, Date.now() - startedAt, options.appliedBy ?? null])
+      }
+      if (migration.repeatable) {
+        repeated.push(migration.id)
+      } else {
+        applied.push(migration.id)
+        log(`[migrations] applied ${migration.id} in ${Date.now() - startedAt}ms`)
+      }
+    }
+    return { applied, alreadyApplied, repeated, unknown }
+  })
+}
+
+/**
+ * Run `work` holding the migration key EXCLUSIVELY, on one dedicated
+ * connection. For schema DDL that runs at boot outside `runMigrations`: a
+ * backup holds this key SHARED for the life of its snapshot
+ * (`holdMigrationExclusion` in backup/backupRestore.ts), so DDL taken under it
+ * waits for the dump on the KEY instead of queueing ACCESS EXCLUSIVE behind
+ * the snapshot transaction — the lock cycle Postgres cannot detect, because
+ * one of its edges runs through the backup process. Changing the key
+ * therefore also silently disables that exclusion.
+ *
+ * `work` may use other pool connections, but must never take this key on one
+ * of them: the lock is not re-entrant ACROSS sessions, so that would wait on
+ * itself.
+ *
+ * The key is session-level and `client.release()` does NOT end the session, so
+ * a failed or refused unlock destroys the connection rather than returning a
+ * lock-holding client to the pool.
+ */
+export async function withMigrationLock<T>(pool: Pool, work: (client: PoolClient) => Promise<T>): Promise<T> {
+  const client = await pool.connect()
+  let releaseError: Error | undefined
   try {
     await client.query('SELECT pg_advisory_lock($1)', [MIGRATION_ADVISORY_LOCK_KEY])
     try {
-      await ensureLedger(client)
-      const { rows } = await client.query<{ id: string }>('SELECT id FROM schema_migrations')
-      const recorded = new Set(rows.map((row) => row.id))
-      const known = new Set(migrations.map((migration) => migration.id))
-      const unknown = [...recorded].filter((id) => !known.has(id)).sort()
-      if (unknown.length > 0) {
-        log(`[migrations] database has ${unknown.length} migration(s) this build does not know: ${unknown.join(', ')}`)
-      }
-
-      for (const migration of migrations) {
-        const seen = recorded.has(migration.id)
-        if (seen && !migration.repeatable) {
-          alreadyApplied.push(migration.id)
-          continue
-        }
-        const startedAt = Date.now()
-        const record = `INSERT INTO schema_migrations (id, duration_ms, applied_by) VALUES ($1, $2, $3)
-             ON CONFLICT (id) DO UPDATE SET applied_at = now(), duration_ms = EXCLUDED.duration_ms,
-                                            applied_by = EXCLUDED.applied_by`
-        if (migration.transactional !== false) {
-          // The migration and its ledger row commit together, so the ledger can
-          // never claim a migration that rolled back.
-          await client.query('BEGIN')
-          try {
-            await migration.run(client)
-            await client.query(record, [migration.id, Date.now() - startedAt, options.appliedBy ?? null])
-            await client.query('COMMIT')
-          } catch (error) {
-            await client.query('ROLLBACK').catch(() => {})
-            throw new Error(`migration ${migration.id} failed`, { cause: error })
-          }
-        } else {
-          try {
-            await migration.run(client)
-          } catch (error) {
-            throw new Error(`migration ${migration.id} failed`, { cause: error })
-          }
-          await client.query(record, [migration.id, Date.now() - startedAt, options.appliedBy ?? null])
-        }
-        if (migration.repeatable) {
-          repeated.push(migration.id)
-        } else {
-          applied.push(migration.id)
-          log(`[migrations] applied ${migration.id} in ${Date.now() - startedAt}ms`)
-        }
-      }
-      return { applied, alreadyApplied, repeated, unknown }
+      return await work(client)
     } finally {
-      await client.query('SELECT pg_advisory_unlock($1)', [MIGRATION_ADVISORY_LOCK_KEY]).catch(() => {})
+      const released = await client
+        .query<{ released: boolean }>('SELECT pg_advisory_unlock($1) AS released', [MIGRATION_ADVISORY_LOCK_KEY])
+        .then((result) => result.rows[0]?.released === true, () => false)
+      if (!released) releaseError = new Error('migration advisory lock was not released; discarding the connection')
     }
   } finally {
-    client.release()
+    client.release(releaseError)
   }
 }
