@@ -59,6 +59,21 @@ import { getCommunityTheme } from '../../plugins/community/registry'
 import type { FrameSnapshot, SnapshotObject } from '../../plugins/sandbox/snapshot'
 import { SpatialGridIndex, type SpatialBounds } from './spatialGrid'
 import { AdaptiveFrameQuality } from './frameQuality'
+import {
+  parentWrapperBox,
+  HDR_DESC_BASE,
+  HDR_GAP_DESC,
+  HDR_GAP_ICON,
+  HDR_GAP_TYPE,
+  HDR_ICON,
+  HDR_MAX_TEXT_W,
+  HDR_PAD_X,
+  HDR_TITLE_BASE,
+  HDR_TOP_INSET,
+  HDR_TYPE,
+  PARENT_WRAPPER_SIDE_PAD,
+  parentWrapperHeaderBand,
+} from '../parentWrapperBox'
 
 interface Viewport {
   x: number
@@ -238,26 +253,15 @@ interface ConnectionGeometry {
 // sparse headers. The stack is top-aligned at HDR_TOP_INSET, which sits below the
 // top-corner hit zones (back/expand icons occupy y ≤ 22) so centered text can't
 // stray into them and trigger a mis-click.
-const GROUP_FOOTER_PAD = 28
-const MIN_HEADER_BAND = 46   // floor (parity with the legacy top reservation)
+// The box geometry (pads, band) is in `../parentWrapperBox`, shared with the
+// inline-expansion planner that has to predict it.
 // Top reservation for a STANDARD (non-parent-wrapper) group: room for the top-left icon +
 // title row (rowCenterY = y+22, icon bottom ≈ y+32) plus a comfortable gap to the first
 // member. MIRRORS GROUP_STD_PAD_TOP in src/lib/layout/metrics.ts (custom + ELK + preview) —
 // keep in lockstep. Sides/bottom keep the symmetric 30px pad.
 const GROUP_STD_HEADER_PAD = 52
-const HDR_TOP_INSET = 24     // stack top; clears the y ≤ 22 corner hit band
-const HDR_BOTTOM_INSET = 12  // gap between the stack and the first member
-const HDR_PAD_X = 16         // horizontal inset for centered text (each side)
-const HDR_ICON = 20          // icon block height (renderTechnologyIcon draws 20px)
-const HDR_GAP_ICON = 8       // gap below the icon
-const HDR_GAP_TYPE = 4       // gap above the type line
-const HDR_GAP_DESC = 6       // gap above the description line
-const HDR_TITLE_BASE = 14
 const HDR_TITLE_MIN = 10
-const HDR_TYPE = 10
-const HDR_DESC_BASE = 12
 const HDR_DESC_MIN = 9.5
-const HDR_MAX_TEXT_W = 360    // cap on text-driven box growth; longer text shrinks/truncates
 
 const OBJECT_DESC_LINE_HEIGHT_FACTOR = 1.15
 
@@ -3635,6 +3639,16 @@ export class CanvasEngine {
     return object ? { width: object.size.width, height: object.size.height } : null
   }
 
+  /**
+   * The narrowest box an INLINE-expansion wrapper will be drawn at (its header
+   * text, measured), for the planner that makes room for it before it is drawn
+   * (`expandInline.ts`). Measured as if the parent object were absent — it is:
+   * the planner removes the host shape, its wrapper is it.
+   */
+  inlineWrapperMinWidth(group: Group): number {
+    return this.measureGroupHeaderMinWidth(group, false)
+  }
+
   private computeGroupBounds(group: Group): { x: number; y: number; width: number; height: number } | null {
     const isParentWrapper = !!group.parentObjectId
     // A parent-wrapper boundary always hugs its members (the parent object's
@@ -3674,6 +3688,22 @@ export class CanvasEngine {
       return { x: pos.x, y: pos.y, width: size.width, height: size.height }
     }
 
+    if (isParentWrapper) {
+      // A nested inline expansion: the outer wrapper lists the inner one's
+      // shapes as its own, and hugging only those would let the inner box's
+      // header band and side padding poke through the outer border. The planner
+      // names the nesting (`innerWrapperIds`); a tree, so this terminates.
+      const contents: Array<{ x: number; y: number; width: number; height: number }> = groupObjects.map(
+        (object) => ({ x: object.position.x, y: object.position.y, width: object.size.width, height: object.size.height }),
+      )
+      for (const innerId of group.innerWrapperIds ?? []) {
+        const inner = this.groupMap.get(innerId)
+        const innerBounds = inner && inner !== group ? this.getGroupBounds(inner) : null
+        if (innerBounds) contents.push(innerBounds)
+      }
+      return parentWrapperBox(contents, this.groupHeaderBandHeight(group), this.measureGroupHeaderMinWidth(group))
+    }
+
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
     for (const obj of groupObjects) {
       minX = Math.min(minX, obj.position.x)
@@ -3682,23 +3712,20 @@ export class CanvasEngine {
       maxY = Math.max(maxY, obj.position.y + obj.size.height)
     }
 
-    const padding = 30
-    // Parent wrappers reserve a centered top band for the identity stack
-    // (icon → title → type → description) and a slim bottom padding; standard groups
-    // reserve GROUP_STD_HEADER_PAD on top for their top-left icon + title row (so the
-    // row clears the first member with a comfortable gap) and keep the symmetric 30px
-    // pad on the other three sides. The band is sized so members never overlap the header.
-    const topPadding = isParentWrapper ? this.groupHeaderBandHeight(group) : GROUP_STD_HEADER_PAD
-    const bottomPadding = isParentWrapper ? GROUP_FOOTER_PAD : padding
+    const padding = PARENT_WRAPPER_SIDE_PAD
+    // Parent wrappers (above, `parentWrapperBox`) reserve a centered top band for
+    // the identity stack and a slim bottom padding; standard groups reserve
+    // GROUP_STD_HEADER_PAD on top for their top-left icon + title row (so the row
+    // clears the first member with a comfortable gap) and keep the symmetric 30px
+    // pad on the other three sides.
+    const topPadding = GROUP_STD_HEADER_PAD
+    const bottomPadding = padding
 
-    // The box must be wide enough for its header text (title + — for parent
-    // wrappers — type/description, all centered). When the members are narrower,
-    // grow the box symmetrically so they stay centered under the header.
+    // The box must be wide enough for its title. When the members are narrower,
+    // grow the box symmetrically so they stay centered under it.
     let x = minX - padding
     let width = maxX - minX + padding * 2
-    const minContentWidth = isParentWrapper
-      ? this.measureGroupHeaderMinWidth(group)
-      : this.measureGroupTitleMinWidth(group)
+    const minContentWidth = this.measureGroupTitleMinWidth(group)
     if (minContentWidth > width) {
       const extra = minContentWidth - width
       x -= extra / 2
@@ -3735,13 +3762,7 @@ export class CanvasEngine {
    *  rendered stack never overlaps the members. No text measurement — presence +
    *  base line heights only — so it's cheap and identical between bounds and render. */
   private groupHeaderBandHeight(group: Group): number {
-    let stack = 0
-    if (group.icon) stack += HDR_ICON + HDR_GAP_ICON
-    if (group.name?.trim()) stack += Math.round(HDR_TITLE_BASE * 1.25)
-    if (group.type?.trim()) stack += HDR_GAP_TYPE + Math.round(HDR_TYPE * 1.3)
-    if (group.description?.trim()) stack += HDR_GAP_DESC + Math.round(HDR_DESC_BASE * 1.3)
-    if (stack === 0) return MIN_HEADER_BAND
-    return Math.max(MIN_HEADER_BAND, HDR_TOP_INSET + stack + HDR_BOTTOM_INSET)
+    return parentWrapperHeaderBand(group)
   }
 
   /** Minimum box width for a parent-wrapper's centered header: the widest of the
@@ -3749,7 +3770,7 @@ export class CanvasEngine {
    *  than the top row of corner affordances (back/up left, expand + link badge
    *  right). Measured at base font sizes; the header font-fit shrinks anything that
    *  exceeds the cap. Font restored after. */
-  private measureGroupHeaderMinWidth(group: Group): number {
+  private measureGroupHeaderMinWidth(group: Group, withParentObject = true): number {
     const ctx = this.ctx
     const prevFont = ctx.font
     const name = group.name?.trim() || ''
@@ -3773,7 +3794,7 @@ export class CanvasEngine {
     // Top-row corner affordances must not collide: back/up icon (left) and the
     // expand icon + optional link badge (right), with a minimum centre gap.
     const leftRow = this.canNavigateUp ? 28 : 12
-    const parentObj = group.parentObjectId ? this.objectMap.get(group.parentObjectId) : undefined
+    const parentObj = withParentObject && group.parentObjectId ? this.objectMap.get(group.parentObjectId) : undefined
     const rightRow = 16 + (parentObj?.links?.length ? 30 : 0) + 12
     return Math.max(contentW, leftRow + rightRow + 16)
   }

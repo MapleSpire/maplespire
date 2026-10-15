@@ -13,6 +13,12 @@
 // GNU Affero General Public License for more details.
 
 import type { C4Object, Connection, Diagram, Group, Position } from '../../types'
+import {
+  PARENT_WRAPPER_MAX_MIN_WIDTH,
+  parentWrapperBox,
+  parentWrapperHeaderBand,
+  type Box,
+} from '../../canvas/parentWrapperBox'
 
 /**
  * Expanding a shape IN PLACE: its linked diagram's shapes are drawn inside it,
@@ -33,7 +39,7 @@ import type { C4Object, Connection, Diagram, Group, Position } from '../../types
  * `filterAndMergeDiagramData` and before `setData`, and nothing it produces is
  * persisted. Collapsing is dropping the entry.
  *
- * ## The four rules that make the result renderable
+ * ## The five rules that make the result renderable
  *
  * 1. **The expanded shape is REPLACED by its wrapper.** A wrapper is the
  *    expanded form of an object, so drawing both would show the same thing
@@ -47,10 +53,35 @@ import type { C4Object, Connection, Diagram, Group, Position } from '../../types
  * 3. **Shapes already on this diagram are left behind.** Two entries with one id
  *    would collide in the engine's `objectMap`/`objectIndex`, and the second
  *    would silently win.
- * 4. **The pulled shapes are translated** so their bounding box lands where the
- *    expanded shape was. They carry the OTHER diagram's coordinates, which have
- *    no relationship to this one's — untranslated, an expansion lands on top of
- *    whatever happens to occupy those coordinates here.
+ * 4. **The pulled shapes are translated** so the WRAPPER's box starts where the
+ *    expanded shape did (its top-left corner). They carry the OTHER diagram's
+ *    coordinates, which have no relationship to this one's — untranslated, an
+ *    expansion lands on top of whatever happens to occupy those coordinates
+ *    here. The anchor is the box and not the shapes because the box extends
+ *    past them on every side (`parentWrapperBox`): anchoring the shapes put the
+ *    border and header over whatever sat just left of and above the host.
+ * 5. **Room is made for the block.** The block is its true size (e.g. ~860×460
+ *    of containers in place of a 200×100 system), so the rest of the diagram is
+ *    pushed out of its way, as inserting columns and rows in a spreadsheet
+ *    would: everything whose left edge is at or past the host's right edge moves
+ *    right by the extra width, everything whose top edge is at or past the
+ *    host's bottom edge moves down by the extra height (both, for a shape below
+ *    and to the right). Applied to shapes, positioned groups, connection
+ *    waypoints and — through `shiftPoint`, by the caller — comment pins. Every
+ *    gap only grows and the order on each axis is kept, so a displaced shape
+ *    never lands on another one, and whatever still touches the wrapper was
+ *    already touching the host. Nested expansions make room INSIDE their outer
+ *    block the same way, before the outer block's size is known, so the outer
+ *    block makes room for its final size.
+ *
+ * ## Writing back through a displaced view
+ *
+ * The displaced coordinates are the view's, never the model's. A drag, a
+ * waypoint edit or a comment move on this canvas reports VIEW coordinates, so
+ * the caller maps them back with `unshiftPoint(result.cuts, …)` before writing:
+ * a shape dragged by d is stored at its model position + d, and stays where it
+ * was dropped once the view is recomputed — unless it was dropped in the gap a
+ * cut opened, which has no model coordinate of its own and snaps to the cut.
  *
  * ## Where the other diagram's coordinates come from
  *
@@ -86,9 +117,24 @@ export type SkippedReason =
   /** The target's placement has not been read yet; the shape stays a shape. */
   | 'pending'
 
+/**
+ * One make-room step on the diagram being drawn (rule 5): every coordinate at or
+ * past `atX` moved right by `byX`, every one at or past `atY` down by `byY`. In
+ * the coordinates as they stood when it was applied, i.e. after the cuts before
+ * it.
+ */
+export interface MakeRoomCut {
+  atX: number
+  byX: number
+  atY: number
+  byY: number
+}
+
 export interface InlineExpansionResult extends DiagramContents {
   /** Every expansion that produced nothing, and why. Never silent. */
   skipped: Array<{ objectId: string; reason: SkippedReason }>
+  /** The make-room steps applied to this diagram's own items, in order. */
+  cuts: MakeRoomCut[]
 }
 
 type Layouts = NonNullable<Diagram['layouts']>
@@ -107,6 +153,12 @@ export interface ExpansionLookup {
    * Omitted, `target.layouts` is used as given.
    */
   layouts?: (diagramId: string) => Layouts | null | undefined
+  /**
+   * The narrowest box the engine will draw this wrapper at (its header text is
+   * measured on a canvas: `CanvasEngine.inlineWrapperMinWidth`). Omitted, the
+   * largest it can be is assumed — more room than needed, never less.
+   */
+  wrapperMinWidth?: (wrapper: Group) => number
 }
 
 /** Stable and derived, so the same expansion yields the same group id twice. */
@@ -114,14 +166,32 @@ export function inlineWrapperId(objectId: string): string {
   return `inline-expand:${objectId}`
 }
 
-function boundingTopLeft(objects: readonly C4Object[]): Position {
-  let x = Infinity
-  let y = Infinity
-  for (const object of objects) {
-    x = Math.min(x, object.position.x)
-    y = Math.min(y, object.position.y)
+/** Where `point` is drawn once `cuts` are applied (rule 5). */
+export function shiftPoint(cuts: readonly MakeRoomCut[], point: Position): Position {
+  let { x, y } = point
+  for (const cut of cuts) {
+    if (x >= cut.atX) x += cut.byX
+    if (y >= cut.atY) y += cut.byY
   }
-  return { x: Number.isFinite(x) ? x : 0, y: Number.isFinite(y) ? y : 0 }
+  return { x, y }
+}
+
+/**
+ * The model coordinate of a point drawn at `point` through `cuts`: the inverse
+ * of `shiftPoint`, undone last cut first. A point inside the gap a cut opened
+ * has no preimage; it maps to the cut line, which `shiftPoint` draws at the
+ * far side of the gap.
+ */
+export function unshiftPoint(cuts: readonly MakeRoomCut[], point: Position): Position {
+  let { x, y } = point
+  for (let index = cuts.length - 1; index >= 0; index--) {
+    const cut = cuts[index]
+    if (x >= cut.atX + cut.byX) x -= cut.byX
+    else if (x >= cut.atX) x = cut.atX
+    if (y >= cut.atY + cut.byY) y -= cut.byY
+    else if (y >= cut.atY) y = cut.atY
+  }
+  return { x, y }
 }
 
 /** Space between grid cells when the target's own arrangement is unknown. */
@@ -139,6 +209,110 @@ function gridPlacement(objects: readonly C4Object[]): C4Object[] {
   }))
 }
 
+/** One applied expansion: its shapes, its edges, and the blocks nested in it. */
+interface Block {
+  expansion: InlineExpansion
+  wrapper: Group
+  /** Ids in the order the target lists them; a nested host stays in this list. */
+  memberIds: string[]
+  /** Our own copies: positions are rewritten freely. Hosts are removed once replaced. */
+  shapes: C4Object[]
+  /** Pulled edges, waypoints copied: they move with the block. */
+  connections: Connection[]
+  children: Block[]
+  /** The wrapper's box, once laid out. */
+  box: Box
+}
+
+/** What a make-room step acts on, at one level (the diagram, or one block). */
+interface Level {
+  shapes: C4Object[]
+  blocks: Block[]
+  points: Position[]
+  groups: Group[]
+}
+
+const boxOf = (object: C4Object): Box => ({
+  x: object.position.x, y: object.position.y, width: object.size.width, height: object.size.height,
+})
+
+function translateBlock(block: Block, dx: number, dy: number): void {
+  if (dx === 0 && dy === 0) return
+  block.box = { ...block.box, x: block.box.x + dx, y: block.box.y + dy }
+  for (const shape of block.shapes) {
+    shape.position = { x: shape.position.x + dx, y: shape.position.y + dy }
+  }
+  // In place: a level being laid out holds these very points.
+  for (const connection of block.connections) {
+    for (const point of connection.waypoints ?? []) {
+      point.x += dx
+      point.y += dy
+    }
+  }
+  for (const child of block.children) translateBlock(child, dx, dy)
+}
+
+/** Rule 5 at one level: push everything past the host's edges out of the way. */
+function makeRoom(level: Level, host: Box, size: { width: number; height: number }): MakeRoomCut {
+  const cut: MakeRoomCut = {
+    atX: host.x + host.width,
+    byX: Math.max(0, size.width - host.width),
+    atY: host.y + host.height,
+    byY: Math.max(0, size.height - host.height),
+  }
+  if (cut.byX === 0 && cut.byY === 0) return cut
+  const shift = (p: Position) => ({ dx: p.x >= cut.atX ? cut.byX : 0, dy: p.y >= cut.atY ? cut.byY : 0 })
+  for (const shape of level.shapes) {
+    const { dx, dy } = shift(shape.position)
+    shape.position = { x: shape.position.x + dx, y: shape.position.y + dy }
+  }
+  for (const block of level.blocks) {
+    const { dx, dy } = shift(block.box)
+    translateBlock(block, dx, dy)
+  }
+  for (const point of level.points) {
+    const { dx, dy } = shift(point)
+    point.x += dx
+    point.y += dy
+  }
+  for (const group of level.groups) {
+    if (!group.position) continue
+    const { dx, dy } = shift(group.position)
+    group.position = { x: group.position.x + dx, y: group.position.y + dy }
+  }
+  return cut
+}
+
+/**
+ * Lay `children` into `level`, each at its host's place, making room for each.
+ * In reading order (top to bottom, then left to right): each one's room is made
+ * on the coordinates the previous ones left, so the order is a choice, and a
+ * stable one is better than the order the store happens to hold the entries in.
+ */
+function placeChildren(
+  level: Level,
+  children: readonly Block[],
+  layout: (block: Block) => void,
+): MakeRoomCut[] {
+  const cuts: MakeRoomCut[] = []
+  const hostOf = (block: Block) => level.shapes.find((shape) => shape.id === block.expansion.objectId)!
+  const ordered = [...children].sort((a, b) => {
+    const pa = hostOf(a).position
+    const pb = hostOf(b).position
+    return pa.y - pb.y || pa.x - pb.x || (a.expansion.objectId < b.expansion.objectId ? -1 : 1)
+  })
+  for (const child of ordered) {
+    // Read now, not before the loop: an earlier sibling's room may have moved it.
+    const host = hostOf(child)
+    layout(child)
+    cuts.push(makeRoom({ ...level, shapes: level.shapes.filter((shape) => shape !== host) }, boxOf(host), child.box))
+    translateBlock(child, host.position.x - child.box.x, host.position.y - child.box.y)
+    level.shapes.splice(level.shapes.indexOf(host), 1)
+    level.blocks.push(child)
+  }
+  return cuts
+}
+
 /**
  * Apply `expansions` to a diagram's already-filtered contents.
  *
@@ -146,6 +320,11 @@ function gridPlacement(objects: readonly C4Object[]): C4Object[] {
  * each entry is applied once its host is on the canvas, whatever order the
  * entries are listed in. `visited` is what stops A→B→A — a diagram already
  * drawn here (the current one included) is refused as a `'cycle'`.
+ *
+ * Two phases: which shapes each expansion pulls in (first applied wins a shape
+ * two of them would pull), then the geometry, inside out — an inner block's size
+ * is needed before its outer block can make room for it, and the outer block's
+ * final size before the diagram can.
  */
 export function expandDiagramsInline(
   base: DiagramContents,
@@ -154,23 +333,23 @@ export function expandDiagramsInline(
   lookup: ExpansionLookup,
 ): InlineExpansionResult {
   if (expansions.length === 0) {
-    return { ...base, skipped: [] }
+    return { ...base, skipped: [], cuts: [] }
   }
 
-  const objects = [...base.objects]
-  const connections = [...base.connections]
-  const groups = [...base.groups]
   const skipped: InlineExpansionResult['skipped'] = []
   const visited = new Set<string>(currentDiagramId ? [currentDiagramId] : [])
   const presentObjectIds = new Set(base.objects.map((object) => object.id))
-  /** objectId -> the wrapper that replaced it, for the connection rewrite. */
-  const replacedBy = new Map<string, string>()
-  /** objectId -> the shapes its wrapper holds, so an enclosing wrapper can
-   *  hold them in its place. */
-  const replacedWith = new Map<string, string[]>()
+  const presentConnectionIds = new Set(base.connections.map((connection) => connection.id))
+  /** Every shape drawn so far and the block it is in (`null`: the diagram itself). */
+  const drawnIn = new Map<string, Block | null>(base.objects.map((object) => [object.id, null]))
+  /** objectId -> the block that replaced it. */
+  const replacedBy = new Map<string, Block>()
+  /** Applied blocks, in the order they were applied (the draw order). */
+  const applied: Block[] = []
+  const roots: Block[] = []
 
-  /** Apply one expansion whose host is on the canvas. */
-  const apply = (expansion: InlineExpansion, host: C4Object): void => {
+  // ── Phase 1: what each expansion pulls in ─────────────────────────────────
+  const resolve = (expansion: InlineExpansion, host: C4Object, parent: Block | null): void => {
     const target = lookup.diagram(expansion.diagramId)
     if (!target) {
       skipped.push({ objectId: expansion.objectId, reason: 'missing' })
@@ -197,58 +376,67 @@ export function expandDiagramsInline(
     }
     visited.add(expansion.diagramId)
 
-    // Land the pulled block where the shape was, in the other diagram's own
-    // relative arrangement. `layouts` is the per-diagram override, and it is the
-    // position the user actually arranged over there.
-    const placed = layouts === null
+    // The other diagram's own relative arrangement. `layouts` is the
+    // per-diagram override, and it is the position the user actually arranged
+    // over there. Our own copies: the geometry phase rewrites them in place.
+    const placed = (layouts === null
       ? gridPlacement(pulled)
       : pulled.map((object) => {
         const layout = layouts?.[object.id]
         return layout ? { ...object, position: layout.position, size: layout.size } : object
       })
-    const origin = boundingTopLeft(placed)
-    const dx = host.position.x - origin.x
-    const dy = host.position.y - origin.y
-    for (const object of placed) {
-      objects.push({
-        ...object,
-        position: { x: object.position.x + dx, y: object.position.y + dy },
-        size: { ...object.size },
-      })
-      presentObjectIds.add(object.id)
-    }
+    ).map((object) => ({ ...object, position: { ...object.position }, size: { ...object.size } }))
 
     // The relationships BETWEEN the pulled shapes come too — an expanded
     // boundary showing its contents unconnected would be a worse picture than
     // the one it replaced. Only edges whose both ends survived the filters.
+    // Their waypoints are in the target's coordinates and move with the block;
+    // over a grid they mean nothing and are dropped.
     const pulledIds = new Set(placed.map((object) => object.id))
+    const pulledConnections: Connection[] = []
     for (const connectionId of target.connectionIds) {
       const connection = lookup.connection(connectionId)
       if (!connection) continue
       if (!pulledIds.has(connection.fromId) || !pulledIds.has(connection.toId)) continue
-      if (connections.some((existing) => existing.id === connection.id)) continue
-      connections.push(connection)
+      if (presentConnectionIds.has(connection.id)) continue
+      presentConnectionIds.add(connection.id)
+      const { waypoints, ...rest } = connection
+      pulledConnections.push(
+        waypoints && layouts !== null ? { ...rest, waypoints: waypoints.map((p) => ({ ...p })) } : rest,
+      )
     }
 
-    const wrapperId = inlineWrapperId(host.id)
-    groups.push({
-      id: wrapperId,
-      // What makes the renderer draw this in the expanded-shape style. See
-      // `renderGroup`'s `isParentWrapper`.
-      parentObjectId: host.id,
-      name: host.name,
-      description: host.shortDescription,
-      type: host.type.charAt(0).toUpperCase() + host.type.slice(1),
-      icon: host.icon,
-      iconAssignment: host.iconAssignment,
-      color: '#EFEDE9',
-      objectIds: placed.map((object) => object.id),
-      tagAssignments: {},
-      tagOrder: [],
-    } as Group)
-
-    replacedBy.set(host.id, wrapperId)
-    replacedWith.set(host.id, placed.map((object) => object.id))
+    const block: Block = {
+      expansion,
+      wrapper: {
+        id: inlineWrapperId(host.id),
+        // What makes the renderer draw this in the expanded-shape style. See
+        // `renderGroup`'s `isParentWrapper`.
+        parentObjectId: host.id,
+        name: host.name,
+        description: host.shortDescription,
+        type: host.type.charAt(0).toUpperCase() + host.type.slice(1),
+        icon: host.icon,
+        iconAssignment: host.iconAssignment,
+        color: '#EFEDE9',
+        objectIds: [],
+        tagAssignments: {},
+        tagOrder: [],
+      } as Group,
+      memberIds: placed.map((object) => object.id),
+      shapes: placed,
+      connections: pulledConnections,
+      children: [],
+      box: { x: 0, y: 0, width: 0, height: 0 },
+    }
+    for (const object of placed) {
+      presentObjectIds.add(object.id)
+      drawnIn.set(object.id, block)
+    }
+    replacedBy.set(host.id, block)
+    applied.push(block)
+    if (parent) parent.children.push(block)
+    else roots.push(block)
   }
 
   // Each pass applies every entry whose host is on the canvas by now; a nested
@@ -259,14 +447,15 @@ export function expandDiagramsInline(
     progressed = false
     const stillWaiting: InlineExpansion[] = []
     for (const expansion of waiting) {
-      const host = replacedBy.has(expansion.objectId)
+      const parent = drawnIn.get(expansion.objectId)
+      const host = replacedBy.has(expansion.objectId) || parent === undefined
         ? undefined
-        : objects.find((object) => object.id === expansion.objectId)
+        : (parent ? parent.shapes : base.objects).find((object) => object.id === expansion.objectId)
       if (!host) {
         stillWaiting.push(expansion)
         continue
       }
-      apply(expansion, host)
+      resolve(expansion, host, parent ?? null)
       progressed = true
     }
     waiting = stillWaiting
@@ -275,30 +464,78 @@ export function expandDiagramsInline(
     skipped.push({ objectId: expansion.objectId, reason: 'missing' })
   }
 
-  if (replacedBy.size === 0) {
-    return { objects, connections, groups, skipped }
+  if (applied.length === 0) {
+    return { ...base, skipped, cuts: [] }
   }
-  /** A replaced shape's id, swapped for what its wrapper holds — recursively,
-   *  so an outer wrapper encloses a nested block rather than a vanished shape. */
+
+  /** A block's ids with each nested host swapped for what replaced it —
+   *  recursively, so an outer wrapper encloses a nested block rather than a
+   *  vanished shape. */
   const resolveMembers = (ids: readonly string[]): string[] =>
     ids.flatMap((id) => {
-      const inner = replacedWith.get(id)
-      return inner ? resolveMembers(inner) : [id]
+      const inner = replacedBy.get(id)
+      return inner ? resolveMembers(inner.memberIds) : [id]
     })
+
+  // ── Phase 2: the geometry, inside out ─────────────────────────────────────
+  /** Lay a block out in its own frame and set its box: room made for its
+   *  nested blocks first, then its wrapper drawn around everything in it. */
+  const layoutBlock = (block: Block): void => {
+    const level: Level = {
+      shapes: block.shapes,
+      blocks: [],
+      points: block.connections.flatMap((connection) => connection.waypoints ?? []),
+      groups: [],
+    }
+    placeChildren(level, block.children, layoutBlock)
+    block.wrapper = {
+      ...block.wrapper,
+      objectIds: resolveMembers(block.memberIds),
+      ...(block.children.length > 0 ? { innerWrapperIds: block.children.map((child) => child.wrapper.id) } : {}),
+    }
+    const minWidth = lookup.wrapperMinWidth?.(block.wrapper) ?? PARENT_WRAPPER_MAX_MIN_WIDTH
+    // The same box the engine will draw (`computeGroupBounds`), from the same
+    // contents: its shapes and the boxes of the wrappers nested in it.
+    block.box = parentWrapperBox(
+      [...level.shapes.map(boxOf), ...level.blocks.map((child) => child.box)],
+      parentWrapperHeaderBand(block.wrapper),
+      minWidth,
+    )!
+  }
+
+  // Our own copies of the diagram's items: the cuts rewrite them in place.
+  const baseLevel: Level = {
+    shapes: base.objects.map((object) => ({ ...object, position: { ...object.position } })),
+    blocks: [],
+    points: [],
+    groups: base.groups.map((group) => ({ ...group })),
+  }
+  const baseConnections = base.connections.map((connection) => {
+    if (!connection.waypoints) return connection
+    const waypoints = connection.waypoints.map((p) => ({ ...p }))
+    baseLevel.points.push(...waypoints)
+    return { ...connection, waypoints }
+  })
+  const cuts = placeChildren(baseLevel, roots, layoutBlock)
+
+  const rewrite = (connection: Connection): Connection => {
+    const from = replacedBy.get(connection.fromId)
+    const to = replacedBy.get(connection.toId)
+    if (!from && !to) return connection
+    return {
+      ...connection,
+      fromId: from ? from.wrapper.id : connection.fromId,
+      toId: to ? to.wrapper.id : connection.toId,
+    }
+  }
   return {
     // The host shapes are gone: their wrapper IS them, expanded.
-    objects: objects.filter((object) => !replacedBy.has(object.id)),
-    connections: connections.map((connection) => {
-      const from = replacedBy.get(connection.fromId)
-      const to = replacedBy.get(connection.toId)
-      if (!from && !to) return connection
-      return { ...connection, fromId: from ?? connection.fromId, toId: to ?? connection.toId }
-    }),
-    // Only the wrappers made here: a persisted group's membership is not this
-    // view transform's to rewrite.
-    groups: groups.map((group) => (group.id.startsWith(inlineWrapperId(''))
-      ? { ...group, objectIds: resolveMembers(group.objectIds) }
-      : group)),
+    objects: [...baseLevel.shapes, ...applied.flatMap((block) => block.shapes)],
+    connections: [...baseConnections, ...applied.flatMap((block) => block.connections)].map(rewrite),
+    // A persisted group's membership is not this view transform's to rewrite;
+    // only its position moves, with everything else past the cut.
+    groups: [...baseLevel.groups, ...applied.map((block) => block.wrapper)],
     skipped,
+    cuts,
   }
 }

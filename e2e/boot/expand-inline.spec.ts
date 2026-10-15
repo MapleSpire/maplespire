@@ -227,6 +227,43 @@ function expectArrangement(drawn: EnginePositions, layouts: Record<string, Place
   }
 }
 
+/**
+ * What the engine DRAWS that sits on something it does not belong to: two
+ * shapes overlapping, a shape over a wrapper it is not inside, two wrappers
+ * crossing without one wholly containing the other. Read from the engine's own
+ * boxes (`getGroupBoundsById`), not recomputed: the box drawn is the claim.
+ */
+function drawnOverlaps(page: Page): Promise<string[]> {
+  return page.evaluate(() => {
+    const engine = (window as any).__canvasEngine
+    type Box = { x: number; y: number; width: number; height: number }
+    const cross = (a: Box, b: Box) => a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height
+    const inside = (o: Box, i: Box) => i.x >= o.x && i.y >= o.y && i.x + i.width <= o.x + o.width && i.y + i.height <= o.y + o.height
+    const shapes = [...(engine.objectMap as Map<string, any>).values()].map((o) => ({
+      id: o.id as string, box: { x: o.position.x, y: o.position.y, width: o.size.width, height: o.size.height } as Box,
+    }))
+    const wrappers = (engine.groups as any[])
+      .filter((g) => String(g.id).startsWith('inline-expand:'))
+      .map((g) => ({ id: g.id as string, members: new Set<string>(g.objectIds), box: engine.getGroupBoundsById(g.id) as Box }))
+    const out: string[] = []
+    for (const a of shapes) {
+      for (const b of shapes) if (a.id < b.id && cross(a.box, b.box)) out.push(`${a.id} × ${b.id}`)
+      for (const w of wrappers) if (!w.members.has(a.id) && cross(a.box, w.box)) out.push(`${a.id} × ${w.id}`)
+    }
+    for (const a of wrappers) {
+      for (const b of wrappers) {
+        if (a.id >= b.id || !cross(a.box, b.box)) continue
+        if (!inside(a.box, b.box) && !inside(b.box, a.box)) out.push(`${a.id} × ${b.id}`)
+      }
+    }
+    return out
+  })
+}
+
+const wrapperBox = (page: Page, hostId: string) =>
+  page.evaluate((id) => (window as any).__canvasEngine.getGroupBoundsById(`inline-expand:${id}`), hostId) as
+    Promise<{ x: number; y: number; width: number; height: number } | null>
+
 // Shared stateful backend — never run beside the rest.
 test.describe.configure({ mode: 'serial' })
 
@@ -289,11 +326,19 @@ test('Expand here draws the linked diagram in its own arrangement, nested expans
   expect(stub?.layouts ?? null, 'precondition: the target must be a layout-less stub when it is expanded').toBeNull()
 
   // ── ⤢ → Expand here, on the system ──────────────────────────────────────
+  const beforeOuter = await enginePositions(page)
   await clickExpandIndicator(page, systemId)
   await page.getByTestId(`expand-here-${containers.id}`).click()
   const afterOuter = await waitDrawn(page, pulledContainers, 'the containers')
   expectArrangement(afterOuter, containers.layouts!, pulledContainers, 'outer expansion')
   expect(afterOuter[systemId], 'the system is replaced by its wrapper').toBeUndefined()
+  // Room is made (2026-10-15, second defect): the block is its true size, many
+  // times the system's, and used to be drawn over the shapes beside and below
+  // it. The wrapper's box takes the system's place; the rest moves out of it.
+  const outerBox = await wrapperBox(page, systemId)
+  expect(outerBox, 'the wrapper is drawn').not.toBeNull()
+  expect({ x: outerBox!.x, y: outerBox!.y }, 'the wrapper starts where the system was').toEqual(beforeOuter[systemId])
+  expect(await drawnOverlaps(page), 'the expanded block is drawn over other shapes').toEqual([])
 
   // ── Nested: ⤢ on a container the first expansion pulled in ──────────────
   // The ⤢ must be DRAWN on it — clicking alone cannot tell: in edit mode the
@@ -313,12 +358,76 @@ test('Expand here draws the linked diagram in its own arrangement, nested expans
   const afterInner = await waitDrawn(page, pulledComponents, 'the components')
   expectArrangement(afterInner, components.layouts!, pulledComponents, 'nested expansion')
   expect(afterInner[serviceId], 'the service is replaced by its wrapper').toBeUndefined()
-  // The rest of the outer block did not move.
-  for (const id of pulledContainers.filter((c) => c !== serviceId)) {
-    expect(afterInner[id], `${id} moved when its sibling was expanded`).toEqual(afterOuter[id])
+  // The inner block's box starts where the service was — the outer block's
+  // origin is unchanged, and so is everything before the service inside it —
+  // and its siblings past it moved out of its way (Payment Service, in the
+  // repro), as did the diagram, for the outer block that grew around it.
+  const innerBox = await wrapperBox(page, serviceId)
+  expect({ x: innerBox!.x, y: innerBox!.y }, 'the nested wrapper starts where the service was').toEqual(afterOuter[serviceId])
+  expect(await drawnOverlaps(page), 'the nested block is drawn over other shapes').toEqual([])
+
+  // ── Dragging a DISPLACED shape writes its model position, not the view's ──
+  // The engine reports where it draws a shape; with room made that is not
+  // where the model has it. The displacement must never reach the model.
+  const displaced = await page.evaluate((ids) => {
+    const store = (window as any).__modelStore.getState()
+    const layouts = store.diagrams.find((d: any) => d.id === store.currentDiagramId).layouts ?? {}
+    const engine = (window as any).__canvasEngine
+    for (const id of ids) {
+      const drawn = engine.objectMap.get(id)
+      const model = layouts[id]?.position
+      if (drawn && model && (drawn.position.x !== model.x || drawn.position.y !== model.y)) {
+        return { id, model: { ...model }, drawn: { ...drawn.position } }
+      }
+    }
+    return null
+  }, context.objectIds.filter((id) => id !== systemId))
+  expect(displaced, 'precondition: some shape of the context diagram was moved out of the way').not.toBeNull()
+  const grab = await page.evaluate((id) => {
+    const engine = (window as any).__canvasEngine
+    const o = engine.objectMap.get(id)
+    const wx = o.position.x + o.size.width / 2
+    const wy = o.position.y + o.size.height / 2
+    engine.panToWorld(wx, wy)
+    const rect = engine.canvas.getBoundingClientRect()
+    const vp = engine.viewport
+    return { x: wx * vp.scale + vp.x + rect.left, y: wy * vp.scale + vp.y + rect.top }
+  }, displaced!.id)
+  // Further along the way it was pushed: a drop inside the gap a cut opened has
+  // no model coordinate of its own and snaps to the cut (a jump, by design).
+  const along = {
+    x: displaced!.drawn.x !== displaced!.model.x ? 10 : 0,
+    y: displaced!.drawn.y !== displaced!.model.y ? 6 : 0,
   }
-  // ...and the inner block starts where the service was.
-  const innerLeft = Math.min(...pulledComponents.map((id) => afterInner[id].x))
-  const innerTop = Math.min(...pulledComponents.map((id) => afterInner[id].y))
-  expect({ x: innerLeft, y: innerTop }).toEqual(afterOuter[serviceId])
+  const drawnNow = (id: string) =>
+    page.evaluate((oid) => ({ ...(window as any).__canvasEngine.objectMap.get(oid).position }), id) as Promise<{ x: number; y: number }>
+  await page.mouse.move(grab.x, grab.y)
+  await page.mouse.down()
+  for (let step = 1; step <= 8; step++) await page.mouse.move(grab.x + step * along.x, grab.y + step * along.y)
+  // The drag is measured BEFORE the drop. After it, the view is recomputed from
+  // whatever was written — and "drawn after − drawn before" then hides a written
+  // displacement exactly (measured: a mutant writing the view coordinate passed
+  // when this was read after mouse-up).
+  const preview = await drawnNow(displaced!.id)
+  await page.mouse.up()
+  const moved = { x: preview.x - displaced!.drawn.x, y: preview.y - displaced!.drawn.y }
+  expect(Math.hypot(moved.x, moved.y), 'the drag moved the shape').toBeGreaterThan(0)
+  // The drop snaps to the grid (half a cell at most); the displacement written
+  // by mistake is hundreds of units, so the tolerance cannot hide it.
+  const SNAP = 20
+  const near = (a: { x: number; y: number } | null, b: { x: number; y: number }) =>
+    !!a && Math.abs(a.x - b.x) <= SNAP && Math.abs(a.y - b.y) <= SNAP
+  const target = { x: displaced!.model.x + moved.x, y: displaced!.model.y + moved.y }
+  await expect
+    .poll(() => page.evaluate((id) => {
+      const store = (window as any).__modelStore.getState()
+      return store.diagrams.find((d: any) => d.id === store.currentDiagramId).layouts?.[id]?.position ?? null
+    }, displaced!.id).then((stored) => near(stored, target) || stored), {
+      timeout: 10_000, message: `the model must hold model position + drag (${JSON.stringify(target)}), not the displaced one`,
+    })
+    .toBe(true)
+  // ...and the recomputed view still draws it where it was dropped: no jump.
+  await expect
+    .poll(() => drawnNow(displaced!.id).then((at) => near(at, preview) || at), { message: 'the shape jumped after the drop' })
+    .toBe(true)
 })

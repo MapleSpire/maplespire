@@ -32,7 +32,7 @@ import { Canvas3DView } from './Canvas3DView'
 import { CanvasEmptyState } from './CanvasEmptyState'
 import { CanvasToolbar } from '../comments/CanvasToolbar'
 import { useDiagramReadyFit } from './useDiagramReadyFit'
-import { expandDiagramsInline } from '../../lib/diagrams/expandInline'
+import { expandDiagramsInline, shiftPoint, unshiftPoint, type MakeRoomCut } from '../../lib/diagrams/expandInline'
 import { loadDiagramLayouts } from '../../lib/diagrams/duplicateSource'
 import { collectRelatedDiagramObjectIds } from '../../canvas/relatedDiagramAffordances'
 import { resolveParentNavigation } from '../../lib/diagrams/parentNavigation'
@@ -53,7 +53,7 @@ import { RemoteCursorOverlay } from '../presence/RemoteCursorOverlay'
 
 import { CommentDetail } from '../comments/CommentDetail'
 import { CommentComposer } from '../comments/CommentComposer'
-import type { C4Object, C4Type, Connection, Diagram, Group, SelectedItem } from '../../types'
+import type { C4Object, C4Type, Comment, Connection, Diagram, Group, SelectedItem } from '../../types'
 import type { Scene3D } from '../../canvas3d'
 
 // Filters objects/connections/groups down to the given diagram's composition and
@@ -379,6 +379,21 @@ export function CanvasView() {
     if (editReady) useModelStore.getState().reconcileTags()
   }, [editReady])
 
+  /**
+   * The make-room steps of the inline expansions currently drawn (rule 5 in
+   * `expandInline.ts`). The engine draws this diagram's own shapes, waypoints
+   * and comment pins DISPLACED by them; everything it reports back is in those
+   * view coordinates, and goes through `unshiftPoint` before it is written.
+   * Empty with nothing expanded, which makes both maps the identity.
+   */
+  const viewCutsRef = useRef<MakeRoomCut[]>([])
+  const pushComments = useCallback((comments: readonly Comment[], diagramId: string | null) => {
+    const cuts = viewCutsRef.current
+    engineRef.current?.setComments(comments
+      .filter((comment) => comment.diagramId === diagramId)
+      .map((comment) => (cuts.length === 0 ? comment : { ...comment, position: shiftPoint(cuts, comment.position) })))
+  }, [])
+
   // Pushes the current diagram's filtered + layout-merged data into the engine, and
   // zoom-fits the viewport the first time this diagram is shown. Shared by the
   // engine-creation effect (below) and the data-sync effect (further down) — both
@@ -424,8 +439,15 @@ export function CanvasView() {
           // for every diagram but the active one. Read from its document;
           // `undefined` until that read lands, so the expansion waits for it.
           layouts: (id) => expandedContentsRef.current.layouts.get(id),
+          // Measured by the engine that will draw it, so the room made is exact.
+          wrapperMinWidth: (wrapper) => engine.inlineWrapperMinWidth(wrapper),
         },
       )
+    const cutsChanged = JSON.stringify(expanded.cuts) !== JSON.stringify(viewCutsRef.current)
+    viewCutsRef.current = expanded.cuts
+    // The pins move with everything else past a cut; their own effect only
+    // runs when the comments change.
+    if (cutsChanged) pushComments(store.comments, store.currentDiagramId)
     const { objects: filteredObjects, connections: filteredConnections, groups: filteredGroups } = expanded
     const relatedDiagramObjectIds = collectRelatedDiagramObjectIds(
       filteredObjects,
@@ -487,7 +509,7 @@ export function CanvasView() {
         }, 400)
       }
     }
-  }, [setZoom])
+  }, [setZoom, pushComments])
 
   useDiagramReadyFit(editReady, currentDiagramId, useCallback(() => {
     // The temporary server render may already have consumed the regular
@@ -574,9 +596,18 @@ export function CanvasView() {
               return Object.keys(data).length > 0 ? [{ id: connection.id, data }] : []
             })
           : []
+        // The engine reports where it DRAWS them; with an expansion open that is
+        // displaced from the model (`viewCutsRef`). Never write the displacement.
+        const cuts = viewCutsRef.current
         updatePlacementsBatch({
-          objects: objectUpdates,
-          groups: groupUpdates,
+          objects: cuts.length === 0
+            ? objectUpdates
+            : objectUpdates.map((update) => ({ ...update, position: unshiftPoint(cuts, update.position) })),
+          groups: cuts.length === 0
+            ? groupUpdates
+            : groupUpdates.map((update) => (update.position
+              ? { ...update, position: unshiftPoint(cuts, update.position) }
+              : update)),
           connections: connectionUpdates,
         })
       },
@@ -666,7 +697,9 @@ export function CanvasView() {
         updateConnection(connId, { labelPosition: position, labelOffset: offset })
       },
       onConnectionWaypointsChange: (connId, waypoints) => {
-        updateConnection(connId, { waypoints: waypoints.length > 0 ? waypoints : undefined })
+        const cuts = viewCutsRef.current
+        const modelWaypoints = cuts.length === 0 ? waypoints : waypoints.map((point) => unshiftPoint(cuts, point))
+        updateConnection(connId, { waypoints: modelWaypoints.length > 0 ? modelWaypoints : undefined })
       },
       onGroupSelect: (id) => {
         if (id === null) {
@@ -712,7 +745,7 @@ export function CanvasView() {
         setOpenCommentId(commentId)
       },
       onCommentMove: (commentId, x, y) => {
-        updateComment(commentId, { position: { x, y } })
+        updateComment(commentId, { position: unshiftPoint(viewCutsRef.current, { x, y }) })
       },
       onContextMenu: (screenX, screenY, objectId, groupId, connectionId, selectedItems) => {
         setContextMenu({ x: screenX, y: screenY, objectId, groupId, connectionId: connectionId ?? null, selectedItems })
@@ -925,8 +958,8 @@ export function CanvasView() {
 
   // Sync comments to engine
   useEffect(() => {
-    engineRef.current?.setComments(comments.filter((c) => c.diagramId === currentDiagramId))
-  }, [comments, currentDiagramId])
+    pushComments(comments, currentDiagramId)
+  }, [comments, currentDiagramId, pushComments])
 
   /**
    * Materialise `autoSize: false` into real geometry.

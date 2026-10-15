@@ -397,6 +397,13 @@ export interface Group {
   autoSize?: boolean
   domainId?: string
   parentObjectId?: string
+  /**
+   * VIEW-ONLY, never persisted: the parent wrappers drawn inside this one, set
+   * only by the inline-expansion planner (`expandInline.ts`) on the wrappers it
+   * hands the engine. The engine draws this box around theirs, not just around
+   * the shapes, so a nested header band cannot poke through the outer border.
+   */
+  innerWrapperIds?: string[]
   description?: string
   type?: string
   /**
