@@ -76,6 +76,45 @@ async function waitForLockWait(admin: Pool, database: string, applicationName: s
   }
 }
 
+/**
+ * `withMigrationLock` POLLS the key (a blocked `pg_advisory_lock` holds a
+ * transaction that `CREATE INDEX CONCURRENTLY` under the key would wait for —
+ * see migrations.ts), so waiting on the key leaves no `Lock` wait to observe.
+ * The witness is therefore two facts: the session has asked for the key with
+ * `pg_try_advisory_lock`, and across a sampling window it is never in a `Lock`
+ * wait — which a queued ALTER, the defect this file exists for, always is.
+ */
+async function observeKeyPolling(
+  admin: Pool,
+  database: string,
+  applicationName: string,
+): Promise<{ polled: boolean; lockWaits: LockWait[] }> {
+  const deadline = Date.now() + 10_000
+  for (;;) {
+    const { rows } = await admin.query(
+      `SELECT 1 FROM pg_stat_activity
+        WHERE application_name = $1 AND datname = $2 AND query ILIKE '%pg_try_advisory_lock%'`,
+      [applicationName, database],
+    )
+    if (rows[0]) break
+    if (Date.now() > deadline) throw new Error(`${applicationName} never asked for the migration key`)
+    await new Promise((resolve) => setTimeout(resolve, 50))
+  }
+  const lockWaits: LockWait[] = []
+  // Several poll intervals of withMigrationLock (100 ms), so the window spans
+  // more than one attempt.
+  for (let sample = 0; sample < 10; sample += 1) {
+    const { rows } = await admin.query<{ wait_event_type: string | null; wait_event: string | null }>(
+      `SELECT wait_event_type, wait_event FROM pg_stat_activity
+        WHERE application_name = $1 AND datname = $2 AND wait_event_type = 'Lock'`,
+      [applicationName, database],
+    )
+    lockWaits.push(...rows.map((row) => ({ waitEventType: row.wait_event_type, waitEvent: row.wait_event })))
+    await new Promise((resolve) => setTimeout(resolve, 50))
+  }
+  return { polled: true, lockWaits }
+}
+
 /** Advisory locks on the migration key, asked from an independent connection:
  * a session-level advisory lock is re-entrant, so the holder's own connection
  * cannot tell "released" from "still mine". */
@@ -186,7 +225,7 @@ describe.skipIf(!TEST_DATABASE_URL)('a backup and a boot migration cannot deadlo
       },
     }
     let migration: Promise<unknown> | null = null
-    let migrationWait: LockWait | null = null
+    let migrationWait: Awaited<ReturnType<typeof observeKeyPolling>> | null = null
     let holdersDuringDump: Array<{ mode: string; granted: boolean }> = []
     const order: string[] = []
 
@@ -197,7 +236,7 @@ describe.skipIf(!TEST_DATABASE_URL)('a backup and a boot migration cannot deadlo
         // every table and the migration arrives before pg_dump takes its locks.
         migration = runMigrations(migrationPool, [addColumn], { log: () => undefined })
           .then((outcome) => { order.push('migration'); return outcome })
-        migrationWait = await waitForLockWait(admin, source.database, 'migration-under-test')
+        migrationWait = await observeKeyPolling(admin, source.database, 'migration-under-test')
         holdersDuringDump = await migrationKeyHolders(admin, source.database)
         await tools.dump(dumpOptions)
         order.push('dump')
@@ -214,13 +253,10 @@ describe.skipIf(!TEST_DATABASE_URL)('a backup and a boot migration cannot deadlo
 
     // The migration waited on the KEY, before any DDL — not on a relation,
     // which is the queued ALTER every reader of the table then lines up behind.
-    expect(migrationWait).toEqual({ waitEventType: 'Lock', waitEvent: 'advisory' })
-    // The backup really held the key (shared, granted) while the migration
-    // queued on it (exclusive, not granted). Control for the zero below.
-    expect(holdersDuringDump).toEqual(expect.arrayContaining([
-      { mode: 'ShareLock', granted: true },
-      { mode: 'ExclusiveLock', granted: false },
-    ]))
+    expect(migrationWait).toEqual({ polled: true, lockWaits: [] })
+    // The backup really held the key (shared, granted), and the polling
+    // migration held nothing on it. Control for the zero below.
+    expect(holdersDuringDump).toEqual([{ mode: 'ShareLock', granted: true }])
 
     expect(manifest.tables.theme_plugins?.rowCount).toBe(1)
     await withCeiling(migration!, 'migration')
@@ -288,7 +324,7 @@ describe.skipIf(!TEST_DATABASE_URL)('a backup and a boot migration cannot deadlo
     // ensureRbacSchema, ensureAiSchema, the technology catalog and the GC
     // worker's initSchema all run DDL after the migrations, at boot.
     let ddl: Promise<unknown> | null = null
-    let ddlWait: LockWait | null = null
+    let ddlWait: Awaited<ReturnType<typeof observeKeyPolling>> | null = null
     const order: string[] = []
     const observed: PgTools = {
       ...tools,
@@ -296,7 +332,7 @@ describe.skipIf(!TEST_DATABASE_URL)('a backup and a boot migration cannot deadlo
         ddl = withMigrationLock(migrationPool, (client) =>
           client.query('ALTER TABLE theme_plugins ADD COLUMN IF NOT EXISTS boot_note TEXT'))
           .then(() => { order.push('ddl') })
-        ddlWait = await waitForLockWait(admin, source.database, 'migration-under-test')
+        ddlWait = await observeKeyPolling(admin, source.database, 'migration-under-test')
         await tools.dump(dumpOptions)
         order.push('dump')
       },
@@ -310,7 +346,7 @@ describe.skipIf(!TEST_DATABASE_URL)('a backup and a boot migration cannot deadlo
     }), 'backup during boot DDL')
     await withCeiling(ddl!, 'boot DDL')
 
-    expect(ddlWait).toEqual({ waitEventType: 'Lock', waitEvent: 'advisory' })
+    expect(ddlWait).toEqual({ polled: true, lockWaits: [] })
     expect(order).toEqual(['dump', 'ddl'])
     expect(await migrationKeyHolders(admin, source.database)).toEqual([])
   }, 120_000)

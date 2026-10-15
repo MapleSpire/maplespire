@@ -12,6 +12,7 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU Affero General Public License for more details.
 
+import { setTimeout as sleep } from 'node:timers/promises'
 import type { Pool, PoolClient } from 'pg'
 
 /**
@@ -95,7 +96,8 @@ async function ensureLedger(client: PoolClient): Promise<void> {
  * Apply every migration the database has not recorded, under an advisory lock.
  *
  * The lock is held on ONE dedicated connection for the whole run, so a second
- * booting server blocks here instead of issuing the same DDL concurrently, and
+ * booting server waits here (polling the key, see `withMigrationLock`) instead
+ * of issuing the same DDL concurrently, and
  * proceeds afterwards seeing every migration already applied. It is released in
  * a `finally`; a process killed mid-run drops it with the connection, so a lock
  * can never outlive its holder and wedge future deploys.
@@ -184,12 +186,26 @@ export async function runMigrations(
  * The key is session-level and `client.release()` does NOT end the session, so
  * a failed or refused unlock destroys the connection rather than returning a
  * lock-holding client to the pool.
+ *
+ * The key is POLLED with `pg_try_advisory_lock`, never waited on with
+ * `pg_advisory_lock`. A blocked `pg_advisory_lock` is a statement in an open
+ * transaction, and `CREATE INDEX CONCURRENTLY` waits for every such older
+ * transaction to end — so a holder running CIC under the key (`initSchema`
+ * does, through `0001-baseline` and the GC worker) and a second session
+ * waiting for the key form a cycle. Measured 2026-10-14 in `ci:local`:
+ * `deadlock detected`, the waiter on the advisory lock, the CIC on the
+ * waiter's virtual transaction. In production the same shape would be two
+ * replicas booting together on a database that still needs those indexes —
+ * inferred, not observed. Between polls this session holds no transaction, so
+ * the CIC has nothing to wait for. Reproduced by the "does not deadlock against a
+ * holder running CREATE INDEX CONCURRENTLY" test in
+ * `migrations.integration.test.ts`.
  */
 export async function withMigrationLock<T>(pool: Pool, work: (client: PoolClient) => Promise<T>): Promise<T> {
   const client = await pool.connect()
   let releaseError: Error | undefined
   try {
-    await client.query('SELECT pg_advisory_lock($1)', [MIGRATION_ADVISORY_LOCK_KEY])
+    await acquireMigrationKey(client)
     try {
       return await work(client)
     } finally {
@@ -200,5 +216,21 @@ export async function withMigrationLock<T>(pool: Pool, work: (client: PoolClient
     }
   } finally {
     client.release(releaseError)
+  }
+}
+
+/** Poll interval while waiting for the migration key. An arbitrage, not a
+ *  measurement: it only adds up to this much to a boot that already waits for
+ *  another holder's whole run. */
+const MIGRATION_KEY_POLL_MS = 100
+
+async function acquireMigrationKey(client: PoolClient): Promise<void> {
+  for (;;) {
+    const { rows } = await client.query<{ acquired: boolean }>(
+      'SELECT pg_try_advisory_lock($1) AS acquired',
+      [MIGRATION_ADVISORY_LOCK_KEY],
+    )
+    if (rows[0]?.acquired === true) return
+    await sleep(MIGRATION_KEY_POLL_MS)
   }
 }

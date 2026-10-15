@@ -14,7 +14,7 @@
 
 import { afterAll, beforeEach, describe, expect, it } from 'vitest'
 import pg from 'pg'
-import { MIGRATION_ADVISORY_LOCK_KEY, runMigrations, type Migration } from './migrations.js'
+import { MIGRATION_ADVISORY_LOCK_KEY, runMigrations, withMigrationLock, type Migration } from './migrations.js'
 import { guardIdleClientErrors } from './poolErrorGuard.js'
 
 /**
@@ -220,4 +220,66 @@ suite('schema migration runner', () => {
     const outcome = await runMigrations(pool!, migrations, { log: silent })
     expect(outcome.applied).toEqual(['0001-concurrent'])
   })
+
+  it('does not deadlock against a holder running CREATE INDEX CONCURRENTLY under the key', async () => {
+    // ci:local, 2026-10-14: `deadlock detected` between a session blocked in
+    // pg_advisory_lock and the key's holder running CIC, which waits for every
+    // older transaction — including the waiter's. initSchema runs CIC under
+    // the key, so this is two replicas booting together.
+    const waiterName = `migration-cic-waiter-${process.pid}`
+    const holder = new pg.Client({ connectionString: URL, options: `-c search_path=${SCHEMA}` })
+    const waiterPool = guardIdleClientErrors(new pg.Pool({
+      connectionString: URL,
+      max: 1,
+      application_name: waiterName,
+      options: `-c search_path=${SCHEMA}`,
+    }), 'migrations:cic-waiter')
+    await holder.connect()
+    let holding = false
+    try {
+      // Polled, not pg_advisory_lock: other suites run real migrations (and
+      // their CIC) under this database-wide key in parallel, and a blocking
+      // acquire here would close the very cycle this test is about.
+      for (;;) {
+        const { rows } = await holder.query<{ acquired: boolean }>(
+          'SELECT pg_try_advisory_lock($1) AS acquired', [MIGRATION_ADVISORY_LOCK_KEY])
+        if (rows[0].acquired) break
+        await new Promise((resolve) => setTimeout(resolve, 50))
+      }
+      holding = true
+      await holder.query('CREATE TABLE widget (id INT)')
+      // A hang must fail the test by name, not by the vitest timeout.
+      await holder.query(`SET statement_timeout = '15s'`)
+
+      let ran = false
+      // Settled into a value at once: a deadlock reported to the waiter must
+      // fail the assertion below, not surface as an unhandled rejection.
+      const settled = withMigrationLock(waiterPool, async () => { ran = true })
+        .then(() => 'acquired', (error: unknown) => error)
+      // The waiter has asked for the key at least once — the precondition of
+      // the cycle, without assuming HOW it waits.
+      const deadline = Date.now() + 10_000
+      for (;;) {
+        const { rows } = await holder.query(
+          `SELECT 1 FROM pg_stat_activity WHERE application_name = $1 AND query ILIKE '%advisory_lock%'`,
+          [waiterName],
+        )
+        if (rows.length > 0) break
+        if (Date.now() > deadline) throw new Error('withMigrationLock never asked for the key')
+        await new Promise((resolve) => setTimeout(resolve, 20))
+      }
+
+      await holder.query('CREATE INDEX CONCURRENTLY widget_id_idx ON widget (id)')
+      expect(ran).toBe(false)
+
+      await holder.query('SELECT pg_advisory_unlock($1)', [MIGRATION_ADVISORY_LOCK_KEY])
+      holding = false
+      expect(await settled).toBe('acquired')
+      expect(ran).toBe(true)
+    } finally {
+      if (holding) await holder.query('SELECT pg_advisory_unlock_all()').catch(() => {})
+      await holder.end().catch(() => {})
+      await waiterPool.end().catch(() => {})
+    }
+  }, 30_000)
 })

@@ -1528,10 +1528,19 @@ async function ensureNewBundleDirectory(bundleDirectory: string): Promise<void> 
  *
  * Polled rather than blocking so the drill's stop signal can interrupt the
  * wait; `pg_advisory_lock_shared` would only return when the migration ends.
- * Polling does not starve a migration that is already queued: measured on
- * Postgres 16 (2026-10-12), `pg_try_advisory_lock_shared` returns false while
- * an exclusive request on the key is waiting behind a shared holder, and true
- * with the same shared holder and no waiter (the control).
+ *
+ * No queue orders this poll against a migration's. On 2026-10-12 this comment
+ * said polling could not starve a queued migration, measured on Postgres 16:
+ * `pg_try_advisory_lock_shared` returns false while an EXCLUSIVE request waits
+ * in the lock queue. Since 2026-10-14 `withMigrationLock` polls too (a waiter
+ * blocked in `pg_advisory_lock` deadlocked a holder's `CREATE INDEX
+ * CONCURRENTLY`), so no exclusive request ever waits in that queue and the
+ * measurement no longer applies. A new shared hold is admitted while a
+ * migration is polling, and the migration gets the key at its first poll with
+ * no shared holder. Drills cannot overlap each other (`drillScheduler.ts`'s
+ * own key), so delaying a boot takes a one-shot backup overlapping a drill,
+ * for as long as they overlap; unbounded delay would take overlapping backups
+ * back to back. Not measured.
  */
 async function holdMigrationExclusion(client: PoolClient, signal?: AbortSignal): Promise<void> {
   for (;;) {

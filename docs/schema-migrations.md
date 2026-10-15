@@ -64,7 +64,7 @@ rename re-runs the migration.
 
 | Guarantee | Enforced by |
 | --- | --- |
-| Only one process migrates at a time | `pg_advisory_lock` held on one dedicated connection for the whole run; a second booting server blocks and then sees everything applied |
+| Only one process migrates at a time | the advisory key held on one dedicated connection for the whole run; a second booting server polls it with `pg_try_advisory_lock` (never a blocking `pg_advisory_lock`, whose open transaction deadlocks a holder's `CREATE INDEX CONCURRENTLY`) and then sees everything applied |
 | The ledger never claims work that did not land | migration + its ledger row commit in one transaction; a failure rolls both back |
 | The lock is never leaked | released in a `finally`; a killed process drops it with its connection |
 | A duplicate id cannot silently shadow a migration | rejected at boot |
