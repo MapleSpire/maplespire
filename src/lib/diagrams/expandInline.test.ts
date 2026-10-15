@@ -177,6 +177,161 @@ describe('expandDiagramsInline', () => {
     expect(result.objects.find((o) => o.id === 'inner2')!.position).toEqual({ x: 500, y: 400 })
   })
 
+  // The defect of 2026-10-15: a non-active diagram is a layout-less STUB in the
+  // store and the diagram index (its placement lives in its own unloaded
+  // DiagramDoc). A Structurizr import leaves every model-level position at the
+  // same default, so a stub-only expansion drew the whole block on ONE point.
+  describe('placement read from the target diagram, not its stub', () => {
+    /** Three containers whose model positions all coincide, as an import leaves them. */
+    const importedWorld = () => world({
+      objects: [
+        object('host', { position: { x: 223, y: 280 } }),
+        object('c1', { position: { x: 0, y: 0 }, size: { width: 185, height: 100 } }),
+        object('c2', { position: { x: 0, y: 0 }, size: { width: 185, height: 100 } }),
+        object('c3', { position: { x: 0, y: 0 }, size: { width: 185, height: 100 } }),
+      ],
+      diagrams: [
+        diagram('A', { objectIds: ['host'] }),
+        // No `layouts`: exactly what `metaToStubDiagram` hands the index.
+        diagram('B', { objectIds: ['c1', 'c2', 'c3'] }),
+      ],
+      connections: [],
+    })
+    const read = {
+      c1: { position: { x: 300, y: 117 }, size: { width: 185, height: 100 } },
+      c2: { position: { x: 750, y: 117 }, size: { width: 185, height: 100 } },
+      c3: { position: { x: 524, y: 349 }, size: { width: 185, height: 100 } },
+    }
+
+    it('lays the pulled shapes out from the placement read for a layout-less stub', () => {
+      const w = importedWorld()
+      const result = expandDiagramsInline(w.base, 'A', [{ objectId: 'host', diagramId: 'B' }], {
+        ...w.lookup,
+        layouts: (id) => (id === 'B' ? read : undefined),
+      })
+      const at = (id: string) => result.objects.find((o) => o.id === id)!.position
+      // Block top-left was (300,117); the host sat at (223,280): dx=-77, dy=163.
+      expect(at('c1')).toEqual({ x: 223, y: 280 })
+      expect(at('c2')).toEqual({ x: 673, y: 280 })
+      expect(at('c3')).toEqual({ x: 447, y: 512 })
+    })
+
+    // While the target's document is still loading the expansion must WAIT, not
+    // draw a pile and then jump: the shape stays a shape for that instant.
+    it('waits while the placement has not been read yet', () => {
+      const w = importedWorld()
+      const result = expandDiagramsInline(w.base, 'A', [{ objectId: 'host', diagramId: 'B' }], {
+        ...w.lookup,
+        layouts: () => undefined,
+      })
+      expect(result.skipped).toEqual([{ objectId: 'host', reason: 'pending' }])
+      expect(result.objects.map((o) => o.id)).toEqual(['host'])
+      expect(result.groups).toEqual([])
+    })
+
+    // Offline with a document this client never synced: the arrangement is
+    // unknowable, and a grid is honest where a pile is not.
+    it('falls back to a grid, never a pile, when the placement cannot be read', () => {
+      const w = importedWorld()
+      const result = expandDiagramsInline(w.base, 'A', [{ objectId: 'host', diagramId: 'B' }], {
+        ...w.lookup,
+        layouts: () => null,
+      })
+      const positions = ['c1', 'c2', 'c3'].map((id) => result.objects.find((o) => o.id === id)!.position)
+      expect(new Set(positions.map((p) => `${p.x},${p.y}`)).size).toBe(3)
+      // ...and the grid still lands where the shape was.
+      expect(Math.min(...positions.map((p) => p.x))).toBe(223)
+      expect(Math.min(...positions.map((p) => p.y))).toBe(280)
+      // No two cells overlap.
+      for (const a of positions) {
+        for (const b of positions) {
+          if (a === b) continue
+          expect(Math.abs(a.x - b.x) >= 185 || Math.abs(a.y - b.y) >= 100).toBe(true)
+        }
+      }
+    })
+  })
+
+  // A shape pulled in by one expansion carries the ⤢ indicator too. Expanding it
+  // used to be refused as 'missing' — a click that did nothing.
+  describe('nested expansion', () => {
+    const nestedWorld = () => world({
+      objects: [
+        object('system', { position: { x: 100, y: 100 } }),
+        object('peer', { position: { x: 900, y: 100 } }),
+        object('svc', { position: { x: 0, y: 0 } }),
+        object('db', { position: { x: 0, y: 0 } }),
+        object('comp1', { position: { x: 0, y: 0 } }),
+        object('comp2', { position: { x: 0, y: 0 } }),
+      ],
+      diagrams: [
+        diagram('context', { objectIds: ['system', 'peer'], connectionIds: ['peer-system'] }),
+        diagram('containers', { objectIds: ['svc', 'db'], connectionIds: ['svc-db'] }),
+        diagram('components', { objectIds: ['comp1', 'comp2', 'db'], connectionIds: ['comp1-comp2'] }),
+      ],
+      connections: [
+        conn('peer-system', 'peer', 'system'),
+        conn('svc-db', 'svc', 'db'),
+        conn('comp1-comp2', 'comp1', 'comp2'),
+      ],
+    })
+    const placements: Record<string, Diagram['layouts']> = {
+      containers: {
+        svc: { position: { x: 0, y: 0 }, size: { width: 100, height: 60 } },
+        db: { position: { x: 400, y: 0 }, size: { width: 100, height: 60 } },
+      },
+      components: {
+        comp1: { position: { x: 50, y: 50 }, size: { width: 100, height: 60 } },
+        comp2: { position: { x: 250, y: 50 }, size: { width: 100, height: 60 } },
+        db: { position: { x: 600, y: 50 }, size: { width: 100, height: 60 } },
+      },
+    }
+    const expandBoth = (order: 'outer-first' | 'inner-first') => {
+      const w = nestedWorld()
+      const outer = { objectId: 'system', diagramId: 'containers' }
+      const inner = { objectId: 'svc', diagramId: 'components' }
+      return expandDiagramsInline(
+        w.base, 'context', order === 'outer-first' ? [outer, inner] : [inner, outer],
+        { ...w.lookup, layouts: (id) => placements[id] },
+      )
+    }
+
+    it('expands a shape that an earlier expansion pulled in', () => {
+      const result = expandBoth('outer-first')
+      expect(result.skipped).toEqual([])
+      expect(result.objects.map((o) => o.id).sort()).toEqual(['comp1', 'comp2', 'db', 'peer'])
+      // svc sat at (100,100) once the containers landed; its components land there.
+      expect(result.objects.find((o) => o.id === 'comp1')!.position).toEqual({ x: 100, y: 100 })
+      expect(result.objects.find((o) => o.id === 'comp2')!.position).toEqual({ x: 300, y: 100 })
+      // db was already drawn by the outer expansion: not pulled twice.
+      expect(result.objects.find((o) => o.id === 'db')!.position).toEqual({ x: 500, y: 100 })
+    })
+
+    // The order the store happens to hold the entries in is not a meaning.
+    it('does not depend on the order the expansions are listed in', () => {
+      const a = expandBoth('outer-first')
+      const b = expandBoth('inner-first')
+      expect(b.skipped).toEqual([])
+      expect(new Map(b.objects.map((o) => [o.id, o.position]))).toEqual(new Map(a.objects.map((o) => [o.id, o.position])))
+    })
+
+    it('keeps the inner block inside the outer wrapper', () => {
+      const result = expandBoth('outer-first')
+      const outer = result.groups.find((g) => g.id === inlineWrapperId('system'))!
+      const inner = result.groups.find((g) => g.id === inlineWrapperId('svc'))!
+      expect(inner.objectIds).toEqual(['comp1', 'comp2'])
+      // svc is gone (its wrapper IS it); the outer box encloses what replaced it.
+      expect([...outer.objectIds].sort()).toEqual(['comp1', 'comp2', 'db'])
+    })
+
+    it('rewrites the outer block\'s edges onto the inner wrapper', () => {
+      const result = expandBoth('outer-first')
+      const edge = result.connections.find((c) => c.id === 'svc-db')!
+      expect(edge.fromId).toBe(inlineWrapperId('svc'))
+      expect(result.connections.find((c) => c.id === 'comp1-comp2')).toBeTruthy()
+    })
+  })
+
   describe('refusals, each reported rather than silent', () => {
     it('refuses to expand a shape into the diagram being drawn', () => {
       const w = world()
@@ -186,15 +341,14 @@ describe('expandDiagramsInline', () => {
     })
 
     // A→B→A: the shape pulled in from B carries its own expansion back to A.
-    // Only shapes present in the BASE are expanded, so it is never consulted —
-    // and the visited set refuses it explicitly if it ever is.
+    // Pulled shapes ARE expandable (nesting), so this is the visited set's job.
     it('cannot recurse back into a diagram already expanded here', () => {
       const w = world()
       const result = expandDiagramsInline(w.base, 'A', [
         { objectId: 'host', diagramId: 'B' },
         { objectId: 'inner1', diagramId: 'A' },
       ], w.lookup)
-      expect(result.skipped).toEqual([{ objectId: 'inner1', reason: 'missing' }])
+      expect(result.skipped).toEqual([{ objectId: 'inner1', reason: 'cycle' }])
       expect(result.groups).toHaveLength(1)
     })
 
@@ -281,5 +435,101 @@ describe('expandDiagramsInline', () => {
     expect(result.skipped).toEqual([])
     expect(result.groups.map((g) => g.parentObjectId)).toEqual(['host', 'host2'])
     expect(result.objects.map((o) => o.id).sort()).toEqual(['inner1', 'other1'])
+  })
+
+  // Each of these was a surviving mutant of the 2026-10-15 fix (independent QA
+  // lens, 33 mutants): behaviour the suite above did not pin.
+  describe('edges of the transform', () => {
+    const sz = (width: number, height: number) => ({ width, height })
+
+    it('sizes grid cells for the LARGEST shape, with a gap, in a near-square', () => {
+      const w = world({
+        objects: [
+          object('host'),
+          object('a', { size: sz(400, 100) }), object('b', { size: sz(100, 300) }),
+          object('c'), object('d'), object('e'),
+        ],
+        // The largest shapes are NOT listed first.
+        diagrams: [diagram('A', { objectIds: ['host'] }), diagram('B', { objectIds: ['c', 'a', 'b', 'd', 'e'] })],
+        connections: [],
+      })
+      const result = expandDiagramsInline(w.base, 'A', [{ objectId: 'host', diagramId: 'B' }], { ...w.lookup, layouts: () => null })
+      for (const p of result.objects) {
+        for (const q of result.objects) {
+          if (p === q) continue
+          const apartX = p.position.x + p.size.width + 1 <= q.position.x || q.position.x + q.size.width + 1 <= p.position.x
+          const apartY = p.position.y + p.size.height + 1 <= q.position.y || q.position.y + q.size.height + 1 <= p.position.y
+          expect(apartX || apartY).toBe(true)
+        }
+      }
+      expect(new Set(result.objects.map((o) => o.position.x)).size).toBe(3)
+      expect(new Set(result.objects.map((o) => o.position.y)).size).toBe(2)
+    })
+
+    it('takes the size from the layout, and never shares the object it came in', () => {
+      const w = world()
+      const placement = {
+        inner1: { position: { x: 0, y: 0 }, size: sz(321, 123) },
+        inner2: { position: { x: 50, y: 0 }, size: sz(10, 20) },
+      }
+      const result = expandDiagramsInline(w.base, 'A', [{ objectId: 'host', diagramId: 'B' }], { ...w.lookup, layouts: () => placement })
+      const inner1 = result.objects.find((o) => o.id === 'inner1')!
+      expect(inner1.size).toEqual(sz(321, 123))
+      expect(inner1.size).not.toBe(placement.inner1.size)
+      const unplaced = expandDiagramsInline(w.base, 'A', [{ objectId: 'host', diagramId: 'B' }], w.lookup)
+      expect(unplaced.objects.find((o) => o.id === 'inner2')!.size).not.toBe(w.lookup.object('inner2')!.size)
+    })
+
+    it('leaves a persisted group\'s membership alone', () => {
+      const w = world()
+      const persisted = { id: 'g1', name: 'g', objectIds: ['host', 'peer'] } as unknown as Group
+      const result = expandDiagramsInline({ ...w.base, groups: [persisted] }, 'A', [{ objectId: 'host', diagramId: 'B' }], w.lookup)
+      expect(result.groups.find((g) => g.id === 'g1')!.objectIds).toEqual(['host', 'peer'])
+    })
+
+    // A paged or off-window id that does not resolve must not take the whole
+    // transform down with it.
+    it('skips an unresolvable member, and an edge with one end outside the block', () => {
+      const w = world({
+        objects: [object('host'), object('x1'), object('x2', { scope: 'external' })],
+        diagrams: [
+          diagram('A', { objectIds: ['host'] }),
+          diagram('B', { objectIds: ['x1', 'ghost', 'x2'], connectionIds: ['in-out', 'x1-ghost'] }),
+        ],
+        connections: [conn('in-out', 'x1', 'x2'), conn('x1-ghost', 'x1', 'ghost')],
+      })
+      const result = expandDiagramsInline(w.base, 'A', [{ objectId: 'host', diagramId: 'B' }], w.lookup)
+      expect(result.groups[0].objectIds).toEqual(['x1'])
+      expect(result.connections).toEqual([])
+    })
+
+    it('resolves three levels of nesting to what the outermost wrapper encloses', () => {
+      const w = world({
+        objects: [object('s'), object('c1'), object('k1'), object('l1')],
+        diagrams: [
+          diagram('D0', { objectIds: ['s'] }), diagram('D1', { objectIds: ['c1'] }),
+          diagram('D2', { objectIds: ['k1'] }), diagram('D3', { objectIds: ['l1'] }),
+        ],
+        connections: [],
+      })
+      const result = expandDiagramsInline(w.base, 'D0', [
+        { objectId: 's', diagramId: 'D1' }, { objectId: 'c1', diagramId: 'D2' }, { objectId: 'k1', diagramId: 'D3' },
+      ], { ...w.lookup, layouts: () => ({}) })
+      expect(result.skipped).toEqual([])
+      expect(result.groups.find((g) => g.id === inlineWrapperId('s'))!.objectIds).toEqual(['l1'])
+    })
+
+    it('expands a shape listed twice only once', () => {
+      const w = world()
+      const result = expandDiagramsInline(w.base, 'A', [
+        { objectId: 'host', diagramId: 'B' }, { objectId: 'host', diagramId: 'C' },
+      ], { ...w.lookup, diagram: (id) => (id === 'C' ? diagram('C', { objectIds: ['peer'] }) : w.lookup.diagram(id)) })
+      expect(result.groups).toHaveLength(1)
+      expect(result.skipped).toEqual([{ objectId: 'host', reason: 'missing' }])
+    })
+
+    it('names the wrapper\'s type the way the renderer labels it', () => {
+      expect(expandHostIntoB(world()).groups[0].type).toBe('App')
+    })
   })
 })

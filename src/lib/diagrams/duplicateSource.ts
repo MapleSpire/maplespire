@@ -71,17 +71,50 @@ function withTimeout<T>(p: Promise<T>, ms = 4000): Promise<T | null> {
  * the resident registry shards are absent whenever the registry is summary-only
  * (boot-from-server, and any server-paged diagram list), and the server is
  * absent offline.
+ *
+ * `serverFirst` asks the server before walking the shards. On a summary-only
+ * registry the walk resolves and pins EVERY registry shard — the cost that mode
+ * exists to avoid. A duplicate is rare enough to pay it; an inline expansion
+ * runs on every "Expand here", so it asks the server and walks only offline.
  */
-async function docUrlFor(diagramId: string): Promise<string | undefined> {
+async function docUrlFor(diagramId: string, serverFirst = false): Promise<string | undefined> {
+  // `diagram-meta` carries the registry entry, layouts NOT included — we want it
+  // only for the `docUrl` that leads to the document that does have them.
+  const fromServer = async () => (await withTimeout(fetchDiagramMeta(diagramId)))?.meta.docUrl || undefined
+  if (serverFirst) {
+    const url = await fromServer()
+    if (url) return url
+  }
   const shards = await withTimeout(getRegistryShardHandles())
   if (shards) {
     const metas = mergeShards(shards.map((h) => h.doc() ?? { diagrams: {} }))
     const url = metas.find((m) => m.id === diagramId)?.docUrl
     if (url) return url
   }
-  // `diagram-meta` carries the registry entry, layouts NOT included — we want it
-  // only for the `docUrl` that leads to the document that does have them.
-  return (await withTimeout(fetchDiagramMeta(diagramId)))?.meta.docUrl || undefined
+  return serverFirst ? undefined : fromServer()
+}
+
+/**
+ * A non-active diagram's placement, read from its own document — the same
+ * resolution a duplicate needs, for an inline expansion (`expandInline.ts`).
+ *
+ * `null` means the document could not be reached (offline and never synced
+ * here, or no URL from either source). A reachable document with no `layouts`
+ * resolves `{}`: its shapes sit at their model positions, as they do when that
+ * diagram is opened, so that is not the same answer as "unknown".
+ *
+ * A deep copy: the planner hands these objects to the engine, which owns its
+ * shapes' geometry, and a frozen document snapshot is not something to share.
+ */
+export async function loadDiagramLayouts(
+  diagramId: string,
+): Promise<NonNullable<Diagram['layouts']> | null> {
+  const url = await docUrlFor(diagramId, true)
+  if (!url) return null
+  const handle = await withTimeout(findDiagramHandle(url))
+  const doc = handle?.doc()
+  if (!doc) return null
+  return structuredClone(diagramDocToDiagram(diagramId, doc).layouts ?? {})
 }
 
 /**

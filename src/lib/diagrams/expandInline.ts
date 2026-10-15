@@ -51,6 +51,16 @@ import type { C4Object, Connection, Diagram, Group, Position } from '../../types
  *    expanded shape was. They carry the OTHER diagram's coordinates, which have
  *    no relationship to this one's — untranslated, an expansion lands on top of
  *    whatever happens to occupy those coordinates here.
+ *
+ * ## Where the other diagram's coordinates come from
+ *
+ * NOT from the diagram index. A diagram that is not the active one is a STUB
+ * there (`metaToStubDiagram`): composition, no `layouts`. Placement lives in
+ * that diagram's own DiagramDoc, which nothing has loaded. Planning from the
+ * stub drops every shape to its model-level position — and an import leaves
+ * those all equal, so the whole block was drawn on one point (2026-10-15: eleven
+ * containers at (223,280), only the top one visible). The caller reads the
+ * placement and hands it in through `lookup.layouts`.
  */
 
 export interface InlineExpansion {
@@ -73,16 +83,30 @@ export type SkippedReason =
   | 'missing'
   /** Nothing left to show once external and already-present shapes are dropped. */
   | 'empty'
+  /** The target's placement has not been read yet; the shape stays a shape. */
+  | 'pending'
 
 export interface InlineExpansionResult extends DiagramContents {
   /** Every expansion that produced nothing, and why. Never silent. */
   skipped: Array<{ objectId: string; reason: SkippedReason }>
 }
 
+type Layouts = NonNullable<Diagram['layouts']>
+
 export interface ExpansionLookup {
   diagram: (id: string) => Diagram | undefined
   object: (id: string) => C4Object | undefined
   connection: (id: string) => Connection | undefined
+  /**
+   * Where the target diagram's members sit, read from that diagram's own
+   * document (see the module header for why the stub cannot answer):
+   *  - a record — the arrangement the user made over there;
+   *  - `null` — it could not be read (offline, document never synced here):
+   *    the shapes go on a grid, because the alternative is a pile;
+   *  - `undefined` — not read YET: the expansion waits (`'pending'`).
+   * Omitted, `target.layouts` is used as given.
+   */
+  layouts?: (diagramId: string) => Layouts | null | undefined
 }
 
 /** Stable and derived, so the same expansion yields the same group id twice. */
@@ -100,14 +124,28 @@ function boundingTopLeft(objects: readonly C4Object[]): Position {
   return { x: Number.isFinite(x) ? x : 0, y: Number.isFinite(y) ? y : 0 }
 }
 
+/** Space between grid cells when the target's own arrangement is unknown. */
+const GRID_GAP = 40
+
+/** A near-square grid, every cell as large as the largest shape: distinct and
+ *  non-overlapping by construction. Only for an arrangement we cannot read. */
+function gridPlacement(objects: readonly C4Object[]): C4Object[] {
+  const columns = Math.ceil(Math.sqrt(objects.length))
+  const cellWidth = Math.max(...objects.map((object) => object.size.width)) + GRID_GAP
+  const cellHeight = Math.max(...objects.map((object) => object.size.height)) + GRID_GAP
+  return objects.map((object, index) => ({
+    ...object,
+    position: { x: (index % columns) * cellWidth, y: Math.floor(index / columns) * cellHeight },
+  }))
+}
+
 /**
  * Apply `expansions` to a diagram's already-filtered contents.
  *
- * ONE LEVEL ONLY, and that is the cycle protection rather than a limitation
- * papered over: only shapes present in `base` are expanded, so a shape pulled in
- * from B carrying its own expansion back to A is never consulted and A→B→A
- * cannot recurse. `visited` still tracks the chain explicitly, so a future
- * recursive version inherits the guard instead of rediscovering the need for it.
+ * Expansions NEST: a shape pulled in by one expansion is itself expandable, so
+ * each entry is applied once its host is on the canvas, whatever order the
+ * entries are listed in. `visited` is what stops A→B→A — a diagram already
+ * drawn here (the current one included) is refused as a `'cycle'`.
  */
 export function expandDiagramsInline(
   base: DiagramContents,
@@ -127,17 +165,25 @@ export function expandDiagramsInline(
   const presentObjectIds = new Set(base.objects.map((object) => object.id))
   /** objectId -> the wrapper that replaced it, for the connection rewrite. */
   const replacedBy = new Map<string, string>()
+  /** objectId -> the shapes its wrapper holds, so an enclosing wrapper can
+   *  hold them in its place. */
+  const replacedWith = new Map<string, string[]>()
 
-  for (const expansion of expansions) {
-    const host = base.objects.find((object) => object.id === expansion.objectId)
+  /** Apply one expansion whose host is on the canvas. */
+  const apply = (expansion: InlineExpansion, host: C4Object): void => {
     const target = lookup.diagram(expansion.diagramId)
-    if (!host || !target) {
+    if (!target) {
       skipped.push({ objectId: expansion.objectId, reason: 'missing' })
-      continue
+      return
     }
     if (visited.has(expansion.diagramId)) {
       skipped.push({ objectId: expansion.objectId, reason: 'cycle' })
-      continue
+      return
+    }
+    const layouts = lookup.layouts ? lookup.layouts(expansion.diagramId) : target.layouts
+    if (layouts === undefined && lookup.layouts) {
+      skipped.push({ objectId: expansion.objectId, reason: 'pending' })
+      return
     }
 
     const pulled = target.objectIds
@@ -147,17 +193,19 @@ export function expandDiagramsInline(
       .filter((object) => !presentObjectIds.has(object.id))
     if (pulled.length === 0) {
       skipped.push({ objectId: expansion.objectId, reason: 'empty' })
-      continue
+      return
     }
     visited.add(expansion.diagramId)
 
     // Land the pulled block where the shape was, in the other diagram's own
     // relative arrangement. `layouts` is the per-diagram override, and it is the
     // position the user actually arranged over there.
-    const placed = pulled.map((object) => {
-      const layout = target.layouts?.[object.id]
-      return layout ? { ...object, position: layout.position, size: layout.size } : object
-    })
+    const placed = layouts === null
+      ? gridPlacement(pulled)
+      : pulled.map((object) => {
+        const layout = layouts?.[object.id]
+        return layout ? { ...object, position: layout.position, size: layout.size } : object
+      })
     const origin = boundingTopLeft(placed)
     const dx = host.position.x - origin.x
     const dy = host.position.y - origin.y
@@ -165,6 +213,7 @@ export function expandDiagramsInline(
       objects.push({
         ...object,
         position: { x: object.position.x + dx, y: object.position.y + dy },
+        size: { ...object.size },
       })
       presentObjectIds.add(object.id)
     }
@@ -199,11 +248,43 @@ export function expandDiagramsInline(
     } as Group)
 
     replacedBy.set(host.id, wrapperId)
+    replacedWith.set(host.id, placed.map((object) => object.id))
+  }
+
+  // Each pass applies every entry whose host is on the canvas by now; a nested
+  // entry waits for the pass after the one that pulled its host in. Stops when a
+  // pass places nothing, so it terminates however the entries are ordered.
+  let waiting = [...expansions]
+  for (let progressed = true; progressed && waiting.length > 0;) {
+    progressed = false
+    const stillWaiting: InlineExpansion[] = []
+    for (const expansion of waiting) {
+      const host = replacedBy.has(expansion.objectId)
+        ? undefined
+        : objects.find((object) => object.id === expansion.objectId)
+      if (!host) {
+        stillWaiting.push(expansion)
+        continue
+      }
+      apply(expansion, host)
+      progressed = true
+    }
+    waiting = stillWaiting
+  }
+  for (const expansion of waiting) {
+    skipped.push({ objectId: expansion.objectId, reason: 'missing' })
   }
 
   if (replacedBy.size === 0) {
     return { objects, connections, groups, skipped }
   }
+  /** A replaced shape's id, swapped for what its wrapper holds — recursively,
+   *  so an outer wrapper encloses a nested block rather than a vanished shape. */
+  const resolveMembers = (ids: readonly string[]): string[] =>
+    ids.flatMap((id) => {
+      const inner = replacedWith.get(id)
+      return inner ? resolveMembers(inner) : [id]
+    })
   return {
     // The host shapes are gone: their wrapper IS them, expanded.
     objects: objects.filter((object) => !replacedBy.has(object.id)),
@@ -213,7 +294,11 @@ export function expandDiagramsInline(
       if (!from && !to) return connection
       return { ...connection, fromId: from ?? connection.fromId, toId: to ?? connection.toId }
     }),
-    groups,
+    // Only the wrappers made here: a persisted group's membership is not this
+    // view transform's to rewrite.
+    groups: groups.map((group) => (group.id.startsWith(inlineWrapperId(''))
+      ? { ...group, objectIds: resolveMembers(group.objectIds) }
+      : group)),
     skipped,
   }
 }

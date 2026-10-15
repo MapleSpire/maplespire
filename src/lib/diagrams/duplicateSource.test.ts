@@ -32,7 +32,7 @@ vi.mock('../../stores/modelStore', () => ({
   useModelStore: { getState: () => getState() },
 }))
 
-const { loadDiagramDuplicateSource } = await import('./duplicateSource')
+const { loadDiagramDuplicateSource, loadDiagramLayouts } = await import('./duplicateSource')
 
 const PLACED = {
   o1: { position: { x: 10, y: 20 }, size: { width: 160, height: 90 } },
@@ -169,5 +169,66 @@ describe('loadDiagramDuplicateSource', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+})
+
+// The inline expansion's source of placement (`expandInline.ts`). Same document,
+// different contract: "unknown" and "nothing placed" are different answers.
+describe('loadDiagramLayouts', () => {
+  it('reads the placement from the document, not the server stub', async () => {
+    // The 2026-10-15 shape of it: the server answers, with composition and NO
+    // layouts — trusting it drew a whole expansion on one point.
+    fetchDiagramMeta.mockResolvedValue({ meta: meta(), diagram: meta(), comments: [], flows: [] })
+    findDiagramHandle.mockResolvedValue({ doc: () => doc() })
+
+    expect(await loadDiagramLayouts('dg1')).toEqual(PLACED)
+    expect(findDiagramHandle).toHaveBeenCalledWith('automerge:abc')
+  })
+
+  // Runs on every "Expand here". On a summary-only registry the shard walk
+  // resolves and pins every registry shard — the cost that mode avoids.
+  it('asks the server for the document before walking the registry shards', async () => {
+    fetchDiagramMeta.mockResolvedValue({ meta: meta(), diagram: meta(), comments: [], flows: [] })
+    findDiagramHandle.mockResolvedValue({ doc: () => doc() })
+
+    expect(await loadDiagramLayouts('dg1')).toEqual(PLACED)
+    expect(getRegistryShardHandles).not.toHaveBeenCalled()
+  })
+
+  it('walks the registry shards when the server cannot answer (offline)', async () => {
+    fetchDiagramMeta.mockRejectedValue(new Error('offline'))
+    getRegistryShardHandles.mockResolvedValue([{ doc: () => ({ diagrams: { dg1: meta() } }) }])
+    findDiagramHandle.mockResolvedValue({ doc: () => doc() })
+
+    expect(await loadDiagramLayouts('dg1')).toEqual(PLACED)
+    expect(findDiagramHandle).toHaveBeenCalledWith('automerge:abc')
+  })
+
+  it('hands back a copy, never the document snapshot itself', async () => {
+    getRegistryShardHandles.mockResolvedValue([{ doc: () => ({ diagrams: { dg1: meta() } }) }])
+    const snapshot = doc()
+    findDiagramHandle.mockResolvedValue({ doc: () => snapshot })
+
+    const layouts = await loadDiagramLayouts('dg1')
+    expect(layouts).toEqual(PLACED)
+    expect(layouts!.o1).not.toBe(snapshot.layouts!.o1)
+  })
+
+  it('answers {} for a reachable document that places nothing', async () => {
+    getRegistryShardHandles.mockResolvedValue([{ doc: () => ({ diagrams: { dg1: meta() } }) }])
+    findDiagramHandle.mockResolvedValue({ doc: () => doc({ layouts: undefined }) })
+
+    expect(await loadDiagramLayouts('dg1')).toEqual({})
+  })
+
+  it('answers null when the document cannot be reached', async () => {
+    fetchDiagramMeta.mockRejectedValue(new Error('offline'))
+    expect(await loadDiagramLayouts('dg1')).toBeNull()
+    // No URL from either source: nothing to ask the repo for.
+    expect(findDiagramHandle).not.toHaveBeenCalled()
+
+    getRegistryShardHandles.mockResolvedValue([{ doc: () => ({ diagrams: { dg1: meta() } }) }])
+    findDiagramHandle.mockRejectedValue(new Error('document unavailable'))
+    expect(await loadDiagramLayouts('dg1')).toBeNull()
   })
 })

@@ -33,6 +33,7 @@ import { CanvasEmptyState } from './CanvasEmptyState'
 import { CanvasToolbar } from '../comments/CanvasToolbar'
 import { useDiagramReadyFit } from './useDiagramReadyFit'
 import { expandDiagramsInline } from '../../lib/diagrams/expandInline'
+import { loadDiagramLayouts } from '../../lib/diagrams/duplicateSource'
 import { collectRelatedDiagramObjectIds } from '../../canvas/relatedDiagramAffordances'
 import { resolveParentNavigation } from '../../lib/diagrams/parentNavigation'
 import { editorCanvasInsets, fitActiveCanvas, zoomActiveCanvas } from './canvasViewportControls'
@@ -404,6 +405,10 @@ export function CanvasView() {
           // fetched through the ModelQuery seam into .
           object: (id) => expandedContentsRef.current.objects.get(id) ?? index.objectById.get(id),
           connection: (id) => expandedContentsRef.current.connections.get(id) ?? index.connectionById.get(id),
+          // Nor the target's placement: `diagramById` holds a layout-less stub
+          // for every diagram but the active one. Read from its document;
+          // `undefined` until that read lands, so the expansion waits for it.
+          layouts: (id) => expandedContentsRef.current.layouts.get(id),
         },
       )
     const { objects: filteredObjects, connections: filteredConnections, groups: filteredGroups } = expanded
@@ -680,7 +685,10 @@ export function CanvasView() {
         setContextMenu({ x: screenX, y: screenY, objectId, groupId, connectionId: connectionId ?? null, selectedItems })
       },
       onExpandClick: (objectId, menuX, menuY) => {
+        // A shape pulled in by an inline expansion is not in the windowed store
+        // (that is why it was fetched), and it is expandable too — nesting.
         const obj = useModelStore.getState().objects.find((o) => o.id === objectId)
+          ?? expandedContentsRef.current.objects.get(objectId)
         if (!obj) return
         setExpandMenu({ object: obj, x: menuX, y: menuY })
       },
@@ -780,13 +788,17 @@ export function CanvasView() {
    * expansion as empty). They come through the
    * ModelQuery seam instead, which reads the whole model on every backend.
    *
+   * The same holds for each target's PLACEMENT, read from its own DiagramDoc
+   * (`loadDiagramLayouts`); `null` there means it could not be read.
+   *
    * Held in a ref as well as state: `syncEngineFromStore` reads it imperatively,
    * and the state copy is only there to re-run the sync once a load lands.
    */
   const expandedContentsRef = useRef<{
     objects: Map<string, C4Object>
     connections: Map<string, Connection>
-  }>({ objects: new Map(), connections: new Map() })
+    layouts: Map<string, NonNullable<Diagram['layouts']> | null>
+  }>({ objects: new Map(), connections: new Map(), layouts: new Map() })
   const [expandedContentsVersion, setExpandedContentsVersion] = useState(0)
 
   useEffect(() => {
@@ -798,22 +810,38 @@ export function CanvasView() {
       // without a second code path that could forget to.
       const objects = new Map<string, C4Object>()
       const connections = new Map<string, Connection>()
+      const layouts = new Map<string, NonNullable<Diagram['layouts']> | null>()
       for (const diagramId of targets) {
         const diagram = getDiagramIndex().diagramById.get(diagramId)
         if (!diagram) continue
-        const resolved = await query.lookupMany(diagram.objectIds)
-        for (const [id, entity] of resolved) {
-          // `lookupMany` answers for objects AND groups; only a C4Object carries
-          // a scope, which is also the field the expansion filters on.
-          if (entity && 'scope' in entity) objects.set(id, entity as C4Object)
+        // Started first: the document read is the slow leg, and it does not
+        // depend on the objects. A failed read is "unknown", never "pending".
+        const placement = loadDiagramLayouts(diagramId).catch((error: unknown) => {
+          console.warn(`inline expansion: placement of ${diagramId} unreadable`, error)
+          return null
+        })
+        // One target failing must not hold back the others: a throw here used
+        // to abandon the whole run, leaving every NEW expansion waiting forever.
+        try {
+          const resolved = await query.lookupMany(diagram.objectIds)
+          for (const [id, entity] of resolved) {
+            // `lookupMany` answers for objects AND groups; only a C4Object carries
+            // a scope, which is also the field the expansion filters on.
+            if (entity && 'scope' in entity) objects.set(id, entity as C4Object)
+          }
+          for (const connectionId of diagram.connectionIds) {
+            const connection = await query.connection(connectionId)
+            if (connection) connections.set(connectionId, connection)
+          }
+        } catch (error) {
+          // Its shapes stay unresolved, so the planner reports it 'empty' and
+          // the host stays a shape.
+          console.warn(`inline expansion: contents of ${diagramId} unavailable`, error)
         }
-        for (const connectionId of diagram.connectionIds) {
-          const connection = await query.connection(connectionId)
-          if (connection) connections.set(connectionId, connection)
-        }
+        layouts.set(diagramId, await placement)
       }
       if (controller.signal.aborted) return
-      expandedContentsRef.current = { objects, connections }
+      expandedContentsRef.current = { objects, connections, layouts }
       setExpandedContentsVersion((version) => version + 1)
     })()
     return () => controller.abort()
@@ -830,7 +858,15 @@ export function CanvasView() {
     const engine = engineRef.current
     if (!engine || !currentDiagramId) return
     const controller = new AbortController()
-    const objectIds = JSON.parse(canvasObjectIdsKey) as string[]
+    // The shapes an inline expansion pulled in are on the canvas but not in the
+    // store; without them this answer replaced the render path's and took their
+    // ⤢ away, so a nested expansion could not even be started.
+    const objectIds = [
+      ...new Set([
+        ...(JSON.parse(canvasObjectIdsKey) as string[]),
+        ...expandedContentsRef.current.objects.keys(),
+      ]),
+    ]
     getModelQuery().relatedDiagramObjectIds(objectIds, { signal: controller.signal })
       .then((relatedObjectIds) => {
         if (
@@ -845,7 +881,7 @@ export function CanvasView() {
         if (!controller.signal.aborted) console.warn('relatedDiagramObjectIds failed:', error)
       })
     return () => controller.abort()
-  }, [canvasObjectIdsKey, currentDiagramId, diagrams])
+  }, [canvasObjectIdsKey, currentDiagramId, diagrams, expandedContentsVersion])
 
   // Sync comments to engine
   useEffect(() => {
