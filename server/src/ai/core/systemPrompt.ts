@@ -58,7 +58,7 @@ export async function buildSystemPrompt(ctx: AiToolCtx, uiContext?: AiUiContext)
   if (currentDiagram) {
     const meta = currentDiagram.meta
     lines.push(
-      `The user is currently in the diagram editor on "${String(meta.name ?? currentDiagram.id)}" (diagram id: ${currentDiagram.id}, type: ${String(meta.type ?? 'context')}). When they say "this diagram" or "here", they mean THIS diagram — use its id, and place new objects on it (create_model_object addToDiagramId) unless they say otherwise.`
+      `The user is currently in the diagram editor on "${String(meta.name ?? currentDiagram.id)}" (diagram id: ${currentDiagram.id}, type: ${String(meta.type ?? 'context')}). When they say "this diagram" or "here", they mean THIS diagram — use its id, and place new objects on it (create_model_object addToDiagramId; for a whole architecture on a context diagram, create_architecture diagramId) unless they say otherwise.`
     )
   } else if (currentDecisionRecord) {
     lines.push(

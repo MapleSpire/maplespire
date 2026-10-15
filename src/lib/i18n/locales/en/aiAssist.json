@@ -39,6 +39,7 @@
       "reasoning": "Reasoning",
       "reasoningStreaming": "Reasoning…",
       "toolRunning": "Running…",
+      "toolInterrupted": "Interrupted",
       "toolFailed": "Failed",
       "toolDone": "Done",
       "jsonInput": "Input",

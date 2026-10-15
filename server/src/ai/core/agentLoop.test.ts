@@ -12,7 +12,7 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU Affero General Public License for more details.
 
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Repo } from '@automerge/automerge-repo'
 import type { Pool } from 'pg'
 import type { LanguageModel, UIMessage, UIMessageChunk } from 'ai'
@@ -22,6 +22,7 @@ import { ModelSession } from './modelOps.js'
 import type { AiToolCtx } from './toolContext.js'
 import { runAgentSequence, runAgentStream } from './agent.js'
 import type { ResolvedAiConfig } from './config.js'
+import { chatStreamOnError } from '../adapters/httpRoutes.js'
 
 /**
  * Agent auto-continuation loop against a MOCK model: when a round ends at the
@@ -243,4 +244,215 @@ describe('agent auto-continuation', () => {
     expect(result.steps.filter((s) => s.toolCalls.length > 0)).toHaveLength(2)
     expect((result.usage as { inputTokens: number }).inputTokens).toBe(30)
   })
+})
+
+/**
+ * A tool call the SDK refuses before executing it (the MODEL's arguments are
+ * not JSON, or do not match the schema) is NOT a provider failure. Measured
+ * 2026-10-14 against LM Studio + gemma-4-12b-qat: create_architecture arrived
+ * as unterminated JSON and the panel said "The AI provider request failed.
+ * Verify the provider and model settings", because the chat route mapped
+ * every stream error through the provider-only helper. These run the chat
+ * route's own `onError`.
+ */
+describe('refused tool calls in the chat stream', () => {
+  const MODEL_TEXT = 'model-raw-arguments-canary-5d1e'
+
+  function toolCallWithInput(toolName: string, input: string) {
+    return {
+      stream: simulateReadableStream({
+        chunks: [
+          { type: 'stream-start', warnings: [] },
+          { type: 'tool-call', toolCallId: 'bad1', toolName, input },
+          { type: 'finish', finishReason: 'tool-calls', usage: USAGE },
+        ] as LanguageModelV3StreamPart[],
+      }),
+    }
+  }
+
+  async function runRefused(toolName: string, input: string) {
+    const repo = new Repo({})
+    const rootUrl = await emptyWorkspace(repo)
+    const model = new MockLanguageModelV3({
+      doStream: [toolCallWithInput(toolName, input), finalTextStream('Retried.')],
+    })
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const chunks = await collect(
+      runAgentStream({
+        ctx: ctxFor(repo, rootUrl),
+        cfg,
+        uiMessages: [userMessage],
+        model: model as unknown as LanguageModel,
+        maxSteps: 5,
+        maxRounds: 1,
+        onError: chatStreamOnError,
+      })
+    )
+    const refused = chunks.find(
+      (c): c is Extract<UIMessageChunk, { type: 'tool-output-error' }> => c.type === 'tool-output-error'
+    )
+    return { model, chunks, refused, log }
+  }
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('malformed JSON arguments name the tool and the model, never the provider', async () => {
+    const { model, chunks, refused, log } = await runRefused(
+      'create_architecture',
+      `{"actors":[{"description":"${MODEL_TEXT}`
+    )
+    expect(refused?.errorText).toMatch(/invalid JSON/)
+    expect(refused?.errorText).toContain('create_architecture')
+    expect(refused?.errorText).not.toMatch(/provider/i)
+    expect(refused?.errorText).not.toContain(MODEL_TEXT)
+    // The model was handed the refusal and got a second step to recover.
+    expect(model.doStreamCalls).toHaveLength(2)
+    expect(JSON.stringify(model.doStreamCalls[1].prompt)).toMatch(/"role":"tool".*error/)
+    expect(chunks.some((c) => c.type === 'text-delta' && c.delta === 'Retried.')).toBe(true)
+    // Logged server-side, by allowlisted name only.
+    expect(log).toHaveBeenCalledWith('[ai] chat stream error', { name: 'AI_InvalidToolInputError' })
+    expect(JSON.stringify(log.mock.calls)).not.toContain(MODEL_TEXT)
+  })
+
+  it('schema-invalid arguments are reported as a schema mismatch', async () => {
+    const { refused } = await runRefused('create_architecture', JSON.stringify({ actors: [{ name: MODEL_TEXT }] }))
+    expect(refused?.errorText).toMatch(/do not match the tool schema/)
+    expect(refused?.errorText).toContain('create_architecture')
+    expect(refused?.errorText).not.toMatch(/provider/i)
+    expect(refused?.errorText).not.toContain(MODEL_TEXT)
+  })
+
+  it('an unknown tool is reported without echoing the model-chosen name', async () => {
+    const { refused, log } = await runRefused(MODEL_TEXT, '{}')
+    expect(refused?.errorText).toMatch(/tool that does not exist/)
+    expect(refused?.errorText).not.toContain(MODEL_TEXT)
+    expect(log).toHaveBeenCalledWith('[ai] chat stream error', { name: 'AI_NoSuchToolError' })
+  })
+
+  it('a genuine provider failure keeps the provider wording', () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    expect(chatStreamOnError(new Error(MODEL_TEXT))).toBe(
+      'The AI provider request failed. Verify the provider and model settings, then retry.'
+    )
+  })
+
+  it('arguments cut off by a provider failure blame the provider, not the model', async () => {
+    // LM Studio, 2026-10-14: "Context size has been exceeded." mid-arguments;
+    // the SDK still finalizes the partial call as an invalid tool input.
+    const repo = new Repo({})
+    const rootUrl = await emptyWorkspace(repo)
+    const model = new MockLanguageModelV3({
+      doStream: [{
+        stream: simulateReadableStream({
+          chunks: [
+            { type: 'stream-start', warnings: [] },
+            { type: 'error', error: new Error('Context size has been exceeded.') },
+            { type: 'tool-call', toolCallId: 'cut1', toolName: 'create_model_object', input: '{"name":"Sho' },
+            { type: 'finish', finishReason: 'error', usage: USAGE },
+          ] as LanguageModelV3StreamPart[],
+        }),
+      }, finalTextStream('unused')],
+    })
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const chunks = await collect(runAgentStream({
+      ctx: ctxFor(repo, rootUrl),
+      cfg,
+      uiMessages: [userMessage],
+      model: model as unknown as LanguageModel,
+      maxSteps: 1,
+      maxRounds: 1,
+      onError: chatStreamOnError,
+    }))
+    const cut = chunks.find(
+      (c): c is Extract<UIMessageChunk, { type: 'tool-output-error' }> => c.type === 'tool-output-error'
+    )
+    expect(cut?.errorText).toMatch(/provider failed before the create_model_object call was complete/)
+    expect(cut?.errorText).not.toMatch(/model sent/)
+  })
+
+  it('an unknown tool after a provider failure stays unknown and its name is never echoed', async () => {
+    const repo = new Repo({})
+    const rootUrl = await emptyWorkspace(repo)
+    const model = new MockLanguageModelV3({
+      doStream: [{
+        stream: simulateReadableStream({
+          chunks: [
+            { type: 'stream-start', warnings: [] },
+            { type: 'error', error: new Error('Context size has been exceeded.') },
+            { type: 'tool-call', toolCallId: 'cut2', toolName: 'leaked_model_text', input: '{}' },
+            { type: 'finish', finishReason: 'error', usage: USAGE },
+          ] as LanguageModelV3StreamPart[],
+        }),
+      }, finalTextStream('unused')],
+    })
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const chunks = await collect(runAgentStream({
+      ctx: ctxFor(repo, rootUrl),
+      cfg,
+      uiMessages: [userMessage],
+      model: model as unknown as LanguageModel,
+      maxSteps: 1,
+      maxRounds: 1,
+      onError: chatStreamOnError,
+    }))
+    const refused = chunks.find(
+      (c): c is Extract<UIMessageChunk, { type: 'tool-output-error' }> => c.type === 'tool-output-error'
+    )
+    expect(refused?.errorText).toMatch(/tool that does not exist/)
+    expect(refused?.errorText).not.toContain('leaked_model_text')
+  })
+})
+
+/**
+ * A tool call still open when the stream closes was persisted as
+ * `input-streaming`, so the reopened panel showed it "Running…" forever
+ * (create_model_object, demo, 2026-10-14). It is now settled before `finish`.
+ */
+describe('tool calls left open when the stream closes', () => {
+  it('a client disconnect mid-arguments settles every open call as an error, before finish, and persists them', async () => {
+    const repo = new Repo({})
+    const rootUrl = await emptyWorkspace(repo)
+    // Five parallel calls: with eager enqueuing, finish overtook the 4th.
+    const ids = ['open1', 'open2', 'open3', 'open4', 'open5']
+    const model = new MockLanguageModelV3({
+      doStream: async () => ({
+        stream: new ReadableStream<LanguageModelV3StreamPart>({
+          start(controller) {
+            controller.enqueue({ type: 'stream-start', warnings: [] })
+            for (const id of ids) {
+              controller.enqueue({ type: 'tool-input-start', id, toolName: 'create_model_object' })
+              controller.enqueue({ type: 'tool-input-delta', id, delta: '{"name":"Sh' })
+            }
+            // never finishes the arguments
+          },
+        }),
+      }),
+    })
+    const client = new AbortController()
+    let persisted: UIMessage[] = []
+    const stream = runAgentStream({
+      ctx: ctxFor(repo, rootUrl),
+      cfg,
+      uiMessages: [userMessage],
+      model: model as unknown as LanguageModel,
+      maxSteps: 1,
+      maxRounds: 1,
+      abortSignal: client.signal,
+      onEnd: (messages) => { persisted = messages },
+    })
+    setTimeout(() => client.abort(), 200)
+    const chunks = await collect(stream)
+
+    const finishAt = chunks.findIndex((c) => c.type === 'finish')
+    for (const id of ids) {
+      const settledAt = chunks.findIndex((c) => c.type === 'tool-output-error' && c.toolCallId === id)
+      expect(settledAt, id).toBeGreaterThan(-1)
+      expect(settledAt, id).toBeLessThan(finishAt)
+      expect((chunks[settledAt] as { errorText: string }).errorText).toMatch(/before this tool call was complete\. Nothing was written/)
+    }
+    const parts = persisted.at(-1)?.parts.filter((p) => p.type === 'tool-create_model_object') as { state?: string }[]
+    expect(parts.map((p) => p.state)).toEqual(ids.map(() => 'output-error'))
+  }, 15_000)
 })

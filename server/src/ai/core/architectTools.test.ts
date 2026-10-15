@@ -225,3 +225,72 @@ describe('create_architecture', () => {
     expect(ok.created.connections).toBe(1)
   })
 })
+
+/**
+ * "Create an architecture in the current diagram" — measured 2026-10-14 on the
+ * demo: create_architecture always made a NEW "System context" diagram, and
+ * the user's current diagram stayed empty. diagramId targets an existing one.
+ */
+describe('create_architecture on an existing diagram (diagramId)', () => {
+  async function withCurrentDiagram(type: 'context' | 'container') {
+    const repo = new Repo({})
+    const rootUrl = await seedMonolith(repo, { legacy: obj('legacy', 'Legacy CRM') })
+    const ctx = ctxFor(repo, rootUrl)
+    const current = (await executeAiTool(ctx, 'create_diagram', {
+      name: 'New context diagram',
+      type,
+      ...(type === 'container' ? { parentObjectId: 'legacy' } : {}),
+      objectIds: ['legacy'],
+    })) as { created: { id: string } }
+    return { ctx, diagramId: current.created.id }
+  }
+
+  const diagramCount = async (ctx: AiToolCtx) =>
+    ((await executeAiTool(ctx, 'list_diagrams', {})) as { diagrams: unknown[] }).diagrams.length
+
+  it('places the actors and systems on the given diagram instead of a new context diagram', async () => {
+    const { ctx, diagramId } = await withCurrentDiagram('context')
+    const before = await diagramCount(ctx)
+    const res = (await executeAiTool(ctx, 'create_architecture', {
+      ...uberPayload,
+      connections: [...uberPayload.connections, { from: 'Ride Platform', to: 'Legacy CRM', label: 'syncs riders to' }],
+      diagramId,
+    })) as {
+      created: { diagrams: { id: string; type: string }[] }
+      warnings?: string[]
+    }
+    // the context view IS the current diagram; only the container view is new
+    expect(res.created.diagrams.filter((d) => d.type === 'context').map((d) => d.id)).toEqual([diagramId])
+    expect(await diagramCount(ctx)).toBe(before + 1)
+    expect(res.warnings ?? []).not.toContainEqual(expect.stringMatching(/could not be placed/))
+
+    const list = (await executeAiTool(ctx, 'list_model_objects', {})) as { objects: { id: string; name: string }[] }
+    const id = (name: string) => list.objects.find((o) => o.name === name)!.id
+    const current = (await executeAiTool(ctx, 'get_diagram', { id: diagramId })) as {
+      objects: { id: string }[]
+      connections: { id: string }[]
+    }
+    // existing content kept, the new context-level objects added, containers not
+    expect(new Set(current.objects.map((o) => o.id))).toEqual(
+      new Set(['legacy', id('Ride Platform'), id('Stripe'), id('Rider')])
+    )
+    // rider→platform, platform→stripe, and platform→the EXISTING Legacy CRM
+    expect(current.connections).toHaveLength(3)
+  })
+
+  it('refuses an unknown diagram and writes nothing', async () => {
+    const { ctx } = await withCurrentDiagram('context')
+    await expect(executeAiTool(ctx, 'create_architecture', { ...uberPayload, diagramId: 'nope' }))
+      .rejects.toMatchObject({ status: 404 })
+    const stats = (await executeAiTool(ctx, 'get_model_stats', {})) as { objects: number }
+    expect(stats.objects).toBe(1)
+  })
+
+  it('refuses a container diagram (actors and systems belong on a context view) and writes nothing', async () => {
+    const { ctx, diagramId } = await withCurrentDiagram('container')
+    await expect(executeAiTool(ctx, 'create_architecture', { ...uberPayload, diagramId }))
+      .rejects.toMatchObject({ status: 400 })
+    const stats = (await executeAiTool(ctx, 'get_model_stats', {})) as { objects: number }
+    expect(stats.objects).toBe(1)
+  })
+})

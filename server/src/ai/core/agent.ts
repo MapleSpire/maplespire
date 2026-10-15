@@ -16,6 +16,7 @@ import {
   convertToModelMessages,
   createUIMessageStream,
   generateText,
+  InvalidToolInputError,
   isStepCount,
   streamText,
   toUIMessageStream,
@@ -32,7 +33,7 @@ import { buildLanguageModel, thinkingProviderOptions } from './providers.js'
 import type { AiToolCtx } from './toolContext.js'
 import { executeAiTool, listAiTools } from './toolRegistry.js'
 import { normalizeToolError } from './serialize.js'
-import { logSafeAiError, safeProviderRequestError } from './providerErrors.js'
+import { logSafeAiError, safeProviderRequestError, ToolCallInterruptedError } from './providerErrors.js'
 import { buildSystemPrompt, type AiUiContext } from './systemPrompt.js'
 import { envNumber } from '../../envNumber.js'
 
@@ -103,24 +104,136 @@ function onAbort(signal: AbortSignal): Promise<typeof ABORTED> {
   })
 }
 
-/** Pass-through that closes when `signal` fires, even if `source` never ends. */
-function closeOnAbort<T>(source: ReadableStream<T>, signal: AbortSignal): ReadableStream<T> {
+const TOOL_CALL_SETTLED = new Set(['tool-input-error', 'tool-output-available', 'tool-output-error', 'tool-output-denied'])
+
+/**
+ * Pass-through that closes when `signal` fires, even if `source` never ends.
+ *
+ * A tool call still open when the stream closes (the client went away, the
+ * watchdog fired, the provider died mid-arguments) would otherwise be
+ * persisted as `input-streaming` / `input-available`, and the reopened panel
+ * shows it "Running…" forever — seen 2026-10-14 on create_model_object after
+ * LM Studio failed with "Context size has been exceeded.". Each open call is
+ * settled as an error before the close, saying whether a write may have run.
+ *
+ * The settlements go out ONE PER PULL, and the next pull comes only once the
+ * consumer has taken the previous chunk, so `onClosed` runs after the last
+ * settlement was read: the turn's `finish`, written after `onClosed`, cannot
+ * overtake them (reviewer lens: enqueuing them all at once, 5 open calls gave
+ * `… c2 finish c3 c4`). `highWaterMark: 0` keeps the wrapper from reading
+ * ahead of its consumer; the order does not depend on it (mutant survived).
+ */
+function closeOnAbort(
+  source: ReadableStream<UIMessageChunk>,
+  signal: AbortSignal,
+  onClosed: () => void
+): ReadableStream<UIMessageChunk> {
   const reader = source.getReader()
   const aborted = onAbort(signal)
-  return new ReadableStream<T>({
+  const open = new Map<string, 'arguments' | 'executing'>()
+  let closing: UIMessageChunk[] | null = null
+  const startClosing = (failure?: UIMessageChunk) => {
+    closing = failure ? [failure] : []
+    for (const [toolCallId, phase] of open) {
+      closing.push({
+        type: 'tool-output-error',
+        toolCallId,
+        errorText: phase === 'arguments'
+          ? 'The response stopped before this tool call was complete. Nothing was written.'
+          : 'The response stopped while this tool was running. Check the model before retrying: the change may or may not have been applied.',
+      })
+    }
+    open.clear()
+    void reader.cancel().catch(() => {})
+  }
+  return new ReadableStream<UIMessageChunk>({
     async pull(controller) {
-      const r = await Promise.race([reader.read(), aborted])
-      if (r === ABORTED || r.done) {
-        controller.close()
-        void reader.cancel().catch(() => {})
+      if (closing === null) {
+        let r: Awaited<ReturnType<typeof reader.read>> | typeof ABORTED
+        try {
+          r = await Promise.race([reader.read(), aborted])
+        } catch (err) {
+          // Was merge's to report; this wrapper now owns the close, so it
+          // must not end the turn looking normal.
+          logSafeAiError('[ai] chat stream read failed', err)
+          r = ABORTED
+          startClosing({ type: 'error', errorText: safeProviderRequestError(err).message })
+        }
+        if (r !== ABORTED && !r.done) {
+          const chunk = r.value
+          if (chunk.type === 'tool-input-start') open.set(chunk.toolCallId, 'arguments')
+          else if (chunk.type === 'tool-input-available') open.set(chunk.toolCallId, 'executing')
+          else if (TOOL_CALL_SETTLED.has(chunk.type)) open.delete((chunk as { toolCallId: string }).toolCallId)
+          controller.enqueue(chunk)
+          return
+        }
+        if (closing === null) startClosing()
+      }
+      const next = closing!.shift()
+      if (next) {
+        controller.enqueue(next)
         return
       }
-      controller.enqueue(r.value)
+      controller.close()
+      onClosed()
     },
     cancel(reason) {
+      onClosed()
       void reader.cancel(reason).catch(() => {})
     },
-  })
+  }, { highWaterMark: 0 })
+}
+
+/**
+ * How long the terminal `finish` waits for the rounds' merged streams to
+ * close, so their settling chunks precede it. Bounded: a consumer that
+ * stopped reading must not keep the turn (and its persistence) open.
+ */
+const ROUND_CLOSE_GRACE_MS = 2_000
+
+/**
+ * The SDK announces a refused tool call twice: a `tool-call` part flagged
+ * `invalid` that carries the TYPED error (InvalidToolInputError,
+ * NoSuchToolError), then a `tool-error` part whose `error` is only
+ * `getErrorMessage(...)` — a string quoting the model's raw arguments (ai
+ * 7.0.15). `toUIMessageStream` hands that string to `onError`, which then
+ * cannot tell a refused call from a provider failure. This puts the typed
+ * error back on the `tool-error` part.
+ *
+ * And when the PROVIDER failed earlier in the same step, the SDK still
+ * finalizes the cut-off arguments as an invalid call: that is not the
+ * model's malformed output, so it becomes a ToolCallInterruptedError.
+ */
+function withTypedToolErrors<T>(source: ReadableStream<T>): ReadableStream<T> {
+  const refused = new Map<string, unknown>()
+  let providerFailedInStep = false
+  return source.pipeThrough(new TransformStream<T, T>({
+    transform(part, controller) {
+      const p = part as { type?: unknown; toolCallId?: unknown; toolName?: unknown; invalid?: unknown; error?: unknown }
+      if (p.type === 'start-step') providerFailedInStep = false
+      else if (p.type === 'error') providerFailedInStep = true
+      if (typeof p.toolCallId === 'string') {
+        if (p.type === 'tool-call' && p.invalid === true) {
+          // Only cut-off ARGUMENTS are the provider's doing; an unknown tool
+          // name is still the model's, and stays a NoSuchToolError (whose
+          // model-chosen name is never echoed).
+          if (providerFailedInStep && InvalidToolInputError.isInstance(p.error)) {
+            const error = new ToolCallInterruptedError(typeof p.toolName === 'string' ? p.toolName : '')
+            refused.set(p.toolCallId, error)
+            controller.enqueue({ ...part, error })
+            return
+          }
+          refused.set(p.toolCallId, p.error)
+        } else if (p.type === 'tool-error' && refused.has(p.toolCallId)) {
+          const error = refused.get(p.toolCallId)
+          refused.delete(p.toolCallId)
+          controller.enqueue({ ...part, error })
+          return
+        }
+      }
+      controller.enqueue(part)
+    },
+  }))
 }
 
 /**
@@ -212,11 +325,14 @@ export function runAgentStream(opts: AgentStreamOpts): ReadableStream<UIMessageC
         tools,
         ignoreIncompleteToolCalls: true,
       })
+      const roundsClosed: Promise<void>[] = []
       for (let round = 0; round < maxRounds; round++) {
         // Per-round watchdog: a stalled provider aborts the round instead of
         // pinning the panel on "running" forever.
         const timeout = AbortSignal.timeout(roundTimeoutMs)
         const signal = opts.abortSignal ? AbortSignal.any([opts.abortSignal, timeout]) : timeout
+        let closed!: () => void
+        roundsClosed.push(new Promise<void>((resolve) => { closed = resolve }))
         const result = streamText({
           model,
           system,
@@ -229,7 +345,7 @@ export function runAgentStream(opts: AgentStreamOpts): ReadableStream<UIMessageC
         writer.merge(
           closeOnAbort(
             toUIMessageStream({
-              stream: result.fullStream,
+              stream: withTypedToolErrors(result.fullStream),
               sendReasoning: true,
               sendStart: round === 0,
               // The terminal finish chunk is written manually below — a round
@@ -237,7 +353,8 @@ export function runAgentStream(opts: AgentStreamOpts): ReadableStream<UIMessageC
               sendFinish: false,
               ...(opts.onError ? { onError: opts.onError } : {}),
             }),
-            signal
+            signal,
+            closed
           )
         )
         let finishReason = 'error'
@@ -266,6 +383,7 @@ export function runAgentStream(opts: AgentStreamOpts): ReadableStream<UIMessageC
         // and let the model pick up right where it left off.
         messages = [...messages, ...responseMessages]
       }
+      await Promise.race([Promise.all(roundsClosed), onAbort(AbortSignal.timeout(ROUND_CLOSE_GRACE_MS))])
       writer.write({ type: 'finish' })
     },
   })

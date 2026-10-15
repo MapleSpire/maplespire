@@ -94,7 +94,7 @@ function assertNoParentCycle(m: FullModel, id: string, newParentId: string): voi
 
 /** Positions for newly-placed entities: continue to the RIGHT of the diagram's
  * current content (or start a grid on an empty diagram). */
-function nextPlacements(m: FullModel, diagramId: string, ids: string[]): Record<string, unknown> {
+export function nextPlacements(m: FullModel, diagramId: string, ids: string[]): Record<string, unknown> {
   const detail = m.diagrams[diagramId]?.detail
   const layouts = (detail?.layouts ?? {}) as Record<string, { position?: { x: number; y: number }; size?: { width: number; height: number } }>
   let maxX = -Infinity

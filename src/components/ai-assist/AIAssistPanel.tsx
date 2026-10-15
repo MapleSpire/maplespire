@@ -503,8 +503,8 @@ export function AIAssistPanel() {
             </div>
           )}
 
-          {messages.map((message) => (
-            <MessageView key={message.id} message={message} />
+          {messages.map((message, index) => (
+            <MessageView key={message.id} message={message} live={busy && index === messages.length - 1} />
           ))}
 
           {waitingForModel && (
@@ -606,7 +606,10 @@ export function AIAssistPanel() {
 
 // ─── message rendering ────────────────────────────────────────────────────────
 
-function MessageView({ message }: { message: UIMessage }) {
+/** `live`: this message is the one the current stream is still writing. A
+ * tool call left open in any OTHER message (a reloaded conversation whose
+ * stream died) can never finish, so it is shown as interrupted, not running. */
+function MessageView({ message, live }: { message: UIMessage; live: boolean }) {
   if (message.role === 'user') {
     const text = message.parts
       .filter((p): p is Extract<AnyPart, { type: 'text' }> => p.type === 'text')
@@ -623,13 +626,13 @@ function MessageView({ message }: { message: UIMessage }) {
   return (
     <div className="mb-4" data-testid="ai-assist-assistant-message">
       {message.parts.map((part, i) => (
-        <PartView key={i} part={part} />
+        <PartView key={i} part={part} live={live} />
       ))}
     </div>
   )
 }
 
-function PartView({ part }: { part: AnyPart }) {
+function PartView({ part, live }: { part: AnyPart; live: boolean }) {
   if (part.type === 'text') return <Markdown text={part.text} />
   if (part.type === 'reasoning') {
     return <Reasoning text={part.text} streaming={part.state === 'streaming'} />
@@ -644,7 +647,7 @@ function PartView({ part }: { part: AnyPart }) {
       errorText?: string
     }
     const name = p.toolName ?? p.type.replace(/^tool-/, '')
-    return <ToolCard name={name} state={p.state} input={p.input} output={p.output} errorText={p.errorText} />
+    return <ToolCard name={name} state={p.state} live={live} input={p.input} output={p.output} errorText={p.errorText} />
   }
   return null
 }
@@ -699,20 +702,24 @@ function extractSwitch(output: unknown): { landscapeId: string; versionId: strin
 export function ToolCard({
   name,
   state,
+  live,
   input,
   output,
   errorText,
 }: {
   name: string
   state: string
+  live: boolean
   input?: unknown
   output?: unknown
   errorText?: string
 }) {
   const { t } = useTranslation()
   const [expanded, setExpanded] = useState(false)
-  const running = state === 'input-streaming' || state === 'input-available'
-  const failed = state === 'output-error' || (output as { error?: unknown } | undefined)?.error !== undefined
+  const open = state === 'input-streaming' || state === 'input-available'
+  const running = open && live
+  const interrupted = open && !live
+  const failed = interrupted || state === 'output-error' || (output as { error?: unknown } | undefined)?.error !== undefined
   const switchRef = extractSwitch(output)
   return (
     <div className="border border-line rounded-xl px-3 py-2 mb-2" data-testid="ai-assist-tool-call">
@@ -734,7 +741,11 @@ export function ToolCard({
         <span className="flex-1 min-w-0">
           <span className="block text-[12px] font-semibold text-fg font-mono truncate">{name}</span>
           <span className="block text-[10.5px] text-fg-muted">
-            {running ? t('aiAssist.panel.toolRunning') : failed ? t('aiAssist.panel.toolFailed') : t('aiAssist.panel.toolDone')}
+            {running
+              ? t('aiAssist.panel.toolRunning')
+              : interrupted
+                ? t('aiAssist.panel.toolInterrupted')
+                : failed ? t('aiAssist.panel.toolFailed') : t('aiAssist.panel.toolDone')}
           </span>
         </span>
         {expanded ? (

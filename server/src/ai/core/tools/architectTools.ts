@@ -16,8 +16,9 @@ import { z } from 'zod'
 import { defineAiTool, type AiToolDef } from '../toolRegistry.js'
 import { AiToolError } from '../toolContext.js'
 import {
-  upsertModelEntities, upsertInlineEntities, createDiagramDoc, newEntityId,
+  upsertModelEntities, upsertInlineEntities, createDiagramDoc, newEntityId, updateDiagramDoc,
 } from '../modelOps.js'
+import { nextPlacements } from './writeTools.js'
 import {
   objects, domains,
   type ObjView, type ConnView, type DomainView,
@@ -76,7 +77,7 @@ export const architectTools: AiToolDef[] = [
     name: 'create_architecture',
     title: 'Create a whole architecture (atomic)',
     description:
-      'Create a complete architecture in ONE call: domains, actors, systems with nested containers (apps/stores) and components, plus named connections. Nesting sets types and parents correctly by construction; icons are validated against the icon catalog; a context diagram and one container diagram per system are created automatically. Technology assignments are managed separately through the governed catalog UI. Names must not collide with existing objects — use the unit tools to modify an existing model. Preferred over many create_model_object calls when building from scratch.',
+      'Create a complete architecture in ONE call: domains, actors, systems with nested containers (apps/stores) and components, plus named connections. Nesting sets types and parents correctly by construction; icons are validated against the icon catalog; one container diagram per system is created automatically, and the actors and systems go on a new context diagram — or on an EXISTING diagram when diagramId is given (use the id of the diagram the user is on when they say "this diagram", "here" or "the current diagram"). Technology assignments are managed separately through the governed catalog UI. Names must not collide with existing objects — use the unit tools to modify an existing model. Preferred over many create_model_object calls when building from scratch.',
     mode: 'write',
     schema: z.object({
       domains: z.array(z.object({ name: min1, description: z.string().optional() })).optional(),
@@ -88,10 +89,25 @@ export const architectTools: AiToolDef[] = [
         label: min1.describe('Verb phrase, e.g. "publishes events to"'),
         type: z.enum(['solid', 'dashed', 'dotted']).optional(),
       })).optional(),
+      diagramId: z.string().optional()
+        .describe('Existing context diagram to place the actors and systems on, instead of creating a new one'),
     }),
     execute: async (ctx, input) => {
       const m = await ctx.session.snapshot()
       const warnings: string[] = []
+
+      // 0) The target diagram, when given, must exist and hold a context view:
+      //    actors and systems on a container or component diagram break C4.
+      if (input.diagramId !== undefined) {
+        const target = m.diagrams[input.diagramId]
+        if (!target) {
+          throw new AiToolError(`no diagram with id "${input.diagramId}" — see list_diagrams`, 404)
+        }
+        const type = String(target.meta.type ?? 'context')
+        if (type !== 'context') {
+          throw new AiToolError(`diagram "${input.diagramId}" is a ${type} diagram — create_architecture places actors and systems, which belong on a context diagram; omit diagramId or pass a context diagram`, 400)
+        }
+      }
 
       // ── Validate everything BEFORE any write ──────────────────────────────
       // 1) Unique names within the payload (connections resolve by name).
@@ -276,15 +292,35 @@ export const architectTools: AiToolDef[] = [
       const contextConns = plannedConnections
         .filter((c) => contextSet.has(c.fromId) && contextSet.has(c.toId))
         .map((c) => c.id)
-      const contextName = 'System context'
-      const contextId = await createDiagramDoc(ctx.repo, ctx.rootUrl, {
-        name: contextName,
-        type: 'context',
-        objectIds: contextIds,
-        connectionIds: contextConns,
-        layouts: grid(contextIds),
-      }, ctx.workspace)
-      diagrams.push({ id: contextId, name: contextName, type: 'context' })
+      if (input.diagramId !== undefined) {
+        // A diagram renders only the connections attached to it, so a new
+        // connection to an object ALREADY on the target diagram is attached too.
+        const shown = new Set([...contextIds, ...(m.diagrams[input.diagramId]!.detail?.objectIds ?? [])])
+        const placed = await updateDiagramDoc(ctx.repo, ctx.rootUrl, input.diagramId, {
+          addObjectIds: contextIds,
+          addConnectionIds: plannedConnections
+            .filter((c) => shown.has(c.fromId) && shown.has(c.toId))
+            .map((c) => c.id),
+          layoutUpserts: nextPlacements(m, input.diagramId, contextIds),
+        })
+        if (!placed) {
+          // The model is written; only the placement failed. Say so instead of
+          // reporting a diagram the user will find empty.
+          warnings.push(`the objects were created but could not be placed on diagram "${input.diagramId}" — add them with update_diagram`)
+        } else {
+          diagrams.push({ id: input.diagramId, name: String(m.diagrams[input.diagramId]!.meta.name ?? input.diagramId), type: 'context' })
+        }
+      } else {
+        const contextName = 'System context'
+        const contextId = await createDiagramDoc(ctx.repo, ctx.rootUrl, {
+          name: contextName,
+          type: 'context',
+          objectIds: contextIds,
+          connectionIds: contextConns,
+          layouts: grid(contextIds),
+        }, ctx.workspace)
+        diagrams.push({ id: contextId, name: contextName, type: 'context' })
+      }
 
       for (const sys of input.systems) {
         const sysId = payloadNames.get(sys.name.trim().toLowerCase())!.id

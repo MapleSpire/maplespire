@@ -12,7 +12,13 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU Affero General Public License for more details.
 
-import { APICallError } from 'ai'
+import {
+  APICallError,
+  InvalidToolInputError,
+  JSONParseError,
+  NoSuchToolError,
+  ToolCallRepairError,
+} from 'ai'
 
 /**
  * Provider failures may contain the complete request URL, response body,
@@ -78,9 +84,13 @@ const SAFE_ERROR_NAMES = new Set([
   'AiConfigInputError',
   'AiToolError',
   'Error',
+  'AI_InvalidToolInputError',
+  'AI_NoSuchToolError',
+  'AI_ToolCallRepairError',
   'InvalidSavedAiConfigError',
   'RetryError',
   'TimeoutError',
+  'ToolCallInterruptedError',
   'TypeError',
 ])
 
@@ -132,6 +142,60 @@ export function safeProviderRequestError(error: unknown): SafeProviderError {
     message: 'The AI provider request failed. Verify the provider and model settings, then retry.',
     httpStatus: 502,
   }
+}
+
+/**
+ * Arguments cut off because the PROVIDER failed mid-step. The SDK still
+ * reports them as an invalid tool input; they are not the model's output.
+ */
+export class ToolCallInterruptedError extends Error {
+  override name = 'ToolCallInterruptedError'
+  constructor(readonly toolName: string) {
+    super('tool call interrupted by a provider failure')
+  }
+}
+
+/** Registry tool names are snake_case identifiers; anything else is not echoed. */
+const TOOL_NAME = /^[a-z][a-z0-9_]{0,63}$/
+
+/**
+ * A tool call the SDK refused before executing it: the MODEL produced
+ * arguments that are not JSON or do not match the tool's schema, or named a
+ * tool that does not exist. The provider answered normally, so calling this a
+ * provider failure sends the user to their provider settings for a model
+ * output problem — measured 2026-10-14 with LM Studio and gemma-4-12b-qat,
+ * which sent unterminated JSON for create_architecture in 1 of 6 runs.
+ *
+ * The SDK's own message quotes the model's raw arguments; only the tool name
+ * (checked against the identifier shape) and a static category are returned.
+ * It needs the TYPED error: the SDK's stream hands `onError` a string, which
+ * `withTypedToolErrors` in agent.ts replaces with the error object.
+ */
+export function safeToolCallError(error: unknown): string | null {
+  const original = ToolCallRepairError.isInstance(error) ? error.originalError : error
+  const nothingWritten = 'Nothing was written; the model is shown the error and may retry.'
+  if (original instanceof ToolCallInterruptedError) {
+    const tool = TOOL_NAME.test(original.toolName) ? `the ${original.toolName} call` : 'a tool call'
+    return `The AI provider failed before ${tool} was complete. Nothing was written. Retry; if it keeps happening, check the provider (for LM Studio: context length and concurrent requests).`
+  }
+  if (NoSuchToolError.isInstance(original)) {
+    return `The model called a tool that does not exist. ${nothingWritten}`
+  }
+  if (!InvalidToolInputError.isInstance(original)) return null
+  const tool = TOOL_NAME.test(original.toolName) ? ` for ${original.toolName}` : ''
+  const problem = JSONParseError.isInstance(original.cause)
+    ? 'malformed arguments (invalid JSON)'
+    : 'arguments that do not match the tool schema'
+  return `The model sent ${problem}${tool}. ${nothingWritten} Smaller local models do this on large payloads; a larger model or a smaller request usually helps.`
+}
+
+/**
+ * The text shown for any error in a chat UI-message stream. The SDK routes
+ * BOTH provider failures and refused tool calls (`tool-output-error`) through
+ * the same `onError`, so a provider-only mapping mislabels the second kind.
+ */
+export function safeAiStreamErrorText(error: unknown): string {
+  return safeToolCallError(error) ?? safeProviderRequestError(error).message
 }
 
 /**

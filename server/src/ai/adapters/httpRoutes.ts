@@ -31,7 +31,7 @@ import { executeAiTool, exportToolSpecs, type ToolSpecFormat } from '../core/too
 import type { SyncCellOwnership } from '../../syncCells/ownership.js'
 import { SYNC_HTTP_ROUTED_HEADER } from '../../syncCells/httpProxy.js'
 import { normalizeToolError } from '../core/serialize.js'
-import { logSafeAiError, safeProviderRequestError } from '../core/providerErrors.js'
+import { logSafeAiError, safeAiStreamErrorText, safeProviderRequestError } from '../core/providerErrors.js'
 import { renderSkillMarkdown } from '../core/skill.js'
 import { identityFromClaims, type AiIdentity } from '../core/identity.js'
 import { createAiToken, listAiTokens, revokeAiToken } from '../core/tokens.js'
@@ -88,6 +88,59 @@ export function relayInstallFor(deps: AiRouteDeps, req: Request): AiToolRelayIns
     credentials,
     alreadyRouted: req.headers[SYNC_HTTP_ROUTED_HEADER] !== undefined,
   }
+}
+
+/**
+ * The chat stream's `onError`: provider failures AND refused tool calls reach
+ * the panel as static text (no stack, no raw model arguments), and both are
+ * logged — the SDK turns them into stream chunks, so without the log line the
+ * server says nothing while the panel shows a failure.
+ */
+export function chatStreamOnError(error: unknown): string {
+  logSafeAiError('[ai] chat stream error', error)
+  return safeAiStreamErrorText(error)
+}
+
+/**
+ * Persistence must not depend on the HTTP consumer. The SDK's response writer
+ * (`writeToServerResponse`, ai 7.0.15) awaits `drain` after a refused write,
+ * and a closed socket never drains: it stops reading, the turn's stream is
+ * never read to its end, and `onEnd` — the conversation save — never runs.
+ * Measured by the reviewer lens: a disconnect with 3 or more chunks still to
+ * come lost the conversation. Once the response closes, this reads the rest of
+ * the turn itself and discards it; the writer's pending read gets one chunk.
+ */
+export function drainAfterClose<T>(
+  source: ReadableStream<T>,
+  response: { once(event: 'close', listener: () => void): unknown }
+): ReadableStream<T> {
+  const reader = source.getReader()
+  let closed = false
+  response.once('close', () => {
+    closed = true
+    void (async () => {
+      try {
+        while (!(await reader.read()).done) { /* discard: the client is gone */ }
+      } catch (err) {
+        logSafeAiError('[ai] chat stream failed after the client left', err)
+      }
+    })()
+  })
+  return new ReadableStream<T>({
+    async pull(controller) {
+      if (closed) return controller.close()
+      try {
+        const r = await reader.read()
+        if (r.done) controller.close()
+        else controller.enqueue(r.value)
+      } catch (err) {
+        controller.error(err)
+      }
+    },
+    cancel(reason) {
+      void reader.cancel(reason).catch(() => {})
+    },
+  }, { highWaterMark: 0 })
 }
 
 type Handler = (req: Request, res: Response) => Promise<void>
@@ -268,18 +321,16 @@ export function registerAiHttpRoutes(app: Express, deps: AiRouteDeps): void {
       response: res,
       // Multi-round agent stream: auto-continues past the per-round step cap
       // so the user never has to type "continue"; still ONE UI message.
-      stream: runAgentStream({
+      stream: drainAfterClose(runAgentStream({
         ctx,
         cfg,
         uiMessages: body.messages,
         thinking: thinkingParam(body.thinking),
         uiContext: uiContextParam(body.context),
         ...(persist ? { onEnd: persist } : {}),
-        // Surface provider/tool failures to the panel (message only, no stack)
-        // instead of the SDK's default opaque "an error occurred".
-        onError: (error) => safeProviderRequestError(error).message,
+        onError: chatStreamOnError,
         abortSignal: abort.signal,
-      }),
+      }), res),
     })
   }))
 

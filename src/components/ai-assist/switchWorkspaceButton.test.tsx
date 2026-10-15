@@ -88,7 +88,7 @@ beforeEach(() => {
 
 describe('AI Assist "Switch to it now"', () => {
   it('clicking actually moves the app to the draft: active ref, store ref and registry all update', async () => {
-    render(<ToolCard name="create_draft" state="output-available" output={switchOutput} />)
+    render(<ToolCard name="create_draft" state="output-available" live={false} output={switchOutput} />)
 
     fireEvent.click(screen.getByTestId('ai-assist-switch-workspace'))
 
@@ -106,7 +106,7 @@ describe('AI Assist "Switch to it now"', () => {
   })
 
   it('renders no switch button for ordinary tool outputs', () => {
-    render(<ToolCard name="get_model_stats" state="output-available" output={{ objects: 3 }} />)
+    render(<ToolCard name="get_model_stats" state="output-available" live={false} output={{ objects: 3 }} />)
     expect(screen.queryByTestId('ai-assist-switch-workspace')).toBeNull()
   })
 })
