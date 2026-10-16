@@ -954,11 +954,10 @@ test('a rename in the expanded diagram, made by another client, reaches the expa
 // containers view as a roll-up — an edge no change names, since roll-ups are
 // computed, not stored. The expansion of the containers must still follow it.
 //
-// What this does NOT pin: on this (server read-model) tier the change feed
-// names every object of the touched model shard, so the target is re-read
-// through its objects anyway — measured 2026-10-16, the hook's edge-ends path
-// disabled, this stayed green. The edge-ends path is pinned by the hook's unit
-// tests, for feeds that name only the connection.
+// Measured 2026-10-16 with the hook's edge-ends path disabled: RED 2 of 2 on
+// a tree with 0dc4dbb, whose change feed names only the rows that changed. On
+// the feed before it (every object of the touched shard), the target was
+// re-read through its objects anyway and this stayed green.
 test('a relationship added elsewhere reaches the expansion as a roll-up', async ({ page, browser }) => {
   test.setTimeout(300_000)
   const { email, context, containers, components, systemId, serviceId, pulledContainers } = await importFixture(page)
