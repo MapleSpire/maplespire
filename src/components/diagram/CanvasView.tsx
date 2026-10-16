@@ -510,6 +510,8 @@ export function CanvasView() {
           // mode), it is the live copy and wins over that snapshot.
           object: (id) => index.objectById.get(id) ?? expandedContentsRef.current.objects.get(id),
           connection: (id) => index.connectionById.get(id) ?? expandedContentsRef.current.connections.get(id),
+          // Nor the target's derived (lower) edges: the stub never lists them.
+          connectionIds: (id) => expandedContentsRef.current.connectionIds.get(id),
           // Nor the target's placement: `diagramById` holds a layout-less stub
           // for every diagram but the active one. Read from its document;
           // `undefined` until that read lands, so the expansion waits for it.

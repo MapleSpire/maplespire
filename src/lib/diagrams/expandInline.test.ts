@@ -1316,3 +1316,205 @@ describe('unreachableExpansions', () => {
     expect(unreachableExpansions({ host: 'B', inner: 'C', stray: 'C' }, ['host'], unknownB)).toEqual([])
   })
 })
+
+// Seen 2026-10-16 on develop bfdceb13a (FoodDash, imported from Structurizr
+// DSL): "Expand here" on the system drew 2 of the containers view's edges —
+// the only two declared between containers. Every other one is DERIVED (a
+// relationship declared on a component, rolled up to its container), which the
+// target's stub never lists; and the edges to the shapes around the block
+// (Payment Service -> Stripe) were dropped for having one end outside it.
+describe('expandDiagramsInline: the target\'s edges', () => {
+  const lower = (fromId: string, toId: string): Connection =>
+    ({ id: `lower:${fromId}→${toId}`, fromId, toId, type: 'dashed', label: '', kind: 'lower' } as Connection)
+  const edge = (fromId: string, toId: string): Connection => conn(`${fromId}-${toId}`, fromId, toId)
+
+  /** The FoodDash DSL, as the import and the server render see it. */
+  const foodDash = () => {
+    const container = (id: string) => object(id, { parentId: 'foodDash' })
+    const component = (id: string) => object(id, { parentId: 'orders' })
+    const objects = [
+      object('customer', { type: 'actor' }), object('courier', { type: 'actor' }),
+      object('restaurant', { type: 'actor' }), object('bank', { scope: 'external' }),
+      object('stripe', { scope: 'external' }), object('maps', { scope: 'external' }),
+      object('foodDash', { type: 'system' }),
+      container('mobile'), container('portal'), container('orders'), container('payments'),
+      container('delivery'), container('db'), container('events'),
+      component('api'), component('checkout'), component('machine'), component('dispatcher'),
+    ]
+    // Declared relationships, as in the DSL (plus bank, which no container uses).
+    const declared = [
+      edge('customer', 'mobile'), edge('courier', 'mobile'), edge('restaurant', 'portal'),
+      edge('mobile', 'api'), edge('portal', 'api'), edge('mobile', 'delivery'),
+      edge('api', 'checkout'), edge('checkout', 'payments'), edge('checkout', 'machine'),
+      edge('machine', 'dispatcher'), edge('dispatcher', 'delivery'), edge('machine', 'db'),
+      edge('machine', 'events'), edge('delivery', 'events'), edge('payments', 'stripe'),
+      edge('delivery', 'maps'), edge('restaurant', 'foodDash'),
+    ]
+    const ids = (...edges: Connection[]) => edges.map((c) => c.id)
+    // The context view: every edge to FoodDash is a roll-up but one, declared
+    // on the system itself (kept to tell a roll-up from a relationship).
+    const contextEdges = [
+      lower('customer', 'foodDash'), lower('courier', 'foodDash'), lower('foodDash', 'stripe'),
+      lower('foodDash', 'maps'), lower('foodDash', 'bank'), edge('restaurant', 'foodDash'),
+    ]
+    const containerDerived = [
+      lower('mobile', 'orders'), lower('portal', 'orders'), lower('orders', 'payments'),
+      lower('orders', 'delivery'), lower('orders', 'db'), lower('orders', 'events'),
+    ]
+    const containerDeclared = [
+      edge('customer', 'mobile'), edge('courier', 'mobile'), edge('restaurant', 'portal'),
+      edge('mobile', 'delivery'), edge('delivery', 'events'), edge('payments', 'stripe'), edge('delivery', 'maps'),
+    ]
+    const componentDeclared = [
+      edge('mobile', 'api'), edge('portal', 'api'), edge('api', 'checkout'), edge('checkout', 'payments'),
+      edge('checkout', 'machine'), edge('machine', 'dispatcher'), edge('dispatcher', 'delivery'),
+      edge('machine', 'db'), edge('machine', 'events'),
+    ]
+    const connections = [...declared, ...contextEdges.filter((c) => c.kind === 'lower'), ...containerDerived]
+    const diagrams = [
+      diagram('context', {
+        objectIds: ['customer', 'courier', 'restaurant', 'foodDash', 'stripe', 'maps', 'bank'],
+        connectionIds: ids(...contextEdges),
+      }),
+      // The STUB: its stored connectionIds never carry the derived edges.
+      diagram('containers', {
+        objectIds: ['customer', 'courier', 'restaurant', 'mobile', 'portal', 'orders', 'payments',
+          'delivery', 'db', 'events', 'stripe', 'maps'],
+        connectionIds: ids(...containerDeclared),
+      }),
+      diagram('components', {
+        objectIds: ['api', 'checkout', 'machine', 'dispatcher', 'mobile', 'portal', 'payments', 'delivery', 'db', 'events'],
+        connectionIds: ids(...componentDeclared),
+      }),
+    ]
+    const byId = <T extends { id: string }>(items: T[]) => (id: string) => items.find((i) => i.id === id)
+    // What the hook read for each target: the stub's edges AND the render's derived ones.
+    const membership: Record<string, string[]> = {
+      containers: ids(...containerDeclared, ...containerDerived),
+      components: ids(...componentDeclared),
+    }
+    return {
+      base: {
+        objects: objects.filter((o) => diagrams[0].objectIds.includes(o.id)),
+        connections: contextEdges,
+        groups: [] as Group[],
+      },
+      lookup: {
+        diagram: byId(diagrams), object: byId(objects), connection: byId(connections),
+        connectionIds: (id: string) => membership[id],
+        layouts: () => ({}),
+        wrapperMinWidth: () => 0,
+      },
+    }
+  }
+  const SYSTEM = { objectId: 'foodDash', diagramId: 'containers' }
+  const ORDERS = { objectId: 'orders', diagramId: 'components' }
+  const drawnIds = (result: InlineExpansionResult) => result.connections.map((c) => c.id)
+
+  it('draws the derived edges between the unfolded containers, which the stub does not list', () => {
+    const w = foodDash()
+    const result = expandDiagramsInline(w.base, 'context', [SYSTEM], w.lookup)
+    expect(drawnIds(result)).toEqual(expect.arrayContaining([
+      'lower:mobile→orders', 'lower:portal→orders', 'lower:orders→payments',
+      'lower:orders→delivery', 'lower:orders→db', 'lower:orders→events',
+      'mobile-delivery', 'delivery-events',
+    ]))
+  })
+
+  it('draws the edges between the unfolded containers and the shapes around them', () => {
+    const w = foodDash()
+    const result = expandDiagramsInline(w.base, 'context', [SYSTEM], w.lookup)
+    for (const id of ['customer-mobile', 'courier-mobile', 'restaurant-portal', 'payments-stripe', 'delivery-maps']) {
+      const drawn = result.connections.find((c) => c.id === id)
+      expect(drawn, `${id} is missing`).toBeDefined()
+      // Both ends are shapes on screen, neither one the wrapper.
+      expect([drawn!.fromId, drawn!.toId]).not.toContain(inlineWrapperId('foodDash'))
+    }
+  })
+
+  // Their waypoints are in the target's frame, where the outer shape is not.
+  it('drops the waypoints of an edge that leaves the block', () => {
+    const w = foodDash()
+    const withBends = { ...edge('payments', 'stripe'), waypoints: [{ x: 1, y: 2 }] }
+    const result = expandDiagramsInline(w.base, 'context', [SYSTEM], {
+      ...w.lookup,
+      connection: (id) => (id === withBends.id ? withBends : w.lookup.connection(id)),
+    })
+    expect(result.connections.find((c) => c.id === withBends.id)!.waypoints).toBeUndefined()
+  })
+
+  it('leaves behind an edge whose other end is not drawn here', () => {
+    const w = foodDash()
+    const base = { ...w.base, objects: w.base.objects.filter((o) => o.id !== 'maps') }
+    const result = expandDiagramsInline(base, 'context', [SYSTEM], w.lookup)
+    expect(drawnIds(result)).not.toContain('delivery-maps')
+  })
+
+  // A roll-up onto the expanded shape says, less precisely, what the block now
+  // draws (Customer -> FoodDash IS Customer -> Mobile App).
+  it('drops a roll-up onto the expanded shape once the block draws what it summarised', () => {
+    const w = foodDash()
+    const result = expandDiagramsInline(w.base, 'context', [SYSTEM], w.lookup)
+    for (const id of ['lower:customer→foodDash', 'lower:courier→foodDash', 'lower:foodDash→stripe', 'lower:foodDash→maps']) {
+      expect(drawnIds(result), `${id} still drawn onto the wrapper`).not.toContain(id)
+    }
+    // Nothing in the block reaches the bank: its roll-up is all there is.
+    expect(result.connections.find((c) => c.id === 'lower:foodDash→bank')!.fromId).toBe(inlineWrapperId('foodDash'))
+    // A relationship declared on the system itself is not a roll-up.
+    expect(result.connections.find((c) => c.id === 'restaurant-foodDash')!.toId).toBe(inlineWrapperId('foodDash'))
+  })
+
+  // Step 5 of the repro: the components' links to the containers were missing.
+  it('draws a nested block\'s edges to the containers around it, in place of their roll-ups', () => {
+    const w = foodDash()
+    for (const order of [[SYSTEM, ORDERS], [ORDERS, SYSTEM]]) {
+      const result = expandDiagramsInline(w.base, 'context', order, w.lookup)
+      expect(result.skipped).toEqual([])
+      expect(drawnIds(result)).toEqual(expect.arrayContaining([
+        'mobile-api', 'portal-api', 'checkout-payments', 'dispatcher-delivery', 'machine-db', 'machine-events',
+        'api-checkout', 'checkout-machine', 'machine-dispatcher',
+      ]))
+      // Every roll-up onto Order Service is now drawn component by component.
+      const ontoOrders = result.connections.filter((c) =>
+        c.fromId === inlineWrapperId('orders') || c.toId === inlineWrapperId('orders'))
+      expect(ontoOrders.map((c) => c.id)).toEqual([])
+    }
+  })
+
+  // Which ends are drawn depends on blocks resolved AFTER this one.
+  it('draws an edge to a shape another block pulls in, whatever order they are listed in', () => {
+    const w = world({
+      objects: [object('sysA'), object('sysB', { position: { x: 600, y: 0 } }), object('a1'), object('b1')],
+      diagrams: [
+        diagram('context', { objectIds: ['sysA', 'sysB'] }),
+        diagram('DA', { objectIds: ['a1'], connectionIds: ['a1-b1'] }),
+        diagram('DB', { objectIds: ['b1'] }),
+      ],
+      connections: [conn('a1-b1', 'a1', 'b1')],
+    })
+    const a = { objectId: 'sysA', diagramId: 'DA' }
+    const b = { objectId: 'sysB', diagramId: 'DB' }
+    for (const order of [[a, b], [b, a]]) {
+      const result = expandDiagramsInline(w.base, 'context', order, w.lookup)
+      expect(result.connections.find((c) => c.id === 'a1-b1'), JSON.stringify(order)).toMatchObject({ fromId: 'a1', toId: 'b1' })
+    }
+  })
+
+  it('does not draw an edge from a block\'s contents to its own wrapper', () => {
+    const w = foodDash()
+    const selfEdge = edge('mobile', 'foodDash')
+    const result = expandDiagramsInline(w.base, 'context', [SYSTEM], {
+      ...w.lookup,
+      connection: (id) => (id === selfEdge.id ? selfEdge : w.lookup.connection(id)),
+      connectionIds: (id) => [...w.lookup.connectionIds(id) ?? [], selfEdge.id],
+    })
+    expect(drawnIds(result)).not.toContain(selfEdge.id)
+  })
+
+  it('falls back to the stub\'s edges when the caller read no membership', () => {
+    const w = foodDash()
+    const result = expandDiagramsInline(w.base, 'context', [SYSTEM], { ...w.lookup, connectionIds: () => undefined })
+    expect(drawnIds(result)).toEqual(expect.arrayContaining(['mobile-delivery', 'payments-stripe']))
+    expect(drawnIds(result)).not.toContain('lower:mobile→orders')
+  })
+})

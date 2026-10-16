@@ -363,18 +363,26 @@ async function clickCollapseIndicator(page: Page, hostObjectId: string): Promise
 /** Select the first shape of `type` by clicking its centre on the canvas, and
  *  rename it in the side panel — the real selection and edit paths. */
 async function renameShapeOfType(page: Page, type: string, name: string): Promise<string> {
-  const pt = await page.evaluate((wanted) => {
-    const eng = (window as any).__canvasEngine
-    const o = [...eng.objectMap.values()].find((candidate: any) => candidate.type === wanted)
-    if (!o) return null
-    const wx = o.position.x + o.size.width / 2
-    const wy = o.position.y + o.size.height / 2
-    eng.panToWorld(wx, wy)
-    const rect = eng.canvas.getBoundingClientRect()
-    const vp = eng.viewport
-    return { id: o.id as string, x: wx * vp.scale + vp.x + rect.left, y: wy * vp.scale + vp.y + rect.top }
-  }, type)
-  expect(pt, `no ${type} on the canvas`).not.toBeNull()
+  // The point must be one the engine's own hit test gives to THAT shape. Right
+  // after an import every shape first sits on one model-level position until
+  // the diagram's layout lands, and a click there renamed whichever shape was
+  // on top (2026-10-16: aimed at Web App, renamed Order Service, 5 runs of 5).
+  let pt = null as { id: string; x: number; y: number } | null
+  await expect.poll(async () => {
+    pt = await page.evaluate((wanted) => {
+      const eng = (window as any).__canvasEngine
+      const o = [...eng.objectMap.values()].find((candidate: any) => candidate.type === wanted)
+      if (!o) return null
+      const wx = o.position.x + o.size.width / 2
+      const wy = o.position.y + o.size.height / 2
+      if (eng.hitTest(wx, wy)?.id !== o.id) return null
+      eng.panToWorld(wx, wy)
+      const rect = eng.canvas.getBoundingClientRect()
+      const vp = eng.viewport
+      return { id: o.id as string, x: wx * vp.scale + vp.x + rect.left, y: wy * vp.scale + vp.y + rect.top }
+    }, type)
+    return pt !== null
+  }, { timeout: 30_000, message: `no ${type} on the canvas that a click at its centre would select` }).toBe(true)
   await page.mouse.click(pt!.x, pt!.y)
   const field = page.getByTestId('object-name')
   await field.waitFor({ state: 'visible', timeout: 10_000 })
@@ -674,6 +682,90 @@ test('collapsing an outer expansion drops the ones nested inside it', async ({ p
   expect(pulledComponents.filter((id) => reExpanded[id]), 'components drawn without being asked for').toEqual([])
 })
 
+/** Every edge the engine draws, as `from→to`, with whether it is a roll-up. */
+function drawnEdges(page: Page): Promise<Array<{ pair: string; fromId: string; toId: string; lower: boolean }>> {
+  return page.evaluate(() =>
+    ((window as any).__canvasEngine.connections as any[]).map((c) => ({
+      pair: `${c.fromId}→${c.toId}`, fromId: c.fromId as string, toId: c.toId as string, lower: c.kind === 'lower',
+    })))
+}
+
+// Seen 2026-10-16 on develop bfdceb13a (FoodDash): the expanded containers
+// showed 2 of the containers view's edges. The rest are DERIVED — declared on
+// a component, drawn between containers (Web App -> Order API is Web App ->
+// Order Service) — and a non-active diagram's stub never lists them; the edges
+// to the shapes around the block (Payment Service -> Card processor) were
+// dropped for having one end outside it. Ground truth: what the engine draws
+// on each target diagram while it is the active one.
+test('Expand here draws the target\'s edges, derived and outward ones included, nested too', async ({ page }) => {
+  test.setTimeout(300_000)
+  const { context, containers, components, systemId, serviceId, pulledContainers, pulledComponents } =
+    await importFixture(page)
+  await waitForWorkspaceProjected(page)
+  const workspace = new URL(page.url()).pathname.match(/\/app\/landscape\/[^/]+\/version\/[^/]+/)![0]
+
+  type Edges = Awaited<ReturnType<typeof drawnEdges>>
+  const truthOf = async (diagramId: string, what: string, settled: (edges: Edges) => boolean) => {
+    await openDiagram(page, workspace, diagramId)
+    let edges: Edges = []
+    await expect.poll(async () => settled(edges = await drawnEdges(page)), {
+      timeout: 30_000, message: `the ${what} diagram never drew what the fixture declares`,
+    }).toBe(true)
+    return edges
+  }
+  // Precondition, and the wait: without a roll-up onto the service this tests
+  // nothing. Right after an import the active diagram first draws its declared
+  // edges only: its render answered 404 before the server projected the import,
+  // and the roll-ups arrive with the live refresh after it (measured 2026-10-16,
+  // FoodDash, AUTH on: ~2 s; on an AUTH-off stack whose new landscape never
+  // turned durable, never — the refresh waits for the badge to be 'ready').
+  const containerEdges = await truthOf(containers.id, 'containers',
+    (edges) => edges.some((e) => e.lower && (e.fromId === serviceId || e.toId === serviceId)))
+  const componentEdges = await truthOf(components.id, 'components', (edges) => edges.length > 0)
+  expect(containerEdges.some((e) => pulledContainers.includes(e.fromId) !== pulledContainers.includes(e.toId)),
+    'fixture: some container edge leaves the system').toBe(true)
+
+  await openDiagram(page, workspace, context.id)
+  await waitDrawn(page, [systemId], 'the system')
+  const stub = await readDiagram(page, containers.id)
+  expect(stub?.layouts ?? null, 'precondition: the target must be a layout-less stub when it is expanded').toBeNull()
+
+  /** The target's edges whose two ends are shapes on screen now. */
+  const expectedOf = async (truth: typeof containerEdges) => {
+    const drawn = await enginePositions(page)
+    return truth.filter((e) => drawn[e.fromId] && drawn[e.toId]).map((e) => e.pair).sort()
+  }
+  const missing = async (truth: typeof containerEdges) => {
+    const pairs = new Set((await drawnEdges(page)).map((e) => e.pair))
+    return (await expectedOf(truth)).filter((pair) => !pairs.has(pair))
+  }
+
+  await clickExpandIndicator(page, systemId)
+  await page.getByTestId(`expand-here-${containers.id}`).click()
+  await waitDrawn(page, pulledContainers, 'the containers')
+  expect((await expectedOf(containerEdges)).length, 'every container edge has its ends on screen').toBe(containerEdges.length)
+  await expect.poll(() => missing(containerEdges), {
+    timeout: 15_000, message: 'container edges the Containers diagram draws are missing from the expansion',
+  }).toEqual([])
+
+  // ── Nested: the components' links to the containers around them ─────────
+  await expect
+    .poll(() => page.evaluate((id) => (window as any).__canvasEngine.relatedDiagramObjectIds.has(id) as boolean, serviceId), {
+      timeout: 15_000,
+    })
+    .toBe(true)
+  await clickExpandIndicator(page, serviceId)
+  await page.getByTestId(`expand-here-${components.id}`).click()
+  await waitDrawn(page, pulledComponents, 'the components')
+  await expect.poll(() => missing(componentEdges), {
+    timeout: 15_000, message: 'component edges the Components diagram draws are missing from the nested expansion',
+  }).toEqual([])
+  // Each roll-up onto the service is now drawn component by component: the
+  // dashed line onto its wrapper would say the same thing twice.
+  const ontoService = (await drawnEdges(page)).filter((e) => e.fromId === `inline-expand:${serviceId}` || e.toId === `inline-expand:${serviceId}`)
+  expect(ontoService.map((e) => e.pair), 'a roll-up onto the expanded service is still drawn').toEqual([])
+})
+
 // The reported follow-up: offline, a target's DiagramDoc that never synced to
 // this browser cannot be read, so the expansion is laid on a GRID. The load ran
 // only when the expansions changed, so reconnecting never replaced that grid
@@ -853,6 +945,59 @@ test('a rename in the expanded diagram, made by another client, reaches the expa
         message: 'the expansion kept the old name',
       })
       .toBe(name)
+  } finally {
+    await other.close()
+  }
+})
+
+// A relationship added between a COMPONENT and a container is drawn on the
+// containers view as a roll-up — an edge no change names, since roll-ups are
+// computed, not stored. The expansion of the containers must still follow it.
+//
+// What this does NOT pin: on this (server read-model) tier the change feed
+// names every object of the touched model shard, so the target is re-read
+// through its objects anyway — measured 2026-10-16, the hook's edge-ends path
+// disabled, this stayed green. The edge-ends path is pinned by the hook's unit
+// tests, for feeds that name only the connection.
+test('a relationship added elsewhere reaches the expansion as a roll-up', async ({ page, browser }) => {
+  test.setTimeout(300_000)
+  const { email, context, containers, components, systemId, serviceId, pulledContainers } = await importFixture(page)
+  await waitForWorkspaceProjected(page)
+  const workspace = new URL(page.url()).pathname.match(/\/app\/landscape\/[^/]+\/version\/[^/]+/)![0]
+  await openDiagram(page, workspace, context.id)
+  await waitDrawn(page, [systemId], 'the system')
+  await clickExpandIndicator(page, systemId)
+  await page.getByTestId(`expand-here-${containers.id}`).click()
+  await waitDrawn(page, pulledContainers, 'the containers')
+
+  const other = await browser.newContext()
+  try {
+    const editor = await other.newPage()
+    await signIn(editor, email)
+    await openDiagram(editor, workspace, components.id)
+    const ends = await editor.evaluate((service) => {
+      const objects = [...(window as any).__canvasEngine.objectMap.values()] as any[]
+      return {
+        machine: objects.find((o) => o.name === 'Order State Machine' && o.parentId === service)?.id as string | undefined,
+        web: objects.find((o) => o.name === 'Web App')?.id as string | undefined,
+      }
+    }, serviceId)
+    expect(ends.machine && ends.web, 'fixture: the components view shows the state machine and the web app').toBeTruthy()
+    const pair = `${serviceId}→${ends.web}`
+    expect((await drawnEdges(page)).map((e) => e.pair), 'precondition: nothing yet from the service to the web app').not.toContain(pair)
+
+    // The same store action the connect tool ends in (see createConnectionOnCanvas).
+    await editor.evaluate(([from, to]) =>
+      (window as any).__modelStore.getState().addConnection({ fromId: from, toId: to, type: 'solid', label: 'Pushes status' }),
+    [ends.machine!, ends.web!] as const)
+
+    // No click, no reload here.
+    await expect
+      .poll(async () => (await drawnEdges(page)).map((e) => e.pair), {
+        timeout: 30_000,
+        message: 'the expansion never drew the roll-up of a relationship added elsewhere',
+      })
+      .toContain(pair)
   } finally {
     await other.close()
   }

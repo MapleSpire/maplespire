@@ -22,15 +22,18 @@ import { isServerReadModelEnabled } from '../../lib/modelQuery/tierFlag'
 import { subscribeCurrentWorkspaceInvalidations } from '../../lib/modelQuery/workspaceInvalidation'
 import { getDiagramIndex } from '../../stores/modelStore'
 import { openDiagramPlacement } from '../../lib/diagrams/duplicateSource'
+import { readDerivedEdges, readEdgeEnds, type EdgeEnds } from '../../lib/diagrams/derivedEdges'
 import { useAutomergeStatus } from '../../stores/automergeStatusStore'
 
 type Layouts = NonNullable<Diagram['layouts']>
-type Composition = Pick<Diagram, 'objectIds' | 'connectionIds'>
+type Composition = Pick<Diagram, 'objectIds' | 'connectionIds'> & Partial<Pick<Diagram, 'groupIds'>>
 
 /** What `syncEngineFromStore` reads for the planner's lookup. */
 export interface ExpandedContents {
   objects: Map<string, C4Object>
   connections: Map<string, Connection>
+  /** Per target: every edge it draws, its derived (lower) ones included. */
+  connectionIds: Map<string, string[]>
   /** `null` = unreadable (grid); absent = not read yet ('pending'). */
   layouts: Map<string, Layouts | null>
 }
@@ -44,6 +47,9 @@ export interface ExpandedContents {
 export interface TargetRead {
   objects?: C4Object[]
   connections?: Connection[]
+  /** The target's derived (lower) edges — never in its `connectionIds`
+   *  (`readDerivedEdges`). */
+  derived?: Connection[]
   layouts: Layouts | null
 }
 
@@ -67,6 +73,13 @@ export interface ExpansionTargetSource {
    * server revisions as "anything changed".
    */
   watchServerChanges?: (onChange: (change: ModelIndexChange | null) => void) => (() => void) | null
+  /**
+   * Each connection's two ends, each as its ancestor-or-self chain (`null`:
+   * the connection cannot be read — deleted, or offline). How a change to an
+   * edge the target does NOT hold is told apart from one that adds, moves or
+   * removes one of its derived edges. Never rejects.
+   */
+  edgeEnds?: (connectionIds: readonly string[]) => Promise<Map<string, EdgeEnds | null>>
 }
 
 /**
@@ -85,6 +98,7 @@ export const defaultExpansionTargetSource: ExpansionTargetSource = {
           return null
         })
         if (!contents) return { layouts: await layouts }
+        const derived = readDerivedEdges(diagramId, composition)
         try {
           const query = getModelQuery()
           const [resolved, connections] = await Promise.all([
@@ -101,12 +115,13 @@ export const defaultExpansionTargetSource: ExpansionTargetSource = {
           return {
             objects,
             connections: [...connections.values()],
+            derived: await derived,
             layouts: await layouts,
           }
         } catch (error) {
           // Unknown this time, not empty: what an earlier read found stays.
           console.warn(`inline expansion: contents of ${diagramId} unavailable`, error)
-          return { layouts: await layouts }
+          return { derived: await derived, layouts: await layouts }
         }
       },
       subscribe: (onChange) => placement.subscribe(onChange),
@@ -157,6 +172,7 @@ export const defaultExpansionTargetSource: ExpansionTargetSource = {
       unsubscribe()
     }
   },
+  edgeEnds: (connectionIds) => readEdgeEnds(connectionIds, getModelQuery()),
 }
 
 /** How long to wait for a burst to end, and the longest to wait regardless. */
@@ -176,6 +192,7 @@ type Staleness = false | 'placement' | 'all'
 interface CacheEntry {
   objects: C4Object[]
   connections: Connection[]
+  derived: Connection[]
   layouts: Layouts | null
   /** The composition this was loaded for; a different one means reload. */
   signature: string
@@ -239,7 +256,9 @@ export function useInlineExpansionContents(
   registry: unknown,
   source: ExpansionTargetSource = defaultExpansionTargetSource,
 ): { contentsRef: MutableRefObject<ExpandedContents>; version: number } {
-  const contentsRef = useRef<ExpandedContents>({ objects: new Map(), connections: new Map(), layouts: new Map() })
+  const contentsRef = useRef<ExpandedContents>({
+    objects: new Map(), connections: new Map(), connectionIds: new Map(), layouts: new Map(),
+  })
   const [version, setVersion] = useState(0)
   const cacheRef = useRef(new Map<string, CacheEntry>())
   const sessionsRef = useRef(new Map<string, Session>())
@@ -255,13 +274,16 @@ export function useInlineExpansionContents(
   const publish = useCallback(() => {
     const objects = new Map<string, C4Object>()
     const connections = new Map<string, Connection>()
+    const connectionIds = new Map<string, string[]>()
     const layouts = new Map<string, Layouts | null>()
     for (const [diagramId, entry] of cacheRef.current) {
       for (const object of entry.objects) objects.set(object.id, object)
-      for (const connection of entry.connections) connections.set(connection.id, connection)
+      const drawn = [...entry.connections, ...entry.derived]
+      for (const connection of drawn) connections.set(connection.id, connection)
+      connectionIds.set(diagramId, [...new Set(drawn.map((connection) => connection.id))])
       layouts.set(diagramId, entry.layouts)
     }
-    contentsRef.current = { objects, connections, layouts }
+    contentsRef.current = { objects, connections, connectionIds, layouts }
     setVersion((v) => v + 1)
   }, [])
 
@@ -321,17 +343,40 @@ export function useInlineExpansionContents(
   /** The model changed: only the targets holding a changed entity re-read,
    *  promptly; when what changed is unknown, every target, on the SLOW lane. */
   const scheduleForChange = useCallback((change: ModelIndexChange | null) => {
+    /** Targets a changed edge might reach only through a derived one. */
+    const undecided: string[] = []
     for (const id of sessionsRef.current.keys()) {
       if (!change) {
         scheduleStale(id, 'all', SLOW)
         continue
       }
       const composition = source.composition(id)
+      const derived = cacheRef.current.get(id)?.derived ?? []
       const touched = !composition
         || change.objectIds.some((changed) => composition.objectIds.includes(changed))
         || change.connectionIds.some((changed) => composition.connectionIds.includes(changed))
+        || change.connectionIds.some((changed) => derived.some((edge) => edge.id === changed))
       if (touched) scheduleStale(id, 'all', FAST)
+      else if (change.connectionIds.length > 0) undecided.push(id)
     }
+    if (!change || undecided.length === 0 || !source.edgeEnds) return
+    // A relationship declared between shapes the target does not show — two
+    // components of one of its containers — is drawn there as a derived edge,
+    // whose id no change names. Added, moved or deleted, it is followed when
+    // both its ends roll up to shapes of the target.
+    void source.edgeEnds(change.connectionIds).then((ends) => {
+      for (const id of undecided) {
+        const composition = source.composition(id)
+        if (!composition) continue
+        const shown = new Set(composition.objectIds)
+        const reaches = [...ends.values()].some((edge) => edge === null
+          // Unreadable (most often deleted): it can only have been drawn here
+          // as one of the derived edges, if the target has any.
+          ? (cacheRef.current.get(id)?.derived.length ?? 0) > 0
+          : edge.from.some((end) => shown.has(end)) && edge.to.some((end) => shown.has(end)))
+        if (reaches) scheduleStale(id, 'all', FAST)
+      }
+    })
   }, [scheduleStale, source])
 
   // The server's changes, with their ids, while anything is expanded. Every
@@ -429,6 +474,9 @@ export function useInlineExpansionContents(
           const previous = cacheRef.current.get(diagramId)
           const objects = mergeById(composition.objectIds, read.objects, previous?.objects ?? [])
           const connections = mergeById(composition.connectionIds, read.connections, previous?.connections ?? [])
+          // Derived edges have no membership list to merge against: a read
+          // that got them is the whole set, one that did not keeps the last.
+          const derived = read.derived ?? previous?.derived ?? []
           const layouts = read.layouts ?? previous?.layouts ?? null
           // Marked stale while this was loading: kept (better than nothing on
           // screen) but left stale, so the reload already asked for runs. And
@@ -436,8 +484,8 @@ export function useInlineExpansionContents(
           // for a set that is no longer the one on screen.
           const outOfDate = compositionSignature(source.composition(diagramId)) !== signature
           const stale: Staleness = outOfDate ? 'all' : superseded ? (previous?.stale || 'all') : false
-          const fingerprint = JSON.stringify([objects, connections, layouts])
-          cacheRef.current.set(diagramId, { objects, connections, layouts, signature, stale, fingerprint })
+          const fingerprint = JSON.stringify([objects, connections, derived, layouts])
+          cacheRef.current.set(diagramId, { objects, connections, derived, layouts, signature, stale, fingerprint })
           if (outOfDate && !superseded) setReloadTick((t) => t + 1)
           if (fingerprint !== previous?.fingerprint) publish()
         },

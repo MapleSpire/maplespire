@@ -148,6 +148,15 @@ export interface ExpansionLookup {
   object: (id: string) => C4Object | undefined
   connection: (id: string) => Connection | undefined
   /**
+   * The target diagram's edges as it draws them: its own AND the derived
+   * (`kind: 'lower'`) ones, which are computed for a render and never listed
+   * in a diagram's stored `connectionIds` — so the stub misses them, and on a
+   * Structurizr import (a relationship declared between components, drawn
+   * between their containers) they are most of a container view's edges.
+   * `undefined` (or omitted): the stub's `connectionIds`.
+   */
+  connectionIds?: (diagramId: string) => readonly string[] | undefined
+  /**
    * Where the target diagram's members sit, read from that diagram's own
    * document (see the module header for why the stub cannot answer):
    *  - a record — the arrangement the user made over there;
@@ -342,6 +351,11 @@ interface Block {
   shapes: C4Object[]
   /** Pulled edges, waypoints copied: they move with the block. */
   connections: Connection[]
+  /** Every edge of the target, before we know which ends are drawn. */
+  candidates: Connection[]
+  /** Whether the target's placement was read (waypoints mean something). */
+  placed: boolean
+  parent: Block | null
   children: Block[]
   /** The wrapper's box, once laid out. */
   box: Box
@@ -514,23 +528,15 @@ export function expandDiagramsInline(
       })
     ).map((object) => ({ ...object, position: { ...object.position }, size: { ...object.size } }))
 
-    // The relationships BETWEEN the pulled shapes come too — an expanded
-    // boundary showing its contents unconnected would be a worse picture than
-    // the one it replaced. Only edges whose both ends survived the filters.
-    // Their waypoints are in the target's coordinates and move with the block;
-    // over a grid they mean nothing and are dropped.
-    const pulledIds = new Set(placed.map((object) => object.id))
-    const pulledConnections: Connection[] = []
-    for (const connectionId of target.connectionIds) {
+    // The target's relationships, sorted out once every block is resolved
+    // (`keepDrawnEdges`): which of their ends are drawn depends on the other
+    // expansions too. The membership is the caller's when it has one — the
+    // stub's `connectionIds` never lists the derived (lower) edges, and on an
+    // import those are most of a container view's edges.
+    const candidates: Connection[] = []
+    for (const connectionId of lookup.connectionIds?.(expansion.diagramId) ?? target.connectionIds) {
       const connection = lookup.connection(connectionId)
-      if (!connection) continue
-      if (!pulledIds.has(connection.fromId) || !pulledIds.has(connection.toId)) continue
-      if (presentConnectionIds.has(connection.id)) continue
-      presentConnectionIds.add(connection.id)
-      const { waypoints, ...rest } = connection
-      pulledConnections.push(
-        waypoints && layouts !== null ? { ...rest, waypoints: waypoints.map((p) => ({ ...p })) } : rest,
-      )
+      if (connection) candidates.push(connection)
     }
 
     const block: Block = {
@@ -552,7 +558,10 @@ export function expandDiagramsInline(
       } as Group,
       memberIds: placed.map((object) => object.id),
       shapes: placed,
-      connections: pulledConnections,
+      connections: [],
+      candidates,
+      placed: layouts !== null,
+      parent,
       children: [],
       box: { x: 0, y: 0, width: 0, height: 0 },
     }
@@ -589,6 +598,45 @@ export function expandDiagramsInline(
   }
   for (const expansion of waiting) {
     skipped.push({ objectId: expansion.objectId, reason: 'missing' })
+  }
+
+  /** `id` is drawn inside `block`, at any depth. */
+  const inside = (id: string, block: Block): boolean => {
+    for (let at = drawnIn.get(id) ?? null; at; at = at.parent) if (at === block) return true
+    return false
+  }
+  /** `id` is `end`, or is drawn inside the block `end` was expanded into. */
+  const standsFor = (id: string, end: string): boolean => {
+    const block = replacedBy.get(end)
+    return id === end || (!!block && inside(id, block))
+  }
+
+  // ── The edges each block draws ────────────────────────────────────────────
+  // A target edge comes when one end is in THIS block and the other is drawn
+  // anywhere — in the block, in another block, or on the diagram itself
+  // (Payment Service -> Stripe, Stripe being on the context diagram). Leaving
+  // out the outward ones drew an expanded boundary whose contents connect to
+  // nothing. An end not drawn here leaves its edge behind. Applied order: the
+  // first block to draw an edge keeps it.
+  for (const block of applied) {
+    for (const connection of block.candidates) {
+      if (presentConnectionIds.has(connection.id)) continue
+      const fromHere = drawnIn.get(connection.fromId) === block
+      const toHere = drawnIn.get(connection.toId) === block
+      if (!fromHere && !toHere) continue
+      if (!drawnIn.has(connection.fromId) || !drawnIn.has(connection.toId)) continue
+      // An edge between a host and what is drawn inside its own wrapper would
+      // be a line from the wrapper's contents to the wrapper.
+      if (standsFor(connection.toId, connection.fromId) || standsFor(connection.fromId, connection.toId)) continue
+      presentConnectionIds.add(connection.id)
+      const { waypoints, ...rest } = connection
+      // Waypoints are in the target's frame and move with the block: they mean
+      // something only for an edge wholly inside it, over a placement read
+      // from the target (over a grid they do not).
+      block.connections.push(
+        waypoints && fromHere && toHere && block.placed ? { ...rest, waypoints: waypoints.map((p) => ({ ...p })) } : rest,
+      )
+    }
   }
 
   if (applied.length === 0) {
@@ -655,10 +703,22 @@ export function expandDiagramsInline(
       toId: to ? to.wrapper.id : connection.toId,
     }
   }
+  // A derived (lower) edge is the roll-up of edges hidden inside its ends. Once
+  // an end is expanded, the block may draw the edge it summarised (Customer ->
+  // FoodDash is Customer -> Mobile App, now on screen): the dashed roll-up onto
+  // the wrapper would then say the same thing twice, less precisely.
+  const drawnEdges = [...baseConnections, ...applied.flatMap((block) => block.connections)]
+  const summarisedHere = (lower: Connection): boolean =>
+    lower.kind === 'lower'
+    && (replacedBy.has(lower.fromId) || replacedBy.has(lower.toId))
+    && drawnEdges.some((edge) =>
+      (edge.fromId !== lower.fromId || edge.toId !== lower.toId)
+      && standsFor(edge.fromId, lower.fromId)
+      && standsFor(edge.toId, lower.toId))
   return {
     // The host shapes are gone: their wrapper IS them, expanded.
     objects: [...baseLevel.shapes, ...applied.flatMap((block) => block.shapes)],
-    connections: [...baseConnections, ...applied.flatMap((block) => block.connections)].map(rewrite),
+    connections: drawnEdges.filter((edge) => !summarisedHere(edge)).map(rewrite),
     // A persisted group's membership is not this view transform's to rewrite;
     // only its position moves, with everything else past the cut.
     groups: [...baseLevel.groups, ...applied.map((block) => block.wrapper)],

@@ -29,6 +29,10 @@ const deps = vi.hoisted(() => ({
   close: vi.fn(),
   openDiagramPlacement: vi.fn(),
   diagramById: new Map<string, unknown>(),
+  readDerivedEdges: vi.fn(),
+}))
+vi.mock('../../lib/diagrams/derivedEdges', () => ({
+  readDerivedEdges: (...args: unknown[]) => deps.readDerivedEdges(...args),
 }))
 vi.mock('../../lib/modelQuery', () => ({
   getModelQuery: () => ({ lookupMany: deps.lookupMany, connectionsMany: deps.connectionsMany }),
@@ -65,12 +69,14 @@ const { defaultExpansionTargetSource: source } = await import('./useInlineExpans
 
 const PLACED = { o1: { position: { x: 10, y: 20 }, size: { width: 100, height: 60 } } }
 const COMPOSITION = { objectIds: ['o1', 'g1', 'gone'], connectionIds: ['c1', 'c-gone'] }
+const DERIVED = { id: 'lower:o1→x', fromId: 'o1', toId: 'x', kind: 'lower' }
 
 let warn: ReturnType<typeof vi.spyOn>
 beforeEach(() => {
   warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
   deps.openDiagramPlacement.mockReturnValue({ read: deps.read, subscribe: deps.subscribe, close: deps.close })
   deps.read.mockResolvedValue(PLACED)
+  deps.readDerivedEdges.mockResolvedValue([DERIVED])
   deps.lookupMany.mockResolvedValue(new Map<string, unknown>([
     ['o1', { id: 'o1', scope: 'internal' }],
     ['g1', { id: 'g1', name: 'a group, no scope' }],
@@ -105,6 +111,19 @@ describe('defaultExpansionTargetSource', () => {
     expect(deps.connectionsMany).toHaveBeenCalledWith(['c1', 'c-gone'])
   })
 
+  // The stub lists none of them (2026-10-16, FoodDash): they come from the render.
+  it('reads the target\'s derived edges with its contents', async () => {
+    const read = await source.open('B').load(COMPOSITION, { contents: true })
+    expect(deps.readDerivedEdges).toHaveBeenCalledWith('B', COMPOSITION)
+    expect(read.derived).toEqual([DERIVED])
+  })
+
+  it('still reads the derived edges when the shapes lookup fails', async () => {
+    deps.lookupMany.mockRejectedValue(new Error('server down'))
+    const read = await source.open('B').load(COMPOSITION, { contents: true })
+    expect(read.derived).toEqual([DERIVED])
+  })
+
   it('hands the document subscription and the close through', () => {
     const target = source.open('B')
     const unsubscribe = vi.fn()
@@ -123,6 +142,7 @@ describe('defaultExpansionTargetSource', () => {
     expect(read).toEqual({ layouts: PLACED })
     expect(deps.lookupMany).not.toHaveBeenCalled()
     expect(deps.connectionsMany).not.toHaveBeenCalled()
+    expect(deps.readDerivedEdges).not.toHaveBeenCalled()
   })
 
   it('a failed shapes lookup is UNKNOWN (absent), not empty, and the placement still comes', async () => {

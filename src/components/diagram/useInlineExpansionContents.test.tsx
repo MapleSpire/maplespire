@@ -96,6 +96,94 @@ describe('useInlineExpansionContents', () => {
     expect(result.current.contentsRef.current.layouts.get('B')).toEqual(PLACED)
   })
 
+  // 2026-10-16, FoodDash: a target's derived (lower) edges are not in its
+  // stub's connectionIds. They are published as part of its membership, and a
+  // re-read that could not get them keeps the last set rather than erasing it.
+  it('publishes the target\'s derived edges with its own, and keeps them through a re-read without them', async () => {
+    const { source, answer } = manualSource({ B: { objectIds: ['inner'], connectionIds: ['c-in'] } })
+    const { result } = renderHook(() => useInlineExpansionContents({ host: 'B' }, null, source))
+    const derived = { ...connection('lower:inner→peer'), kind: 'lower' } as Connection
+    await answer(0, { ...full(PLACED), connections: [connection('c-in')], derived: [derived] })
+    const contents = () => result.current.contentsRef.current
+    expect(contents().connectionIds.get('B')).toEqual(['c-in', 'lower:inner→peer'])
+    expect(contents().connections.get('lower:inner→peer')).toEqual(derived)
+
+    act(() => { useAutomergeStatus.getState().noteTransportRestored() })
+    await answer(1, { ...full(PLACED), connections: [connection('c-in')] })
+    expect(contents().connectionIds.get('B')).toEqual(['c-in', 'lower:inner→peer'])
+
+    // A read that DID get them is the whole set: a roll-up gone over there goes here.
+    act(() => { useAutomergeStatus.getState().noteTransportRestored() })
+    await answer(2, { ...full(PLACED), connections: [connection('c-in')], derived: [] })
+    expect(contents().connectionIds.get('B')).toEqual(['c-in'])
+  })
+
+  it('re-reads a target when one of its derived edges is named by a change', async () => {
+    vi.useFakeTimers()
+    const { source, loads, answer } = manualSource({ B: { objectIds: ['inner'], connectionIds: [] } })
+    renderHook(() => useInlineExpansionContents({ host: 'B' }, null, source))
+    await answer(0, { ...full(PLACED), derived: [{ ...connection('lower:inner→peer'), kind: 'lower' } as Connection] })
+    act(() => { notifyModelIndexChanged({ objectIds: [], connectionIds: ['lower:inner→peer'] }) })
+    act(() => { vi.advanceTimersByTime(160) })
+    expect(loads).toHaveLength(2)
+  })
+
+  // A relationship declared between two shapes the target does not show (a
+  // component of one of its containers to another container) is drawn there as
+  // a derived edge no change names. It is followed through its ends.
+  describe('a changed edge the target does not hold', () => {
+    const ends = (map: Record<string, { from: string[]; to: string[] } | null>) =>
+      vi.fn(async (ids: readonly string[]) => new Map(ids.map((id) => [id, id in map ? map[id] : null])))
+    const setup = async (edgeEnds: ReturnType<typeof ends>, derived: Connection[] = []) => {
+      vi.useFakeTimers()
+      const manual = manualSource({ B: { objectIds: ['mobile', 'orders'], connectionIds: [] } })
+      const source = { ...manual.source, edgeEnds }
+      renderHook(() => useInlineExpansionContents({ host: 'B' }, null, source))
+      await manual.answer(0, { ...full(PLACED), derived })
+      return manual
+    }
+    const change = async (connectionIds: string[]) => {
+      act(() => { notifyModelIndexChanged({ objectIds: [], connectionIds }) })
+      await act(async () => {})
+      act(() => { vi.advanceTimersByTime(160) })
+    }
+
+    it('re-reads a target both of whose shapes the new edge rolls up to', async () => {
+      const edgeEnds = ends({ 'mobile-api': { from: ['mobile', 'foodDash'], to: ['api', 'orders', 'foodDash'] } })
+      const { loads } = await setup(edgeEnds)
+      await change(['mobile-api'])
+      expect(edgeEnds).toHaveBeenCalledWith(['mobile-api'])
+      expect(loads).toHaveLength(2)
+    })
+
+    it('leaves a target alone when only one end reaches it', async () => {
+      const { loads } = await setup(ends({ 'mobile-x': { from: ['mobile'], to: ['x', 'elsewhere'] } }))
+      await change(['mobile-x'])
+      expect(loads).toHaveLength(1)
+    })
+
+    it('an unreadable (deleted) edge re-reads only a target that draws derived edges', async () => {
+      const none = await setup(ends({}))
+      await change(['gone'])
+      expect(none.loads).toHaveLength(1)
+      vi.useRealTimers()
+      const some = await setup(ends({}), [{ ...connection('lower:mobile→orders'), kind: 'lower' } as Connection])
+      await change(['gone'])
+      expect(some.loads).toHaveLength(2)
+    })
+
+    it('does not ask about the ends when the change already names a held edge', async () => {
+      const edgeEnds = ends({})
+      vi.useFakeTimers()
+      const manual = manualSource({ B: { objectIds: ['mobile'], connectionIds: ['c-in'] } })
+      renderHook(() => useInlineExpansionContents({ host: 'B' }, null, { ...manual.source, edgeEnds }))
+      await manual.answer(0, full(PLACED))
+      await change(['c-in'])
+      expect(edgeEnds).not.toHaveBeenCalled()
+      expect(manual.loads).toHaveLength(2)
+    })
+  })
+
   // Architect lens, B1: with the backend down and the browser online, a failed
   // durable-heads acknowledgement sets 'saving' — a rising edge into
   // "connected" during the outage. The badge is not the transport.

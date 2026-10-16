@@ -77,8 +77,13 @@ vi.mock('../../canvas/engine/CanvasEngine', async (importOriginal) => ({
 const hook = vi.hoisted(() => {
   const state = {
     calls: [] as Array<{ expansions: Record<string, string>; registry: unknown }>,
-    ref: { current: { objects: new Map(), connections: new Map(), layouts: new Map() } } as {
-      current: { objects: Map<string, unknown>; connections: Map<string, unknown>; layouts: Map<string, unknown> }
+    ref: { current: { objects: new Map(), connections: new Map(), connectionIds: new Map(), layouts: new Map() } } as {
+      current: {
+        objects: Map<string, unknown>
+        connections: Map<string, unknown>
+        connectionIds: Map<string, string[]>
+        layouts: Map<string, unknown>
+      }
     },
     version: 0,
     listeners: new Set<() => void>(),
@@ -104,6 +109,8 @@ function publish(
   hook.ref.current = {
     objects: new Map(objects.map((o) => [o.id, o])),
     connections: new Map(connections.map((c) => [c.id, c])),
+    // As the real hook: every edge it read for the target, derived ones included.
+    connectionIds: new Map([[diagramId, connections.map((c) => c.id)]]),
     layouts: new Map([[diagramId, layouts]]),
   }
   act(() => {
@@ -153,7 +160,7 @@ beforeEach(() => {
   engine.callbacks = null
   engine.setData.length = 0
   hook.calls.length = 0
-  hook.ref.current = { objects: new Map(), connections: new Map(), layouts: new Map() }
+  hook.ref.current = { objects: new Map(), connections: new Map(), connectionIds: new Map(), layouts: new Map() }
   related.mockClear()
   useAutomergeStatus.setState({ status: 'ready', ready: true, visualReady: true, editReady: true, error: null })
   useModelStore.setState({
@@ -205,6 +212,20 @@ describe('CanvasView ↔ inline expansion wires', () => {
     publish([obj('inner'), obj('inner2')], PLACED, [{ id: 'c-in', fromId: 'inner', toId: 'inner2' } as never])
     const drawnConnections = (engine.setData.at(-1)![1] as Array<{ id: string }>).map((c) => c.id)
     expect(drawnConnections).toContain('c-in')
+  })
+
+  // 2026-10-16, FoodDash: the stub of a non-active diagram never lists its
+  // derived (lower) edges, so the expansion drew 2 of the containers' 13. The
+  // membership the hook read is what the planner must use.
+  it('draws the target\'s derived edges, which its stub does not list, to an outer shape too', () => {
+    useUIStore.getState().expandInline('A', 'host', 'B')
+    render(<CanvasView />)
+    publish([obj('inner'), obj('inner2')], PLACED, [
+      { id: 'lower:inner→inner2', fromId: 'inner', toId: 'inner2', kind: 'lower' } as never,
+      { id: 'lower:inner2→peer', fromId: 'inner2', toId: 'peer', kind: 'lower' } as never,
+    ])
+    const drawn = engine.setData.at(-1)![1] as Array<{ id: string; fromId: string; toId: string }>
+    expect(drawn.map((c) => c.id)).toEqual(expect.arrayContaining(['lower:inner→inner2', 'lower:inner2→peer']))
   })
 
   it('asks for the related-diagram ⤢ of the shapes an expansion pulled in', async () => {
