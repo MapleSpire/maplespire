@@ -47,10 +47,28 @@ export interface ExpandedContents {
 export interface TargetRead {
   objects?: C4Object[]
   connections?: Connection[]
-  /** The target's derived (lower) edges — never in its `connectionIds`
-   *  (`readDerivedEdges`). */
+  /** The target's derived (lower) edges — not in a boot-from-server stub's
+   *  `connectionIds` (`readDerivedEdges`). */
   derived?: Connection[]
+  /** The derived edges, still being read when the rest was ready: merged when
+   *  they land, so a slow render never holds the expansion back. */
+  lateDerived?: Promise<Connection[] | undefined>
   layouts: Layouts | null
+}
+
+/** How long the rest of a read waits for the derived edges before going ahead
+ *  without them. Not measured: a render answers in milliseconds on a local
+ *  stack, and its fetch ceiling is 10 s (`fetchDiagramRender`). */
+const DERIVED_GRACE_MS = 1_500
+
+async function derivedOrLate(
+  derived: Promise<Connection[] | undefined>,
+): Promise<Pick<TargetRead, 'derived' | 'lateDerived'>> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const late = new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), DERIVED_GRACE_MS) })
+  const settled = await Promise.race([derived.then((value) => ({ value })), late])
+  clearTimeout(timer)
+  return settled ? { derived: settled.value } : { lateDerived: derived }
 }
 
 /** A target held open for as long as it is expanded. */
@@ -115,13 +133,13 @@ export const defaultExpansionTargetSource: ExpansionTargetSource = {
           return {
             objects,
             connections: [...connections.values()],
-            derived: await derived,
             layouts: await layouts,
+            ...await derivedOrLate(derived),
           }
         } catch (error) {
           // Unknown this time, not empty: what an earlier read found stays.
           console.warn(`inline expansion: contents of ${diagramId} unavailable`, error)
-          return { derived: await derived, layouts: await layouts }
+          return { layouts: await layouts, ...await derivedOrLate(derived) }
         }
       },
       subscribe: (onChange) => placement.subscribe(onChange),
@@ -192,6 +210,9 @@ type Staleness = false | 'placement' | 'all'
 interface CacheEntry {
   objects: C4Object[]
   connections: Connection[]
+  /** The composition's own edge ids when loaded: the target's membership even
+   *  when its contents could not be read (resolved through the window index). */
+  membership: string[]
   derived: Connection[]
   layouts: Layouts | null
   /** The composition this was loaded for; a different one means reload. */
@@ -280,7 +301,7 @@ export function useInlineExpansionContents(
       for (const object of entry.objects) objects.set(object.id, object)
       const drawn = [...entry.connections, ...entry.derived]
       for (const connection of drawn) connections.set(connection.id, connection)
-      connectionIds.set(diagramId, [...new Set(drawn.map((connection) => connection.id))])
+      connectionIds.set(diagramId, [...new Set([...entry.membership, ...entry.derived.map((connection) => connection.id)])])
       layouts.set(diagramId, entry.layouts)
     }
     contentsRef.current = { objects, connections, connectionIds, layouts }
@@ -342,30 +363,17 @@ export function useInlineExpansionContents(
 
   /** The model changed: only the targets holding a changed entity re-read,
    *  promptly; when what changed is unknown, every target, on the SLOW lane. */
-  const scheduleForChange = useCallback((change: ModelIndexChange | null) => {
-    /** Targets a changed edge might reach only through a derived one. */
-    const undecided: string[] = []
-    for (const id of sessionsRef.current.keys()) {
-      if (!change) {
-        scheduleStale(id, 'all', SLOW)
-        continue
-      }
-      const composition = source.composition(id)
-      const derived = cacheRef.current.get(id)?.derived ?? []
-      const touched = !composition
-        || change.objectIds.some((changed) => composition.objectIds.includes(changed))
-        || change.connectionIds.some((changed) => composition.connectionIds.includes(changed))
-        || change.connectionIds.some((changed) => derived.some((edge) => edge.id === changed))
-      if (touched) scheduleStale(id, 'all', FAST)
-      else if (change.connectionIds.length > 0) undecided.push(id)
-    }
-    if (!change || undecided.length === 0 || !source.edgeEnds) return
-    // A relationship declared between shapes the target does not show — two
-    // components of one of its containers — is drawn there as a derived edge,
-    // whose id no change names. Added, moved or deleted, it is followed when
-    // both its ends roll up to shapes of the target.
-    void source.edgeEnds(change.connectionIds).then((ends) => {
-      for (const id of undecided) {
+  /** Connection ids named by recent changes and held by no target, asked about
+   *  in ONE batch per burst (`edgeEnds` reads them and their ancestors). */
+  const pendingEdgeIdsRef = useRef(new Set<string>())
+  const edgeEndsTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  const askEdgeEnds = useCallback(() => {
+    edgeEndsTimerRef.current = undefined
+    const ids = [...pendingEdgeIdsRef.current]
+    pendingEdgeIdsRef.current.clear()
+    if (ids.length === 0 || !source.edgeEnds || sessionsRef.current.size === 0) return
+    void source.edgeEnds(ids).then((ends) => {
+      for (const id of sessionsRef.current.keys()) {
         const composition = source.composition(id)
         if (!composition) continue
         const shown = new Set(composition.objectIds)
@@ -373,11 +381,39 @@ export function useInlineExpansionContents(
           // Unreadable (most often deleted): it can only have been drawn here
           // as one of the derived edges, if the target has any.
           ? (cacheRef.current.get(id)?.derived.length ?? 0) > 0
-          : edge.from.some((end) => shown.has(end)) && edge.to.some((end) => shown.has(end)))
+          // EITHER end: an edge re-pointed away from the target keeps one end
+          // in it, and the roll-up it used to make must go.
+          : edge.from.some((end) => shown.has(end)) || edge.to.some((end) => shown.has(end)))
         if (reaches) scheduleStale(id, 'all', FAST)
       }
     })
   }, [scheduleStale, source])
+
+  /** The model changed: only the targets holding a changed entity re-read,
+   *  promptly; when what changed is unknown, every target, on the SLOW lane. */
+  const scheduleForChange = useCallback((change: ModelIndexChange | null) => {
+    let undecided = false
+    for (const id of sessionsRef.current.keys()) {
+      if (!change) {
+        scheduleStale(id, 'all', SLOW)
+        continue
+      }
+      const composition = source.composition(id)
+      const touched = !composition
+        || change.objectIds.some((changed) => composition.objectIds.includes(changed))
+        || change.connectionIds.some((changed) => composition.connectionIds.includes(changed))
+      if (touched) scheduleStale(id, 'all', FAST)
+      else if (change.connectionIds.length > 0) undecided = true
+    }
+    if (!change || !undecided || !source.edgeEnds) return
+    // A relationship declared between shapes the target does not show — two
+    // components of one of its containers — is drawn there as a derived edge,
+    // whose id no change names. It is followed through its ends. Not followed:
+    // a re-parented shape (its change names no edge) and an end that rolls up
+    // through a group on the target — both wait for another trigger.
+    for (const id of change.connectionIds) pendingEdgeIdsRef.current.add(id)
+    if (edgeEndsTimerRef.current === undefined) edgeEndsTimerRef.current = setTimeout(askEdgeEnds, FAST.debounce)
+  }, [scheduleStale, source, askEdgeEnds])
 
   // The server's changes, with their ids, while anything is expanded. Every
   // edit — the user's own included — reaches the client as an id-less server
@@ -484,10 +520,20 @@ export function useInlineExpansionContents(
           // for a set that is no longer the one on screen.
           const outOfDate = compositionSignature(source.composition(diagramId)) !== signature
           const stale: Staleness = outOfDate ? 'all' : superseded ? (previous?.stale || 'all') : false
+          const membership = [...composition.connectionIds]
           const fingerprint = JSON.stringify([objects, connections, derived, layouts])
-          cacheRef.current.set(diagramId, { objects, connections, derived, layouts, signature, stale, fingerprint })
+          const entry: CacheEntry = { objects, connections, membership, derived, layouts, signature, stale, fingerprint }
+          cacheRef.current.set(diagramId, entry)
           if (outOfDate && !superseded) setReloadTick((t) => t + 1)
           if (fingerprint !== previous?.fingerprint) publish()
+          // Derived edges that missed the read: merged into THIS entry when they
+          // land, unless a newer read replaced it meanwhile.
+          void read.lateDerived?.then((late) => {
+            if (!late || cacheRef.current.get(diagramId) !== entry) return
+            entry.derived = late
+            entry.fingerprint = JSON.stringify([objects, connections, late, layouts])
+            publish()
+          })
         },
         (error: unknown) => {
           // The default source never rejects; an injected one that does is a
@@ -505,6 +551,8 @@ export function useInlineExpansionContents(
     for (const id of [...sessionsRef.current.keys()]) closeSession(id)
     cacheRef.current.clear()
     inflightRef.current.clear()
+    clearTimeout(edgeEndsTimerRef.current)
+    pendingEdgeIdsRef.current.clear()
   }, [closeSession])
 
   return { contentsRef, version }

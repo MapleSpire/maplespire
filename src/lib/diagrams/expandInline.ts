@@ -528,11 +528,11 @@ export function expandDiagramsInline(
       })
     ).map((object) => ({ ...object, position: { ...object.position }, size: { ...object.size } }))
 
-    // The target's relationships, sorted out once every block is resolved
-    // (`keepDrawnEdges`): which of their ends are drawn depends on the other
-    // expansions too. The membership is the caller's when it has one — the
-    // stub's `connectionIds` never lists the derived (lower) edges, and on an
-    // import those are most of a container view's edges.
+    // The target's relationships, sorted out once every block is resolved (the
+    // edge post-pass below): which of their ends are drawn depends on the other
+    // expansions too. The membership is the caller's when it has one — under
+    // boot-from-server the stub's `connectionIds` never lists the derived
+    // (lower) edges, and on an import those are most of a container view's edges.
     const candidates: Connection[] = []
     for (const connectionId of lookup.connectionIds?.(expansion.diagramId) ?? target.connectionIds) {
       const connection = lookup.connection(connectionId)
@@ -618,9 +618,17 @@ export function expandDiagramsInline(
   // out the outward ones drew an expanded boundary whose contents connect to
   // nothing. An end not drawn here leaves its edge behind. Applied order: the
   // first block to draw an edge keeps it.
+  //
+  // Roll-ups are matched by their two ends, not their id: on the resident tier
+  // the store holds them under generated ids, and the same pair also comes back
+  // as `lower:<from>→<to>` from a render — one id-only dedupe drew every roll-up
+  // twice (architect and reviewer lenses, 2026-10-16).
+  const lowerPair = (connection: Connection) => `${connection.fromId}→${connection.toId}`
+  const presentLowerPairs = new Set(base.connections.filter((c) => c.kind === 'lower').map(lowerPair))
   for (const block of applied) {
     for (const connection of block.candidates) {
       if (presentConnectionIds.has(connection.id)) continue
+      if (connection.kind === 'lower' && presentLowerPairs.has(lowerPair(connection))) continue
       const fromHere = drawnIn.get(connection.fromId) === block
       const toHere = drawnIn.get(connection.toId) === block
       if (!fromHere && !toHere) continue
@@ -629,6 +637,7 @@ export function expandDiagramsInline(
       // be a line from the wrapper's contents to the wrapper.
       if (standsFor(connection.toId, connection.fromId) || standsFor(connection.fromId, connection.toId)) continue
       presentConnectionIds.add(connection.id)
+      if (connection.kind === 'lower') presentLowerPairs.add(lowerPair(connection))
       const { waypoints, ...rest } = connection
       // Waypoints are in the target's frame and move with the block: they mean
       // something only for an edge wholly inside it, over a placement read
@@ -703,22 +712,16 @@ export function expandDiagramsInline(
       toId: to ? to.wrapper.id : connection.toId,
     }
   }
-  // A derived (lower) edge is the roll-up of edges hidden inside its ends. Once
-  // an end is expanded, the block may draw the edge it summarised (Customer ->
-  // FoodDash is Customer -> Mobile App, now on screen): the dashed roll-up onto
-  // the wrapper would then say the same thing twice, less precisely.
-  const drawnEdges = [...baseConnections, ...applied.flatMap((block) => block.connections)]
-  const summarisedHere = (lower: Connection): boolean =>
-    lower.kind === 'lower'
-    && (replacedBy.has(lower.fromId) || replacedBy.has(lower.toId))
-    && drawnEdges.some((edge) =>
-      (edge.fromId !== lower.fromId || edge.toId !== lower.toId)
-      && standsFor(edge.fromId, lower.fromId)
-      && standsFor(edge.toId, lower.toId))
+  // A roll-up onto an expanded shape is KEPT, on its wrapper, even when the
+  // block draws a finer edge between the same two ends: a roll-up may summarise
+  // several relationships, some through members the target view leaves out, and
+  // the edges drawn cannot prove they cover all of it (architect and reviewer
+  // lenses, 2026-10-16 — dropping it lost Customer -> Web Portal when Web Portal
+  // was not on the containers view).
   return {
     // The host shapes are gone: their wrapper IS them, expanded.
     objects: [...baseLevel.shapes, ...applied.flatMap((block) => block.shapes)],
-    connections: drawnEdges.filter((edge) => !summarisedHere(edge)).map(rewrite),
+    connections: [...baseConnections, ...applied.flatMap((block) => block.connections)].map(rewrite),
     // A persisted group's membership is not this view transform's to rewrite;
     // only its position moves, with everything else past the cut.
     groups: [...baseLevel.groups, ...applied.map((block) => block.wrapper)],

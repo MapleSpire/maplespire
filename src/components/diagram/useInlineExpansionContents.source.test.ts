@@ -30,9 +30,11 @@ const deps = vi.hoisted(() => ({
   openDiagramPlacement: vi.fn(),
   diagramById: new Map<string, unknown>(),
   readDerivedEdges: vi.fn(),
+  readEdgeEnds: vi.fn(),
 }))
 vi.mock('../../lib/diagrams/derivedEdges', () => ({
   readDerivedEdges: (...args: unknown[]) => deps.readDerivedEdges(...args),
+  readEdgeEnds: (...args: unknown[]) => deps.readEdgeEnds(...args),
 }))
 vi.mock('../../lib/modelQuery', () => ({
   getModelQuery: () => ({ lookupMany: deps.lookupMany, connectionsMany: deps.connectionsMany }),
@@ -116,6 +118,36 @@ describe('defaultExpansionTargetSource', () => {
     const read = await source.open('B').load(COMPOSITION, { contents: true })
     expect(deps.readDerivedEdges).toHaveBeenCalledWith('B', COMPOSITION)
     expect(read.derived).toEqual([DERIVED])
+  })
+
+  // Reviewer lens N5: a render that hangs (up to its 10 s ceiling) must not
+  // hold the expansion back.
+  it('goes ahead without derived edges that are slow, handing them over to land later', async () => {
+    vi.useFakeTimers()
+    try {
+      let land!: (edges: unknown[]) => void
+      deps.readDerivedEdges.mockReturnValue(new Promise((resolve) => { land = resolve }))
+      const pending = source.open('B').load(COMPOSITION, { contents: true })
+      await vi.advanceTimersByTimeAsync(1_500)
+      const read = await pending
+      expect(read.objects!.map((o) => o.id)).toEqual(['o1'])
+      expect(read.derived).toBeUndefined()
+      land([DERIVED])
+      expect(await read.lateDerived).toEqual([DERIVED])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  // QA lens H15: without this wire the derived-edge follow path is dead in
+  // production while every hook test (which injects its own) stays green.
+  it('follows changed edges through the ModelQuery seam', async () => {
+    const ends = new Map([['c9', null]])
+    deps.readEdgeEnds.mockResolvedValue(ends)
+    expect(await source.edgeEnds!(['c9'])).toBe(ends)
+    expect(deps.readEdgeEnds).toHaveBeenCalledWith(['c9'], expect.objectContaining({
+      lookupMany: deps.lookupMany, connectionsMany: deps.connectionsMany,
+    }))
   })
 
   it('still reads the derived edges when the shapes lookup fails', async () => {

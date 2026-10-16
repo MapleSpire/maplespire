@@ -102,17 +102,22 @@ const lowerOnly = (connections: readonly Connection[]): Connection[] =>
  * The derived (`kind: 'lower'`) edges a diagram draws: a relationship between
  * shapes that are NOT on it, rolled up to their nearest ancestors that are.
  *
- * They are computed for a render and never stored in the diagram's
- * `connectionIds`, so a diagram that is not the active one — a layout-less
- * stub in the index — does not list them. On a Structurizr import they carry
- * most of a container view (`mobileApp -> orderService.orderApi` is drawn as
- * Mobile App -> Order Service), and an inline expansion read from the stub
- * alone drew 2 of its 13 edges (2026-10-16, FoodDash).
+ * Under boot-from-server they are computed for a render and never stored in
+ * the diagram's `connectionIds`, so a diagram that is not the active one — a
+ * layout-less stub in the index — does not list them. On a Structurizr import
+ * they carry most of a container view (`mobileApp -> orderService.orderApi` is
+ * drawn as Mobile App -> Order Service), and an inline expansion read from the
+ * stub alone drew 2 of its 13 edges (2026-10-16, FoodDash).
  *
- * Same sources as the active diagram's projection (`loadDiagramRenderForProjection`):
+ * On the RESIDENT tier the store's lower sync does list them, under generated
+ * ids, so the stub may already carry them: the planner matches roll-ups by
+ * their two ends, not their id. There the roll-up is computed from the store,
+ * which is complete and current (unsynced local edits included) — never from a
+ * cached render, which offline could be older than the store.
+ *
+ * Elsewhere, the active diagram's sources (`loadDiagramRenderForProjection`):
  * the server's render, else the cached render or one rebuilt from the local
- * index when the server is unreachable. With no render at all, on the resident
- * tier (the whole model in the store), the same roll-up is computed here.
+ * index when the server is unreachable.
  *
  * `undefined` = not known this time (offline with nothing cached, or a diagram
  * the server does not know); the caller keeps what it knew. Never rejects.
@@ -123,18 +128,16 @@ export async function readDerivedEdges(
   sources: DerivedEdgeSources = defaultDerivedEdgeSources,
 ): Promise<Connection[] | undefined> {
   try {
-    let render: DiagramRenderResult | undefined
-    try {
-      render = await sources.fetchRender(diagramId)
-    } catch (error) {
-      console.warn(`inline expansion: render of ${diagramId} unreachable, trying the offline copy`, error)
-      render = await sources.offlineRender(diagramId)
+    if (!sources.resident()) {
+      let render: DiagramRenderResult | undefined
+      try {
+        render = await sources.fetchRender(diagramId)
+      } catch (error) {
+        console.warn(`inline expansion: render of ${diagramId} unreachable, trying the offline copy`, error)
+        render = await sources.offlineRender(diagramId)
+      }
+      return render ? lowerOnly(render.connections) : undefined
     }
-    if (render) return lowerOnly(render.connections)
-    // No render anywhere — a server without a read model answers 404. Only
-    // the resident tier holds the whole model the roll-up walks; anywhere else
-    // the store is a window and a roll-up over it would be confidently partial.
-    if (!sources.resident()) return undefined
     const { objects, connections, groups } = sources.model()
     const parentOf = new Map(objects.map((object) => [object.id, object.parentId ?? undefined]))
     const groupObjectIds = new Map(groups.map((group) => [group.id, group.objectIds ?? []]))

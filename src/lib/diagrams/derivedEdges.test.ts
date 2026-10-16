@@ -79,22 +79,32 @@ describe('readDerivedEdges', () => {
 
   // No read model on the server (404): only the resident tier has the whole
   // model to roll up.
-  it('rolls the edges up itself on the resident tier when there is no render', async () => {
+  it('rolls the edges up from the store on the resident tier', async () => {
     const got = await readDerivedEdges('containers', CONTAINERS, sources({ resident: () => true }))
     expect(got).toEqual([expect.objectContaining({ fromId: 'mobile', toId: 'orders', kind: 'lower' })])
+  })
+
+  it('rolls an end up to a group placed on the diagram', async () => {
+    const got = await readDerivedEdges('containers', { objectIds: ['mobile'], groupIds: ['g'] }, sources({
+      resident: () => true,
+      model: () => ({ ...MODEL, groups: [{ id: 'g', objectIds: ['api'] } as Group] }),
+    }))
+    expect(got).toEqual([expect.objectContaining({ fromId: 'mobile', toId: 'g', kind: 'lower' })])
   })
 
   it('does not roll up over a windowed store: unknown, not empty', async () => {
     expect(await readDerivedEdges('containers', CONTAINERS, sources())).toBeUndefined()
   })
 
-  it('a render found offline wins over the resident roll-up', async () => {
-    const got = await readDerivedEdges('containers', CONTAINERS, sources({
-      resident: () => true,
-      fetchRender: async () => { throw new Error('down') },
-      offlineRender: async () => render([]),
-    }))
-    expect(got).toEqual([])
+  // The store is complete and current there (unsynced edits included); a
+  // cached render read offline could be older (architect lens).
+  it('never reads a render on the resident tier, not even the offline copy', async () => {
+    const fetchRender = vi.fn(async () => render([]))
+    const offlineRender = vi.fn(async () => render([]))
+    const got = await readDerivedEdges('containers', CONTAINERS, sources({ resident: () => true, fetchRender, offlineRender }))
+    expect(fetchRender).not.toHaveBeenCalled()
+    expect(offlineRender).not.toHaveBeenCalled()
+    expect(got).toHaveLength(1)
   })
 
   it('never rejects: a failing offline copy is unknown', async () => {
@@ -125,7 +135,8 @@ describe('readEdgeEnds', () => {
     const ends = await readEdgeEnds(['mobile-api'], q as never)
     expect(ends.get('mobile-api')).toEqual({ from: ['mobile', 'foodDash'], to: ['api', 'orders', 'foodDash'] })
     expect(q.connectionsMany).toHaveBeenCalledOnce()
-    expect(q.lookupMany.mock.calls.length).toBeLessThanOrEqual(3)
+    // mobile+api, then foodDash+orders: an ancestor already read is not asked again.
+    expect(q.lookupMany).toHaveBeenCalledTimes(2)
   })
 
   it('a connection that cannot be read (deleted) is null, not left out', async () => {
@@ -138,6 +149,12 @@ describe('readEdgeEnds', () => {
     const q = { connectionsMany: async () => { throw new Error('down') }, lookupMany: async () => new Map() }
     const ends = await readEdgeEnds(['a', 'b'], q as never)
     expect([...ends.values()]).toEqual([null, null])
+  })
+
+  it('follows a chain deeper than a container view to its root', async () => {
+    entities.set('code', { id: 'code', parentId: 'api' })
+    const ends = await readEdgeEnds(['deep'], query([edge('deep', 'code', 'mobile')]) as never)
+    expect(ends.get('deep')!.from).toEqual(['code', 'api', 'orders', 'foodDash'])
   })
 
   it('stops on a parent cycle in bad data', async () => {

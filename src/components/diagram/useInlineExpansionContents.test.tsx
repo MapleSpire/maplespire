@@ -118,14 +118,38 @@ describe('useInlineExpansionContents', () => {
     expect(contents().connectionIds.get('B')).toEqual(['c-in'])
   })
 
-  it('re-reads a target when one of its derived edges is named by a change', async () => {
-    vi.useFakeTimers()
-    const { source, loads, answer } = manualSource({ B: { objectIds: ['inner'], connectionIds: [] } })
-    renderHook(() => useInlineExpansionContents({ host: 'B' }, null, source))
-    await answer(0, { ...full(PLACED), derived: [{ ...connection('lower:inner→peer'), kind: 'lower' } as Connection] })
-    act(() => { notifyModelIndexChanged({ objectIds: [], connectionIds: ['lower:inner→peer'] }) })
-    act(() => { vi.advanceTimersByTime(160) })
-    expect(loads).toHaveLength(2)
+  // Reviewer lens N1: the target's own edges stay its membership when the
+  // contents read failed (they resolve through the window index).
+  it('keeps the composition\'s edges as the membership when the contents could not be read', async () => {
+    const { source, answer } = manualSource({ B: { objectIds: ['inner'], connectionIds: ['c-in'] } })
+    const { result } = renderHook(() => useInlineExpansionContents({ host: 'B' }, null, source))
+    await answer(0, { layouts: PLACED, derived: [{ ...connection('lower:inner→peer'), kind: 'lower' } as Connection] })
+    expect(result.current.contentsRef.current.connectionIds.get('B')).toEqual(['c-in', 'lower:inner→peer'])
+  })
+
+  // Reviewer lens N5: a slow render must not hold the expansion back; its
+  // derived edges are merged when they land, into the read they belong to.
+  it('merges derived edges that land after the read', async () => {
+    const { source, answer } = manualSource({ B: { objectIds: ['inner'], connectionIds: [] } })
+    const { result } = renderHook(() => useInlineExpansionContents({ host: 'B' }, null, source))
+    let land!: (edges: Connection[]) => void
+    const lateDerived = new Promise<Connection[] | undefined>((resolve) => { land = resolve })
+    await answer(0, { ...full(PLACED), lateDerived })
+    expect(result.current.contentsRef.current.objects.has('inner'), 'drawn without waiting').toBe(true)
+    expect(result.current.contentsRef.current.connectionIds.get('B')).toEqual([])
+    await act(async () => { land([{ ...connection('lower:inner→peer'), kind: 'lower' } as Connection]) })
+    expect(result.current.contentsRef.current.connectionIds.get('B')).toEqual(['lower:inner→peer'])
+  })
+
+  it('drops derived edges that land after a newer read replaced theirs', async () => {
+    const { source, answer } = manualSource({ B: { objectIds: ['inner'], connectionIds: [] } })
+    const { result } = renderHook(() => useInlineExpansionContents({ host: 'B' }, null, source))
+    let land!: (edges: Connection[]) => void
+    await answer(0, { ...full(PLACED), lateDerived: new Promise((resolve) => { land = resolve }) })
+    act(() => { useAutomergeStatus.getState().noteTransportRestored() })
+    await answer(1, { ...full(PLACED), derived: [] })
+    await act(async () => { land([{ ...connection('lower:old'), kind: 'lower' } as Connection]) })
+    expect(result.current.contentsRef.current.connectionIds.get('B')).toEqual([])
   })
 
   // A relationship declared between two shapes the target does not show (a
@@ -142,8 +166,10 @@ describe('useInlineExpansionContents', () => {
       await manual.answer(0, { ...full(PLACED), derived })
       return manual
     }
+    /** A change, then the burst window (edge ends asked), then the re-read window. */
     const change = async (connectionIds: string[]) => {
       act(() => { notifyModelIndexChanged({ objectIds: [], connectionIds }) })
+      act(() => { vi.advanceTimersByTime(160) })
       await act(async () => {})
       act(() => { vi.advanceTimersByTime(160) })
     }
@@ -156,10 +182,75 @@ describe('useInlineExpansionContents', () => {
       expect(loads).toHaveLength(2)
     })
 
-    it('leaves a target alone when only one end reaches it', async () => {
+    // Reviewer lens N3: re-pointed AWAY, only one end is left in the target,
+    // and the roll-up the edge used to make must go.
+    it('re-reads a target only one end reaches (an edge re-pointed away)', async () => {
       const { loads } = await setup(ends({ 'mobile-x': { from: ['mobile'], to: ['x', 'elsewhere'] } }))
       await change(['mobile-x'])
+      expect(loads).toHaveLength(2)
+    })
+
+    it('leaves a target alone when neither end reaches it', async () => {
+      const { loads } = await setup(ends({ 'x-y': { from: ['x', 'elsewhere'], to: ['y'] } }))
+      await change(['x-y'])
       expect(loads).toHaveLength(1)
+    })
+
+    // QA lens H13: any of the changed edges, not only the first.
+    it('re-reads a target that only the second changed edge reaches', async () => {
+      const { loads } = await setup(ends({
+        'x-y': { from: ['x'], to: ['y'] },
+        'mobile-api': { from: ['mobile'], to: ['api', 'orders'] },
+      }))
+      await change(['x-y', 'mobile-api'])
+      expect(loads).toHaveLength(2)
+    })
+
+    // QA lens H8: a change naming no edge asks nothing.
+    it('does not ask about edge ends for a change that names no edge', async () => {
+      const edgeEnds = ends({})
+      await setup(edgeEnds)
+      act(() => { notifyModelIndexChanged({ objectIds: ['elsewhere'], connectionIds: [] }) })
+      act(() => { vi.advanceTimersByTime(500) })
+      await act(async () => {})
+      expect(edgeEnds).not.toHaveBeenCalled()
+    })
+
+    // QA lens H12: a target gone from the index while its ends were being read.
+    it('survives a composition that disappears while the ends are read', async () => {
+      let answerEnds!: (map: Map<string, null>) => void
+      const edgeEnds = vi.fn(() => new Promise<Map<string, null>>((resolve) => { answerEnds = resolve }))
+      vi.useFakeTimers()
+      const compositions: Record<string, { objectIds: string[]; connectionIds: string[] } | undefined> = {
+        B: { objectIds: ['mobile'], connectionIds: [] },
+      }
+      const manual = manualSource(compositions as never)
+      const unhandled = vi.fn()
+      process.on('unhandledRejection', unhandled)
+      try {
+        renderHook(() => useInlineExpansionContents({ host: 'B' }, null, { ...manual.source, edgeEnds }))
+        await manual.answer(0, { ...full(PLACED), derived: [{ ...connection('lower:a→b'), kind: 'lower' } as Connection] })
+        act(() => { notifyModelIndexChanged({ objectIds: [], connectionIds: ['gone'] }) })
+        act(() => { vi.advanceTimersByTime(160) })
+        compositions.B = undefined
+        await act(async () => { answerEnds(new Map([['gone', null]])) })
+        await act(async () => {})
+        expect(unhandled).not.toHaveBeenCalled()
+      } finally {
+        process.off('unhandledRejection', unhandled)
+      }
+    })
+
+    // Reviewer lens N6: one batched read per burst, not one per change.
+    it('asks about the ends of a burst of changes once', async () => {
+      const edgeEnds = ends({})
+      await setup(edgeEnds)
+      act(() => { notifyModelIndexChanged({ objectIds: [], connectionIds: ['a'] }) })
+      act(() => { notifyModelIndexChanged({ objectIds: [], connectionIds: ['b'] }) })
+      act(() => { vi.advanceTimersByTime(160) })
+      await act(async () => {})
+      expect(edgeEnds).toHaveBeenCalledOnce()
+      expect([...edgeEnds.mock.calls[0][0]].sort()).toEqual(['a', 'b'])
     })
 
     it('an unreadable (deleted) edge re-reads only a target that draws derived edges', async () => {

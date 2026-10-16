@@ -760,10 +760,10 @@ test('Expand here draws the target\'s edges, derived and outward ones included, 
   await expect.poll(() => missing(componentEdges), {
     timeout: 15_000, message: 'component edges the Components diagram draws are missing from the nested expansion',
   }).toEqual([])
-  // Each roll-up onto the service is now drawn component by component: the
-  // dashed line onto its wrapper would say the same thing twice.
-  const ontoService = (await drawnEdges(page)).filter((e) => e.fromId === `inline-expand:${serviceId}` || e.toId === `inline-expand:${serviceId}`)
-  expect(ontoService.map((e) => e.pair), 'a roll-up onto the expanded service is still drawn').toEqual([])
+  // The roll-ups onto the service stay, on its wrapper (they may summarise
+  // more than the block draws) — and no pair is drawn twice.
+  const pairs = (await drawnEdges(page)).filter((e) => e.lower).map((e) => e.pair)
+  expect(pairs.filter((pair, i) => pairs.indexOf(pair) !== i), 'a roll-up drawn twice').toEqual([])
 })
 
 // The reported follow-up: offline, a target's DiagramDoc that never synced to
