@@ -34,6 +34,7 @@ import { CanvasToolbar } from '../comments/CanvasToolbar'
 import { useDiagramReadyFit } from './useDiagramReadyFit'
 import {
   expandDiagramsInline,
+  GestureCutsLatch,
   modelCommentsToView,
   shiftPoint,
   unshiftBox,
@@ -363,6 +364,9 @@ export function CanvasView() {
    * Empty with nothing expanded, which makes both maps the identity.
    */
   const viewCutsRef = useRef<MakeRoomCut[]>([])
+  /** The cuts a drag or resize STARTED under, if the view was re-planned
+   *  during it (see `GestureCutsLatch`). */
+  const gestureCutsRef = useRef(new GestureCutsLatch())
   /** View point -> model point, through the cuts drawn right now. */
   const toModel = useCallback((point: { x: number; y: number }) => unshiftPoint(viewCutsRef.current, point), [])
   /**
@@ -466,6 +470,7 @@ export function CanvasView() {
         },
       )
     const cutsChanged = JSON.stringify(expanded.cuts) !== JSON.stringify(viewCutsRef.current)
+    gestureCutsRef.current.replanned(viewCutsRef.current, engine.activePlacementGesture())
     viewCutsRef.current = expanded.cuts
     const ownIds = new Set<string>([
       ...merged.filteredObjects.map((o) => o.id),
@@ -633,10 +638,11 @@ export function CanvasView() {
         // The engine reports where it DRAWS them; with an expansion open that is
         // displaced from the model (`viewCutsRef`). Never write the displacement.
         const viewOnly = viewOnlyIdsRef.current
-        const modelPlacements = viewPlacementsToModel(viewCutsRef.current, viewOnly, {
-          objects: objectUpdates,
-          groups: groupUpdates,
-        })
+        const modelPlacements = viewPlacementsToModel(
+          gestureCutsRef.current.forCommit(viewCutsRef.current, engineRef.current?.activePlacementGesture() ?? null),
+          viewOnly,
+          { objects: objectUpdates, groups: groupUpdates },
+        )
         updatePlacementsBatch({
           ...modelPlacements,
           connections: connectionUpdates.filter((update) => !viewOnly.has(update.id)),
@@ -732,7 +738,10 @@ export function CanvasView() {
         updateConnection(connId, { labelPosition: position, labelOffset: offset })
       },
       onConnectionWaypointsChange: (connId, waypoints) => {
-        const modelWaypoints = viewWaypointsToModel(viewCutsRef.current, viewOnlyIdsRef.current, connId, waypoints)
+        // A waypoint drag keeps its points in the frame it started in, like a
+        // shape drag (`GestureCutsLatch`).
+        const cuts = gestureCutsRef.current.forCommit(viewCutsRef.current, engineRef.current?.activePlacementGesture() ?? null)
+        const modelWaypoints = viewWaypointsToModel(cuts, viewOnlyIdsRef.current, connId, waypoints)
         if (!modelWaypoints) return
         updateConnection(connId, { waypoints: modelWaypoints.length > 0 ? modelWaypoints : undefined })
       },
@@ -811,6 +820,11 @@ export function CanvasView() {
         setExpandMenu({ object: obj, x: menuX, y: menuY })
       },
       onGroupNavigateUp: () => navigateToParentRef.current?.(),
+      // The room made for an inline expansion was sized with the engine's
+      // measurement at the time; re-plan when that measurement changes.
+      onWrapperMetricsChanged: () => {
+        if (Object.keys(useUIStore.getState().inlineExpansions).length > 0) syncEngineFromStore()
+      },
     }, resolvedSkin)
 
     engineRef.current = engine

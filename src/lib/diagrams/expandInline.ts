@@ -268,6 +268,36 @@ export function viewPlacementsToModel<
   }
 }
 
+/**
+ * Which cuts a placement commit must be undone with.
+ *
+ * Not always the current ones: while a drag or resize is under the pointer the
+ * engine keeps that shape where the pointer put it across any `setData`
+ * (`preserveActivePlacementPreview`), so if the view is re-planned mid-gesture —
+ * the target's placement read lands, a peer moves the host — the shape is still
+ * in the frame the gesture STARTED in, and undoing it with the new cuts would
+ * store the difference. Told about every re-plan, this keeps the frame the
+ * gesture began under and hands it to THAT gesture's commit. Keyed by the
+ * engine's gesture id, so a gesture that ended without a commit (pressed,
+ * re-planned, released in place) cannot leak its frame into the next one.
+ */
+export class GestureCutsLatch {
+  private latched: { gesture: number; cuts: MakeRoomCut[] } | null = null
+
+  /** Called on every re-plan, BEFORE the new cuts are adopted. */
+  replanned(previousCuts: MakeRoomCut[], activeGesture: number | null): void {
+    if (activeGesture === null) this.latched = null
+    else if (this.latched?.gesture !== activeGesture) this.latched = { gesture: activeGesture, cuts: previousCuts }
+  }
+
+  /** The cuts the commit of `activeGesture` was drawn under; the latch is released. */
+  forCommit(currentCuts: MakeRoomCut[], activeGesture: number | null): MakeRoomCut[] {
+    const cuts = this.latched && this.latched.gesture === activeGesture ? this.latched.cuts : currentCuts
+    this.latched = null
+    return cuts
+  }
+}
+
 /** A connection's edited waypoints in the MODEL frame; `null` when the edge was
  *  pulled in by an expansion and the edit must be dropped. */
 export function viewWaypointsToModel(

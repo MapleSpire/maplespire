@@ -172,16 +172,25 @@ function readDiagram(page: Page, id: string): Promise<ProbeDiagram | null> {
  *  the only moment its layout is in memory, and the ground truth below. */
 async function materialise(page: Page, id: string): Promise<ProbeDiagram> {
   await page.getByTestId(`diagram-card-${id}`).click()
+  // Keep the SAME read that satisfied the poll. Reading again afterwards raced
+  // the next projection: the diagram could already be a layout-less stub again,
+  // and the ground truth came back with `layouts: null` (measured 2026-10-15:
+  // 1 run in ~20, a TypeError deep in expectArrangement).
+  // Widened by hand: assigned inside the poll callback, which control-flow
+  // analysis cannot see, so a plain `null` initialiser narrows it to `never`.
+  let placed = null as ProbeDiagram | null
   await expect
     .poll(
       async () => {
         const d = await readDiagram(page, id)
-        return !!d && d.objectIds.length > 0 && d.objectIds.every((o) => d.layouts?.[o] !== undefined)
+        const complete = !!d && d.objectIds.length > 0 && d.objectIds.every((o) => d.layouts?.[o] !== undefined)
+        if (complete) placed = d
+        return complete
       },
       { timeout: 45_000, message: `diagram ${id} never became fully placed in the store` },
     )
     .toBe(true)
-  return (await readDiagram(page, id))!
+  return placed!
 }
 
 type EnginePositions = Record<string, { x: number; y: number }>

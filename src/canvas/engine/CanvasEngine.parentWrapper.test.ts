@@ -16,7 +16,10 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { CanvasEngine } from './CanvasEngine'
+
+type CanvasCallbacks = ConstructorParameters<typeof CanvasEngine>[1]
 import { parentWrapperBox, parentWrapperHeaderBand } from '../parentWrapperBox'
+import { defaultSkin } from '../../skins/defaultSkin'
 import type { C4Object, Group } from '../../types'
 
 /**
@@ -41,7 +44,14 @@ function wrapper(hostId: string, objectIds: string[], over: Partial<Group> = {})
   } as Group
 }
 
-function engineWith(objects: C4Object[], groups: Group[]) {
+function mouse(type: string, x: number, y: number): MouseEvent {
+  const event = new MouseEvent(type, { button: 0, clientX: x, clientY: y })
+  Object.defineProperty(event, 'offsetX', { value: x })
+  Object.defineProperty(event, 'offsetY', { value: y })
+  return event
+}
+
+function engineWith(objects: C4Object[], groups: Group[], extra: Partial<CanvasCallbacks> = {}) {
   const canvas = document.createElement('canvas')
   const noop = () => undefined
   const engine = new CanvasEngine(canvas, {
@@ -50,6 +60,7 @@ function engineWith(objects: C4Object[], groups: Group[]) {
     onConnectionWaypointsChange: noop, onConnectionStart: noop, onConnectionEnd: noop,
     onConnectionAnchorMove: noop, onZoom: noop, onCommentClick: noop, onCommentMove: noop,
     onContextMenu: noop, onGroupSelect: noop, onCopyApply: noop, onExpandClick: noop,
+    ...extra,
   })
   engine.setData(objects, [], groups)
   return engine
@@ -116,6 +127,73 @@ describe('CanvasEngine parent-wrapper box', () => {
     const withHost = engineWith([host, object('a', 0, 0)], [w])
     const without = engineWith([object('a', 0, 0)], [w])
     expect(withHost.inlineWrapperMinWidth(w)).toBe(without.inlineWrapperMinWidth(w))
+  })
+
+  // The planner sized the room with the measurement of its moment; when the
+  // measurement changes, the engine says so and redraws the box to the new one.
+  it('redraws a wrapper and tells the caller when the back glyph changes its floor', () => {
+    const outer = wrapper('sys', ['a'], { name: '' })
+    const changed = vi.fn()
+    // A member narrower than the corner-affordance floor, so the floor binds.
+    const tiny = { ...object('a', 0, 0), size: { width: 4, height: 4 } }
+    const engine = engineWith([tiny], [outer], { onWrapperMetricsChanged: changed })
+    const narrow = engine.getGroupBoundsById(outer.id)!.width
+    engine.setCanNavigateUp(true)
+    expect(changed).toHaveBeenCalledTimes(1)
+    expect(engine.getGroupBoundsById(outer.id)!.width).toBe(engine.inlineWrapperMinWidth(outer))
+    expect(engine.getGroupBoundsById(outer.id)!.width).toBeGreaterThan(narrow)
+    engine.setCanNavigateUp(true)
+    expect(changed).toHaveBeenCalledTimes(1)
+  })
+
+  it('tells the caller when web fonts arrive', () => {
+    // jsdom has no FontFaceSet; the engine listens on whatever document.fonts is.
+    const fonts = new EventTarget()
+    Object.defineProperty(document, 'fonts', { value: fonts, configurable: true })
+    try {
+      const changed = vi.fn()
+      const engine = engineWith([object('a', 0, 0)], [], { onWrapperMetricsChanged: changed })
+      fonts.dispatchEvent(new Event('loadingdone'))
+      expect(changed).toHaveBeenCalledTimes(1)
+      engine.destroy()
+      fonts.dispatchEvent(new Event('loadingdone'))
+      expect(changed).toHaveBeenCalledTimes(1)
+    } finally {
+      delete (document as unknown as { fonts?: EventTarget }).fonts
+    }
+  })
+
+  it('tells the caller when the skin changes', () => {
+    const changed = vi.fn()
+    const engine = engineWith([object('a', 0, 0)], [], { onWrapperMetricsChanged: changed })
+    changed.mockClear()
+    engine.setSkin(defaultSkin)
+    expect(changed).toHaveBeenCalledTimes(1)
+  })
+
+  // CanvasView matches a commit to the gesture that started under a given set
+  // of cuts (`GestureCutsLatch`): the id must still be there DURING the commit,
+  // and a new gesture must get a new one.
+  it('names the drag under the pointer, still during its commit, and none at rest', () => {
+    const seen: Array<number | null> = []
+    let engine: CanvasEngine | null = null
+    engine = engineWith([object('a', 0, 0)], [], {
+      onPlacementsCommit: () => { seen.push(engine!.activePlacementGesture()) },
+    })
+    expect(engine.activePlacementGesture()).toBeNull()
+    const drag = (from: number, to: number) => {
+      const internals = engine as unknown as Record<'onMouseDown' | 'onMouseMove' | 'onMouseUp', (e?: MouseEvent) => void>
+      internals.onMouseDown(mouse('mousedown', from, 20))
+      internals.onMouseMove(mouse('mousemove', to, 20))
+      internals.onMouseUp()
+    }
+    drag(20, 80)
+    drag(80, 140)
+    expect(seen).toHaveLength(2)
+    expect(seen[0]).not.toBeNull()
+    expect(seen[1]).not.toBeNull()
+    expect(seen[1]).not.toBe(seen[0])
+    expect(engine.activePlacementGesture()).toBeNull()
   })
 
   it('ignores a nesting it cannot resolve rather than failing', () => {

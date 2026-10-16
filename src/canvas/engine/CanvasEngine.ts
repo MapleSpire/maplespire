@@ -198,6 +198,10 @@ interface EngineCallbacks {
   onExpandClick: (objectId: string, menuX: number, menuY: number) => void
   onGroupExpandClick?: (objectId: string, menuX: number, menuY: number) => void
   onGroupNavigateUp?: () => void
+  /** A parent wrapper's measured minimum width may have changed (web fonts
+   *  loaded, the back glyph appeared or went): a caller that predicted wrapper
+   *  boxes (the inline-expansion planner) must predict them again. */
+  onWrapperMetricsChanged?: () => void
 }
 
 export interface CanvasViewportInsets {
@@ -331,6 +335,8 @@ export class CanvasEngine {
   private smartGuides: SmartGuide[] = []
   private smartGuideSnap = { x: false, y: false }
   private placementGestureStartedAt = 0
+  /** Bumped at every drag/resize start: names the gesture a commit belongs to. */
+  private placementGestureSeq = 0
   private placementPreviewUpdates = 0
 
   // Resize handle state
@@ -385,6 +391,9 @@ export class CanvasEngine {
     this.shapeConnectionSidesCache.clear()
     this.connectionSpatialIndex = null
     this.scheduleRender()
+    // A wrapper's header floor is measured text: whoever predicted its box
+    // with the old face (the inline-expansion planner) must predict again.
+    this.callbacks.onWrapperMetricsChanged?.()
   }
   private needsRender = true
   private dataRevision = 0
@@ -611,6 +620,8 @@ export class CanvasEngine {
     const community = getCommunityTheme(skin.id)
     this.themeBridge.activate(community ?? getOfficialTheme(skin.id))
     this.scheduleRender()
+    // The font changes the measured header floor of a parent wrapper.
+    this.callbacks.onWrapperMetricsChanged?.()
   }
 
   /** Keep catalog artwork aligned with the application theme. The image cache
@@ -1060,7 +1071,34 @@ export class CanvasEngine {
   setCanNavigateUp(value: boolean) {
     if (this.canNavigateUp === value) return
     this.canNavigateUp = value
+    // The back glyph is part of a parent wrapper's minimum width
+    // (`measureGroupHeaderMinWidth`), so its box and header layout change.
+    this.groupBoundsCache.clear()
+    this.groupHeaderCache.clear()
+    this.groupSpatialIndex = null
+    this.connectionGeometryCache.clear()
+    this.shapeConnectionSidesCache.clear()
+    this.connectionSpatialIndex = null
     this.scheduleRender()
+    this.callbacks.onWrapperMetricsChanged?.()
+  }
+
+  private beginPlacementGesture(): void {
+    this.placementGestureStartedAt = performance.now()
+    this.placementGestureSeq += 1
+  }
+
+  /**
+   * The drag, resize or waypoint drag under the pointer right now, or `null`:
+   * until mouse-up the engine keeps what is being dragged where the pointer
+   * put it, whatever `setData` says (`preserveActivePlacementPreview`, and
+   * `workingWaypoints`). Still set while its commit callback runs, so the
+   * commit can be matched to the gesture.
+   */
+  activePlacementGesture(): number | null {
+    return this.draggingId || this.draggingGroupId || this.resizingId || this.draggingWaypointConnId
+      ? this.placementGestureSeq
+      : null
   }
 
   private startInteraction() {
@@ -1800,7 +1838,7 @@ export class CanvasEngine {
     // Check if clicking on a resize handle (skip in readonly)
     const resizeHit = !this.readonly ? this.hitTestResizeHandle(pos.x, pos.y) : null
     if (resizeHit) {
-      this.placementGestureStartedAt = performance.now()
+      this.beginPlacementGesture()
       this.placementPreviewUpdates = 0
       this.resizingId = resizeHit.targetId
       this.resizingType = resizeHit.targetType
@@ -1879,6 +1917,7 @@ export class CanvasEngine {
         if (wpHit) {
           const conn = this.connections.find((c) => c.id === wpHit.connId)
           this.draggingWaypointConnId = wpHit.connId
+          this.placementGestureSeq += 1
           this.draggingWaypointIndex = wpHit.index
           this.workingWaypoints = (conn?.waypoints ?? []).map((p) => ({ ...p }))
           this.scheduleRender()
@@ -1978,7 +2017,7 @@ export class CanvasEngine {
       }
 
       this.draggingId = obj.id
-      this.placementGestureStartedAt = performance.now()
+      this.beginPlacementGesture()
       this.placementPreviewUpdates = 0
       this.dragOffset = { x: pos.x - obj.position.x, y: pos.y - obj.position.y }
       // If dragging an object that's part of a multi-selection, capture all selected object positions
@@ -2026,7 +2065,7 @@ export class CanvasEngine {
           }
           if (!this.readonly) {
             this.draggingGroupId = group.id
-            this.placementGestureStartedAt = performance.now()
+            this.beginPlacementGesture()
             this.placementPreviewUpdates = 0
             this.dragGroupStartPositions.clear()
             const groupObjects = this.objects.filter((o) => group.objectIds.includes(o.id))
@@ -2327,6 +2366,7 @@ export class CanvasEngine {
           wps.splice(this.pendingWaypoint.index, 0, { x: pos.x, y: pos.y })
           this.workingWaypoints = wps
           this.draggingWaypointConnId = this.pendingWaypoint.connId
+          this.placementGestureSeq += 1
           this.draggingWaypointIndex = this.pendingWaypoint.index
           this.invalidateConnectionGeometry(this.pendingWaypoint.connId)
         }

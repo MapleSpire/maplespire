@@ -16,6 +16,7 @@ import { describe, expect, it } from 'vitest'
 
 import {
   expandDiagramsInline,
+  GestureCutsLatch,
   inlineWrapperId,
   modelCommentsToView,
   shiftBox,
@@ -772,6 +773,44 @@ describe('expandDiagramsInline', () => {
       ])
       expect(comments[0].position).toEqual({ x: 900, y: 700 })
       expect(modelCommentsToView([], comments)).toEqual(comments)
+    })
+
+    // The engine keeps a dragged shape in the frame its gesture started in,
+    // whatever setData says; a re-plan mid-drag must not change how its commit
+    // is undone.
+    describe('the frame a gesture started in', () => {
+      const before = cuts.slice(0, 1)
+      const after = cuts
+
+      it('undoes a commit with the cuts its gesture began under, once', () => {
+        const latch = new GestureCutsLatch()
+        latch.replanned(before, 7)
+        latch.replanned(after, 7)
+        expect(latch.forCommit(after, 7)).toBe(before)
+        // Released: the next commit uses the current cuts.
+        expect(latch.forCommit(after, 8)).toBe(after)
+      })
+
+      it('uses the current cuts when nothing was re-planned during the gesture', () => {
+        expect(new GestureCutsLatch().forCommit(after, 3)).toBe(after)
+      })
+
+      it('does not leak a gesture that ended without a commit into the next one', () => {
+        const latch = new GestureCutsLatch()
+        latch.replanned(before, 4)
+        // Gesture 4 released in place, no commit; gesture 5 is re-planned under the new cuts.
+        latch.replanned(after, 5)
+        expect(latch.forCommit(after, 5)).toBe(after)
+        latch.replanned(before, 6)
+        expect(latch.forCommit(after, 7)).toBe(after)
+      })
+
+      it('forgets the frame once no gesture is active', () => {
+        const latch = new GestureCutsLatch()
+        latch.replanned(before, 1)
+        latch.replanned(after, null)
+        expect(latch.forCommit(after, 1)).toBe(after)
+      })
     })
 
     it('is the identity with nothing expanded', () => {
