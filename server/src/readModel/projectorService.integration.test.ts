@@ -19,6 +19,7 @@ import { startReadModelProjector } from './projectorService.js'
 import { documentRetryRegistry } from './documentRetryQueue.js'
 import { roObject, roGroup, roConnectionCount } from './queries.js'
 import { roObjectCacheByIds } from './objectExplorer.js'
+import { roDiagramCacheByIds } from './diagramOffline.js'
 import { verifyWorkspaceIntegrity } from './projectionIntegrity.js'
 import type { WorkspaceKey } from './projector.js'
 import { guardIdleClientErrors } from '../db/poolErrorGuard.js'
@@ -208,7 +209,12 @@ suite('read-model projector wiring (in-process Automerge → Postgres)', () => {
       const attached = await objectsEventsOf(() => meta.change((d: { objectShardUrls: string[] }) => {
         d.objectShardUrls.push(os2.url)
       }))
-      expect(attached).toEqual([{ generation: expect.any(Number), upsertIds: ['n1', 'n2', 'p'], deleteIds: [] }])
+      // Two generations: the metadata pass itself, which moved no served row
+      // (it used to publish reset/all here), then the attach.
+      expect(attached).toEqual([
+        { generation: expect.any(Number), upsertIds: [], deleteIds: [] },
+        { generation: expect.any(Number), upsertIds: ['n1', 'n2', 'p'], deleteIds: [] },
+      ])
 
       // A parent deleted from ITS shard re-roots a child living in ANOTHER one:
       // `n2`'s served parent moves although no shard naming `n2` changed. The
@@ -235,13 +241,299 @@ suite('read-model projector wiring (in-process Automerge → Postgres)', () => {
       const bigAttached = await objectsEventsOf(() => meta.change((d: { objectShardUrls: string[] }) => {
         d.objectShardUrls.push(os3.url)
       }))
-      expect(bigAttached[0]?.upsertIds).toHaveLength(520)
+      // [0] is the metadata pass, which moved nothing; [1] the attach.
+      expect(bigAttached.map((event) => event.upsertIds.length)).toEqual([0, 520])
       const lastRenamed = await objectsEventsOf(() => os3.change((d: Shard) => { d.objects.b519.name = 'last' }))
       expect(lastRenamed).toEqual([{ generation: expect.any(Number), upsertIds: ['b519'], deleteIds: [] }])
     } finally {
       stop()
     }
   }, 60_000)
+
+  it('publishes what each pass moved — connections, groups, tombstones, flows, registry — and no blanket reset', async () => {
+    // Measured 2026-10-16 before this: a connection-label edit listed every
+    // connection of its shard, and the metadata (a Structurizr system rename
+    // renames its boundary group), flow (EVERY change of a diagram document,
+    // a drag included) and registry passes each published reset/all — which
+    // makes an inline expansion re-read and an offline copy re-download.
+    type Stored = { kind: string; payload: Record<string, unknown> }
+    // Order within a list is not part of the contract.
+    const sortedIds = (value: unknown): unknown => Array.isArray(value)
+      ? [...value].sort()
+      : value && typeof value === 'object'
+        ? Object.fromEntries(Object.entries(value).map(([field, inner]) => [field, sortedIds(inner)]))
+        : value
+    const eventsAfter = async (generation: number): Promise<Stored[]> => (await pool!.query<{
+      change_kind: string; payload: Record<string, unknown>
+    }>(
+      `SELECT change_kind, payload FROM read_model_change_events
+       WHERE landscape_id = $1 AND version_id = $2 AND generation > $3 ORDER BY generation`,
+      [WS.landscapeId, WS.versionId, generation],
+    )).rows.map((row) => ({ kind: row.change_kind, payload: sortedIds(row.payload) as Record<string, unknown> }))
+    const eventsOf = async (edit: () => void): Promise<Stored[]> => {
+      const baseline = await projectedGeneration()
+      edit()
+      await until(() => eventsAfter(baseline), (events) => events.length > 0)
+      await until(
+        async () => (await pool!.query<{ observed: number; projected: number }>(
+          `SELECT observed_generation::int AS observed, projected_generation::int AS projected
+           FROM read_model_projection_state WHERE landscape_id = $1 AND version_id = $2`,
+          [WS.landscapeId, WS.versionId],
+        )).rows[0],
+        (value) => value.observed === value.projected,
+      )
+      await new Promise((resolve) => setTimeout(resolve, 150))
+      return eventsAfter(baseline)
+    }
+    const ids = (upsertIds: string[], deleteIds: string[] = []) => ({ upsertIds, deleteIds })
+
+    const repo = new Repo({})
+    // `a` sits under `p` structurally, but its group takes precedence: `p` is
+    // nobody's effective parent until `a` leaves the group.
+    const os0 = repo.create({ objects: {
+      a: { id: 'a', name: 'A', parentId: 'p' }, b: { id: 'b', name: 'B' }, p: { id: 'p', name: 'P' },
+    } })
+    const cs0 = repo.create({ connections: {
+      c0: { id: 'c0', fromId: 'a', toId: 'b', label: 'L' }, c1: { id: 'c1', fromId: 'b', toId: 'a', label: 'M' },
+    } })
+    const doc1 = repo.create({ layouts: {}, comments: {}, flows: { f1: { id: 'f1', steps: [{ connectionId: 'c0' }] } } })
+    const registry = repo.create({ diagrams: { d1: {
+      id: 'd1', name: 'D', docUrl: doc1.url, objectIds: ['a', 'b'], connectionIds: ['c0'],
+    } } })
+    const meta = repo.create({
+      objectShardUrls: [os0.url], connectionShardUrls: [cs0.url],
+      groups: { g1: { id: 'g1', name: 'G', objectIds: ['a'] } },
+    })
+    const root = repo.create({ modelMetaUrl: meta.url, modelUrl: '', shardUrls: [registry.url] })
+    await Promise.all([os0, cs0, doc1, registry, meta, root].map((h) => h.whenReady()))
+    type Meta = {
+      groups: Record<string, { id: string; name: string; objectIds: string[] }>
+      deletedObjectIds?: string[]; deletedConnectionIds?: string[]
+    }
+    type Doc = { layouts: Record<string, unknown>; flows: Record<string, { id: string; steps: { connectionId: string }[] }> }
+    type Registry = { diagrams: Record<string, { name: string; connectionIds: string[] }> }
+
+    const stop = await startReadModelProjector(repo, root.url, pool!, WS)
+    try {
+      // The diagram document attaches AFTER boot returns, and its first flow
+      // projection is a generation of its own (c0's flow_count 0 -> 1): let it
+      // land before any arm takes its baseline.
+      await until(async () => (await pool!.query<{ n: number }>(
+        `SELECT count(*)::int AS n FROM ro_connection_flows WHERE landscape_id = $1 AND version_id = $2`,
+        [WS.landscapeId, WS.versionId],
+      )).rows[0]!.n, (n) => n === 1)
+      await until(
+        async () => (await pool!.query<{ observed: number; projected: number }>(
+          `SELECT observed_generation::int AS observed, projected_generation::int AS projected
+           FROM read_model_projection_state WHERE landscape_id = $1 AND version_id = $2`,
+          [WS.landscapeId, WS.versionId],
+        )).rows[0],
+        (value) => value.observed === value.projected,
+      )
+      await new Promise((resolve) => setTimeout(resolve, 150))
+
+      // Connection shard: one label, one id.
+      expect(await eventsOf(() => cs0.change((d: { connections: Record<string, { label: string }> }) => {
+        d.connections.c0.label = 'L2'
+      }))).toEqual([{ kind: 'connections', payload: ids(['c0']) }])
+
+      // ModelMeta, a group renamed: the group, and nothing else.
+      expect(await eventsOf(() => meta.change((d: Meta) => { d.groups.g1.name = 'G2' })))
+        .toEqual([{ kind: 'objects', payload: ids(['g1']) }])
+      // A member joins: its served parent becomes the group, the group's count moves.
+      expect(await eventsOf(() => meta.change((d: Meta) => { d.groups.g1.objectIds.push('b') })))
+        .toEqual([{ kind: 'objects', payload: ids(['b', 'g1']) }])
+      // A member LEAVES: it falls back to its structural parent, whose count
+      // rises — a parent that was nobody's effective parent before the write.
+      expect(await eventsOf(() => meta.change((d: Meta) => { d.groups.g1.objectIds.splice(0, 1) })))
+        .toEqual([{ kind: 'objects', payload: ids(['a', 'g1', 'p']) }])
+
+      // The diagram document, layout only: the flow pass runs and moves nothing.
+      expect(await eventsOf(() => doc1.change((d: Doc) => { d.layouts.a = { x: 1, y: 2 } })))
+        .toEqual([{ kind: 'connections', payload: ids([]) }])
+      // A flow now walks c1: its served flow_count moves, c0's does not.
+      expect(await eventsOf(() => doc1.change((d: Doc) => {
+        d.flows.f2 = { id: 'f2', steps: [{ connectionId: 'c1' }] }
+      }))).toEqual([{ kind: 'connections', payload: ids(['c1']) }])
+
+      // The registry, c1 added to d1: its manifest and c1's diagram_count. Two
+      // kinds, so stored as reset/all — what an older reader rebuilds from —
+      // carrying the exact lists a current one applies.
+      expect(await eventsOf(() => registry.change((d: Registry) => { d.diagrams.d1.connectionIds.push('c1') })))
+        .toEqual([{ kind: 'reset', payload: { scope: 'all', exact: { diagrams: ids(['d1']), connections: ids(['c1']) } } }])
+      // The registry, a rename: a manifest is references only — nothing served moved.
+      expect(await eventsOf(() => registry.change((d: Registry) => { d.diagrams.d1.name = 'D2' })))
+        .toEqual([{ kind: 'objects', payload: ids([]) }])
+
+      // Tombstones, both families at once: b's row goes (and g1's count with
+      // it), c0's row goes — and d1's manifest, which listed both.
+      expect(await eventsOf(() => meta.change((d: Meta) => {
+        d.deletedObjectIds = ['b']
+        d.deletedConnectionIds = ['c0']
+      }))).toEqual([{ kind: 'reset', payload: { scope: 'all', exact: {
+        objects: ids(['g1'], ['b']), connections: ids([], ['c0']), diagrams: ids(['d1']),
+      } } }])
+
+      // Shard deletes move manifests too: c1 leaves its shard (d1 lists it),
+      // then `a` leaves its shard (d1 lists it; `p` loses its only child).
+      // The shard pass also re-writes c0, which the tombstone above deleted
+      // but which is still IN this shard: its row comes back, and the feed
+      // says so (the tombstone/shard precedence is not this change's to settle).
+      expect(await eventsOf(() => cs0.change((d: { connections: Record<string, unknown> }) => {
+        delete d.connections.c1
+      }))).toEqual([{ kind: 'reset', payload: { scope: 'all', exact: {
+        connections: ids(['c0'], ['c1']), diagrams: ids(['d1']),
+      } } }])
+      // Same for b: tombstoned above, still in os0, so this os0 pass brings it back.
+      expect(await eventsOf(() => os0.change((d: { objects: Record<string, unknown> }) => {
+        delete d.objects.a
+      }))).toEqual([{ kind: 'reset', payload: { scope: 'all', exact: {
+        objects: ids(['b', 'p'], ['a']), diagrams: ids(['d1']),
+      } } }])
+    } finally {
+      stop()
+    }
+  }, 60_000)
+
+  it('names the side each candidate list exists for: deletes, removals, leavers, new and gone rows', async () => {
+    // Lifted from the QA lens battery (2026-10-16): each arm below killed a
+    // mutant that dropped ONE source of candidates and left every other test
+    // green — the BEFORE side of a flow, previous members, previous groups,
+    // registry ids before AND after, a manifest's groupIds, flow_count alone.
+    type Stored = { kind: string; payload: Record<string, unknown> }
+    const sortedIds = (value: unknown): unknown => Array.isArray(value)
+      ? [...value].sort()
+      : value && typeof value === 'object'
+        ? Object.fromEntries(Object.entries(value).map(([field, inner]) => [field, sortedIds(inner)]))
+        : value
+    const eventsAfter = async (generation: number): Promise<Stored[]> => (await pool!.query<{
+      change_kind: string; payload: Record<string, unknown>
+    }>(
+      `SELECT change_kind, payload FROM read_model_change_events
+       WHERE landscape_id = $1 AND version_id = $2 AND generation > $3 ORDER BY generation`,
+      [WS.landscapeId, WS.versionId, generation],
+    )).rows.map((row) => ({ kind: row.change_kind, payload: sortedIds(row.payload) as Record<string, unknown> }))
+    const settle = async () => {
+      await until(
+        async () => (await pool!.query<{ observed: number; projected: number }>(
+          `SELECT observed_generation::int AS observed, projected_generation::int AS projected
+           FROM read_model_projection_state WHERE landscape_id = $1 AND version_id = $2`,
+          [WS.landscapeId, WS.versionId],
+        )).rows[0],
+        (value) => value.observed === value.projected,
+      )
+      await new Promise((resolve) => setTimeout(resolve, 250))
+    }
+    const eventsOf = async (edit: () => void, minEvents = 1): Promise<Stored[]> => {
+      const baseline = await projectedGeneration()
+      edit()
+      await until(() => eventsAfter(baseline), (events) => events.length >= minEvents, 8000)
+      await settle()
+      return eventsAfter(baseline)
+    }
+    const ids = (upsertIds: string[], deleteIds: string[] = []) => ({ upsertIds, deleteIds })
+
+    const repo = new Repo({})
+    const os0 = repo.create({ objects: {
+      a: { id: 'a', name: 'A' }, b: { id: 'b', name: 'B' }, x: { id: 'x', name: 'X' },
+    } })
+    const cs0 = repo.create({ connections: {
+      c0: { id: 'c0', fromId: 'a', toId: 'b', label: 'L' },
+      c1: { id: 'c1', fromId: 'b', toId: 'a', label: 'M' },
+      c5: { id: 'c5', fromId: 'a', toId: 'x', label: 'N' },
+      c7: { id: 'c7', fromId: 'a', toId: 'b', label: 'O' },
+    } })
+    const doc1 = repo.create({ layouts: {}, comments: {}, flows: {
+      f1: { id: 'f1', steps: [{ connectionId: 'c0' }] }, f2: { id: 'f2', steps: [{ connectionId: 'c1' }] },
+    } })
+    // dX's flow walks c5, which is in NO diagram's connectionIds: c5's
+    // diagram_count is 0 throughout, only its flow_count can move.
+    const docX = repo.create({ layouts: {}, comments: {}, flows: { fx: { id: 'fx', steps: [{ connectionId: 'c5' }] } } })
+    // dY walks c5 too: removing dX moves c5's flow_count 2 -> 1, never to absent.
+    const docY = repo.create({ layouts: {}, comments: {}, flows: { fy: { id: 'fy', steps: [{ connectionId: 'c5' }] } } })
+    const registry = repo.create({ diagrams: {
+      d1: { id: 'd1', name: 'D', docUrl: doc1.url, objectIds: ['a', 'b'], connectionIds: ['c0', 'c1'] },
+      dX: { id: 'dX', name: 'DX', docUrl: docX.url, objectIds: ['a'], connectionIds: [] },
+      dY: { id: 'dY', name: 'DY', docUrl: docY.url, objectIds: ['a'], connectionIds: [] },
+    } })
+    const meta = repo.create({
+      objectShardUrls: [os0.url], connectionShardUrls: [cs0.url],
+      groups: { g1: { id: 'g1', name: 'G', objectIds: ['a', 'b'] } },
+    })
+    const root = repo.create({ modelMetaUrl: meta.url, modelUrl: '', shardUrls: [registry.url] })
+    await Promise.all([os0, cs0, doc1, docX, docY, registry, meta, root].map((h) => h.whenReady()))
+    type Meta = {
+      groups: Record<string, { id: string; name: string; objectIds: string[] }>
+      deletedObjectIds?: string[]; deletedConnectionIds?: string[]
+      connectionShardUrls: string[]
+    }
+    type Doc = { flows: Record<string, unknown> }
+    type Registry = { diagrams: Record<string, Record<string, unknown>> }
+
+    const stop = await startReadModelProjector(repo, root.url, pool!, WS)
+    try {
+      await until(async () => (await pool!.query<{ n: number }>(
+        `SELECT count(*)::int AS n FROM ro_connection_flows WHERE landscape_id = $1 AND version_id = $2`,
+        [WS.landscapeId, WS.versionId],
+      )).rows[0]!.n, (n) => n === 4, 8000)
+      await settle()
+
+      // D9: a connection deleted from its shard.
+      expect(await eventsOf(() => cs0.change((d: { connections: Record<string, unknown> }) => {
+        delete d.connections.c7
+      }))).toEqual([{ kind: 'connections', payload: ids([], ['c7']) }])
+
+      // D8: a flow removed — only the BEFORE side names c0.
+      expect(await eventsOf(() => doc1.change((d: Doc) => { delete d.flows.f1 })))
+        .toEqual([{ kind: 'connections', payload: ids(['c0']) }])
+
+      // D4b: a member LEAVES a group — only the previous membership names b.
+      expect(await eventsOf(() => meta.change((d: Meta) => { d.groups.g1.objectIds.splice(1, 1) })))
+        .toEqual([{ kind: 'objects', payload: ids(['b', 'g1']) }])
+
+      // D5: a tombstoned object in no group, with no parent, no children.
+      expect(await eventsOf(() => meta.change((d: Meta) => { d.deletedObjectIds = ['x'] })))
+        .toEqual([{ kind: 'objects', payload: ids([], ['x']) }])
+
+      // D7: a NEW empty group — only the current groups name it.
+      expect(await eventsOf(() => meta.change((d: Meta) => { d.groups.g2 = { id: 'g2', name: 'G2', objectIds: [] } })))
+        .toEqual([{ kind: 'objects', payload: ids(['g2']) }])
+
+      // D4a: an empty group DELETED — only the previous groups name it.
+      expect(await eventsOf(() => meta.change((d: Meta) => { delete d.groups.g2 })))
+        .toEqual([{ kind: 'objects', payload: ids([], ['g2']) }])
+
+      // D1 + D3: a diagram removed from the registry: its manifest goes, and
+      // c5's flow_count (its only moving column) drops.
+      expect(await eventsOf(() => registry.change((d: Registry) => { delete d.diagrams.dX })))
+        .toEqual([{ kind: 'reset', payload: { scope: 'all', exact: { diagrams: ids([], ['dX']), connections: ids(['c5']) } } }])
+
+      // D2: a diagram ADDED to the registry.
+      expect(await eventsOf(() => registry.change((d: Registry) => {
+        d.diagrams.d3 = { id: 'd3', name: 'D3', objectIds: ['a'], connectionIds: ['c0'] }
+      }))).toEqual([{ kind: 'reset', payload: { scope: 'all', exact: { diagrams: ids(['d3']), connections: ids(['c0']) } } }])
+
+      // D13: a manifest's groupIds move.
+      expect(await eventsOf(() => registry.change((d: Registry) => { d.diagrams.d1.groupIds = ['g1'] })))
+        .toEqual([{ kind: 'reset', payload: { scope: 'all', exact: { diagrams: ids(['d1']) } } }])
+
+      // D14: the by-ids endpoint serves what the digest digested.
+      const served = await roDiagramCacheByIds(pool!, WS, ['d1', 'd3', 'dX'])
+      expect(served.items).toEqual([
+        { diagramId: 'd1', objectIds: ['a', 'b'], connectionIds: ['c0', 'c1'], groupIds: ['g1'] },
+        { diagramId: 'd3', objectIds: ['a'], connectionIds: ['c0'], groupIds: [] },
+      ])
+
+      // D10: a connection shard ATTACHED: the metadata pass (nothing served
+      // moved), then the attach naming its new connection.
+      const cs1 = repo.create({ connections: { c9: { id: 'c9', fromId: 'a', toId: 'b', label: 'Z' } } })
+      await cs1.whenReady()
+      expect(await eventsOf(() => meta.change((d: Meta) => { d.connectionShardUrls.push(cs1.url) }), 2))
+        .toEqual([{ kind: 'objects', payload: ids([]) }, { kind: 'connections', payload: ids(['c9']) }])
+    } finally {
+      stop()
+    }
+  }, 90_000)
 
   it('seals a digest a REAL cold build can be verified against, and detects a row removed behind its back', async () => {
     // The seam nothing else covers. The unit tests drive the projector with a

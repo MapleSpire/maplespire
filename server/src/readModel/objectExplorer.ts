@@ -20,6 +20,7 @@ import {
   ReadModelCursorError,
   readModelQueryHash,
 } from './cursor.js'
+import { servedRowsChangedBy, type ServedRowChanges } from './servedRowDigest.js'
 
 const MAX_PAGE = 50
 const MAX_HIERARCHY_DEPTH = 64
@@ -225,7 +226,7 @@ function mapObjectCacheRow(row: {
 }
 
 /** The row `roObjectCacheByIds` serves, for ids `$3` of workspace `$1`/`$2`.
- * ONE text for two readers: the endpoint, and `objectCacheRowDigests`, which
+ * ONE text for two readers: the endpoint, and `servedObjectRowsChangedBy`, which
  * decides which ids the change feed lists. If they could drift, the feed could
  * omit an id whose served row changed and a cache would keep the stale one. */
 const OBJECT_CACHE_ROWS_BY_IDS_SQL = `
@@ -247,38 +248,16 @@ const OBJECT_CACHE_ROWS_BY_IDS_SQL = `
        FROM ro_objects o
        WHERE o.landscape_id = $1 AND o.version_id = $2 AND o.id = ANY($3::text[])`
 
-/** A digest of the served cache row of each id that has one, read through the
- * caller's transaction. Taken before and after a projection's writes, it says
- * which rows a client re-fetching by id would actually see differ. Unbounded on
- * purpose: a shard is not capped at the endpoint's 500. */
-export async function objectCacheRowDigests(
-  db: Queryable,
-  key: WorkspaceKey,
-  ids: readonly string[],
-): Promise<Map<string, string>> {
-  const uniqueIds = [...new Set(ids.filter((id) => typeof id === 'string' && id.length > 0))]
-  if (!uniqueIds.length) return new Map()
-  const { rows } = await db.query<{ id: string; digest: string }>(
-    // Aggregated per id: a group and an object sharing an id are both served,
-    // and one digest must cover both, in an order that does not depend on the plan.
-    // sha256, not md5: md5() raises under a FIPS-mode OpenSSL (PostgreSQL 14+),
-    // which would fail every object-shard projection.
-    `SELECT served.id,
-            encode(sha256(convert_to(
-              string_agg(to_jsonb(served)::text, ',' ORDER BY to_jsonb(served)::text), 'UTF8')), 'hex') AS digest
-     FROM (${OBJECT_CACHE_ROWS_BY_IDS_SQL}) AS served
-     GROUP BY served.id`,
-    [key.landscapeId, key.versionId, uniqueIds],
-  )
-  return new Map(rows.map((row) => [row.id, row.digest]))
-}
-
 /** The ids whose served row a write to `ids` can move WITHOUT being one of
  * them, read from the rows as they stand — so before the write:
  *  - children (`parent_id` in `ids`, any shard): `refreshEffectiveParents`
  *    re-roots them when a parent appears or goes;
  *  - the current effective parents of `ids`: their `child_count` moves when
  *    a child leaves, including a shared id another shard last parented;
+ *  - the structural parents of `ids`: group membership takes precedence over
+ *    `parent_id`, so a member leaving its group (or the group going) falls
+ *    back to its parent, whose `child_count` rises — a parent that is nobody's
+ *    EFFECTIVE parent before the write;
  *  - the groups holding `ids`: deleting a member drops their `child_count`.
  * A projection's own snapshot cannot name these: they live in other shards. */
 export async function objectCacheNeighbourIds(
@@ -295,6 +274,9 @@ export async function objectCacheNeighbourIds(
      SELECT effective_parent_id FROM ro_objects
      WHERE landscape_id = $1 AND version_id = $2 AND id = ANY($3::text[]) AND effective_parent_id IS NOT NULL
      UNION
+     SELECT parent_id FROM ro_objects
+     WHERE landscape_id = $1 AND version_id = $2 AND id = ANY($3::text[]) AND parent_id IS NOT NULL
+     UNION
      SELECT group_id FROM ro_group_objects
      WHERE landscape_id = $1 AND version_id = $2 AND object_id = ANY($3::text[])`,
     [key.landscapeId, key.versionId, uniqueIds],
@@ -302,31 +284,18 @@ export async function objectCacheNeighbourIds(
   return rows.map((row) => row.id)
 }
 
-/** Run `write` through `tx` and return the ids whose served cache row it
- * changed: `seeds` (what the write names) and their neighbours, digested
- * before and after, in the caller's transaction. The ONE place the change feed
- * of an object projection learns its ids, so the two projection paths cannot
- * disagree about which rows they look at. */
-export async function servedObjectRowsChangedBy(
+/** Run `write` through `tx` and return what it did to the served object/group
+ * cache rows of `seeds` (what the write names) and their neighbours. The ONE
+ * place an object-feed event learns its ids, so the projection paths cannot
+ * disagree about which rows they look at (`servedRowDigest.ts`). */
+export function servedObjectRowsChangedBy(
   tx: Queryable,
   key: WorkspaceKey,
   seeds: readonly string[],
   write: () => Promise<void>,
-): Promise<string[]> {
-  const candidates = [...seeds, ...await objectCacheNeighbourIds(tx, key, seeds)]
-  const before = await objectCacheRowDigests(tx, key, candidates)
-  await write()
-  return changedCacheRowIds(candidates, before, await objectCacheRowDigests(tx, key, candidates))
-}
-
-/** The candidates whose served row differs between two digests — appeared,
- * disappeared or changed. An id with no row on either side is not a change. */
-export function changedCacheRowIds(
-  candidates: readonly string[],
-  before: ReadonlyMap<string, string>,
-  after: ReadonlyMap<string, string>,
-): string[] {
-  return [...new Set(candidates)].filter((id) => before.get(id) !== after.get(id))
+): Promise<ServedRowChanges> {
+  return servedRowsChangedBy(tx, key, OBJECT_CACHE_ROWS_BY_IDS_SQL,
+    async () => [...seeds, ...await objectCacheNeighbourIds(tx, key, seeds)], write)
 }
 
 /** Fetch a bounded set of changed object/group identities for the incremental

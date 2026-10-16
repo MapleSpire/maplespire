@@ -108,7 +108,7 @@ import {
 } from './readModel/diagramRenderGeneration.js'
 import { DiagramRenderCache, diagramRenderCacheConfig } from './readModel/diagramRenderCache.js'
 import { RedisDiagramRenderCache, redisDiagramRenderCacheConfig } from './readModel/diagramRenderRedisCache.js'
-import { roDiagramCachePage } from './readModel/diagramOffline.js'
+import { roDiagramCacheByIds, roDiagramCachePage } from './readModel/diagramOffline.js'
 import { roObjectCacheByIds, roObjectCachePage, roObjectSearchPage, roObjectTreeChildren } from './readModel/objectExplorer.js'
 import { roConnectionExplorerPage } from './readModel/connectionExplorer.js'
 import {
@@ -1511,6 +1511,11 @@ if (READ_MODEL_ENABLED) {
     const key = await ensureWorkspace(req, res)
     if (!key) return
     res.json(await roObjectCacheByIds(pool, key, boundedIdsParam(req.query.ids, 500)))
+  }))
+  app.get('/api/model/cache/diagrams/by-ids', route(async (req, res) => {
+    const key = await ensureWorkspace(req, res)
+    if (!key) return
+    res.json(await roDiagramCacheByIds(pool, key, boundedIdsParam(req.query.ids, 500)))
   }))
   app.get('/api/model/cache/diagrams', route(async (req, res) => {
     const key = await ensureWorkspace(req, res)

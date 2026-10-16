@@ -15,6 +15,7 @@
 import type { WorkspaceKey } from './projector.js'
 import type { Queryable } from './types.js'
 import { decodeReadModelCursor, encodeReadModelCursor, readModelQueryHash, ReadModelCursorError } from './cursor.js'
+import { servedRowsChangedBy, type ServedRowChanges } from './servedRowDigest.js'
 
 export interface OfflineCacheEstimate {
   objectCount: number
@@ -159,6 +160,53 @@ const connectionCacheSelect = (pageSql: string) => `WITH page AS (${pageSql})
     AND to_group.version_id = $2 AND to_group.id = page.to_id
   ORDER BY page.id`
 
+/** The row `roConnectionCacheByIds` serves, for ids `$3`. ONE text for the
+ * endpoint and for `servedConnectionRowsChangedBy`, which decides which ids a
+ * connection-feed event names. */
+const CONNECTION_CACHE_ROWS_BY_IDS_SQL = connectionCacheSelect(
+  `SELECT c.id, c.from_id, c.to_id, c.data
+   FROM ro_connections c
+   WHERE c.landscape_id = $1 AND c.version_id = $2 AND c.id = ANY($3::text[])`,
+)
+
+/** Run `write` through `tx` and return what it did to the served connection
+ * cache rows of `candidates`. A connection's served row moves with its own
+ * data, its endpoints' name/icon/type/domain, and its diagram and flow counts.
+ * Endpoint changes are NOT candidates here: an objects event already makes a
+ * cache refresh the connections adjacent to the ids it names
+ * (`fetchAdjacentConnections`), so the connection feed covers the rest. */
+export function servedConnectionRowsChangedBy(
+  tx: Queryable,
+  key: WorkspaceKey,
+  candidates: readonly string[] | (() => Promise<readonly string[]>),
+  write: () => Promise<void>,
+): Promise<ServedRowChanges> {
+  return servedRowsChangedBy(tx, key, CONNECTION_CACHE_ROWS_BY_IDS_SQL, candidates, write)
+}
+
+/** Per connection, the two served columns `connectionCacheSelect` derives from
+ * diagram membership and flows — `diagram_count` and `flow_count`, computed
+ * the same way — for every connection that has either. A full sync of the
+ * diagram registry rewrites both tables for the whole workspace and moves NO
+ * other served column (data and endpoints come from shards and objects), so
+ * the difference of two of these maps IS the set of connection rows it moved.
+ * Keep the two expressions in step with `connectionCacheSelect`. */
+export async function connectionMembershipCounts(db: Queryable, key: WorkspaceKey): Promise<Map<string, string>> {
+  const { rows } = await db.query<{ id: string; diagram_count: string | number; flow_count: string | number }>(
+    `SELECT id, sum(diagram_count)::int AS diagram_count, sum(flow_count)::int AS flow_count FROM (
+       SELECT connection_id AS id, count(*) AS diagram_count, 0 AS flow_count
+       FROM ro_diagram_connections WHERE landscape_id = $1 AND version_id = $2
+       GROUP BY connection_id
+       UNION ALL
+       SELECT connection_id AS id, 0 AS diagram_count, count(DISTINCT flow_id) AS flow_count
+       FROM ro_connection_flows WHERE landscape_id = $1 AND version_id = $2
+       GROUP BY connection_id
+     ) AS counts GROUP BY id`,
+    [key.landscapeId, key.versionId],
+  )
+  return new Map(rows.map((row) => [row.id, `${Number(row.diagram_count)}:${Number(row.flow_count)}`]))
+}
+
 /** Bounded point lookup used by the incremental cache feed. The same enriched
  * row contract as the snapshot feed prevents the main thread from resolving
  * endpoint names or scanning connection membership after a change. */
@@ -178,11 +226,7 @@ export async function roConnectionCacheByIds(
     return { projectionGeneration: Number(generationResult.rows[0]?.projected_generation ?? 0), items: [] }
   }
   const [{ rows }, generationResult] = await Promise.all([
-    db.query<ConnectionCacheSqlRow>(connectionCacheSelect(
-      `SELECT c.id, c.from_id, c.to_id, c.data
-       FROM ro_connections c
-       WHERE c.landscape_id = $1 AND c.version_id = $2 AND c.id = ANY($3::text[])`,
-    ), [key.landscapeId, key.versionId, boundedIds]),
+    db.query<ConnectionCacheSqlRow>(CONNECTION_CACHE_ROWS_BY_IDS_SQL, [key.landscapeId, key.versionId, boundedIds]),
     generationPromise,
   ])
   return {

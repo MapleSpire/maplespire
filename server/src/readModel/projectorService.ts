@@ -91,6 +91,9 @@ import {
 } from './documentRetryQueue.js'
 import { appendReadModelChange, type ReadModelChangePayload } from './changeFeed.js'
 import { servedObjectRowsChangedBy } from './objectExplorer.js'
+import { connectionMembershipCounts, servedConnectionRowsChangedBy } from './offlineCache.js'
+import { diagramIdsReferencing, servedDiagramRowsChangedBy } from './diagramOffline.js'
+import { changedCacheRowIds, type ServedRowChanges } from './servedRowDigest.js'
 import { withReadModelProjectionTransaction } from './projectionTransaction.js'
 import { ReadModelPlaneError, isProjectionMutexTimeout, isReadModelAuthorityLoss } from './projectionAuthority.js'
 import {
@@ -1624,12 +1627,28 @@ export async function startReadModelProjector(
               `${diagram.id}: ${docUrl} carries no flows map; its flow rows are left untouched`)
           return
         }
-        await runTracked('registry', (tx) => syncConnectionFlows(
-          tx, key, orgId, diagram.id, Object.values(readFlows.map),
-          // Certify coverage only for a real flows map: a `field-not-a-map`
-          // defect reads as `{}` and must not become "complete, no flows".
-          readFlows.defect === null,
-        ), { kind: 'reset', scope: 'all' },
+        const flows = Object.values(readFlows.map)
+        // The only served row a flow pass moves is a connection's `flow_count`,
+        // for the connections this diagram's flows reference before or after.
+        // It runs on EVERY change of the diagram document — a drag included —
+        // so a reset here re-downloaded every offline copy per gesture.
+        const flowConnectionIds = flows.flatMap((flow) => (flow.steps ?? [])
+          .flatMap((step) => step.connectionId ? [step.connectionId] : []))
+        await runTracked('registry', (tx) => servedConnectionRowsChangedBy(tx, key,
+          // GROUP BY, not the DISTINCT `syncConnectionFlows` itself issues: the
+          // projector suite counts that statement as "one flow projection".
+          async () => [...flowConnectionIds, ...(await tx.query<{ connection_id: string }>(
+            `SELECT connection_id FROM ro_connection_flows
+             WHERE landscape_id = $1 AND version_id = $2 AND diagram_id = $3
+             GROUP BY connection_id`,
+            [key.landscapeId, key.versionId, diagram.id],
+          )).rows.map((row) => row.connection_id)],
+          () => syncConnectionFlows(
+            tx, key, orgId, diagram.id, flows,
+            // Certify coverage only for a real flows map: a `field-not-a-map`
+            // defect reads as `{}` and must not become "complete, no flows".
+            readFlows.defect === null,
+          )), (changes) => ({ kind: 'connections', ...changes }),
         // Writes ro_connection_flows, ro_flows, ro_flow_objects and
         // ro_diagram_flow_index — NOTHING a digest covers (DIGEST_KINDS is the
         // object/connection/group/diagram id sets), so all four seals stay
@@ -2037,13 +2056,13 @@ export async function startReadModelProjector(
             )
           }
           await acknowledgeOverlayBatches(tx, key, 'object', h.documentId, attachBatchIds, 'projected', 0, 0)
-          const changedIds = await servedObjectRowsChangedBy(tx, key, candidateIds,
+          const changes = await servedObjectRowsChangedBy(tx, key, candidateIds,
             () => applyObjectShardDelta(tx, key, orgId, [], initial))
           await recordShardWatermark(tx, h, attachHeads, preparedWatermarks)
-          return changedIds
+          return changes
         },
         // See projectLatest below: only the ids whose served row changed.
-        (changedIds) => ({ kind: 'objects', upsertIds: changedIds, deleteIds: [] }),
+        (changes) => ({ kind: 'objects', ...changes }),
         // One shard's ids are not the workspace's, so `object` cannot be
         // re-sealed here and goes un-comparable until the next full extraction.
         // The other three are untouched and keep theirs.
@@ -2150,7 +2169,6 @@ export async function startReadModelProjector(
       // on the shard's next edit and a precise feed would otherwise never name
       // (`servedObjectRowsChangedBy`).
       const candidateIds = [...objects.map((object) => object.id), ...parentIds, ...deletedIds]
-      const deleted = new Set(deletedIds)
       await runTracked(
         'object_shard',
         async (tx) => {
@@ -2160,16 +2178,20 @@ export async function startReadModelProjector(
             )
           }
           await acknowledgeOverlayBatches(tx, key, 'object', h.documentId, batchIds, 'projected', 0, 0)
-          const changedIds = await servedObjectRowsChangedBy(tx, key, candidateIds,
-            () => applyObjectShardDelta(tx, key, orgId, oldIds, objects))
+          // `deleteObjects` also rewrites the manifests listing a deleted id.
+          let objectChanges: ServedRowChanges = { upsertIds: [], deleteIds: [] }
+          const diagramChanges = await servedDiagramRowsChangedBy(tx, key,
+            () => diagramIdsReferencing(tx, key, deletedIds, []),
+            async () => {
+              objectChanges = await servedObjectRowsChangedBy(tx, key, candidateIds,
+                () => applyObjectShardDelta(tx, key, orgId, oldIds, objects))
+            })
           await recordShardWatermark(tx, h, sampledHeads, preparedWatermarks)
-          return changedIds
+          return { objects: objectChanges, diagrams: diagramChanges }
         },
-        // A deleted id's row vanished, so it is "changed"; it is published as
-        // a delete, not also as an upsert.
-        (changedIds) => ({
-          kind: 'objects', upsertIds: changedIds.filter((id) => !deleted.has(id)), deleteIds: deletedIds,
-        }),
+        // A row that vanished is a delete; one that appeared or moved, an
+        // upsert. Objects only — the plain event — unless a manifest moved.
+        (changes): ReadModelChangePayload => ({ kind: 'exact', changes }),
         { unchanged: ['connection', 'group', 'diagram'] },
       )
       // Advance only after rows + feed + generation commit atomically.
@@ -2237,10 +2259,13 @@ export async function startReadModelProjector(
             )
           }
           await acknowledgeOverlayBatches(tx, key, 'connection', h.documentId, attachBatchIds, 'projected', 0, 0)
-          await applyConnectionShardDelta(tx, key, orgId, [], initial)
+          const changes = await servedConnectionRowsChangedBy(tx, key, initial.map((connection) => connection.id),
+            () => applyConnectionShardDelta(tx, key, orgId, [], initial))
           await recordShardWatermark(tx, h, attachHeads, preparedWatermarks)
+          return changes
         },
-        { kind: 'connections', upsertIds: initial.map((connection) => connection.id), deleteIds: [] },
+        // See watchObjectShard: only the ids whose served row changed.
+        (changes) => ({ kind: 'connections', ...changes }),
         { unchanged: ['object', 'group', 'diagram'] },
       )
       for (const batchId of attachBatchIds) acknowledgedBatchIds.add(batchId)
@@ -2303,10 +2328,22 @@ export async function startReadModelProjector(
             )
           }
           await acknowledgeOverlayBatches(tx, key, 'connection', h.documentId, batchIds, 'projected', 0, 0)
-          await applyConnectionShardDelta(tx, key, orgId, oldIds, connections)
+          // Same rule as the object shard: the whole shard is rewritten, the
+          // feed names the served rows that moved (a shared id included — a
+          // base shard and an overlay head both carry an edited connection).
+          // `deleteConnections` also rewrites the manifests listing a deleted id.
+          let connectionChanges: ServedRowChanges = { upsertIds: [], deleteIds: [] }
+          const diagramChanges = await servedDiagramRowsChangedBy(tx, key,
+            () => diagramIdsReferencing(tx, key, [], deletedIds),
+            async () => {
+              connectionChanges = await servedConnectionRowsChangedBy(tx, key,
+                [...connections.map((connection) => connection.id), ...deletedIds],
+                () => applyConnectionShardDelta(tx, key, orgId, oldIds, connections))
+            })
           await recordShardWatermark(tx, h, sampledHeads, preparedWatermarks)
+          return { connections: connectionChanges, diagrams: diagramChanges }
         },
-        { kind: 'connections', upsertIds: connections.map((connection) => connection.id), deleteIds: deletedIds },
+        (changes): ReadModelChangePayload => ({ kind: 'exact', changes }),
         { unchanged: ['object', 'group', 'diagram'] },
       )
       snap = next
@@ -2341,8 +2378,24 @@ export async function startReadModelProjector(
     // the DIAGRAM digest is sealed: `syncDiagrams` is a full sync of ro_diagrams
     // and nothing else, so the object/connection/group rows this generation
     // leaves behind are the previous generation's and must keep their own stamp.
-    await runTracked('registry', (tx) => syncDiagrams(tx, key, orgId, m.diagrams),
-      { kind: 'reset', scope: 'all' },
+    // What a full registry sync moves in the served rows: diagram manifests
+    // (all of them are candidates — it is a full sync, of every id before and
+    // after) and two connection counts. Published as an `exact` change, which
+    // a reader that predates the field still reads as the reset/all this
+    // pass used to publish on every registry edit.
+    await runTracked('registry', async (tx) => {
+      const countsBefore = await connectionMembershipCounts(tx, key)
+      const diagrams = await servedDiagramRowsChangedBy(tx, key,
+        async () => [...m.diagrams.map((diagram) => diagram.id), ...(await tx.query<{ id: string }>(
+          'SELECT id FROM ro_diagrams WHERE landscape_id = $1 AND version_id = $2',
+          [key.landscapeId, key.versionId],
+        )).rows.map((row) => row.id)],
+        () => syncDiagrams(tx, key, orgId, m.diagrams))
+      const countsAfter = await connectionMembershipCounts(tx, key)
+      const moved = changedCacheRowIds([...countsBefore.keys(), ...countsAfter.keys()], countsBefore, countsAfter)
+      return { diagrams, connections: { upsertIds: moved, deleteIds: [] } }
+    },
+      (changes): ReadModelChangePayload => ({ kind: 'exact', changes }),
       {
         defects: m.defects,
         digests: { diagram: digestOfIds(uniqueIds(m.diagrams)) },
@@ -2494,14 +2547,41 @@ export async function startReadModelProjector(
         return
       }
       const groups = Object.values(readGroups.map)
+      // Every change of ModelMeta lands here — a group renamed (a Structurizr
+      // system's boundary group follows the system's name), a tombstone, a new
+      // overlay head — and each used to publish reset/all. The served rows it
+      // can move: groups (all of them, before and after: a full sync), their
+      // members' effective parent (members before and after) and their
+      // structural parents, tombstoned objects and their neighbours, tombstoned
+      // connections, and the diagram manifests that listed a tombstone.
+      const tombstonedObjectIds = meta.deletedObjectIds ?? []
+      const tombstonedConnectionIds = meta.deletedConnectionIds ?? []
       await runTracked('metadata', async (tx) => {
-        await syncGroups(tx, key, orgId, groups)
-        // Apply delete tombstones (boot-from-server deletes): idempotent — deleting an
-        // already-gone row is a no-op. Covers base-shard-only objects the client can't
-        // remove directly; the overlay-resident ones are also deleted via their shard delta.
-        await deleteObjects(tx, key, meta.deletedObjectIds ?? [])
-        await deleteConnections(tx, key, meta.deletedConnectionIds ?? [])
-      }, { kind: 'reset', scope: 'all' },
+        let connections: ServedRowChanges = { upsertIds: [], deleteIds: [] }
+        let objects: ServedRowChanges = { upsertIds: [], deleteIds: [] }
+        // The tombstone deletes also rewrite the manifests that list them.
+        const diagrams = await servedDiagramRowsChangedBy(tx, key,
+          () => diagramIdsReferencing(tx, key, tombstonedObjectIds, tombstonedConnectionIds),
+          async () => { objects = await servedObjectRowsChangedBy(tx, key, [
+          ...groups.map((group) => group.id),
+          ...groups.flatMap((group) => group.objectIds ?? []),
+          ...tombstonedObjectIds,
+          ...(await tx.query<{ id: string }>(
+            `SELECT id FROM ro_groups WHERE landscape_id = $1 AND version_id = $2
+             UNION SELECT object_id FROM ro_group_objects WHERE landscape_id = $1 AND version_id = $2`,
+            [key.landscapeId, key.versionId],
+          )).rows.map((row) => row.id),
+        ], async () => {
+          await syncGroups(tx, key, orgId, groups)
+          // Apply delete tombstones (boot-from-server deletes): idempotent — deleting an
+          // already-gone row is a no-op. Covers base-shard-only objects the client can't
+          // remove directly; the overlay-resident ones are also deleted via their shard delta.
+          await deleteObjects(tx, key, tombstonedObjectIds)
+          connections = await servedConnectionRowsChangedBy(tx, key, tombstonedConnectionIds,
+            () => deleteConnections(tx, key, tombstonedConnectionIds))
+        }) })
+        return { objects, connections, diagrams }
+      }, (changes): ReadModelChangePayload => ({ kind: 'exact', changes }),
       // GROUPS are re-sealed: `syncGroups` is a full sync of ro_groups.
       //
       // Objects and connections are only carried forward when this pass applies

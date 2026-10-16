@@ -165,3 +165,70 @@ test('quota blocking preserves the old copy and abandoning removes only the targ
   expect(afterDiscard?.offlineDownload).toBeUndefined()
   expect(afterDiscard?.generationStats['42']).toBeUndefined()
 })
+
+// The feed used to carry a reset/all for every registry, flow and metadata
+// pass, so a pinned copy re-downloaded — moving to a new generation and leaving
+// every render it had built behind. Precise `exact` pages change rows and
+// manifests UNDER the same generation: a memoized render must be dropped and a
+// vanished manifest deleted, or offline keeps drawing the old diagram for ever.
+test('an exact page updates manifests in place and drops the renders built from the old ones', async ({ page }) => {
+  // The feed reader calls `${API_BASE}/…`, cross-origin from this fixture page:
+  // answer the preflight and carry the CORS headers a real server sends.
+  const cors = {
+    'access-control-allow-origin': 'http://127.0.0.1:5199',
+    'access-control-allow-credentials': 'true',
+    'access-control-allow-headers': '*',
+    'access-control-allow-methods': 'GET, OPTIONS',
+  }
+  const preflight = (route: Parameters<Parameters<typeof page.route>[1]>[0]) =>
+    route.request().method() === 'OPTIONS' ? route.fulfill({ status: 204, headers: cors }).then(() => true) : Promise.resolve(false)
+  await page.route('**/api/model/cache/changes**', async (route) => {
+    if (await preflight(route)) return
+    const after = Number(new URL(route.request().url()).searchParams.get('afterGeneration'))
+    const event = after === 42
+      ? { generation: 43, kind: 'reset', scope: 'all', exact: { diagrams: { upsertIds: ['diagram-1'], deleteIds: [] } } }
+      : after === 43
+        ? { generation: 44, kind: 'reset', scope: 'all', exact: { diagrams: { upsertIds: [], deleteIds: ['diagram-1'] } } }
+        : null
+    await route.fulfill({
+      contentType: 'application/json',
+      headers: cors,
+      body: JSON.stringify({
+        projectionGeneration: event?.generation ?? 44,
+        events: event ? [event] : [],
+        nextGeneration: event?.generation ?? after,
+        hasMore: false,
+        resetRequired: false,
+      }),
+    })
+  })
+  await page.route('**/api/model/cache/diagrams/by-ids**', async (route) => {
+    if (await preflight(route)) return
+    await route.fulfill({
+      contentType: 'application/json',
+      headers: cors,
+      body: JSON.stringify({ projectionGeneration: 43, items: [
+        { diagramId: 'diagram-1', objectIds: ['object-1'], connectionIds: [], groupIds: [] },
+      ] }),
+    })
+  })
+  // The feed consumer only runs on the server tier. Set BEFORE load: the
+  // setter reloads the page (`tierFlag.ts`), which aborted the feed request
+  // mid-test when the gate called it.
+  await page.addInitScript(() => localStorage.setItem('maplespire:serverReadModel', 'true'))
+  await page.goto('/e2e/fixtures/offline-download-recovery.html')
+  await waitForGate(page)
+  await page.evaluate(() => window.__offlineDownloadRecoveryGate!.reset())
+  const result = await page.evaluate(() => window.__offlineDownloadRecoveryGate!.incrementalManifestPages())
+
+  // The witness that the memo existed — otherwise "gone afterwards" proves nothing.
+  expect(result.memoBefore).toEqual(['object-1', 'object-2'])
+  // Page 1, the manifest shrank: the memo is gone, a rebuild reads the new one.
+  expect(result.memoAfterUpsert).toBeNull()
+  expect(result.rebuiltAfterUpsert).toEqual(['object-1'])
+  // Page 2, the diagram went: no memo, and nothing to rebuild from.
+  expect(result.memoAfterDelete).toBeNull()
+  expect(result.rebuiltAfterDelete).toBeNull()
+  // Applied in place: no re-download, the same generation, the feed advanced.
+  expect(result.meta).toMatchObject({ activeGeneration: 42, serverGeneration: 44 })
+})

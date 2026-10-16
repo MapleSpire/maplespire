@@ -22,6 +22,7 @@ const mocks = vi.hoisted(() => ({
   storageStatus: vi.fn(),
   upsertObjects: vi.fn(),
   upsertConnections: vi.fn(),
+  upsertDiagramManifests: vi.fn(),
   deleteEntities: vi.fn(),
   commitServerGeneration: vi.fn(),
   downloadWorkspaceForOffline: vi.fn(),
@@ -36,6 +37,7 @@ vi.mock('./workerClient', () => ({
     storageStatus: mocks.storageStatus,
     upsertObjects: mocks.upsertObjects,
     upsertConnections: mocks.upsertConnections,
+    upsertDiagramManifests: mocks.upsertDiagramManifests,
     deleteEntities: mocks.deleteEntities,
     commitServerGeneration: mocks.commitServerGeneration,
   }),
@@ -137,7 +139,9 @@ describe('incremental model read cache feed', () => {
     }), undefined)
     expect(mocks.deleteEntities).toHaveBeenCalledWith({
       workspaceKey: 'large/v1', generation: 5,
-      objectIds: ['o2'], connectionIds: ['c2'],
+      objectIds: ['o2'], connectionIds: ['c2'], diagramIds: [],
+      // Renders built offline from these rows are stale now: dropped.
+      dropRenders: true,
     }, undefined)
     expect(mocks.commitServerGeneration).toHaveBeenCalledWith({
       workspaceKey: 'large/v1', serverGeneration: 12,
@@ -150,6 +154,96 @@ describe('incremental model read cache feed', () => {
     const change = modelIndexChangesSince(0)
     expect([...change!.objectIds].sort()).toEqual(['o1', 'o2'])
     expect([...change!.connectionIds].sort()).toEqual(['c1', 'c2'])
+  })
+
+  it('applies an exact reset precisely — manifests by id, vanished rows deleted — and does not rebuild', async () => {
+    const requested: string[] = []
+    mocks.upsertDiagramManifests.mockResolvedValue({ count: 1 })
+    mocks.apiFetch.mockImplementation(async (url: string) => {
+      const parsed = new URL(url, 'http://localhost')
+      requested.push(`${parsed.pathname}?${parsed.searchParams.get('ids') ?? ''}`)
+      if (parsed.pathname === '/api/model/cache/changes') {
+        return json({
+          projectionGeneration: 11,
+          events: [{
+            generation: 11, kind: 'reset', scope: 'all',
+            exact: {
+              diagrams: { upsertIds: ['d1', 'gone'], deleteIds: ['d9'] },
+              connections: { upsertIds: ['c1'], deleteIds: [] },
+            },
+          }],
+          nextGeneration: 11,
+          hasMore: false,
+          resetRequired: false,
+        })
+      }
+      if (parsed.pathname === '/api/model/cache/diagrams/by-ids') {
+        return json({ projectionGeneration: 11, items: [
+          { diagramId: 'd1', objectIds: ['o1'], connectionIds: ['c1'], groupIds: [] },
+        ] })
+      }
+      if (parsed.pathname === '/api/model/cache/connections/by-ids') {
+        return json({ projectionGeneration: 11, items: [{
+          connection: { id: 'c1', fromId: 'o1', toId: 'db' },
+          fromName: 'Checkout', toName: 'DB', diagramCount: 2, flowCount: 0,
+        }] })
+      }
+      return new Response('missing', { status: 404 })
+    })
+
+    await pollCurrentWorkspaceChangeFeed()
+
+    expect(mocks.downloadWorkspaceForOffline).not.toHaveBeenCalled()
+    expect(requested).toContain('/api/model/cache/diagrams/by-ids?d1,gone')
+    expect(mocks.upsertDiagramManifests).toHaveBeenCalledWith({
+      workspaceKey: 'large/v1', generation: 5,
+      items: [{ diagramId: 'd1', objectIds: ['o1'], connectionIds: ['c1'], groupIds: [] }],
+    }, undefined)
+    expect(mocks.upsertConnections).toHaveBeenCalledWith(expect.objectContaining({
+      items: [expect.objectContaining({ diagramCount: 2 })],
+    }), undefined)
+    // `gone` was asked for and not returned: a newer deletion, a tombstone.
+    expect(mocks.deleteEntities).toHaveBeenCalledWith(expect.objectContaining({
+      diagramIds: expect.arrayContaining(['d9', 'gone']),
+      dropRenders: true,
+    }), undefined)
+    expect(mocks.commitServerGeneration).toHaveBeenCalledWith({
+      workspaceKey: 'large/v1', serverGeneration: 11,
+    }, undefined)
+  })
+
+  it('refuses a manifest page served behind the feed: nothing applied, nothing committed', async () => {
+    mocks.apiFetch.mockImplementation(async (url: string) => {
+      const parsed = new URL(url, 'http://localhost')
+      if (parsed.pathname === '/api/model/cache/changes') {
+        return json({
+          projectionGeneration: 11,
+          events: [{ generation: 11, kind: 'reset', scope: 'all', exact: { diagrams: { upsertIds: ['d1'], deleteIds: [] } } }],
+          nextGeneration: 11, hasMore: false, resetRequired: false,
+        })
+      }
+      if (parsed.pathname === '/api/model/cache/diagrams/by-ids') {
+        // A replica that has not reached generation 11 yet.
+        return json({ projectionGeneration: 10, items: [] })
+      }
+      return new Response('missing', { status: 404 })
+    })
+    await expect(pollCurrentWorkspaceChangeFeed()).rejects.toThrow(/behind/)
+    expect(mocks.deleteEntities).not.toHaveBeenCalled()
+    expect(mocks.commitServerGeneration).not.toHaveBeenCalled()
+  })
+
+  it('still rebuilds on a plain reset/all, the one without the exact lists', async () => {
+    mocks.apiFetch.mockResolvedValue(json({
+      projectionGeneration: 11,
+      events: [{ generation: 11, kind: 'reset', scope: 'all' }],
+      nextGeneration: 11,
+      hasMore: false,
+      resetRequired: false,
+    }))
+    await pollCurrentWorkspaceChangeFeed()
+    expect(mocks.downloadWorkspaceForOffline).toHaveBeenCalled()
+    expect(mocks.commitServerGeneration).not.toHaveBeenCalled()
   })
 
   it('rebuilds a complete copy on a retained-history gap instead of guessing', async () => {
@@ -311,6 +405,26 @@ describe('changedIdsSince', () => {
     expect(await changedIdsSince(workspace, 7, 9)).toBeNull()
     mocks.apiFetch.mockResolvedValueOnce(page({ events: [{ generation: 8, kind: 'reset', scope: 'groups' }] }))
     expect(await changedIdsSince(workspace, 7, 9)).toBeNull()
+    mocks.apiFetch.mockResolvedValueOnce(page({ events: [{ generation: 8, kind: 'reset', scope: 'all' }] }))
+    expect(await changedIdsSince(workspace, 7, 9)).toBeNull()
+  })
+
+  it('reads an exact reset as the ids it carries — a group rename is not "anything changed"', async () => {
+    mocks.apiFetch.mockResolvedValueOnce(json({
+      projectionGeneration: 9,
+      events: [{
+        generation: 9, kind: 'reset', scope: 'all',
+        exact: {
+          objects: { upsertIds: ['g1'], deleteIds: ['b'] },
+          connections: { upsertIds: [], deleteIds: ['c0'] },
+          diagrams: { upsertIds: ['d1'], deleteIds: [] },
+        },
+      }],
+      nextGeneration: 9, hasMore: false, resetRequired: false,
+    }))
+    const change = await changedIdsSince(workspace, 8, 9)
+    expect([...change!.objectIds].sort()).toEqual(['b', 'g1'])
+    expect(change!.connectionIds).toEqual(['c0'])
   })
 
   // Reviewer lens: an empty page from a projection that has not reached the

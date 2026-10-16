@@ -155,7 +155,7 @@ export class ModelReadCacheWorkerClient implements ModelReadCacheApi {
     return this.send({ op: 'queryViewerLevel', ...input }, signal)
   }
 
-  deleteEntities(input: Parameters<ModelReadCacheApi['deleteEntities']>[0], signal?: AbortSignal): Promise<{ objectsDeleted: number; connectionsDeleted: number }> {
+  deleteEntities(input: Parameters<ModelReadCacheApi['deleteEntities']>[0], signal?: AbortSignal): Promise<{ objectsDeleted: number; connectionsDeleted: number; diagramsDeleted: number }> {
     return this.send({ op: 'deleteEntities', ...input }, signal)
   }
 

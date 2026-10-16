@@ -19,6 +19,8 @@ import {
 } from '../../src/lib/modelQuery/modelReadCacheBootstrap'
 import { MODEL_READ_CACHE_DB, type ModelCacheWorkspaceMeta } from '../../src/lib/modelQuery/idbSchema'
 import { accountDatabaseName } from '../../src/lib/auth/accountNamespace'
+import { setActiveWorkspaceRef } from '../../src/lib/automerge/workspace'
+import { pollCurrentWorkspaceChangeFeed } from '../../src/lib/modelQuery/modelReadCacheChangeFeed'
 import {
   disposeModelReadCacheWorker,
   getModelReadCacheWorker,
@@ -34,6 +36,7 @@ export interface OfflineDownloadRecoveryGateApi {
   interruptAfterFirstPage(): Promise<ModelCacheWorkspaceMeta>
   resumeAfterRestart(): Promise<{ meta: ModelCacheWorkspaceMeta; objectBatches: string[][] }>
   blockOnQuotaAfterFirstPage(): Promise<ModelCacheWorkspaceMeta>
+  incrementalManifestPages(): ReturnType<typeof incrementalManifestPages>
   discard(): Promise<ModelCacheWorkspaceMeta | null>
   status(): Promise<ModelCacheWorkspaceMeta | null>
 }
@@ -174,6 +177,39 @@ async function blockOnQuotaAfterFirstPage(): Promise<ModelCacheWorkspaceMeta> {
   return meta
 }
 
+/** One complete copy, one render built from it, then the REAL incremental feed
+ * consumer applying two `exact` pages (the spec serves them): a manifest that
+ * changed, then a manifest that went. Reports what an offline reader would get
+ * after each — through the real Worker and IndexedDB, which no unit test has. */
+async function incrementalManifestPages(): Promise<{
+  memoBefore: string[] | null
+  memoAfterUpsert: string[] | null
+  rebuiltAfterUpsert: string[] | null
+  memoAfterDelete: string[] | null
+  rebuiltAfterDelete: string[] | null
+  meta: ModelCacheWorkspaceMeta | null
+}> {
+  const worker = getModelReadCacheWorker()
+  await downloadWorkspaceForOffline({ workspace })
+  // The server tier is switched on by the spec BEFORE the page loads:
+  // `setServerReadModel` reloads the page, which aborts whatever is in flight.
+  setActiveWorkspaceRef(workspace)
+  const ids = (record: { payload: unknown } | null) => record
+    ? ((record.payload as { objects?: { id: string }[] }).objects ?? []).map((object) => object.id).sort()
+    : null
+  const memo = async () => ids(await worker.getDiagramRender({ workspaceKey, diagramId: 'diagram-1' }))
+  const rebuild = async () => ids(await worker.buildDiagramRender({ workspaceKey, diagramId: 'diagram-1' }))
+  await rebuild()
+  const memoBefore = await memo()
+  await pollCurrentWorkspaceChangeFeed()
+  const memoAfterUpsert = await memo()
+  const rebuiltAfterUpsert = await rebuild()
+  await pollCurrentWorkspaceChangeFeed()
+  const memoAfterDelete = await memo()
+  const rebuiltAfterDelete = await rebuild()
+  return { memoBefore, memoAfterUpsert, rebuiltAfterUpsert, memoAfterDelete, rebuiltAfterDelete, meta: await status() }
+}
+
 async function discard(): Promise<ModelCacheWorkspaceMeta | null> {
   await discardWorkspaceOfflineDownload(workspace)
   return status()
@@ -186,6 +222,7 @@ window.__offlineDownloadRecoveryGate = {
   interruptAfterFirstPage,
   resumeAfterRestart,
   blockOnQuotaAfterFirstPage,
+  incrementalManifestPages,
   discard,
   status,
 }

@@ -1374,16 +1374,20 @@ async function queryViewerLevel(
   }
 }
 
-async function deleteEntities(request: Extract<ModelReadCacheRequest, { op: 'deleteEntities' }>): Promise<OperationResult<{ objectsDeleted: number; connectionsDeleted: number }>> {
+async function deleteEntities(request: Extract<ModelReadCacheRequest, { op: 'deleteEntities' }>): Promise<OperationResult<{ objectsDeleted: number; connectionsDeleted: number; diagramsDeleted: number }>> {
   const db = await openModelReadCache()
   const tx = db.transaction([
     MODEL_CACHE_STORES.objects,
     MODEL_CACHE_STORES.connections,
     MODEL_CACHE_STORES.searchPostings,
+    MODEL_CACHE_STORES.diagramMembership,
+    MODEL_CACHE_STORES.diagramRenders,
     MODEL_CACHE_STORES.workspaceMeta,
   ], 'readwrite')
   const objectStore = tx.objectStore(MODEL_CACHE_STORES.objects)
   const connectionStore = tx.objectStore(MODEL_CACHE_STORES.connections)
+  const manifestStore = tx.objectStore(MODEL_CACHE_STORES.diagramMembership)
+  const renderStore = tx.objectStore(MODEL_CACHE_STORES.diagramRenders)
   const postingStore = tx.objectStore(MODEL_CACHE_STORES.searchPostings)
   const postingByEntity = postingStore.index('byEntity')
   const metaStore = tx.objectStore(MODEL_CACHE_STORES.workspaceMeta)
@@ -1393,7 +1397,8 @@ async function deleteEntities(request: Extract<ModelReadCacheRequest, { op: 'del
   const generation = request.generation ?? meta.activeGeneration
   const objectIds = [...new Set(request.objectIds ?? [])]
   const connectionIds = [...new Set(request.connectionIds ?? [])]
-  const [objects, postingKeys, connections] = await Promise.all([
+  const diagramIds = [...new Set(request.diagramIds ?? [])]
+  const [objects, postingKeys, connections, manifests] = await Promise.all([
     Promise.all(objectIds.map((id) => requestResult(
       objectStore.get([request.workspaceKey, generation, id]) as IDBRequest<CachedModelEntityRecord | undefined>
     ))),
@@ -1403,6 +1408,9 @@ async function deleteEntities(request: Extract<ModelReadCacheRequest, { op: 'del
     ))))),
     Promise.all(connectionIds.map((id) => requestResult(
       connectionStore.get([request.workspaceKey, generation, id]) as IDBRequest<CachedConnectionRecord | undefined>
+    ))),
+    Promise.all(diagramIds.map((id) => requestResult(
+      manifestStore.get([request.workspaceKey, generation, id, '__manifest__']) as IDBRequest<CachedDiagramManifestRecord | undefined>
     ))),
   ])
   let objectBytes = 0
@@ -1427,7 +1435,24 @@ async function deleteEntities(request: Extract<ModelReadCacheRequest, { op: 'del
     connectionBytes += record.accountedBytes
     connectionsDeleted += 1
   })
+  let manifestBytes = 0
+  let diagramsDeleted = 0
+  manifests.forEach((record) => {
+    if (!record) return
+    manifestStore.delete([request.workspaceKey, generation, record.diagramId, record.entityId])
+    manifestBytes += record.accountedBytes
+    diagramsDeleted += 1
+  })
+  // Renders this worker BUILT from the normalized copy are memoized at the
+  // copy's generation, and only a full re-download used to move past them. An
+  // incremental page changes rows and manifests under that same generation, so
+  // the memo would be served stale for ever: drop it, the next read rebuilds.
+  const renderBytes = request.dropRenders
+    ? await deleteRendersAtGeneration(renderStore, request.workspaceKey, generation)
+    : 0
   const stats = statsFor(meta, generation)
+  addBytes(stats.accountedBytes, MODEL_CACHE_STORES.diagramMembership, -manifestBytes)
+  addBytes(stats.accountedBytes, MODEL_CACHE_STORES.diagramRenders, -renderBytes)
   stats.objectCount = Math.max(0, stats.objectCount - objectsDeleted)
   stats.connectionCount = Math.max(0, stats.connectionCount - connectionsDeleted)
   addBytes(stats.accountedBytes, MODEL_CACHE_STORES.objects, -objectBytes)
@@ -1442,8 +1467,9 @@ async function deleteEntities(request: Extract<ModelReadCacheRequest, { op: 'del
   metaStore.put(meta)
   await transactionDone(tx)
   return {
-    result: { objectsDeleted, connectionsDeleted },
-    rowsRead: objects.length + connections.length + postingKeys.reduce((sum, keys) => sum + keys.length, 0),
+    result: { objectsDeleted, connectionsDeleted, diagramsDeleted },
+    rowsRead: objects.length + connections.length + manifests.length
+      + postingKeys.reduce((sum, keys) => sum + keys.length, 0),
   }
 }
 
@@ -1956,6 +1982,28 @@ function deleteRange(store: IDBObjectStore, range: IDBKeyRange): Promise<number>
       }
       cursor.delete()
       deleted += 1
+      cursor.continue()
+    }
+  })
+}
+
+/** Delete one workspace's renders at one generation; resolves to their bytes. */
+function deleteRendersAtGeneration(store: IDBObjectStore, workspaceKey: string, generation: number): Promise<number> {
+  return new Promise((resolve, reject) => {
+    let bytes = 0
+    const cursorRequest = store.openCursor(IDBKeyRange.bound([workspaceKey], [workspaceKey, []]))
+    cursorRequest.onerror = () => reject(cursorRequest.error ?? new Error('IndexedDB render invalidation cursor failed'))
+    cursorRequest.onsuccess = () => {
+      const cursor = cursorRequest.result
+      if (!cursor) {
+        resolve(bytes)
+        return
+      }
+      const record = cursor.value as CachedDiagramRenderRecord
+      if (record.generation === generation) {
+        bytes += record.accountedBytes ?? 0
+        cursor.delete()
+      }
       cursor.continue()
     }
   })

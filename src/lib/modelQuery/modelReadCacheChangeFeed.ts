@@ -20,7 +20,9 @@ import {
   workspaceRefKey,
   type WorkspaceRef,
 } from '../automerge/workspace'
-import type { CachedConnectionInput, CachedModelEntityInput, ModelCacheWorkspaceMeta } from './idbSchema'
+import type {
+  CachedConnectionInput, CachedDiagramManifestInput, CachedModelEntityInput, ModelCacheWorkspaceMeta,
+} from './idbSchema'
 import { downloadWorkspaceForOffline } from './modelReadCacheBootstrap'
 import { isServerReadModelEnabled } from './tierFlag'
 import { getModelReadCacheWorker } from './workerClient'
@@ -39,10 +41,21 @@ type EntityChange = {
   upsertIds: string[]
   deleteIds: string[]
 }
+type ChangedIds = { upsertIds: string[]; deleteIds: string[] }
+/** The precise lists a server publishes when one generation moved several
+ *  kinds of rows (or diagram manifests). Carried on a reset/all so that a tab
+ *  running an older build rebuilds, as it always did, instead of missing it. */
+type ExactChanges = { objects?: ChangedIds; connections?: ChangedIds; diagrams?: ChangedIds }
 type ResetChange = {
   generation: number
   kind: 'reset'
   scope: 'all' | 'groups' | 'diagrams' | 'connection_metrics'
+  exact?: ExactChanges
+}
+
+/** A reset this reader must honour as one: every reset except an `exact` one. */
+function isRealReset(event: ReadModelChange): boolean {
+  return event.kind === 'reset' && !event.exact
 }
 type ReadModelChange = EntityChange | ResetChange
 
@@ -85,12 +98,18 @@ async function getJson<T>(path: string, params: URLSearchParams, signal?: AbortS
   return response.json() as Promise<T>
 }
 
-function coalesce(events: ReadModelChange[], kind: EntityChange['kind']): Map<string, ChangeAction> {
+function idsOf(event: ReadModelChange, kind: keyof ExactChanges): ChangedIds | undefined {
+  if (event.kind === 'reset') return event.exact?.[kind]
+  return event.kind === kind ? event : undefined
+}
+
+function coalesce(events: ReadModelChange[], kind: keyof ExactChanges): Map<string, ChangeAction> {
   const actions = new Map<string, ChangeAction>()
   for (const event of events) {
-    if (event.kind !== kind) continue
-    for (const id of event.upsertIds) if (id) actions.set(id, 'upsert')
-    for (const id of event.deleteIds) if (id) actions.set(id, 'delete')
+    const ids = idsOf(event, kind)
+    if (!ids) continue
+    for (const id of ids.upsertIds ?? []) if (id) actions.set(id, 'upsert')
+    for (const id of ids.deleteIds ?? []) if (id) actions.set(id, 'delete')
   }
   return actions
 }
@@ -115,7 +134,7 @@ export async function changedIdsSince(
   params.set('afterGeneration', String(afterGeneration))
   params.set('limit', String(CHANGED_IDS_LIMIT))
   const page = await getJson<ChangeFeedPage>('/api/model/cache/changes', params, signal)
-  if (page.resetRequired || page.hasMore || page.events.some((event) => event.kind === 'reset')) return null
+  if (page.resetRequired || page.hasMore || page.events.some(isRealReset)) return null
   // Answered by a projection that has not reached the generation the
   // invalidation announced: an empty page would read "nothing changed" and
   // the change would be lost for good. Unknown instead.
@@ -187,6 +206,28 @@ async function fetchChangedConnections(
   return result
 }
 
+interface DiagramByIdsPage {
+  projectionGeneration: number
+  items: CachedDiagramManifestInput[]
+}
+
+async function fetchChangedDiagrams(
+  workspace: WorkspaceRef,
+  ids: string[],
+  expectedGeneration: number,
+  signal?: AbortSignal,
+): Promise<CachedDiagramManifestInput[]> {
+  const result: CachedDiagramManifestInput[] = []
+  for (const batch of chunks(ids, ID_BATCH)) {
+    const params = workspaceParams(workspace)
+    params.set('ids', batch.join(','))
+    const page = await getJson<DiagramByIdsPage>('/api/model/cache/diagrams/by-ids', params, signal)
+    requireGeneration(page.projectionGeneration, expectedGeneration)
+    result.push(...page.items)
+  }
+  return result
+}
+
 async function fetchAdjacentConnections(
   workspace: WorkspaceRef,
   endpointIds: string[],
@@ -247,13 +288,16 @@ async function applyChangePage(
   const workspaceKey = workspaceRefKey(workspace)
   const objectActions = coalesce(page.events, 'objects')
   const connectionActions = coalesce(page.events, 'connections')
+  const diagramActions = coalesce(page.events, 'diagrams')
   const objectUpsertIds = [...objectActions].filter(([, action]) => action === 'upsert').map(([id]) => id)
   const connectionUpsertIds = [...connectionActions].filter(([, action]) => action === 'upsert').map(([id]) => id)
+  const diagramUpsertIds = [...diagramActions].filter(([, action]) => action === 'upsert').map(([id]) => id)
 
-  const [objects, changedConnections, adjacentConnections] = await Promise.all([
+  const [objects, changedConnections, adjacentConnections, diagrams] = await Promise.all([
     fetchChangedObjects(workspace, objectUpsertIds, page.nextGeneration, signal),
     fetchChangedConnections(workspace, connectionUpsertIds, page.nextGeneration, signal),
     fetchAdjacentConnections(workspace, [...objectActions.keys()], page.nextGeneration, signal),
+    fetchChangedDiagrams(workspace, diagramUpsertIds, page.nextGeneration, signal),
   ])
 
   const returnedObjectIds = new Set(objects.map((item) => item.id))
@@ -268,17 +312,30 @@ async function applyChangePage(
   // deletion. Treat it as a tombstone; replaying the later event stays idempotent.
   for (const id of objectUpsertIds) if (!returnedObjectIds.has(id)) objectDeletes.add(id)
   for (const id of connectionUpsertIds) if (!returnedConnectionIds.has(id)) connectionDeletes.add(id)
+  const returnedDiagramIds = new Set(diagrams.map((item) => item.diagramId))
+  const diagramDeletes = new Set(
+    [...diagramActions].filter(([, action]) => action === 'delete').map(([id]) => id),
+  )
+  for (const id of diagramUpsertIds) if (!returnedDiagramIds.has(id)) diagramDeletes.add(id)
 
   const connectionById = new Map<string, CachedConnectionInput>()
   for (const item of adjacentConnections) connectionById.set(item.connection.id, item)
   for (const item of changedConnections) connectionById.set(item.connection.id, item)
   await upsertObjectBatches(workspaceKey, meta.activeGeneration, objects, signal)
   await upsertConnectionBatches(workspaceKey, meta.activeGeneration, [...connectionById.values()], signal)
+  for (const batch of chunks(diagrams, UPSERT_BATCH)) {
+    await getModelReadCacheWorker().upsertDiagramManifests(
+      { workspaceKey, generation: meta.activeGeneration, items: batch }, signal)
+  }
   await getModelReadCacheWorker().deleteEntities({
     workspaceKey,
     generation: meta.activeGeneration,
     objectIds: [...objectDeletes],
     connectionIds: [...connectionDeletes],
+    diagramIds: [...diagramDeletes],
+    // A render this cache built offline is a function of the rows and
+    // manifests just changed, at the same generation: it must be rebuilt.
+    dropRenders: objectActions.size + connectionActions.size + diagramActions.size > 0,
   }, signal)
   // Commit last. A crash before this line replays harmlessly; a committed
   // generation therefore always means every cache mutation is durable.
@@ -304,7 +361,7 @@ async function runPoll(workspace: WorkspaceRef, signal?: AbortSignal): Promise<v
     params.set('afterGeneration', String(meta.serverGeneration))
     params.set('limit', String(FEED_LIMIT))
     const page = await getJson<ChangeFeedPage>('/api/model/cache/changes', params, signal)
-    if (page.resetRequired || page.events.some((event) => event.kind === 'reset' && event.scope === 'all')) {
+    if (page.resetRequired || page.events.some((event) => isRealReset(event) && event.kind === 'reset' && event.scope === 'all')) {
       await downloadWorkspaceForOffline({ signal, workspace })
       return
     }

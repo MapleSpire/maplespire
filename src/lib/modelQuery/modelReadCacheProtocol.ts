@@ -86,7 +86,7 @@ export type ModelReadCacheRequest =
   | { id: number; op: 'queryConnections'; workspaceKey: string; query?: string; domainId?: string | null; sortBy?: 'name' | 'sender' | 'receiver' | 'diagrams' | 'flows'; sortAsc?: boolean; limit: number; after?: string | null }
   | { id: number; op: 'queryDependencyPeers'; workspaceKey: string; focusId: string; direction: 'incoming' | 'outgoing'; search?: string; globalSearch?: string; domainId?: string | null; limit: number; after?: string | null }
   | { id: number; op: 'queryViewerLevel'; workspaceKey: string; parentId?: string | null; query?: string; domainIds?: string[]; limit: number; connectionLimit: number; after?: string | null }
-  | { id: number; op: 'deleteEntities'; workspaceKey: string; generation?: number; objectIds?: string[]; connectionIds?: string[] }
+  | { id: number; op: 'deleteEntities'; workspaceKey: string; generation?: number; objectIds?: string[]; connectionIds?: string[]; diagramIds?: string[]; dropRenders?: boolean }
   | { id: number; op: 'commitServerGeneration'; workspaceKey: string; serverGeneration: number }
   | { id: number; op: 'putDiagramRender'; record: CachedDiagramRenderRecord }
   | { id: number; op: 'getDiagramRender'; workspaceKey: string; diagramId: string; generation?: number; allowLatest?: boolean }
@@ -122,7 +122,7 @@ export interface ModelReadCacheApi {
   queryConnections(input: Omit<Extract<ModelReadCacheCommand, { op: 'queryConnections' }>, 'id' | 'op'>, signal?: AbortSignal): Promise<ModelCacheConnectionPage>
   queryDependencyPeers(input: Omit<Extract<ModelReadCacheCommand, { op: 'queryDependencyPeers' }>, 'id' | 'op'>, signal?: AbortSignal): Promise<ModelCacheDependencyPage>
   queryViewerLevel(input: Omit<Extract<ModelReadCacheCommand, { op: 'queryViewerLevel' }>, 'id' | 'op'>, signal?: AbortSignal): Promise<ModelCacheViewerLevel>
-  deleteEntities(input: Omit<Extract<ModelReadCacheCommand, { op: 'deleteEntities' }>, 'id' | 'op'>, signal?: AbortSignal): Promise<{ objectsDeleted: number; connectionsDeleted: number }>
+  deleteEntities(input: Omit<Extract<ModelReadCacheCommand, { op: 'deleteEntities' }>, 'id' | 'op'>, signal?: AbortSignal): Promise<{ objectsDeleted: number; connectionsDeleted: number; diagramsDeleted: number }>
   commitServerGeneration(input: Omit<Extract<ModelReadCacheCommand, { op: 'commitServerGeneration' }>, 'id' | 'op'>, signal?: AbortSignal): Promise<ModelCacheWorkspaceMeta>
   putDiagramRender(input: Omit<Extract<ModelReadCacheCommand, { op: 'putDiagramRender' }>, 'id' | 'op'>, signal?: AbortSignal): Promise<{ stored: true }>
   getDiagramRender(input: Omit<Extract<ModelReadCacheCommand, { op: 'getDiagramRender' }>, 'id' | 'op'>, signal?: AbortSignal): Promise<CachedDiagramRenderRecord | null>

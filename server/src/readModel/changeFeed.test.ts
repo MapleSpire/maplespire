@@ -78,4 +78,70 @@ describe('read-model change feed', () => {
     expect(page.resetRequired).toBe(false)
     expect(page.events).toEqual([{ generation: 3, kind: 'reset', scope: 'diagrams' }])
   })
+
+  describe('exact changes', () => {
+    const stored = async (changes: Parameters<typeof appendReadModelChange>[3]) => {
+      const query = vi.fn(async () => ({ rows: [], rowCount: 1 }))
+      await appendReadModelChange(
+        { query }, { landscapeId: 'ls', versionId: 'v1' }, { generation: 7, startedAtMs: Date.now() }, changes,
+      )
+      const params = query.mock.calls[0][1] as unknown[]
+      return { kind: params[3], payload: JSON.parse(params[4] as string) }
+    }
+
+    it('stores one kind of row as the plain event every reader understands', async () => {
+      expect(await stored({ kind: 'exact', changes: { objects: { upsertIds: ['g1', 'g1'], deleteIds: [] } } }))
+        .toEqual({ kind: 'objects', payload: { upsertIds: ['g1'], deleteIds: [] } })
+      expect(await stored({ kind: 'exact', changes: {
+        objects: { upsertIds: [], deleteIds: [] }, connections: { upsertIds: ['c1'], deleteIds: [] },
+      } })).toEqual({ kind: 'connections', payload: { upsertIds: ['c1'], deleteIds: [] } })
+      // Nothing served moved: an empty event, never a reset.
+      expect(await stored({ kind: 'exact', changes: {} }))
+        .toEqual({ kind: 'objects', payload: { upsertIds: [], deleteIds: [] } })
+    })
+
+    it('stores several kinds — or any diagram — as reset/all carrying the lists', async () => {
+      // An older reader sees exactly the reset/all these passes always wrote.
+      expect(await stored({ kind: 'exact', changes: {
+        objects: { upsertIds: ['g1'], deleteIds: [] }, connections: { upsertIds: [], deleteIds: ['c9'] },
+      } })).toEqual({ kind: 'reset', payload: { scope: 'all', exact: {
+        objects: { upsertIds: ['g1'], deleteIds: [] }, connections: { upsertIds: [], deleteIds: ['c9'] },
+      } } })
+      expect(await stored({ kind: 'exact', changes: { diagrams: { upsertIds: ['d1'], deleteIds: [] } } }))
+        .toEqual({ kind: 'reset', payload: { scope: 'all', exact: { diagrams: { upsertIds: ['d1'], deleteIds: [] } } } })
+    })
+
+    it('falls back to a plain reset past the id ceiling, whichever kinds carry the ids', async () => {
+      const many = Array.from({ length: 3_000 }, (_, index) => `x${index}`)
+      expect(await stored({ kind: 'exact', changes: {
+        objects: { upsertIds: many, deleteIds: [] }, diagrams: { upsertIds: many.map((id) => `d${id}`), deleteIds: [] },
+      } })).toEqual({ kind: 'reset', payload: { scope: 'all' } })
+      // Every kind counts toward the ceiling, connections included.
+      expect(await stored({ kind: 'exact', changes: {
+        objects: { upsertIds: many, deleteIds: [] }, connections: { upsertIds: many.map((id) => `c${id}`), deleteIds: [] },
+      } })).toEqual({ kind: 'reset', payload: { scope: 'all' } })
+    })
+
+    it('reads the envelope back as precise, and only a reset WITHOUT it as requiring a rebuild', async () => {
+      const page = async (payload: Record<string, unknown>) => roReadModelChanges({
+        query: vi.fn(async (sql: string) => sql.includes('projection_state')
+          ? { rows: [{ projected_generation: 3 }], rowCount: 1 }
+          : { rows: [{ generation: 3, change_kind: 'reset', payload }], rowCount: 1 }),
+      }, { landscapeId: 'ls', versionId: 'v' }, { afterGeneration: 2 })
+      const exact = { diagrams: { upsertIds: ['d1'], deleteIds: [] }, connections: { upsertIds: ['c1'], deleteIds: [] } }
+      const precise = await page({ scope: 'all', exact })
+      expect(precise.resetRequired).toBe(false)
+      expect(precise.events).toEqual([{ generation: 3, kind: 'reset', scope: 'all', exact }])
+      expect((await page({ scope: 'all' })).resetRequired).toBe(true)
+      // A malformed or not-fully-understood envelope is the plain reset it also
+      // is — never "nothing", and never the part this build happens to know.
+      expect((await page({ scope: 'all', exact: 'garbage' })).resetRequired).toBe(true)
+      expect((await page({ scope: 'all', exact: {} })).resetRequired).toBe(true)
+      expect((await page({ scope: 'all', exact: { objects: 5 } })).resetRequired).toBe(true)
+      expect((await page({ scope: 'all', exact: { objects: { upsertIds: ['o1'] } } })).resetRequired).toBe(true)
+      expect((await page({ scope: 'all', exact: {
+        objects: { upsertIds: ['o1'], deleteIds: [] }, flows: { upsertIds: ['f1'], deleteIds: [] },
+      } })).resetRequired).toBe(true)
+    })
+  })
 })
