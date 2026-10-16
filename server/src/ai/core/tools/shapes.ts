@@ -174,10 +174,12 @@ export interface CommentView {
   type?: string
   text?: string
   author?: string
+  /** Writer's `AuthUser.id`; absent on legacy entries whose `author` is 'You'. */
+  authorId?: string
   createdAt?: string
   resolved?: boolean
   pinned?: boolean
-  replies?: { id: string; text: string; author: string; createdAt: string }[]
+  replies?: { id: string; text: string; author: string; authorId?: string; createdAt: string }[]
   position?: { x: number; y: number }
   [k: string]: unknown
 }

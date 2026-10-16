@@ -985,7 +985,7 @@ export const writeTools: AiToolDef[] = [
     execute: async (ctx, input) => {
       const ok = await mutateComment(ctx.repo, ctx.rootUrl, input.diagramId, input.commentId, {
         resolve: true,
-        ...(input.reply ? { reply: { text: input.reply, author: ctx.userLabel } } : {}),
+        ...(input.reply ? { reply: { text: input.reply, author: ctx.userLabel, authorId: ctx.userId } } : {}),
       })
       if (!ok) throw new AiToolError(`comment "${input.commentId}" not found on diagram "${input.diagramId}"`, 404)
       return done(ctx, { resolved: input.commentId })
@@ -1003,7 +1003,7 @@ export const writeTools: AiToolDef[] = [
     }),
     execute: async (ctx, input) => {
       const ok = await mutateComment(ctx.repo, ctx.rootUrl, input.diagramId, input.commentId, {
-        reply: { text: input.text, author: ctx.userLabel },
+        reply: { text: input.text, author: ctx.userLabel, authorId: ctx.userId },
       })
       if (!ok) throw new AiToolError(`comment "${input.commentId}" not found on diagram "${input.diagramId}"`, 404)
       return done(ctx, { replied: input.commentId })

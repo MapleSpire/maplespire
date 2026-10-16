@@ -534,9 +534,15 @@ export const readTools: AiToolDef[] = [
             type: c.type,
             text: c.text,
             author: c.author,
+            ...(c.authorId ? { authorId: c.authorId } : {}),
             createdAt: c.createdAt,
             resolved: !!c.resolved,
-            replies: (c.replies ?? []).map((r) => ({ author: r.author, text: r.text, createdAt: r.createdAt })),
+            replies: (c.replies ?? []).map((r) => ({
+              author: r.author,
+              ...(r.authorId ? { authorId: r.authorId } : {}),
+              text: r.text,
+              createdAt: r.createdAt,
+            })),
           })
         }
       }

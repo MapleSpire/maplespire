@@ -20,6 +20,10 @@
       "addIdea": "Ajouter une idée",
       "placeholder": "Saisissez votre commentaire…"
     },
+    "author": {
+      "you": "Vous",
+      "unknown": "Auteur inconnu"
+    },
     "detail": {
       "pin": "Épingler",
       "unpin": "Désépingler",

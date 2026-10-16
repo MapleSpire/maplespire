@@ -19,6 +19,8 @@ import { cn } from '../../lib/utils'
 import { SegmentedTabs } from '../ui/SegmentedTabs'
 import { useModelStore } from '../../stores/modelStore'
 import { useUIStore } from '../../stores/uiStore'
+import { useAuthStore } from '../../stores/authStore'
+import { commentAuthorLabel, isOwnCommentEntry } from '../../lib/comments/authorship'
 import type { Comment } from '../../types'
 
 const typeConfig = {
@@ -40,6 +42,7 @@ export function CommentsDropdown({
   const comments = useModelStore((s) => s.comments)
   const currentDiagramId = useModelStore((s) => s.currentDiagramId)
   const toggleResolved = useModelStore((s) => s.toggleResolved)
+  const viewer = useAuthStore((s) => s.user)
   const setRightSidebarTab = useUIStore((s) => s.setRightSidebarTab)
   const setRightSidebarOpen = useUIStore((s) => s.setRightSidebarOpen)
   const [activeTab, setActiveTab] = useState<CommentTab>('all')
@@ -48,7 +51,7 @@ export function CommentsDropdown({
   const diagramComments = comments.filter((c) => c.diagramId === currentDiagramId)
 
   const filtered = diagramComments.filter((c) => {
-    if (activeTab === 'yours') return c.author === 'You'
+    if (activeTab === 'yours') return isOwnCommentEntry(c, viewer)
     if (activeTab === 'mentions') return false // No mention system yet
     return true
   })
@@ -148,6 +151,7 @@ function CommentRow({
   resolved?: boolean
 }) {
   const { t } = useTranslation()
+  const viewer = useAuthStore((s) => s.user)
   const config = typeConfig[comment.type]
   const Icon = config.icon
 
@@ -172,7 +176,7 @@ function CommentRow({
       <div className="flex-1 min-w-0">
         <p className="text-[12px] text-fg truncate">{comment.text || t('comments.dropdown.noText')}</p>
         <div className="flex items-center gap-2 mt-0.5">
-          <span className="text-[10px] text-fg-subtle">{comment.author}</span>
+          <span className="text-[10px] text-fg-subtle" data-testid="comment-row-author">{commentAuthorLabel(comment, viewer, t)}</span>
           {comment.replies.length > 0 && (
             <span className="flex items-center gap-0.5 text-[10px] text-fg-subtle">
               <MessageCircle className="w-3 h-3" />

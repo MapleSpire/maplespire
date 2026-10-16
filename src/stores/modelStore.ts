@@ -16,6 +16,7 @@ import { create } from 'zustand'
 import { immer } from 'zustand/middleware/immer'
 import type { C4Object, Connection, Diagram, Flow, FlowStep, Group, Tag, SelectedItem, Domain, Comment, DecisionRecord, Position, Size, ConnectionShape } from '../types'
 import { generateId } from '../lib/utils'
+import { LEGACY_COMMENT_AUTHOR, type CommentAuthorship } from '../lib/comments/authorship'
 import { assertTechnologyUsageIdentityPreserved } from '../lib/technologyUsage'
 import { assignTag, unassignTag, orderedTagIds } from '../lib/tags/assignments'
 import { buildDuplicateDiagram, buildDuplicateFlows } from '../lib/diagrams/duplicate'
@@ -460,7 +461,9 @@ interface ModelState {
   addComment: (comment: Omit<Comment, 'id' | 'createdAt'>) => string
   updateComment: (id: string, data: Partial<Comment>) => void
   deleteComment: (id: string) => void
-  addReply: (commentId: string, text: string) => void
+  /** `authorship` defaults to the identity-less legacy author; UI callers pass
+   *  `commentAuthorshipFor(user)` so the reply names its writer. */
+  addReply: (commentId: string, text: string, authorship?: CommentAuthorship) => void
   deleteReply: (commentId: string, replyId: string) => void
   toggleResolved: (commentId: string) => void
   togglePinned: (commentId: string) => void
@@ -2267,13 +2270,19 @@ export const useModelStore = create<ModelState>()(
       })
     },
 
-    addReply: (commentId, text) => {
+    addReply: (commentId, text, authorship = { author: LEGACY_COMMENT_AUTHOR }) => {
       const id = generateId()
       const now = new Date().toISOString()
       set((state) => {
         const comment = state.comments.find((c) => c.id === commentId)
         if (!comment) return
-        comment.replies.push({ id, text, author: 'You', createdAt: now })
+        comment.replies.push({
+          id,
+          text,
+          author: authorship.author,
+          ...(authorship.authorId ? { authorId: authorship.authorId } : {}),
+          createdAt: now,
+        })
       })
     },
 

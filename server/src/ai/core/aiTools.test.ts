@@ -544,6 +544,24 @@ describe('write tools (monolith)', () => {
     expect(comments.comments[0].resolved).toBe(true)
     expect(comments.comments[0].replies.map((r) => r.text)).toEqual(['Confirmed REST now.'])
   })
+
+  // Regression (2026-10-16): replies were stamped with a display label only, so
+  // the SPA could not tell whose they were and fell back to the literal 'You'.
+  it('stamps the acting user id on an AI reply, and list_comments surfaces it', async () => {
+    const repo = new Repo({})
+    const rootUrl = await seedMonolith(repo, richSeed)
+    const ctx = ctxFor(repo, rootUrl, { userId: 'u-sarah', userLabel: 'Sarah' })
+    await executeAiTool(ctx, 'reply_to_comment', { diagramId: 'D1', commentId: 'cm1', text: 'On it.' })
+    const anon = ctxFor(repo, rootUrl)
+    await executeAiTool(anon, 'reply_to_comment', { diagramId: 'D1', commentId: 'cm1', text: 'Anon.' })
+    const listed = (await executeAiTool(ctx, 'list_comments', { diagramId: 'D1' })) as {
+      comments: { replies: { author: string; authorId?: string; text: string }[] }[]
+    }
+    expect(listed.comments[0].replies).toEqual([
+      expect.objectContaining({ author: 'Sarah', authorId: 'u-sarah', text: 'On it.' }),
+      expect.not.objectContaining({ authorId: expect.anything() }),
+    ])
+  })
 })
 
 describe('write tools (sharded model)', () => {

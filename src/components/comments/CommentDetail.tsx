@@ -29,6 +29,8 @@ import { useTranslation } from 'react-i18next'
 import type { TFunction } from 'i18next'
 import { cn } from '../../lib/utils'
 import { useModelStore } from '../../stores/modelStore'
+import { useAuthStore } from '../../stores/authStore'
+import { commentAuthorLabel, commentAuthorshipFor } from '../../lib/comments/authorship'
 import type { Comment } from '../../types'
 
 function typeConfigFor(t: TFunction) {
@@ -90,6 +92,7 @@ export function CommentDetail({
   const toggleResolved = useModelStore((s) => s.toggleResolved)
   const togglePinned = useModelStore((s) => s.togglePinned)
   const deleteReply = useModelStore((s) => s.deleteReply)
+  const viewer = useAuthStore((s) => s.user)
 
   const typeConfig = typeConfigFor(t)
   const config = typeConfig[comment.type]
@@ -97,7 +100,7 @@ export function CommentDetail({
 
   const handleAddReply = () => {
     if (readonly || !replyText.trim()) return
-    addReply(comment.id, replyText.trim())
+    addReply(comment.id, replyText.trim(), commentAuthorshipFor(useAuthStore.getState().user))
     setReplyText('')
   }
 
@@ -125,17 +128,23 @@ export function CommentDetail({
           onMove && 'cursor-move'
         )}
       >
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 min-w-0">
           <span
-            className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-medium"
+            className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-medium shrink-0"
             style={{ backgroundColor: config.bg, color: config.color }}
           >
             <Icon className="w-3 h-3" />
             {config.label}
           </span>
-          <span className="text-[11px] text-fg-subtle">{comment.author}</span>
+          <span
+            className="text-[11px] text-fg-subtle truncate"
+            data-testid="comment-detail-author"
+            title={commentAuthorLabel(comment, viewer, t)}
+          >
+            {commentAuthorLabel(comment, viewer, t)}
+          </span>
         </div>
-        <div className="flex items-center gap-0.5">
+        <div className="flex items-center gap-0.5 shrink-0">
           <button
             disabled={readonly}
             onClick={() => togglePinned(comment.id)}
@@ -234,14 +243,16 @@ export function CommentDetail({
       {/* Replies */}
       {comment.replies.length > 0 && (
         <div className="px-3 py-2 border-t border-line space-y-2">
-          {comment.replies.map((reply) => (
+          {comment.replies.map((reply) => {
+            const replyAuthor = commentAuthorLabel(reply, viewer, t)
+            return (
             <div key={reply.id} className="flex items-start gap-2">
               <div className="w-5 h-5 rounded-full bg-surface-300 flex items-center justify-center text-[10px] font-bold text-fg-secondary shrink-0">
-                {reply.author.charAt(0)}
+                {replyAuthor.charAt(0)}
               </div>
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-1.5">
-                  <span className="text-[11px] font-medium text-fg">{reply.author}</span>
+                  <span className="text-[11px] font-medium text-fg" data-testid="comment-reply-author">{replyAuthor}</span>
                   <span className="text-[10px] text-fg-subtle">{formatDate(reply.createdAt)}</span>
                 </div>
                 <p className="text-[12px] text-fg-secondary leading-relaxed">{reply.text}</p>
@@ -254,7 +265,8 @@ export function CommentDetail({
                 <Trash2 className="w-3 h-3" />
               </button>
             </div>
-          ))}
+            )
+          })}
         </div>
       )}
 

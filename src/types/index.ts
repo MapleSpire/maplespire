@@ -317,7 +317,12 @@ export type CommentType = 'question' | 'inaccuracy' | 'idea'
 export interface CommentReply {
   id: string
   text: string
+  /** Display label captured at write time; never compared against an identity.
+   *  Legacy entries hold the literal 'You' (see lib/comments/authorship.ts). */
   author: string
+  /** Stable `AuthUser.id` of the writer. Absent on legacy and identity-less
+   *  (AUTH off) entries. */
+  authorId?: string
   createdAt: string
 }
 
@@ -327,7 +332,12 @@ export interface Comment {
   type: CommentType
   text: string
   position: Position
+  /** Display label captured at write time; never compared against an identity.
+   *  Legacy entries hold the literal 'You' (see lib/comments/authorship.ts). */
   author: string
+  /** Stable `AuthUser.id` of the writer. Absent on legacy and identity-less
+   *  (AUTH off) entries. */
+  authorId?: string
   createdAt: string
   resolved: boolean
   pinned: boolean

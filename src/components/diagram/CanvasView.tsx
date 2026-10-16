@@ -23,6 +23,8 @@ import { getModelQuery } from '../../lib/modelQuery'
 import { seedObjectForEdit } from '../../lib/automerge/bridge'
 import { reloadWorkspace } from '../../lib/automerge/switchWorkspace'
 import { useUIStore } from '../../stores/uiStore'
+import { useAuthStore } from '../../stores/authStore'
+import { commentAuthorshipFor } from '../../lib/comments/authorship'
 import { useSkinStore } from '../../stores/skinStore'
 import { useThemeStore } from '../../stores/themeStore'
 import { useAutomergeStatus } from '../../stores/automergeStatusStore'
@@ -1634,7 +1636,8 @@ export function CanvasView() {
                 type,
                 text,
                 position: worldPos,
-                author: 'You',
+                // The signed-in identity, never a literal: "You" is decided at render.
+                ...commentAuthorshipFor(useAuthStore.getState().user),
                 resolved: false,
                 pinned: false,
                 replies: [],

@@ -519,7 +519,9 @@ export async function stripIdsFromAllDiagrams(
 
 export interface CommentMutation {
   resolve?: boolean
-  reply?: { text: string; author: string }
+  /** `authorId` is the writer's `AuthUser.id` — the identity the SPA compares
+   *  against to render "You"; `author` is only a display label. */
+  reply?: { text: string; author: string; authorId?: string | null }
 }
 
 export async function mutateComment(
@@ -545,6 +547,7 @@ export async function mutateComment(
           id: newEntityId(),
           text: mutation.reply.text,
           author: mutation.reply.author,
+          ...(mutation.reply.authorId ? { authorId: mutation.reply.authorId } : {}),
           createdAt: new Date().toISOString(),
         })
       )

@@ -20,6 +20,8 @@ import i18n from '../../lib/i18n'
 import { cn } from '../../lib/utils'
 import { useModelStore } from '../../stores/modelStore'
 import { useUIStore } from '../../stores/uiStore'
+import { useAuthStore } from '../../stores/authStore'
+import { commentAuthorLabel } from '../../lib/comments/authorship'
 import type { Comment } from '../../types'
 
 function typeConfigFor(t: TFunction) {
@@ -49,6 +51,7 @@ export function CommentsPanel() {
   const comments = useModelStore((s) => s.comments)
   const currentDiagramId = useModelStore((s) => s.currentDiagramId)
   const toggleResolved = useModelStore((s) => s.toggleResolved)
+  const viewer = useAuthStore((s) => s.user)
   const filter = useUIStore((s) => s.commentsFilter)
   const setFilter = useUIStore((s) => s.setCommentsFilter)
   const setOpenCommentId = useUIStore((s) => s.setOpenCommentId)
@@ -181,7 +184,7 @@ export function CommentsPanel() {
 
                     {/* Footer */}
                     <div className="flex items-center gap-2 mt-1.5">
-                      <span className="text-[11px] text-fg-subtle">{comment.author}</span>
+                      <span className="text-[11px] text-fg-subtle" data-testid="comment-row-author">{commentAuthorLabel(comment, viewer, t)}</span>
                       {comment.replies.length > 0 && (
                         <span className="flex items-center gap-0.5 text-[11px] text-fg-muted">
                           <MessageSquare className="w-3 h-3" />

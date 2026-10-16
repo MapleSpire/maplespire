@@ -20,6 +20,10 @@
       "addIdea": "Add idea",
       "placeholder": "Type your comment…"
     },
+    "author": {
+      "you": "You",
+      "unknown": "Unknown author"
+    },
     "detail": {
       "pin": "Pin",
       "unpin": "Unpin",
