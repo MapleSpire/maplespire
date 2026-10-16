@@ -1328,30 +1328,36 @@ export class CanvasEngine {
     this.scheduleRender()
   }
 
-  focusOnObject(objectId: string, padding = 120) {
+  /** Centre on a shape or group. Returns false (viewport untouched) when the
+   *  id is not drawn on this diagram. */
+  focusOnObject(objectId: string, padding = 120): boolean {
     const obj = this.objects.find((o) => o.id === objectId)
     if (obj) {
       this.focusOnBounds(
         { x: obj.position.x, y: obj.position.y, width: obj.size.width, height: obj.size.height },
         padding
       )
-      return
+      return true
     }
     const group = this.groups.find((g) => g.id === objectId)
     if (group) {
       const bounds = this.getGroupBounds(group)
       if (bounds) {
         this.focusOnBounds(bounds, padding)
+        return true
       }
     }
+    return false
   }
 
-  focusOnConnection(connectionId: string, padding = 120) {
+  /** Centre on a connection's two endpoints. Returns false (viewport untouched)
+   *  when the connection or an endpoint is not drawn on this diagram. */
+  focusOnConnection(connectionId: string, padding = 120): boolean {
     const conn = this.connections.find((c) => c.id === connectionId)
-    if (!conn) return
+    if (!conn) return false
     const from = this.getConnectionEndpoint(conn.fromId, conn.lockedToAnchors ? conn.fromAnchor : undefined)
     const to = this.getConnectionEndpoint(conn.toId, conn.lockedToAnchors ? conn.toAnchor : undefined)
-    if (!from || !to) return
+    if (!from || !to) return false
 
     // Compute bounds that encompass both endpoints
     const minX = Math.min(from.cx, to.cx) - Math.max(from.width, to.height) / 2
@@ -1362,6 +1368,7 @@ export class CanvasEngine {
       { x: minX, y: minY, width: maxX - minX, height: maxY - minY },
       padding
     )
+    return true
   }
 
   focusOnFlowStep(flow: Flow, stepIndex: number) {

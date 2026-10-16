@@ -42,12 +42,13 @@ import {
   objectTeamRows,
   objectTechnologyRows,
   objectToRow,
+  replaceDiagramFlowIndex,
   type WorkspaceKey,
 } from '../src/readModel/projector.js'
 import { ensureReadModelSchema } from '../src/readModel/schema.js'
 import { registerStaticReadModelDocuments } from '../src/readModel/staticWorkspace.js'
 import { synchronizeOverlaySegments } from '../src/readModel/overlayHistoryStore.js'
-import type { ConnectionInput, DiagramInput, ObjectInput } from '../src/readModel/types.js'
+import type { ConnectionInput, DiagramInput, FlowInput, ObjectInput } from '../src/readModel/types.js'
 
 const OBJECT_BATCH = 1_000
 const CONNECTION_BATCH = 1_000
@@ -335,6 +336,10 @@ async function updateDenseDiagramReadModel(
         [JSON.stringify(flowRows)],
       )
     }
+    // Keep the object-flow index in step with ro_connection_flows: same flows,
+    // same transaction, or the witness would certify the old flow set.
+    await replaceDiagramFlowIndex(client, key, orgId, diagram.id,
+      Object.values((diagram.flows ?? {}) as Record<string, FlowInput>))
   })
 }
 

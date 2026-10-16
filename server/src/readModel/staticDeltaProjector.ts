@@ -40,6 +40,8 @@ import {
   deleteDiagrams,
   deleteGroups,
   deleteObjects,
+  dropDiagramFlowIndex,
+  replaceDiagramFlowIndex,
   upsertConnections,
   upsertDiagrams,
   upsertGroups,
@@ -3666,8 +3668,12 @@ export class StaticDeltaProjector {
       const flows = Object.values(doc.flows ?? {})
       const flowRows = flows.flatMap((flow) => unique((flow.steps ?? []).map((step) => step.connectionId))
         .map((connectionId) => ({ entityId: connectionId, auxiliaryId: flow.id })))
+      // Only a document that CARRIES a flows map may certify its flow set; one
+      // without (treated as empty just above, as it always was) leaves the
+      // diagram uncovered rather than covered-and-empty.
+      const flowIndex = doc.flows && typeof doc.flows === 'object' && !Array.isArray(doc.flows) ? flows : null
 
-      await replaceDiagramMembership(tx, descriptor, descriptor.orgId, diagramId, objectIds, groupIds, connectionIds, flowRows)
+      await replaceDiagramMembership(tx, descriptor, descriptor.orgId, diagramId, objectIds, groupIds, connectionIds, flowRows, flowIndex)
       await recordStaticEntityDeltas(tx, descriptor, 'diagram', generation, [merged])
       await recordStaticMembershipSnapshot(tx, descriptor, 'diagram_object', diagramId, generation, previousObjects, objectIds.map((entityId) => ({ entityId })))
       await recordStaticMembershipSnapshot(tx, descriptor, 'diagram_group', diagramId, generation, previousGroups, groupIds.map((entityId) => ({ entityId })))
@@ -4123,8 +4129,11 @@ async function replaceDiagramMembership(
   groupIds: string[],
   connectionIds: string[],
   flows: StaticMembershipValue[],
+  flowIndex: readonly FlowInput[] | null,
 ): Promise<void> {
   const params = [key.landscapeId, key.versionId, diagramId]
+  if (flowIndex) await replaceDiagramFlowIndex(db, key, orgId, diagramId, flowIndex)
+  else await dropDiagramFlowIndex(db, key, diagramId)
   const previousConnectionIds = await db.query<{ connection_id: string }>(
     `SELECT connection_id FROM ro_diagram_connections
      WHERE landscape_id = $1 AND version_id = $2 AND diagram_id = $3

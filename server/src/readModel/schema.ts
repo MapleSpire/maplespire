@@ -971,6 +971,51 @@ export async function ensureReadModelSchema(db: Queryable): Promise<void> {
   await db.query(`CREATE INDEX IF NOT EXISTS idx_ro_connection_flows_connection
     ON ro_connection_flows (landscape_id, version_id, connection_id, flow_id)`)
 
+  // Flow names and the objects each flow's steps touch (a process step's
+  // object, a message step's sender and receiver), so the Details panel can
+  // answer "which flows use this object" without opening every DiagramDoc.
+  // Both are replaced per diagram, exactly like ro_connection_flows.
+  //
+  // ro_diagram_flow_index is the COVERAGE witness: a row means this diagram's
+  // flows were projected by a writer that maintains the two tables above. A
+  // diagram projected before they existed has flow rows nowhere, and there is
+  // no SQL backfill (flows live only in DiagramDocs), so an answer over a
+  // diagram without a witness row is reported incomplete, never as zero.
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS ro_flows (
+      landscape_id TEXT NOT NULL,
+      version_id   TEXT NOT NULL,
+      org_id       TEXT,
+      diagram_id   TEXT NOT NULL,
+      flow_id      TEXT NOT NULL,
+      name         TEXT NOT NULL DEFAULT '',
+      PRIMARY KEY (landscape_id, version_id, diagram_id, flow_id)
+    )
+  `)
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS ro_flow_objects (
+      landscape_id TEXT NOT NULL,
+      version_id   TEXT NOT NULL,
+      org_id       TEXT,
+      diagram_id   TEXT NOT NULL,
+      flow_id      TEXT NOT NULL,
+      object_id    TEXT NOT NULL,
+      PRIMARY KEY (landscape_id, version_id, diagram_id, flow_id, object_id)
+    )
+  `)
+  await db.query(`CREATE INDEX IF NOT EXISTS idx_ro_flow_objects_object
+    ON ro_flow_objects (landscape_id, version_id, object_id, diagram_id, flow_id)`)
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS ro_diagram_flow_index (
+      landscape_id TEXT NOT NULL,
+      version_id   TEXT NOT NULL,
+      org_id       TEXT,
+      diagram_id   TEXT NOT NULL,
+      index_version INTEGER NOT NULL DEFAULT 1,
+      PRIMARY KEY (landscape_id, version_id, diagram_id)
+    )
+  `)
+
   // Compact, scalar projections for the highest-volume list/explorer paths.
   // These rows are derived and replay-safe: projector writes maintain them and
   // the INSERTs below backfill an older read model once on upgrade.
@@ -1262,6 +1307,9 @@ export async function dropReadModelSchema(db: Queryable): Promise<void> {
       EXECUTE format('DROP TABLE IF EXISTS %I.ro_diagram_groups', s);
       EXECUTE format('DROP TABLE IF EXISTS %I.ro_diagram_connections', s);
       EXECUTE format('DROP TABLE IF EXISTS %I.ro_connection_flows', s);
+      EXECUTE format('DROP TABLE IF EXISTS %I.ro_flows', s);
+      EXECUTE format('DROP TABLE IF EXISTS %I.ro_flow_objects', s);
+      EXECUTE format('DROP TABLE IF EXISTS %I.ro_diagram_flow_index', s);
       EXECUTE format('DROP TABLE IF EXISTS %I.ro_diagram_summaries', s);
       EXECUTE format('DROP TABLE IF EXISTS %I.ro_connection_stats', s);
       EXECUTE format('DROP TABLE IF EXISTS %I.ro_object_child_stats', s);

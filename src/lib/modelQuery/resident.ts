@@ -136,7 +136,16 @@ export const residentModelQuery: ModelQuery = {
     return useModelStore.getState().connections
   },
   async relatedDiagrams(objectId, options) {
-    return boundRelatedDiagrams(useModelStore.getState().getRelatedDiagrams(objectId), options)
+    return boundRelatedDiagrams(
+      useModelStore.getState().getRelatedDiagrams(objectId, { includeCurrent: options?.includeCurrent }),
+      options,
+    )
+  },
+  async entityFlows() {
+    return null
+  },
+  async entityDiagrams() {
+    return null
   },
   async relatedDiagramObjectIds(objectIds) {
     const state = useModelStore.getState()

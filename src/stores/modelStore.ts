@@ -413,7 +413,7 @@ interface ModelState {
   syncAllLowerConnections: () => void
 
   // Related diagrams for expand/zoom navigation
-  getRelatedDiagrams: (objectId: string) => {
+  getRelatedDiagrams: (objectId: string, options?: { includeCurrent?: boolean }) => {
     detail: Diagram[]
     reference: Diagram[]
     parent: Diagram[]
@@ -1909,8 +1909,9 @@ export const useModelStore = create<ModelState>()(
       return Array.from(closure)
     },
 
-    getRelatedDiagrams: (objectId) => {
+    getRelatedDiagrams: (objectId, options) => {
       const state = get()
+      const excluded = options?.includeCurrent ? null : state.currentDiagramId
       const idx = getDiagramIndex()
       const obj = idx.objectById.get(objectId)
       if (!obj) return { detail: [], reference: [], parent: [] }
@@ -1931,7 +1932,7 @@ export const useModelStore = create<ModelState>()(
       ) => {
         if (!ids) return
         for (const did of ids) {
-          if (did === state.currentDiagramId || seen.has(did)) continue
+          if (did === excluded || seen.has(did)) continue
           const diagram = idx.diagramById.get(did)
           if (!diagram) continue
           into.push(diagram)

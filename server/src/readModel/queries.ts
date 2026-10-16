@@ -14,7 +14,7 @@
 
 import type { Queryable } from './types.js'
 import type { WorkspaceKey } from './projector.js'
-import { technologyText } from './projector.js'
+import { FLOW_INDEX_VERSION, technologyText } from './projector.js'
 import { getWorkspaceProjectionFreshness, type ReadModelWorkspaceStatus } from './health.js'
 
 /**
@@ -365,6 +365,137 @@ export async function roRelatedDiagramObjectIds(
     [key.landscapeId, key.versionId, currentDiagramId, boundedObjectIds],
   )
   return rows.map((row) => row.id)
+}
+
+export interface EntityFlows {
+  flows: Array<{ id: string; diagramId: string; name: string }>
+  /** Distinct (diagram, flow) pairs; may exceed `flows.length` (bounded). */
+  total: number
+  /** False when a diagram holding the entity has no CURRENT coverage witness
+   * (`ro_diagram_flow_index` at FLOW_INDEX_VERSION): its flows were never
+   * projected into the index, so `total` is a floor, not a count. */
+  complete: boolean
+}
+
+export interface EntityFlowsOptions {
+  limit?: number
+  /** Leave this diagram out of hits AND coverage. The client passes the OPEN
+   * diagram, whose flows it holds live (and may hold unsynced or newer than
+   * the projection), and adds them itself. */
+  excludeDiagramId?: string | null
+}
+
+/**
+ * The flows whose steps use an object (process step on it, message sent or
+ * received by it), or that travel over a connection, across the WHOLE model.
+ *
+ * Hits: `ro_flow_objects` for objects, `ro_connection_flows` for connections
+ * (the Connections table's flow source); both only on diagrams that still
+ * exist. Completeness, for BOTH kinds: every diagram holding the entity
+ * (`ro_diagram_objects` / `ro_diagram_connections`) carries a current coverage
+ * witness. A cold build wipes every flow row and the per-diagram flow pass
+ * runs after it, unawaited — without the witness test a connection would read
+ * "0 flows, exact" through that whole window.
+ *
+ * Assumes a flow only references entities placed on its own diagram: a stale
+ * step on an entity that has since left an UNCOVERED diagram is neither
+ * counted nor flagged.
+ */
+export async function roEntityFlows(
+  db: Queryable,
+  key: WorkspaceKey,
+  kind: 'object' | 'connection',
+  id: string,
+  options: EntityFlowsOptions = {},
+): Promise<EntityFlows> {
+  const limit = Math.min(100, Math.max(1, Math.floor(options.limit ?? 50)))
+  const postings = kind === 'object'
+    ? { table: 'ro_flow_objects', column: 'object_id' }
+    : { table: 'ro_connection_flows', column: 'connection_id' }
+  const membership = kind === 'object'
+    ? { table: 'ro_diagram_objects', column: 'object_id' }
+    : { table: 'ro_diagram_connections', column: 'connection_id' }
+  const { rows } = await db.query<{ uncovered: string | number; total: string | number; items: EntityFlows['flows'] }>(
+    // No DISTINCT: both posting tables' primary keys end in (…, flow_id,
+    // <entity>_id), so with the entity fixed each (diagram, flow) is already
+    // one row — a DISTINCT here could never change the answer.
+    `WITH hits AS MATERIALIZED (
+       SELECT posting.diagram_id, posting.flow_id
+       FROM ${postings.table} posting
+       WHERE posting.landscape_id = $1 AND posting.version_id = $2 AND posting.${postings.column} = $3
+         AND ($5::text IS NULL OR posting.diagram_id <> $5)
+         AND EXISTS (
+           SELECT 1 FROM ro_diagrams diagram
+           WHERE diagram.landscape_id = $1 AND diagram.version_id = $2 AND diagram.id = posting.diagram_id)
+     )
+     SELECT (SELECT count(*) FROM ${membership.table} member
+             WHERE member.landscape_id = $1 AND member.version_id = $2 AND member.${membership.column} = $3
+               AND ($5::text IS NULL OR member.diagram_id <> $5)
+               AND NOT EXISTS (
+                 SELECT 1 FROM ro_diagram_flow_index covered
+                 WHERE covered.landscape_id = $1 AND covered.version_id = $2
+                   AND covered.diagram_id = member.diagram_id AND covered.index_version = $6)) AS uncovered,
+            (SELECT count(*) FROM hits) AS total,
+            COALESCE((
+              SELECT jsonb_agg(jsonb_build_object('id', page.flow_id, 'diagramId', page.diagram_id, 'name', page.name)
+                               ORDER BY page.ordinal)
+              FROM (
+                SELECT hit.flow_id, hit.diagram_id, COALESCE(flow.name, '') AS name,
+                       row_number() OVER (
+                         ORDER BY lower(COALESCE(flow.name, '')) COLLATE "C", hit.diagram_id COLLATE "C", hit.flow_id COLLATE "C"
+                       ) AS ordinal
+                FROM hits hit
+                LEFT JOIN ro_flows flow
+                  ON flow.landscape_id = $1 AND flow.version_id = $2
+                 AND flow.diagram_id = hit.diagram_id AND flow.flow_id = hit.flow_id
+              ) page
+              WHERE page.ordinal <= $4
+            ), '[]'::jsonb) AS items`,
+    [key.landscapeId, key.versionId, id, limit, options.excludeDiagramId ?? null, FLOW_INDEX_VERSION],
+  )
+  const row = rows[0]
+  return {
+    flows: row?.items ?? [],
+    total: Number(row?.total ?? 0),
+    complete: Number(row?.uncovered ?? 0) === 0,
+  }
+}
+
+export interface EntityDiagrams {
+  /** Name-sorted diagram stubs, bounded by `limit`. */
+  diagrams: Json[]
+  total: number
+}
+
+/** Diagrams placing a group or a connection — `ro_diagram_groups` /
+ * `ro_diagram_connections`, the sources of the Model Objects group row and the
+ * Connections table's diagram column on this tier. The client's diagram
+ * registry can be a bounded window under the summary contract, so it is not
+ * a substitute. */
+export async function roEntityDiagrams(
+  db: Queryable,
+  key: WorkspaceKey,
+  kind: 'group' | 'connection',
+  id: string,
+  options: { limit?: number } = {},
+): Promise<EntityDiagrams> {
+  const limit = Math.min(100, Math.max(1, Math.floor(options.limit ?? 50)))
+  const membership = kind === 'group'
+    ? { table: 'ro_diagram_groups', column: 'group_id' }
+    : { table: 'ro_diagram_connections', column: 'connection_id' }
+  const { rows } = await db.query<{ data: Json; total: string | number }>(
+    `SELECT diagram.data, count(*) OVER () AS total
+     FROM ${membership.table} member
+     JOIN ro_diagrams diagram
+       ON diagram.landscape_id = member.landscape_id AND diagram.version_id = member.version_id
+      AND diagram.id = member.diagram_id
+     WHERE member.landscape_id = $1 AND member.version_id = $2 AND member.${membership.column} = $3
+     ORDER BY lower(COALESCE(diagram.data->>'name', '')) COLLATE "C", diagram.id COLLATE "C"
+     LIMIT $4`,
+    [key.landscapeId, key.versionId, id, limit],
+  )
+  if (rows.length) return { diagrams: rows.map((row) => row.data), total: Number(rows[0].total) }
+  return { diagrams: [], total: 0 }
 }
 
 // ── search (SQL filter + Node rank for exact parity) ──────────────────────────

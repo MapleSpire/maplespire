@@ -1623,10 +1623,15 @@ export async function startReadModelProjector(
         }
         await runTracked('registry', (tx) => syncConnectionFlows(
           tx, key, orgId, diagram.id, Object.values(readFlows.map),
+          // Certify coverage only for a real flows map: a `field-not-a-map`
+          // defect reads as `{}` and must not become "complete, no flows".
+          readFlows.defect === null,
         ), { kind: 'reset', scope: 'all' },
-        // Writes ro_connection_flows and NOTHING a digest covers, so all four
-        // seals stay accurate and only their generation moves. Without this the
-        // boot's per-diagram flow pass would invalidate every seal it walked past.
+        // Writes ro_connection_flows, ro_flows, ro_flow_objects and
+        // ro_diagram_flow_index — NOTHING a digest covers (DIGEST_KINDS is the
+        // object/connection/group/diagram id sets), so all four seals stay
+        // accurate and only their generation moves. Without this the boot's
+        // per-diagram flow pass would invalidate every seal it walked past.
         { unchanged: DIGEST_KINDS })
         degradedDocuments.delete(docUrl)
         clearDegradationIfRecovered()

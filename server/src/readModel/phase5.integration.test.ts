@@ -160,7 +160,7 @@ suite('Phase-5 derived read model (isolated PostgreSQL)', () => {
     )
     await syncConnectionFlows(pool, key, 'org', 'd1', [
       { id: 'flow-1', steps: [{ connectionId: 'c1' }] },
-    ])
+    ], true)
     await upsertDecisionRecords(pool, key, 'org', [
       { id: 'adr-old', title: 'Old', status: 'approved', createdAt: '2026-01-01T00:00:00.000Z' },
       { id: 'adr-new', title: 'New', status: 'proposed', createdAt: '2026-02-01T00:00:00.000Z' },

@@ -199,6 +199,10 @@ interface UIState {
   previousDiagramId: string | null
   isTransitioning: boolean
   transitionDirection: 'in' | 'out' | null
+  /** An entity to centre on when `diagramId` is next fitted on the canvas, set
+   *  by "open in diagram" links (Details panel). The canvas consumes it in place
+   *  of its first zoom-to-fit, so the switch lands on the entity. */
+  pendingCanvasFocus: { diagramId: string; kind: 'object' | 'group' | 'connection'; id: string } | null
 
   // Decision records view state
   selectedADRId: string | null
@@ -325,6 +329,7 @@ interface UIState {
   expandInline: (diagramId: string, objectId: string, targetDiagramId: string) => void
   collapseInline: (objectId: string) => void
   setZoomedFromObjectId: (id: string | null) => void
+  setPendingCanvasFocus: (focus: UIState['pendingCanvasFocus']) => void
   setPreviousDiagramId: (id: string | null) => void
   setIsTransitioning: (value: boolean) => void
   setTransitionDirection: (dir: 'in' | 'out' | null) => void
@@ -380,6 +385,7 @@ export const useUIStore = create<UIState>()(
     previousDiagramId: null,
     isTransitioning: false,
     transitionDirection: null,
+    pendingCanvasFocus: null,
 
     selectedADRId: null,
     adrSearchQuery: '',
@@ -447,6 +453,9 @@ export const useUIStore = create<UIState>()(
     setCurrentView: (view) =>
       set((state) => {
         state.currentView = view
+        // A canvas-centring request is for the NEXT canvas visit only; coming
+        // back later through the nav must fit normally.
+        if (view !== 'diagram') state.pendingCanvasFocus = null
       }),
 
     setToolMode: (mode) =>
@@ -816,6 +825,11 @@ export const useUIStore = create<UIState>()(
     setZoomedFromObjectId: (id) =>
       set((state) => {
         state.zoomedFromObjectId = id
+      }),
+
+    setPendingCanvasFocus: (focus) =>
+      set((state) => {
+        state.pendingCanvasFocus = focus
       }),
 
     setPreviousDiagramId: (id) =>

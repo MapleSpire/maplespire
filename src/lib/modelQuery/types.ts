@@ -30,6 +30,10 @@ export interface RelatedDiagramsOptions {
   query?: string
   limit?: number
   signal?: AbortSignal
+  /** Keep the active diagram in the buckets. Off by default: the expand menu
+   * navigates AWAY from it. On, `reference` is every diagram that contains the
+   * object — the membership the Model Objects "In diagrams" column counts. */
+  includeCurrent?: boolean
 }
 
 export interface RelatedDiagramsResult {
@@ -39,6 +43,16 @@ export interface RelatedDiagramsResult {
   totals: { detail: number; reference: number; parent: number }
   limit: number
   truncated: boolean
+}
+
+/** Whole-model flows that use an object or travel over a connection. */
+export interface EntityFlowsResult {
+  flows: Array<{ id: string; diagramId: string; name: string }>
+  /** Distinct (diagram, flow) pairs; may exceed `flows.length` (bounded). */
+  total: number
+  /** False when some diagram holding the entity has not been flow-indexed
+   * yet: `total` is then a floor. */
+  complete: boolean
 }
 
 export interface RelatedDiagramObjectIdsOptions {
@@ -355,6 +369,29 @@ export interface ModelQuery {
     objectIds: string[],
     opts?: RelatedDiagramObjectIdsOptions,
   ): Promise<string[]>
+  /** Flows using an object / travelling over a connection, across the whole
+   * model. `null` when this tier holds no whole-model flow index (the store
+   * only ever carries the OPEN diagram's flows) — the caller then counts the
+   * open diagram's flows and says so. */
+  entityFlows(
+    kind: 'object' | 'connection',
+    id: string,
+    opts?: {
+      limit?: number
+      signal?: AbortSignal
+      /** Leave this diagram (the OPEN one, whose flows the caller holds live)
+       * out of the hits and of the completeness test. */
+      excludeDiagramId?: string | null
+    },
+  ): Promise<EntityFlowsResult | null>
+  /** Diagrams placing a group / connection, from the read model. `null` when
+   * this tier has none — the caller then uses the diagram registry, which can
+   * be a bounded window under the summary contract. */
+  entityDiagrams(
+    kind: 'group' | 'connection',
+    id: string,
+    opts?: { limit?: number; signal?: AbortSignal },
+  ): Promise<{ diagrams: Diagram[]; total: number } | null>
   /** Global text search over object name/description/technology + connection label.
    * Substring match, relevance-ranked; requires >= SEARCH_MIN_CHARS to search. */
   search(query: string, limit?: number): Promise<SearchHit[]>

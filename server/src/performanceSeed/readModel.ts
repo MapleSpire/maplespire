@@ -18,6 +18,8 @@ import {
   upsertConnections,
   upsertDiagrams,
   upsertObjects,
+  insertDiagramFlowIndex,
+  type FlowIndexInput,
   type WorkspaceKey,
 } from '../readModel/projector.js'
 import { markStaticReadModelWorkspace } from '../readModel/staticWorkspace.js'
@@ -108,7 +110,8 @@ async function clearWorkspace(db: Pool, key: WorkspaceKey): Promise<void> {
     'read_model_diagram_render_generations',
     'ro_object_technologies', 'ro_group_technologies', 'ro_object_tags', 'ro_group_tags',
     'ro_object_teams', 'ro_group_objects', 'ro_diagram_objects', 'ro_diagram_groups',
-    'ro_diagram_connections', 'ro_connection_flows', 'ro_objects', 'ro_connections',
+    'ro_diagram_connections', 'ro_connection_flows',
+    'ro_flows', 'ro_flow_objects', 'ro_diagram_flow_index', 'ro_objects', 'ro_connections',
     'ro_groups', 'ro_diagrams', 'ro_decision_records',
   ]
   let rollbackFailure: Error | true | undefined
@@ -307,6 +310,7 @@ export async function materializePerformanceReadModel(
     const objectRows: Record<string, unknown>[] = []
     const connectionRows: Record<string, unknown>[] = []
     const flowRows: Record<string, unknown>[] = []
+    const flowIndexEntries: Array<{ diagramId: string; flows: FlowIndexInput[] }> = []
     for (let offset = 0; offset < count; offset += 1) {
       const index = start + offset
       const full = plan.diagramAt(index)
@@ -323,10 +327,15 @@ export async function materializePerformanceReadModel(
           flowRows.push({ ...common, flow_id: flow.id, connection_id })
         }
       }
+      flowIndexEntries.push({ diagramId: full.id, flows: Object.values(full.flows) })
     }
     await insertMembershipRows(db, 'ro_diagram_objects', objectRows)
     await insertMembershipRows(db, 'ro_diagram_connections', connectionRows)
     await insertMembershipRows(db, 'ro_connection_flows', flowRows)
+    // Flow names, object postings and the coverage witness, from the same
+    // `full.flows` — without them every seeded diagram reads as unindexed and
+    // the panel could only ever say "at least N flows" on this workspace.
+    await insertDiagramFlowIndex(db, key, orgId, flowIndexEntries)
     const completed = start + count
     onProgress?.({
       phase: 'read_model_diagrams', completed, total: plan.diagramCount,

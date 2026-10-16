@@ -98,7 +98,7 @@ import { gcOrphanedDocs } from './gc.js'
 import {
   roObject, roGroup, roConnection, roLookupMany, durabilityWitnessPayload, roIncoming, roOutgoing,
   roConnectionCount, roDescendants, roRelatedDiagrams, roRelatedDiagramObjectIds, roSearch, roPageObjects, roPageConnections,
-  roDiagramMeta, roFilteredObjectTree, roModelObjectFacets,
+  roDiagramMeta, roFilteredObjectTree, roModelObjectFacets, roEntityFlows, roEntityDiagrams,
 } from './readModel/queries.js'
 import { roDiagramRender, toFirstPaintDiagramRender } from './readModel/diagramRender.js'
 import {
@@ -1771,6 +1771,56 @@ if (READ_MODEL_ENABLED) {
       },
     ))
     const body = timing.measureSync('serialize', () => JSON.stringify(related))
+    timing.write(res)
+    res.type('application/json').send(body)
+  }))
+  app.get('/api/model/entity-flows', route(async (req, res) => {
+    const timing = new ServerTimingTrace()
+    const key = await timing.measure('workspace', () => ensureWorkspace(req, res))
+    if (!key) return
+    const kind = req.query.kind === 'connection' ? 'connection' : req.query.kind === 'object' ? 'object' : null
+    if (!kind) {
+      res.status(400).json({ error: 'kind must be object or connection' })
+      return
+    }
+    const flows = await timing.measure('query', () => roEntityFlows(
+      pool,
+      key,
+      kind,
+      String(req.query.id ?? '').slice(0, 256),
+      {
+        limit: intParam(req.query.limit, 50),
+        excludeDiagramId: typeof req.query.excludeDiagram === 'string' && req.query.excludeDiagram
+          ? req.query.excludeDiagram.slice(0, 256) : null,
+      },
+    ))
+    // `ensureWorkspace` answers a sparse draft from its BASE version's rows.
+    // A draft's DiagramDocs fork lazily and nothing projects their flows into
+    // the base, so the base's witnesses certify flows the draft may have
+    // changed: never call that answer complete.
+    const requestedKey = await canonicalWorkspaceKey(pool, workspaceFromReq(req))
+    if (requestedKey && requestedKey.versionId !== key.versionId) flows.complete = false
+    const body = timing.measureSync('serialize', () => JSON.stringify(flows))
+    timing.write(res)
+    res.type('application/json').send(body)
+  }))
+  app.get('/api/model/entity-diagrams', route(async (req, res) => {
+    const timing = new ServerTimingTrace()
+    const key = await timing.measure('workspace', () => ensureWorkspace(req, res))
+    if (!key) return
+    const kind = req.query.kind === 'group' ? 'group' : req.query.kind === 'connection' ? 'connection' : null
+    if (!kind) {
+      res.status(400).json({ error: 'kind must be group or connection' })
+      return
+    }
+    const diagrams = await timing.measure('query', () => roEntityDiagrams(
+      pool,
+      key,
+      kind,
+      String(req.query.id ?? '').slice(0, 256),
+      { limit: intParam(req.query.limit, 50) },
+    ))
+    const body = timing.measureSync('serialize', () => JSON.stringify(diagrams))
     timing.write(res)
     res.type('application/json').send(body)
   }))

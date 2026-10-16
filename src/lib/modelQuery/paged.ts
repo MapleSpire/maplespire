@@ -125,7 +125,7 @@ async function relatedDiagramsFromRegistry(
   if (!obj) return emptyRelatedDiagrams(options.limit)
 
   const state = useModelStore.getState()
-  const currentDiagramId = state.currentDiagramId
+  const currentDiagramId = options.includeCurrent ? null : state.currentDiagramId
   const detail: Diagram[] = []
   const reference: Diagram[] = []
   const parent: Diagram[] = []
@@ -341,6 +341,27 @@ export const pagedModelQuery: ModelQuery = {
       }
     }
     return relatedDiagramsFromRegistry(store(), objectId, options)
+  },
+  entityFlows: async (kind, id, options) => {
+    if (isServerReadModelEnabled() && (typeof navigator === 'undefined' || navigator.onLine)) {
+      try {
+        return await serverModelQuery.entityFlows(kind, id, options)
+      } catch (error) {
+        if (options?.signal?.aborted || (error instanceof DOMException && error.name === 'AbortError')) throw error
+      }
+    }
+    // Offline / no read model: nothing here indexes other diagrams' flows.
+    return null
+  },
+  entityDiagrams: async (kind, id, options) => {
+    if (isServerReadModelEnabled() && (typeof navigator === 'undefined' || navigator.onLine)) {
+      try {
+        return await serverModelQuery.entityDiagrams(kind, id, options)
+      } catch (error) {
+        if (options?.signal?.aborted || (error instanceof DOMException && error.name === 'AbortError')) throw error
+      }
+    }
+    return null
   },
   relatedDiagramObjectIds: async (objectIds, options) => {
     const uniqueObjectIds = [...new Set(objectIds)]

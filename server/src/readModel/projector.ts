@@ -1059,6 +1059,9 @@ export async function deleteDiagrams(db: Queryable, key: WorkspaceKey, ids: read
       `DELETE FROM ro_connection_flows WHERE landscape_id = $1 AND version_id = $2 AND diagram_id = ANY($3::text[])`,
       params,
     )
+    for (const table of DIAGRAM_FLOW_INDEX_TABLES) {
+      await tx.query(`DELETE FROM ${table} WHERE landscape_id = $1 AND version_id = $2 AND diagram_id = ANY($3::text[])`, params)
+    }
     const deleted = await tx.query(
       `DELETE FROM ro_diagrams WHERE landscape_id = $1 AND version_id = $2 AND id = ANY($3::text[])`,
       params,
@@ -1097,6 +1100,12 @@ export async function syncDiagrams(db: Queryable, key: WorkspaceKey, orgId: stri
       `DELETE FROM ro_connection_flows WHERE landscape_id = $1 AND version_id = $2 AND diagram_id <> ALL($3::text[])`,
       [key.landscapeId, key.versionId, diagrams.map((d) => d.id)]
     )
+    for (const table of DIAGRAM_FLOW_INDEX_TABLES) {
+      await tx.query(
+        `DELETE FROM ${table} WHERE landscape_id = $1 AND version_id = $2 AND diagram_id <> ALL($3::text[])`,
+        [key.landscapeId, key.versionId, diagrams.map((d) => d.id)],
+      )
+    }
     await replaceDiagramMembership(tx, key, orgId, diagrams)
     await refreshDiagramSummaries(tx, key)
     await refreshConnectionStats(tx, key)
@@ -1189,14 +1198,137 @@ async function replaceDiagramMembership(
   }
 }
 
+/** Every table `replaceDiagramFlowIndex` writes, keyed by diagram. A path that
+ * drops a diagram's (or a workspace's) ro_connection_flows drops these too —
+ * the coverage witness above all: left behind, it would certify flows that no
+ * longer have rows. */
+export const DIAGRAM_FLOW_INDEX_TABLES = ['ro_flows', 'ro_flow_objects', 'ro_diagram_flow_index'] as const
+
+/** The fields of a flow the flow index reads — structural, so a DiagramDoc's
+ * FlowInput and the performance seed's flows both fit. */
+export interface FlowIndexInput {
+  id: string
+  name?: unknown
+  steps?: unknown
+}
+
+/** The objects one flow's steps touch: a process step's object, a message
+ * step's sender and receiver. Mirrors the client's `flowsReferencingObject`. */
+export function flowObjectIds(flow: FlowIndexInput): string[] {
+  const ids = new Set<string>()
+  // A malformed document must not throw here: this runs inside the flow
+  // projection transaction, where a throw degrades the whole workspace.
+  for (const raw of Array.isArray(flow.steps) ? (flow.steps as unknown[]) : []) {
+    if (!raw || typeof raw !== 'object') continue
+    const step = raw as Record<string, unknown>
+    const candidates = step.type === 'process'
+      ? [step.objectId]
+      : step.type === 'message' ? [step.fromObjectId, step.toObjectId] : []
+    for (const id of candidates) if (typeof id === 'string' && id) ids.add(id)
+  }
+  return [...ids]
+}
+
+/** Replace ONE diagram's flow names + object postings and record that the
+ * diagram is covered (`ro_diagram_flow_index`). Callers pass the diagram's
+ * COMPLETE flow set, read from a DiagramDoc that carries a flows map — a
+ * document without one must not reach here, or the witness would certify an
+ * empty set it never saw. Runs inside the caller's transaction. */
+export async function replaceDiagramFlowIndex(
+  db: Queryable,
+  key: WorkspaceKey,
+  orgId: string | null,
+  diagramId: string,
+  flows: readonly FlowInput[],
+): Promise<void> {
+  await dropDiagramFlowIndex(db, key, diagramId)
+  await insertDiagramFlowIndex(db, key, orgId, [{ diagramId, flows }])
+}
+
+/** Forget one diagram's flow index, coverage witness included: its flows are
+ * then reported as unknown. Runs inside the caller's transaction. */
+export async function dropDiagramFlowIndex(db: Queryable, key: WorkspaceKey, diagramId: string): Promise<void> {
+  for (const table of DIAGRAM_FLOW_INDEX_TABLES) {
+    await db.query(
+      `DELETE FROM ${table} WHERE landscape_id = $1 AND version_id = $2 AND diagram_id = $3`,
+      [key.landscapeId, key.versionId, diagramId],
+    )
+  }
+}
+
+/** The derivation `ro_diagram_flow_index.index_version` certifies. Bump it when
+ * `flowObjectIds` (or what a flow row holds) changes meaning: every older
+ * witness then stops counting as coverage, so its diagrams read as incomplete
+ * until re-projected instead of certifying the old semantics. */
+export const FLOW_INDEX_VERSION = 1
+
+/** Insert flow names, object postings and coverage witnesses for diagrams
+ * whose previous rows are already gone (a per-diagram replace, or the seed of
+ * an empty workspace). Three statements whatever the diagram count. */
+export async function insertDiagramFlowIndex(
+  db: Queryable,
+  key: WorkspaceKey,
+  orgId: string | null,
+  entries: ReadonlyArray<{ diagramId: string; flows: readonly FlowIndexInput[] }>,
+): Promise<void> {
+  if (!entries.length) return
+  const names: Array<{ diagramId: string; flowId: string; name: string }> = []
+  const postings: Array<{ diagramId: string; flowId: string; objectId: string }> = []
+  for (const { diagramId, flows } of entries) {
+    for (const flow of flows) {
+      if (typeof flow.id !== 'string' || !flow.id) continue
+      names.push({ diagramId, flowId: flow.id, name: typeof flow.name === 'string' ? flow.name : '' })
+      for (const objectId of flowObjectIds(flow)) postings.push({ diagramId, flowId: flow.id, objectId })
+    }
+  }
+  // text[] + unnest, NOT jsonb: a user-typed flow name holding U+0000 or a lone
+  // surrogate is rejected by the jsonb parser, which would fail this whole
+  // flow transaction (ro_connection_flows included) on every retry. Text
+  // parameters go through pg's UTF-8 encoding; NUL is stripped (Postgres text
+  // cannot hold it).
+  const clean = (value: string) => value.split(String.fromCharCode(0)).join('')
+  if (names.length) {
+    await db.query(
+      `INSERT INTO ro_flows (landscape_id, version_id, org_id, diagram_id, flow_id, name)
+       SELECT $1, $2, $3, item.diagram_id, item.flow_id, item.name
+       FROM unnest($4::text[], $5::text[], $6::text[]) AS item(diagram_id, flow_id, name)
+       ON CONFLICT DO NOTHING`,
+      [key.landscapeId, key.versionId, orgId,
+        names.map((row) => clean(row.diagramId)), names.map((row) => clean(row.flowId)), names.map((row) => clean(row.name))],
+    )
+  }
+  if (postings.length) {
+    await db.query(
+      `INSERT INTO ro_flow_objects (landscape_id, version_id, org_id, diagram_id, flow_id, object_id)
+       SELECT $1, $2, $3, item.diagram_id, item.flow_id, item.object_id
+       FROM unnest($4::text[], $5::text[], $6::text[]) AS item(diagram_id, flow_id, object_id)
+       ON CONFLICT DO NOTHING`,
+      [key.landscapeId, key.versionId, orgId,
+        postings.map((row) => clean(row.diagramId)), postings.map((row) => clean(row.flowId)), postings.map((row) => clean(row.objectId))],
+    )
+  }
+  await db.query(
+    `INSERT INTO ro_diagram_flow_index (landscape_id, version_id, org_id, diagram_id, index_version)
+     SELECT $2, $3, $4, id, $5 FROM unnest($1::text[]) AS id
+     ON CONFLICT (landscape_id, version_id, diagram_id) DO UPDATE SET index_version = EXCLUDED.index_version`,
+    [[...new Set(entries.map((entry) => clean(entry.diagramId)))], key.landscapeId, key.versionId, orgId, FLOW_INDEX_VERSION],
+  )
+}
+
 /** Project the flow→connection postings from one DiagramDoc. Diagram documents
- * are independently synced, so replacement is scoped to exactly one diagram. */
+ * are independently synced, so replacement is scoped to exactly one diagram.
+ *
+ * `certify` — no default, on purpose: true only when `flows` was read from a
+ * DiagramDoc whose `flows` IS a map. Otherwise (e.g. a `field-not-a-map`
+ * defect, read as `{}`) the diagram's object-flow index and coverage witness
+ * are dropped instead, so its flows read as unknown rather than as none. */
 export async function syncConnectionFlows(
   db: Queryable,
   key: WorkspaceKey,
   orgId: string | null,
   diagramId: string,
   flows: FlowInput[],
+  certify: boolean,
 ): Promise<void> {
   await withPoolTransaction(db, async (tx) => {
     const old = await tx.query<{ connection_id: string }>(
@@ -1225,6 +1357,8 @@ export async function syncConnectionFlows(
         params,
       )
     }
+    if (certify) await replaceDiagramFlowIndex(tx, key, orgId, diagramId, flows)
+    else await dropDiagramFlowIndex(tx, key, diagramId)
     await refreshConnectionStats(tx, key, [
       ...old.rows.map((row) => row.connection_id),
       ...rows.map(([, connectionId]) => connectionId),
@@ -1291,6 +1425,9 @@ export async function coldBuildReadModel(
     await tx.query(`DELETE FROM ro_diagram_groups WHERE landscape_id = $1 AND version_id = $2`, params)
     await tx.query(`DELETE FROM ro_diagram_connections WHERE landscape_id = $1 AND version_id = $2`, params)
     await tx.query(`DELETE FROM ro_connection_flows WHERE landscape_id = $1 AND version_id = $2`, params)
+    for (const table of DIAGRAM_FLOW_INDEX_TABLES) {
+      await tx.query(`DELETE FROM ${table} WHERE landscape_id = $1 AND version_id = $2`, params)
+    }
     await tx.query(`DELETE FROM ro_objects WHERE landscape_id = $1 AND version_id = $2`, params)
     await tx.query(`DELETE FROM ro_connections WHERE landscape_id = $1 AND version_id = $2`, params)
     await tx.query(`DELETE FROM ro_groups WHERE landscape_id = $1 AND version_id = $2`, params)

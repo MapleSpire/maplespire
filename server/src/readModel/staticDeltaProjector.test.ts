@@ -1756,6 +1756,44 @@ describe('StaticDeltaProjector — les tombstones de diagramme (T6)', () => {
     // `refreshDiagramSummaries` purges `ro_diagram_summaries` through its
     // NOT EXISTS clause once the `ro_diagrams` row is gone.
     expect(ran('DELETE FROM ro_diagram_summaries')).toBe(true)
+    // …and the object-flow index with its coverage witness, or the witness
+    // would certify flows that no longer have rows.
+    expect(ran('DELETE FROM ro_flow_objects')).toBe(true)
+    expect(ran('DELETE FROM ro_diagram_flow_index')).toBe(true)
+  })
+
+  it('certifie la couverture des flux seulement pour une vraie map flows', async () => {
+    // A DiagramDoc whose `flows` is missing or not a map is projected as an
+    // EMPTY flow set (as it always was for ro_connection_flows). The coverage
+    // witness must not certify that: it is dropped, so the diagram's flows
+    // read as unknown ("at least N") instead of "exactly 0".
+    const project = async (flows: unknown) => {
+      const { internal, ran, callsMatching } = harness()
+      const diagramDescriptor = { ...descriptorOf('dg-doc'), kind: 'diagram', entityId: 'dg1' }
+      await (internal as unknown as {
+        projectDiagram(descriptor: unknown, doc: unknown, revision: number): Promise<void>
+      }).projectDiagram(diagramDescriptor, {
+        id: 'dg1', name: 'D', objectIds: ['A'], connectionIds: [], groupIds: [],
+        ...(flows === undefined ? {} : { flows }),
+      }, 3)
+      return { ran, callsMatching }
+    }
+
+    const real = await project({ f1: { id: 'f1', name: 'Checkout', steps: [{ type: 'process', objectId: 'A' }] } })
+    expect(real.ran('INSERT INTO ro_flow_objects')).toBe(true)
+    const witness = real.callsMatching('INSERT INTO ro_diagram_flow_index')
+    expect(witness).toHaveLength(1)
+    expect(witness[0].params[0]).toEqual(['dg1'])
+
+    for (const notAMap of [undefined, [{ id: 'f1', steps: [] }], 'garbage']) {
+      const run = await project(notAMap)
+      expect(run.ran('INSERT INTO ro_diagram_flow_index')).toBe(false)
+      // All three tables, scoped to exactly this diagram of this workspace.
+      for (const table of ['ro_flows', 'ro_flow_objects', 'ro_diagram_flow_index']) {
+        expect(run.callsMatching(`DELETE FROM ${table} WHERE`).map((call) => call.params))
+          .toEqual([['land', 'version', 'dg1']])
+      }
+    }
   })
 
   it('ne supprime pas deux fois pour deux projections du meme tombstone', async () => {

@@ -92,6 +92,8 @@ import { planBulkTagAssign, planBulkTagRemove, planBulkTechnologyAssign, planBul
 import { generateId } from '../../lib/utils'
 import { SegmentedTabs } from '../ui/SegmentedTabs'
 import { Switch } from '../ui/switch'
+import { FieldRow } from './FieldRow'
+import { ContainsField, UsageFields } from './EntityUsageFields'
 import { TagPicker } from '../tags/TagPicker'
 import {
   assignTechnologyUsage,
@@ -570,9 +572,7 @@ export function RightSidebar() {
                   )}
                 </div>
               </FieldRow>
-              <FieldRow label={t('layoutNav.rightSidebar.field.diagrams')}>
-                <span className="text-[12px] text-fg-secondary">{t('layoutNav.rightSidebar.inOneDiagram')}</span>
-              </FieldRow>
+              <UsageFields kind="group" id={selectedGroup.id} />
             </div>
 
             {/* Tags */}
@@ -951,12 +951,7 @@ export function RightSidebar() {
                 )
               })()}
             </FieldRow>
-            <FieldRow label={t('layoutNav.rightSidebar.field.diagrams')}>
-              <span className="text-[12px] text-fg-secondary">{t('layoutNav.rightSidebar.inOneDiagram')}</span>
-            </FieldRow>
-            <FieldRow label={t('layoutNav.rightSidebar.field.flows')}>
-              <span className="text-[12px] text-fg-secondary">{t('layoutNav.rightSidebar.inZeroFlows')}</span>
-            </FieldRow>
+            <UsageFields kind="connection" id={selectedConnection.id} />
             <FieldRow label={t('layoutNav.rightSidebar.field.anchorLock')}>
               <button
                 data-testid="connection-anchor-lock"
@@ -1268,11 +1263,7 @@ export function RightSidebar() {
                       ))}
                     </select>
                   </FieldRow>
-                  <FieldRow label={t('layoutNav.rightSidebar.field.contains')}>
-                    <span className="text-[12px] font-medium text-fg-secondary">
-                      {selected.parentId ? t('layoutNav.rightSidebar.oneObject') : t('layoutNav.rightSidebar.zeroObjects')}
-                    </span>
-                  </FieldRow>
+                  <ContainsField objectId={selected.id} />
                   <FieldRow label={t('layoutNav.rightSidebar.field.inGroups')} align="top">
                     <MembershipEditor
                       memberOf={groups.filter((g) => g.objectIds.includes(selected.id))}
@@ -1282,15 +1273,7 @@ export function RightSidebar() {
                       onRemove={(gid) => removeObjectFromGroup(selected.id, gid)}
                     />
                   </FieldRow>
-                  <FieldRow label={t('layoutNav.rightSidebar.field.diagrams')}>
-                    <button className="flex items-center gap-1 text-[12px] font-semibold text-accent hover:underline">
-                      {t('layoutNav.rightSidebar.inOneDiagram')}
-                      <ChevronRight className="w-3 h-3" />
-                    </button>
-                  </FieldRow>
-                  <FieldRow label={t('layoutNav.rightSidebar.field.flows')}>
-                    <span className="text-[12px] font-medium text-fg-secondary">{t('layoutNav.rightSidebar.inZeroFlows')}</span>
-                  </FieldRow>
+                  <UsageFields kind="object" id={selected.id} />
                 </div>
 
                 {/* Tags */}
@@ -1489,26 +1472,6 @@ export function RightSidebar() {
         </>
       )}
     </aside>
-  )
-}
-
-function FieldRow({
-  label,
-  children,
-  align = 'center',
-}: {
-  label: string
-  children: React.ReactNode
-  // `top` first-line-aligns the label with multi-line / wrapping values (e.g. a
-  // flex-wrap chip cloud) instead of centering it against the whole block.
-  align?: 'center' | 'top'
-}) {
-  const items = align === 'top' ? 'items-start' : 'items-center'
-  return (
-    <div className={cn('flex justify-between', items)}>
-      <span className="text-[12px] text-fg-subtle">{label}</span>
-      <div className={cn('flex', items)}>{children}</div>
-    </div>
   )
 }
 

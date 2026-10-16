@@ -14,11 +14,11 @@
 
 import { describe, it, expect, afterAll, beforeEach, afterEach } from 'vitest'
 import pg from 'pg'
-import { coldBuildReadModel, type WorkspaceKey } from './projector.js'
+import { coldBuildReadModel, deleteDiagrams, FLOW_INDEX_VERSION, replaceDiagramFlowIndex, syncConnectionFlows, syncDiagrams, type WorkspaceKey } from './projector.js'
 import {
   roObject, roGroup, roLookupMany, roIncoming, roOutgoing,
   roConnectionCount, roDescendants, roRelatedDiagrams, roRelatedDiagramObjectIds, roSearch, roPageObjects, roPageConnections,
-  roFilteredObjectTree,
+  roFilteredObjectTree, roEntityFlows, roEntityDiagrams,
 } from './queries.js'
 import type { ObjectInput, ConnectionInput, GroupInput, DiagramInput } from './types.js'
 import { guardIdleClientErrors } from '../db/poolErrorGuard.js'
@@ -282,6 +282,134 @@ suite('read-model queries (Postgres integration, txn-isolated)', () => {
       limit: 50,
       truncated: false,
     })
+  })
+
+  it('entityFlows: whole-model object flows, complete only once every holding diagram is indexed', async () => {
+    const dia = (id: string, objectIds: string[], connectionIds: string[] = []): DiagramInput =>
+      ({ id, name: id, type: 'container', objectIds, connectionIds, groupIds: [] })
+    // A is on dgOne AND dgTwo; B only on dgOne. c1 = A→B on dgOne AND dgTwo.
+    await build([o('A'), o('B')], [c('c1', 'A', 'B')], [], [dia('dgOne', ['A', 'B'], ['c1']), dia('dgTwo', ['A'], ['c1'])])
+    const ids = (r: { flows: Array<{ diagramId: string; id: string }> }) => r.flows.map((f) => `${f.diagramId}/${f.id}`)
+
+    // Nothing indexed yet (the cold-build window): unknown, never "0, exact" — for objects AND connections.
+    expect(await roEntityFlows(client, WS, 'object', 'A')).toEqual({ flows: [], total: 0, complete: false })
+    expect(await roEntityFlows(client, WS, 'connection', 'c1')).toEqual({ flows: [], total: 0, complete: false })
+
+    await syncConnectionFlows(client, WS, null, 'dgOne', [
+      { id: 'checkout', name: 'Checkout', steps: [{ type: 'message', fromObjectId: 'A', toObjectId: 'B', connectionId: 'c1' }] },
+      { id: 'audit', name: 'Audit', steps: [{ type: 'process', objectId: 'B' }, { type: 'introduction' }] },
+    ], true)
+    // dgTwo still unindexed → a floor, for the object and for the connection.
+    expect(await roEntityFlows(client, WS, 'object', 'A')).toMatchObject({ total: 1, complete: false })
+    expect(await roEntityFlows(client, WS, 'connection', 'c1')).toMatchObject({ total: 1, complete: false })
+    // B is only on dgOne, which is indexed → exact; process + message receiver both count.
+    const b = await roEntityFlows(client, WS, 'object', 'B')
+    expect(b).toMatchObject({ total: 2, complete: true })
+    expect(b.flows.map((f) => f.name)).toEqual(['Audit', 'Checkout'])
+    // Excluding the open diagram drops its hits AND its coverage requirement.
+    expect(await roEntityFlows(client, WS, 'object', 'A', { excludeDiagramId: 'dgTwo' }))
+      .toMatchObject({ total: 1, complete: true })
+    expect(await roEntityFlows(client, WS, 'object', 'B', { excludeDiagramId: 'dgOne' }))
+      .toEqual({ flows: [], total: 0, complete: true })
+
+    await syncConnectionFlows(client, WS, null, 'dgTwo', [
+      { id: 'refund', name: 'Refund', steps: [{ type: 'process', objectId: 'A' }] },
+    ], true)
+    const a = await roEntityFlows(client, WS, 'object', 'A')
+    expect(a).toMatchObject({ total: 2, complete: true })
+    expect(ids(a)).toEqual(['dgOne/checkout', 'dgTwo/refund'])
+    expect(await roEntityFlows(client, WS, 'object', 'A', { limit: 1 })).toMatchObject({ total: 2, complete: true })
+    expect((await roEntityFlows(client, WS, 'object', 'A', { limit: 1 })).flows).toHaveLength(1)
+    // Connections read ro_connection_flows (the Connections table's source).
+    expect(await roEntityFlows(client, WS, 'connection', 'c1'))
+      .toEqual({ flows: [{ id: 'checkout', diagramId: 'dgOne', name: 'Checkout' }], total: 1, complete: true })
+
+    // A projection that could not read a flows MAP must not certify: rows AND witness go.
+    await syncConnectionFlows(client, WS, null, 'dgTwo', [], false)
+    expect(await roEntityFlows(client, WS, 'object', 'A')).toMatchObject({ total: 1, complete: false })
+
+    // Re-projecting a diagram REPLACES its rows (and keeps it covered).
+    await syncConnectionFlows(client, WS, null, 'dgOne', [], true)
+    expect(await roEntityFlows(client, WS, 'object', 'B')).toEqual({ flows: [], total: 0, complete: true })
+
+    // Deleting a diagram drops its rows AND its coverage witness.
+    await syncConnectionFlows(client, WS, null, 'dgTwo', [{ id: 'refund', name: 'Refund', steps: [{ type: 'process', objectId: 'A' }] }], true)
+    await deleteDiagrams(client, WS, ['dgTwo'])
+    expect(await roEntityFlows(client, WS, 'object', 'A')).toEqual({ flows: [], total: 0, complete: true })
+    const witness = await client.query(
+      `SELECT diagram_id FROM ro_diagram_flow_index WHERE landscape_id = $1 AND version_id = $2 ORDER BY diagram_id`,
+      [WS.landscapeId, WS.versionId],
+    )
+    expect(witness.rows.map((r) => r.diagram_id)).toEqual(['dgOne'])
+  })
+
+  it('entityFlows: postings for a diagram that no longer exists are not counted', async () => {
+    const dia = (id: string, objectIds: string[]): DiagramInput =>
+      ({ id, name: id, type: 'container', objectIds, connectionIds: [], groupIds: [] })
+    await build([o('A')], [], [], [dia('dgReal', ['A'])])
+    await syncConnectionFlows(client, WS, null, 'dgReal', [{ id: 'f1', name: 'One', steps: [{ type: 'process', objectId: 'A' }] }], true)
+    // A late, coalesced flow projection for a diagram the registry already dropped.
+    await replaceDiagramFlowIndex(client, WS, null, 'dgGhost', [{ id: 'f9', name: 'Ghost', steps: [{ type: 'process', objectId: 'A' }] }])
+    expect(await roEntityFlows(client, WS, 'object', 'A')).toMatchObject({ total: 1, complete: true })
+  })
+
+  it('entityFlows: a witness from an older index version does not count as coverage', async () => {
+    const dia = (id: string, objectIds: string[]): DiagramInput =>
+      ({ id, name: id, type: 'container', objectIds, connectionIds: [], groupIds: [] })
+    await build([o('A')], [], [], [dia('dgOld', ['A'])])
+    await syncConnectionFlows(client, WS, null, 'dgOld', [{ id: 'f1', name: 'One', steps: [{ type: 'process', objectId: 'A' }] }], true)
+    expect((await roEntityFlows(client, WS, 'object', 'A')).complete).toBe(true)
+    await client.query(
+      `UPDATE ro_diagram_flow_index SET index_version = $3 WHERE landscape_id = $1 AND version_id = $2`,
+      [WS.landscapeId, WS.versionId, FLOW_INDEX_VERSION - 1],
+    )
+    expect((await roEntityFlows(client, WS, 'object', 'A')).complete).toBe(false)
+  })
+
+  it('entityFlows: a hostile flow name (NUL, lone surrogate) cannot fail the flow projection', async () => {
+    const dia = (id: string, objectIds: string[]): DiagramInput =>
+      ({ id, name: id, type: 'container', objectIds, connectionIds: [], groupIds: [] })
+    await build([o('A')], [], [], [dia('dgOne', ['A'])])
+    await syncConnectionFlows(client, WS, null, 'dgOne', [
+      { id: 'f1', name: 'Cut \uD83D emoji\u0000', steps: [{ type: 'process', objectId: 'A' }] },
+      { id: 'f2', name: 42, steps: [{ type: 'process', objectId: 'A' }] },
+    ], true)
+    const a = await roEntityFlows(client, WS, 'object', 'A')
+    expect(a).toMatchObject({ total: 2, complete: true })
+    expect(a.flows.map((f) => f.id).sort()).toEqual(['f1', 'f2'])
+    expect(a.flows.find((f) => f.id === 'f2')?.name).toBe('')
+  })
+
+  it('entityFlows: a registry sync and a cold build drop the flow index of what they remove', async () => {
+    const dia = (id: string, objectIds: string[]): DiagramInput =>
+      ({ id, name: id, type: 'container', objectIds, connectionIds: [], groupIds: [] })
+    await build([o('A')], [], [], [dia('dgKeep', ['A']), dia('dgGone', ['A'])])
+    await syncConnectionFlows(client, WS, null, 'dgKeep', [{ id: 'f1', name: 'One', steps: [{ type: 'process', objectId: 'A' }] }], true)
+    await syncConnectionFlows(client, WS, null, 'dgGone', [{ id: 'f2', name: 'Two', steps: [{ type: 'process', objectId: 'A' }] }], true)
+    expect((await roEntityFlows(client, WS, 'object', 'A')).total).toBe(2)
+
+    await syncDiagrams(client, WS, null, [dia('dgKeep', ['A'])])
+    expect(await roEntityFlows(client, WS, 'object', 'A')).toMatchObject({ total: 1, complete: true })
+
+    await build([o('A')], [], [], [dia('dgKeep', ['A'])])
+    // Rebuilt from scratch: the diagram is back, its flows are not projected yet.
+    expect(await roEntityFlows(client, WS, 'object', 'A')).toEqual({ flows: [], total: 0, complete: false })
+  })
+
+  it('entityDiagrams: groups and connections answered from the read model, name-sorted and bounded', async () => {
+    const dia = (id: string, name: string, over: Partial<DiagramInput>): DiagramInput =>
+      ({ id, name, type: 'container', objectIds: [], connectionIds: [], groupIds: [], ...over })
+    await build([o('A'), o('B')], [c('c1', 'A', 'B')], [g('G1')], [
+      dia('d1', 'Zeta', { groupIds: ['G1'], connectionIds: ['c1'] }),
+      dia('d2', 'alpha', { groupIds: ['G1'] }),
+      dia('d3', 'Mid', { connectionIds: [] }),
+    ])
+    const group = await roEntityDiagrams(client, WS, 'group', 'G1')
+    expect(group.total).toBe(2)
+    expect(group.diagrams.map((d) => d.id)).toEqual(['d2', 'd1'])
+    expect(await roEntityDiagrams(client, WS, 'group', 'G1', { limit: 1 })).toMatchObject({ total: 2 })
+    expect((await roEntityDiagrams(client, WS, 'connection', 'c1')).diagrams.map((d) => d.id)).toEqual(['d1'])
+    expect(await roEntityDiagrams(client, WS, 'connection', 'nope')).toEqual({ diagrams: [], total: 0 })
   })
 
   it('relatedDiagrams: bounds a large fan-out and searches beyond the first page', async () => {

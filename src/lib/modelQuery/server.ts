@@ -27,9 +27,10 @@ import type {
   PeerEdge,
   SearchHit,
   RelatedDiagramsResult,
+  EntityFlowsResult,
   ViewerLevelResult,
 } from './types'
-import type { C4Object, Group, Connection } from '../../types'
+import type { C4Object, Group, Connection, Diagram } from '../../types'
 import { warnWholeModelRead } from './wholeModelGuard'
 import { currentWorkspaceRef, workspaceRefKey } from '../automerge/workspace'
 import { getModelReadCacheWorker } from './workerClient'
@@ -328,12 +329,22 @@ export const serverModelQuery: ModelQuery = {
     return useModelStore.getState().connections
   },
   relatedDiagrams: async (objectId, options) => {
-    const current = useModelStore.getState().currentDiagramId
+    // No `current` parameter = the server excludes nothing (roRelatedDiagrams).
+    const current = options?.includeCurrent ? null : useModelStore.getState().currentDiagramId
     const own = `object=${enc(objectId)}${current ? `&current=${enc(current)}` : ''}`
       + `${options?.query?.trim() ? `&q=${enc(options.query.trim())}` : ''}`
       + `&limit=${Math.min(100, Math.max(1, Math.floor(options?.limit ?? 50)))}`
     const path = `/api/model/related-diagrams?${withWorkspaceParams(own)}`
     return getJson<RelatedDiagramsResult>(path, options?.signal)
+  },
+  entityFlows: async (kind, id, options) => {
+    const own = `kind=${kind}&id=${enc(id)}&limit=${Math.min(100, Math.max(1, Math.floor(options?.limit ?? 50)))}`
+      + (options?.excludeDiagramId ? `&excludeDiagram=${enc(options.excludeDiagramId)}` : '')
+    return getJson<EntityFlowsResult>(`/api/model/entity-flows?${withWorkspaceParams(own)}`, options?.signal)
+  },
+  entityDiagrams: async (kind, id, options) => {
+    const own = `kind=${kind}&id=${enc(id)}&limit=${Math.min(100, Math.max(1, Math.floor(options?.limit ?? 50)))}`
+    return getJson<{ diagrams: Diagram[]; total: number }>(`/api/model/entity-diagrams?${withWorkspaceParams(own)}`, options?.signal)
   },
   relatedDiagramObjectIds: async (objectIds, options) => {
     const current = useModelStore.getState().currentDiagramId

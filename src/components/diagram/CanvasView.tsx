@@ -47,7 +47,7 @@ import {
   isParentWrapper,
   planCopyWrites,
 } from './copyStyle'
-import type { ObjectTextBand } from '../../canvas/engine/CanvasEngine'
+import type { CanvasViewportInsets, ObjectTextBand } from '../../canvas/engine/CanvasEngine'
 import { publishDiagramCursor } from '../../lib/presence/diagramPresence'
 import { RemoteCursorOverlay } from '../presence/RemoteCursorOverlay'
 
@@ -85,6 +85,21 @@ function filterAndMergeDiagramData(
       return layout ? { ...g, position: layout.position, size: layout.size } : g
     })
   return { filteredObjects, filteredConnections, filteredGroups }
+}
+
+/** A diagram's first fit: centre on the entity an "open in diagram" link asked
+ *  for, else zoom-to-fit. The request is NOT consumed here — the DiagramDoc
+ *  re-fit (useDiagramReadyFit) runs this again and must land on the same
+ *  entity; CanvasView drops it once the user leaves that diagram. */
+function fitOrFocusPending(engine: CanvasEngine, diagramId: string, insets: CanvasViewportInsets) {
+  const focus = useUIStore.getState().pendingCanvasFocus
+  if (focus && focus.diagramId === diagramId) {
+    const focused = focus.kind === 'connection'
+      ? engine.focusOnConnection(focus.id)
+      : engine.focusOnObject(focus.id)
+    if (focused) return
+  }
+  engine.zoomToFit(insets)
 }
 
 /** The zoom readout, the only part of the canvas chrome that changes per wheel tick. */
@@ -443,7 +458,7 @@ export function CanvasView() {
         prevDiagramIdRef.current = diagramId
         if (fitFallbackRef.current) { clearTimeout(fitFallbackRef.current); fitFallbackRef.current = null }
         requestAnimationFrame(() => {
-          engine.zoomToFit(viewportInsetsRef.current)
+          fitOrFocusPending(engine, diagramId, viewportInsetsRef.current)
           setZoom(engine.getZoom())
         })
       }
@@ -466,7 +481,7 @@ export function CanvasView() {
           const e = engineRef.current
           if (e && useModelStore.getState().currentDiagramId === diagramId && prevDiagramIdRef.current !== diagramId) {
             prevDiagramIdRef.current = diagramId
-            e.zoomToFit(viewportInsetsRef.current)
+            fitOrFocusPending(e, diagramId, viewportInsetsRef.current)
             setZoom(e.getZoom())
           }
         }, 400)
@@ -481,6 +496,24 @@ export function CanvasView() {
     prevDiagramIdRef.current = null
     syncEngineFromStore()
   }, [syncEngineFromStore]))
+
+  // A pending "centre on this entity" request belongs to ONE diagram: drop it
+  // when the canvas shows another, so returning later fits normally.
+  // When it targets the diagram ALREADY fitted, no further fit will run to
+  // consume it, so centre now.
+  const pendingCanvasFocus = useUIStore((s) => s.pendingCanvasFocus)
+  useEffect(() => {
+    if (!pendingCanvasFocus) return
+    if (pendingCanvasFocus.diagramId !== currentDiagramId) {
+      useUIStore.getState().setPendingCanvasFocus(null)
+      return
+    }
+    const engine = engineRef.current
+    if (engine && prevDiagramIdRef.current === currentDiagramId) {
+      fitOrFocusPending(engine, pendingCanvasFocus.diagramId, viewportInsetsRef.current)
+      setZoom(engine.getZoom())
+    }
+  }, [pendingCanvasFocus, currentDiagramId, setZoom])
 
   // Restore the remembered 2D/3D view (per-user, per-diagram) when entering a
   // diagram — unless a `?view=` deep link is present on boot, which wins for the
@@ -741,6 +774,13 @@ export function CanvasView() {
     // data-sync effect below uses — see syncEngineFromStore's comment for why
     // this must be shared rather than each effect doing its own partial version.
     syncEngineFromStore()
+    // Same reason for the selection: the sync effect below only pushes on a
+    // change, so a selection made BEFORE this engine existed (e.g. an "open in
+    // diagram" link from the Model Objects page) would never be drawn.
+    engine.setSelectedItems(store.selectedItems)
+    // …and the current flow (an "open flow" link from the Details panel).
+    const flowState = useUIStore.getState()
+    engine.setFlowState(flowState.currentFlowId, flowState.currentFlowStepIndex)
 
     const resize = () => {
       const parent = canvas.parentElement
