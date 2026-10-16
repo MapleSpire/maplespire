@@ -467,6 +467,13 @@ export function TagPerspectiveBar() {
   const [dragged, setDragged] = useState<{ kind: 'group' | 'tag'; id: string } | null>(null)
   const [dropTarget, setDropTarget] = useState<{ kind: 'group' | 'tag'; id: string; before: boolean } | null>(null)
   const [teamNames, setTeamNames] = useState<Record<string, string>>({})
+  // Groups and values created from THIS bar during the session. The strip
+  // lists only what the current diagram uses, so without this a freshly
+  // created (necessarily empty) group or unassigned value is filtered out and
+  // the Save looks like it did nothing. Every other empty catalog group stays
+  // hidden — the strip must not list the whole org catalog.
+  const [createdGroupIds, setCreatedGroupIds] = useState<ReadonlySet<string>>(() => new Set())
+  const [createdTagIds, setCreatedTagIds] = useState<ReadonlySet<string>>(() => new Set())
 
   const moreRef = useRef<HTMLButtonElement>(null)
   const newGroupRef = useRef<HTMLButtonElement>(null)
@@ -481,11 +488,11 @@ export function TagPerspectiveBar() {
     }
 
     const catalogGroups = groups
-      .filter((group) => diagramTagsByGroup.has(group.id))
+      .filter((group) => diagramTagsByGroup.has(group.id) || createdGroupIds.has(group.id))
       .map((group) => ({
         ...group,
         catalogBacked: true,
-        diagramTagCount: diagramTagsByGroup.get(group.id)!.length,
+        diagramTagCount: diagramTagsByGroup.get(group.id)?.length ?? 0,
       }))
     const loadedGroupIds = new Set(catalogGroups.map((group) => group.id))
     const snapshotGroups = [...diagramTagsByGroup.entries()]
@@ -505,7 +512,7 @@ export function TagPerspectiveBar() {
         diagramTagCount: diagramTags.length,
       }))
     return [...catalogGroups, ...snapshotGroups]
-  }, [diagramTagSnapshots, groups, orgId])
+  }, [createdGroupIds, diagramTagSnapshots, groups, orgId])
   const activeGroup = useMemo(
     () => perspectiveGroups.find((group) => group.id === activeTagGroupId) ?? null,
     [activeTagGroupId, perspectiveGroups],
@@ -518,7 +525,8 @@ export function TagPerspectiveBar() {
       visibleSnapshots.map((snapshot) => [canonicalTagId(snapshot.tagId), snapshot]),
     )
     const catalogTags = tags
-      .filter((tag) => visibleSnapshotByCanonicalId.has(canonicalTagId(tag.canonicalTagId || tag.id)))
+      .filter((tag) => visibleSnapshotByCanonicalId.has(canonicalTagId(tag.canonicalTagId || tag.id))
+        || (createdTagIds.has(tag.id) && (!activeTagGroupId || tag.groupId === activeTagGroupId)))
       .map((tag) => ({ ...tag, catalogBacked: true }))
     const loadedCanonicalIds = new Set(
       catalogTags.map((tag) => canonicalTagId(tag.canonicalTagId || tag.id)),
@@ -540,7 +548,7 @@ export function TagPerspectiveBar() {
         catalogBacked: false,
       }))
     return [...catalogTags, ...snapshotTags]
-  }, [activeTagGroupId, diagramTagSnapshots, orgId, tags])
+  }, [activeTagGroupId, createdTagIds, diagramTagSnapshots, orgId, tags])
   const pinned = useMemo(() => new Set(pinnedTagIds), [pinnedTagIds])
   const hidden = useMemo(() => new Set(hiddenTagIds), [hiddenTagIds])
   const barLayout = resolvePerspectiveBarLayout(
@@ -814,6 +822,7 @@ export function TagPerspectiveBar() {
         workspace,
       })
       setGroups((current) => mergeUnique(current, [group]))
+      setCreatedGroupIds((current) => new Set(current).add(group.id))
       setActiveTagGroup(group.id)
       setBottomTab('tags')
       setGroupName('')
@@ -837,6 +846,7 @@ export function TagPerspectiveBar() {
         workspace,
       })
       setTags((current) => mergeUnique(current, [tag]))
+      setCreatedTagIds((current) => new Set(current).add(tag.id))
       setTagValue('')
       setNewTagOpen(false)
     } catch (cause) {
@@ -1051,6 +1061,7 @@ export function TagPerspectiveBar() {
                 <button
                   ref={newGroupRef}
                   type="button"
+                  data-testid="tag-new-group"
                   onClick={() => setNewGroupOpen(true)}
                   className="flex h-8 shrink-0 items-center gap-1 rounded-lg border border-dashed border-line-strong px-2.5 text-[12px] font-semibold text-fg-muted transition-colors hover:border-accent hover:text-accent"
                 >
@@ -1206,6 +1217,7 @@ export function TagPerspectiveBar() {
                 <button
                   ref={newTagRef}
                   type="button"
+                  data-testid="tag-new-tag"
                   onClick={() => setNewTagOpen(true)}
                   className="flex h-8 shrink-0 items-center gap-1 rounded-full border border-dashed border-line-strong px-2.5 text-[11px] font-semibold text-fg-muted hover:border-accent hover:text-accent"
                 >
@@ -1252,6 +1264,7 @@ export function TagPerspectiveBar() {
             {t('layoutChrome.bottomBar.tags.groupName')}
             <input
               autoFocus
+              data-testid="perspective-new-group-name"
               value={groupName}
               onChange={(event) => setGroupName(event.target.value)}
               className="mt-1 h-9 w-full rounded-lg border border-line bg-surface-50 px-3 text-[12px] text-fg outline-none focus:border-accent focus:ring-1 focus:ring-accent"
@@ -1277,6 +1290,7 @@ export function TagPerspectiveBar() {
             {t('layoutChrome.bottomBar.tags.tagName')}
             <input
               autoFocus
+              data-testid="perspective-new-tag-name"
               value={tagValue}
               onChange={(event) => setTagValue(event.target.value)}
               className="mt-1 h-9 w-full rounded-lg border border-line bg-surface-50 px-3 text-[12px] text-fg outline-none focus:border-accent focus:ring-1 focus:ring-accent"

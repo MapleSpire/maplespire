@@ -89,6 +89,14 @@ vi.mock('../../lib/tags/api', async (importOriginal) => ({
   })),
   reorderCatalogTag: vi.fn(async (_orgId, source) => ({ ...source, version: source.version + 1 })),
   reorderCatalogTagGroup: vi.fn(async (_orgId, source) => ({ ...source, version: source.version + 1 })),
+  createCatalogTagGroup: vi.fn(async (orgId: string, input: { name: string }) => ({
+    id: 'release', orgId, name: input.name, description: null, iconKey: null,
+    lifecycleStatus: 'active', version: 1, createdAt: '', updatedAt: '', tagCount: 0,
+  })),
+  createCatalogTag: vi.fn(async (orgId: string, input: { groupId: string; value: string; color: string }) => ({
+    id: 'release-ga', orgId, groupId: input.groupId, groupName: 'Release', value: input.value,
+    color: input.color, lifecycleStatus: 'active', canonicalTagId: null, version: 1, createdAt: '', updatedAt: '',
+  })),
 }))
 
 describe('TagPerspectiveBar', () => {
@@ -247,6 +255,38 @@ describe('TagPerspectiveBar', () => {
     } finally {
       useAutomergeStatus.setState({ status: 'connecting' })
     }
+  })
+
+  // Regression (2026-10-15): "New group" → Save created the group on the
+  // server and then NOTHING changed — the strip only lists groups whose Tags
+  // the current diagram uses, so the fresh empty group was filtered out (and
+  // the active-group reset effect then cleared the selection).
+  it('shows a group created from the bar as the active group, with its empty state and New tag', async () => {
+    render(<TagPerspectiveBar />)
+    fireEvent.click(screen.getByTestId('bottom-tab-tags'))
+    await screen.findByTestId('tag-group-risk')
+
+    fireEvent.click(await screen.findByRole('button', { name: 'New group' }))
+    fireEvent.change(await screen.findByLabelText('Group name'), { target: { value: 'Release' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    const chip = await screen.findByTestId('tag-group-release')
+    expect(chip.textContent).toContain('Release')
+    expect(chip.textContent).toContain('0')
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Release' }).getAttribute('aria-pressed')).toBe('true'))
+    expect(useUIStore.getState().activeTagGroupId).toBe('release')
+    expect(screen.getByText('No values in this diagram')).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'New tag' })).toBeTruthy()
+    // The rule for every OTHER empty catalog group is unchanged.
+    expect(screen.queryByTestId('tag-group-cost')).toBeNull()
+
+    // Continuing from the bar: a value created in the new group shows up too.
+    fireEvent.click(screen.getByRole('button', { name: 'New tag' }))
+    fireEvent.change(await screen.findByLabelText('Tag name'), { target: { value: 'GA' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    expect(await screen.findByTestId('tag-value-release-ga')).toBeTruthy()
+    expect(screen.queryByText('No values in this diagram')).toBeNull()
+    expect(screen.getByTestId('tag-group-release')).toBeTruthy()
   })
 
   it('keeps current-diagram Tags visible when the catalog pages are empty', async () => {
