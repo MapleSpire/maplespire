@@ -640,6 +640,39 @@ let bootCachedRootFallbackKey: string | null = null
  * server, stall again, and the one-shot guard would brick the whole recovery. */
 let bootFallbackReentryPending = false
 
+/** A parked diagram the next boot PREFERS rather than REQUESTS. A deep link
+ * requests a diagram: when it is absent, the canvas shows not-found, which is
+ * the honest answer to "open this diagram". A workspace switch that only wants
+ * to keep the user where they were (entering, leaving or merging a Draft)
+ * prefers one: absent from the target version, the boot falls back to its
+ * default pick instead of stranding the user on not-found. Set by
+ * `switchWorkspace` before every load (null for a request or no park), and
+ * consumed by the boot's initial-diagram choice — it survives the boot
+ * fallback's stopBridge → startBridge re-entry on purpose. */
+let preferredInitialDiagramId: string | null = null
+
+export function preferInitialDiagram(id: string | null): void {
+  preferredInitialDiagramId = id
+}
+
+/** The parked diagram, or null when it is only a preference the target
+ * version does not contain — or cannot be confirmed to contain (the park is
+ * then cleared from the store, so the default pick applies). Consumes the
+ * preference either way. */
+async function takeParkedInitialDiagram(
+  parked: string | null,
+  exists: (id: string) => boolean | Promise<boolean>,
+): Promise<string | null> {
+  const preferred = preferredInitialDiagramId
+  preferredInitialDiagramId = null
+  if (!parked || parked !== preferred || await exists(parked)) return parked
+  // The user may have picked a diagram while the existence check was in flight.
+  const now = useModelStore.getState().currentDiagramId
+  if (now !== parked) return now
+  withRemote(() => useModelStore.setState({ currentDiagramId: null }))
+  return null
+}
+
 /** TEST-ONLY: clear the one-shot boot-fallback guard between tests. The guard
  * is module state that survives a FAILED fallback boot on purpose (see above),
  * so a test that legitimately ends in 'error' would otherwise leak a latched
@@ -6379,7 +6412,30 @@ export async function startBridge(ref: WorkspaceRef = DEFAULT_WORKSPACE_REF): Pr
     await Promise.all([placementHydration, overlayBatchHydration])
     if (bootFromServer) {
       if (registrySummaryOnly) {
-        let requestedId = useModelStore.getState().currentDiagramId
+        let requestedId = await takeParkedInitialDiagram(
+          useModelStore.getState().currentDiagramId,
+          async (id) => {
+            if (tombstoneDiagrams.has(id)) return false
+            if (summaryRegistryMetas().some((diagram) => diagram.id === id)) return true
+            // Share the answer with the open below (it reuses preparedInitial).
+            if (id === requestedAtStart && !preparedInitial.bootstrap) {
+              preparedInitial.bootstrap = fetchDiagramMeta(id)
+              void preparedInitial.bootstrap.catch(() => undefined)
+            }
+            try {
+              return Boolean(await (id === requestedAtStart ? preparedInitial.bootstrap : fetchDiagramMeta(id)))
+            } catch {
+              // Unknown counts as absent for a PREFERENCE: keeping the park
+              // would make the open below await this rejected request outside
+              // any try and fail the whole boot (offline, or a draft's
+              // retryable 503 while the repository warms up). Forget the
+              // failed prefetch too, so the default pick takes exactly the
+              // pre-preference path.
+              if (id === requestedAtStart) preparedInitial.bootstrap = undefined
+              return false
+            }
+          },
+        )
         try {
           requestedId = await resolveSummaryRegistryInitialDiagram(
             requestedId,
@@ -6425,8 +6481,12 @@ export async function startBridge(ref: WorkspaceRef = DEFAULT_WORKSPACE_REF): Pr
     // blank diagram can sort first and become diagrams[0]. Prefer the first diagram that
     // actually has content so a fresh boot never lands the user (or a test) in an empty canvas.
     const initialDiagrams = useModelStore.getState().diagrams
+    const parked = await takeParkedInitialDiagram(
+      useModelStore.getState().currentDiagramId,
+      (id) => initialDiagrams.some((d) => d.id === id),
+    )
     const initial =
-      useModelStore.getState().currentDiagramId ??
+      parked ??
       (initialDiagrams.find((d) => d.objectIds.length > 0) ?? initialDiagrams[0])?.id ??
       null
     if (initial) {

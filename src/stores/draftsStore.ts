@@ -38,6 +38,8 @@ interface DraftsStoreState {
   create: (landscapeId: string, label: string) => Promise<api.DraftInfo | null>
   /** Open (switch into) an existing draft. */
   open: (draft: api.DraftInfo) => Promise<void>
+  /** Leave the active draft for the landscape's live version. */
+  exit: (landscapeId: string) => Promise<void>
   /** Change a draft's lifecycle status (archive / delete / restore). */
   setStatus: (landscapeId: string, draftId: string, status: api.DraftStatus) => Promise<void>
   /** Recompute the active draft's changes (server 3-way diff). Debounced by callers. */
@@ -84,8 +86,9 @@ export const useDraftsStore = create<DraftsStoreState>((set, get) => ({
     try {
       const draft = await api.createDraft(landscapeId, label)
       await get().load(landscapeId)
-      // Open it: switch the live workspace into the draft's version root.
-      await useWorkspaceStore.getState().switchTo(landscapeId, draft.id)
+      // Open it: switch the live workspace into the draft's version root, staying on
+      // the diagram the user was viewing.
+      await useWorkspaceStore.getState().switchTo(landscapeId, draft.id, undefined, { stayOnDiagram: true })
       set({ busy: false })
       return draft
     } catch (err) {
@@ -98,11 +101,15 @@ export const useDraftsStore = create<DraftsStoreState>((set, get) => ({
     if (get().busy) return
     set({ busy: true, error: null })
     try {
-      await useWorkspaceStore.getState().switchTo(draft.landscapeId, draft.id)
+      await useWorkspaceStore.getState().switchTo(draft.landscapeId, draft.id, undefined, { stayOnDiagram: true })
       set({ busy: false })
     } catch (err) {
       set({ busy: false, error: (err as Error).message })
     }
+  },
+
+  exit: async (landscapeId) => {
+    await useWorkspaceStore.getState().switchTo(landscapeId, CURRENT_VERSION_ID, undefined, { stayOnDiagram: true })
   },
 
   setStatus: async (landscapeId, draftId, status) => {
@@ -141,7 +148,7 @@ export const useDraftsStore = create<DraftsStoreState>((set, get) => ({
       if (result.ok) {
         await get().load(landscapeId) // status → merged
         // Leave the draft for the live workspace (which now carries the merged changes).
-        await useWorkspaceStore.getState().switchTo(landscapeId, CURRENT_VERSION_ID)
+        await useWorkspaceStore.getState().switchTo(landscapeId, CURRENT_VERSION_ID, undefined, { stayOnDiagram: true })
         set({ busy: false, changes: null, changesFor: null })
       } else {
         await get().loadChanges(landscapeId, draftId) // surface the blocking conflicts

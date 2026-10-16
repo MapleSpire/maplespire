@@ -64,8 +64,16 @@ interface WorkspaceStoreState {
   /** Switch the live workspace to a landscape + version ('current' follows default).
    * `openDiagramId` parks a deep-linked diagram so the switch lands on it. Store-led
    * callers (menu, drafts) get a URL update; the URL-led caller (WorkspaceRoute)
-   * passes `{ silent: true }` since the address bar already names the ref. */
-  switchTo: (landscapeId: string, versionId: string, openDiagramId?: string, opts?: { silent?: boolean }) => Promise<void>
+   * passes `{ silent: true }` since the address bar already names the ref.
+   * `stayOnDiagram` (entering, leaving or merging a Draft) keeps the user on the
+   * diagram they are viewing when the target version has it, and lands on the
+   * default diagram otherwise — never on not-found. */
+  switchTo: (
+    landscapeId: string,
+    versionId: string,
+    openDiagramId?: string,
+    opts?: { silent?: boolean; stayOnDiagram?: boolean },
+  ) => Promise<void>
   /** Create a new landscape (fresh Main version) and switch into it. Resolves with the
    * ref it landed on, or null when nothing was created (blank name, busy, or a failure —
    * `error` then carries why). Callers that write into the new workspace must gate on
@@ -110,7 +118,12 @@ export const useWorkspaceStore = create<WorkspaceStoreState>((set, get) => ({
     const before = currentWorkspaceRef()
     set({ busy: true, error: null })
     try {
-      await switchWorkspace({ landscapeId, versionId }, openDiagramId)
+      if (opts?.stayOnDiagram) {
+        const viewing = openDiagramId ?? useModelStore.getState().currentDiagramId ?? undefined
+        await switchWorkspace({ landscapeId, versionId }, viewing, { preferDiagram: true })
+      } else {
+        await switchWorkspace({ landscapeId, versionId }, openDiagramId)
+      }
     } catch (err) {
       set({ error: (err as Error).message })
     } finally {

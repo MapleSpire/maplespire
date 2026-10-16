@@ -39,6 +39,8 @@ import { generateAutomergeUrl } from '@automerge/automerge-repo'
 import * as repoModule from './repo'
 import * as durableSyncModule from './durableSync'
 import * as serverQueryModule from '../modelQuery/server'
+import * as diagramMetaModule from '../modelQuery/diagramMeta'
+import { fetchDiagramListPage } from '../modelQuery/diagrams'
 import { DEFAULT_WORKSPACE_REF, type WorkspaceRef } from './workspace'
 import { OVERLAY_WRITE_HEAD_VERSION } from './overlayWriteHead'
 import { useModelStore } from '../../stores/modelStore'
@@ -61,7 +63,7 @@ vi.mock('../modelQuery/kvStore', () => ({
 // locally: this suite is about which CONTRACT the boot enters, and a real fetch
 // would only add a rejected request to every case.
 vi.mock('../modelQuery/diagrams', () => ({
-  fetchDiagramListPage: async () => ({ items: [], nextCursor: null, total: 0 }),
+  fetchDiagramListPage: vi.fn(async () => ({ items: [], nextCursor: null, total: 0 })),
 }))
 
 /** `doc` may be a value or a getter — the projection caches skip re-reading a
@@ -573,5 +575,77 @@ describe('the summary boot contract is read from the ROOT, never from the build 
     expect(isRegistrySummaryOnlyActive()).toBe(false)
     expect(isWorkspaceSummaryActive()).toBe(false)
     expect(isServerReadModelEnabled()).toBe(false)
+  })
+
+  /**
+   * Defect 2026-10-16 (draft create/merge left the viewed diagram), summary
+   * half: a Draft switch parks the viewed diagram as a PREFERENCE. On a summary
+   * root the registry is not resident, so existence is the server's answer
+   * (`fetchDiagramMeta` → undefined). The resident half is in
+   * bridgePreferredDiagram.test.ts.
+   */
+  describe('a preferred diagram on a summary root', () => {
+    async function bootSummaryParked(parked: string, prefer: boolean, served: string[]) {
+      const { root, meta } = summaryRoot(usableMeta())
+      vi.spyOn(repoModule, 'getRootHandle').mockResolvedValue(root)
+      vi.spyOn(repoModule, 'findModelMetaHandle').mockResolvedValue(meta)
+      vi.spyOn(repoModule, 'getRegistryShardHandles').mockResolvedValue([])
+      vi.mocked(fetchDiagramListPage).mockResolvedValue({
+        items: [{ id: 'server-first' }], nextCursor: null, total: 1,
+      } as any)
+      vi.spyOn(diagramMetaModule, 'fetchDiagramMeta').mockImplementation(async (id: string) =>
+        served.includes(id)
+          ? { meta: diagramMeta(id, id), diagram: diagramMeta(id, id), comments: [], flows: [] } as any
+          : undefined)
+      const { startBridge, preferInitialDiagram } = await import('./bridge')
+      useModelStore.setState({ currentDiagramId: parked })
+      preferInitialDiagram(prefer ? parked : null)
+      await startBridge(DEFAULT_WORKSPACE_REF)
+      return useModelStore.getState().currentDiagramId
+    }
+
+    afterEach(async () => {
+      const { preferInitialDiagram } = await import('./bridge')
+      preferInitialDiagram(null)
+      vi.mocked(fetchDiagramListPage).mockResolvedValue({ items: [], nextCursor: null, total: 0 } as any)
+    })
+
+    it('is opened when the server has it — and asked about once, not twice', async () => {
+      expect(await bootSummaryParked('viewed', true, ['viewed', 'server-first'])).toBe('viewed')
+      // The existence check and the open share one diagram-meta request.
+      const asked = vi.mocked(diagramMetaModule.fetchDiagramMeta).mock.calls.filter(([id]) => id === 'viewed')
+      expect(asked).toHaveLength(1)
+    })
+
+    it('falls back to the server first page when the version lacks it', async () => {
+      expect(await bootSummaryParked('made-in-the-draft', true, ['server-first'])).toBe('server-first')
+    })
+
+    it('a diagram-meta FAILURE (offline, warming-up 503) falls back and the boot still completes', async () => {
+      // Reviewer finding: keeping the park on an unknown answer made the open
+      // await the rejected request outside any try, so exiting a Draft while
+      // the server was down failed the whole boot.
+      const { root, meta } = summaryRoot(usableMeta())
+      vi.spyOn(repoModule, 'getRootHandle').mockResolvedValue(root)
+      vi.spyOn(repoModule, 'findModelMetaHandle').mockResolvedValue(meta)
+      vi.spyOn(repoModule, 'getRegistryShardHandles').mockResolvedValue([])
+      vi.mocked(fetchDiagramListPage).mockResolvedValue({
+        items: [{ id: 'server-first' }], nextCursor: null, total: 1,
+      } as any)
+      vi.spyOn(diagramMetaModule, 'fetchDiagramMeta').mockImplementation(async (id: string) => {
+        if (id === 'viewed') throw new Error('diagram-meta API -> HTTP 503')
+        return { meta: diagramMeta(id, id), diagram: diagramMeta(id, id), comments: [], flows: [] } as any
+      })
+      const { startBridge, preferInitialDiagram } = await import('./bridge')
+      useModelStore.setState({ currentDiagramId: 'viewed' })
+      preferInitialDiagram('viewed')
+      await startBridge(DEFAULT_WORKSPACE_REF)
+      expect(useAutomergeStatus.getState().status).not.toBe('error')
+      expect(useModelStore.getState().currentDiagramId).toBe('server-first')
+    })
+
+    it('control: a REQUESTED (deep-linked) missing diagram stays parked', async () => {
+      expect(await bootSummaryParked('made-in-the-draft', false, ['server-first'])).toBe('made-in-the-draft')
+    })
   })
 })

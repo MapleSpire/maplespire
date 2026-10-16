@@ -37,6 +37,7 @@ import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/re
 vi.mock('../../lib/automerge/bridge', () => ({
   startBridge: vi.fn(async () => {}),
   stopBridge: vi.fn(() => {}),
+  preferInitialDiagram: vi.fn(() => {}),
 }))
 vi.mock('../../lib/automerge/repo', () => ({
   forgetWorkspace: vi.fn(() => {}),

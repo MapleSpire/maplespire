@@ -12,7 +12,7 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU Affero General Public License for more details.
 
-import { startBridge, stopBridge } from './bridge'
+import { preferInitialDiagram, startBridge, stopBridge } from './bridge'
 import { forgetWorkspace, routeWorkspaceNetwork } from './repo'
 import { holdWorkspaceOn } from './workspaceBinding'
 import { setActiveWorkspaceRef, workspaceRefEquals, currentWorkspaceRef, type WorkspaceRef } from './workspace'
@@ -41,7 +41,7 @@ function serialize(work: () => Promise<void>): Promise<void> {
   return chain
 }
 
-async function loadWorkspace(ref: WorkspaceRef, openDiagramId?: string): Promise<void> {
+async function loadWorkspace(ref: WorkspaceRef, openDiagramId?: string, preferDiagram = false): Promise<void> {
   const t0 = import.meta.env.DEV ? performance.now() : 0
   // A real (re)load ENDS any transport hold, by definition: the hold exists to
   // keep a live session on the version it was editing, and this is the session
@@ -60,6 +60,9 @@ async function loadWorkspace(ref: WorkspaceRef, openDiagramId?: string): Promise
   // a switch driven by opening /app/landscape/…/diagram/X lands on X, not the
   // workspace's default diagram.
   resetWorkspaceProjection(openDiagramId ?? null)
+  // …unless the park is only a preference (stay on the diagram the user was
+  // viewing when it exists in the target version) — see preferInitialDiagram.
+  preferInitialDiagram(preferDiagram ? openDiagramId ?? null : null)
   forgetWorkspace(ref)
   setActiveWorkspaceRef(ref)
   // A concrete workspace change gets a new routed socket; a reload of the
@@ -89,10 +92,16 @@ async function refreshWorkspaceReadOnly(ref: WorkspaceRef): Promise<void> {
 }
 
 /** Switch to a different workspace ref. No-op if already there. `openDiagramId`
- * parks a deep-linked diagram so the switch lands on it (see loadWorkspace). */
-export function switchWorkspace(ref: WorkspaceRef, openDiagramId?: string): Promise<void> {
+ * parks a deep-linked diagram so the switch lands on it (see loadWorkspace);
+ * with `preferDiagram` it lands there only when the target version has it,
+ * and on the default diagram otherwise. */
+export function switchWorkspace(
+  ref: WorkspaceRef,
+  openDiagramId?: string,
+  opts?: { preferDiagram?: boolean },
+): Promise<void> {
   if (workspaceRefEquals(ref, currentWorkspaceRef())) return Promise.resolve()
-  return serialize(() => loadWorkspace(ref, openDiagramId))
+  return serialize(() => loadWorkspace(ref, openDiagramId, opts?.preferDiagram ?? false))
 }
 
 /** Force-reload the CURRENT workspace (e.g. after set-default moves what a

@@ -39,7 +39,6 @@ import { useModelStore } from '../../stores/modelStore'
 import { useWorkspaceStore } from '../../stores/workspaceStore'
 import { useDraftsStore } from '../../stores/draftsStore'
 import { useAuthStore } from '../../stores/authStore'
-import { CURRENT_VERSION_ID } from '../../lib/automerge/workspace'
 import { ChangesDropdown } from '../drafts/ChangesDropdown'
 import { ImportModal } from '../modals/ImportModal'
 import { cn } from '../../lib/utils'
@@ -78,11 +77,11 @@ export function EditorToolPill({ editReady = true }: EditorToolPillProps) {
 
   const workspaceRef = useWorkspaceStore((s) => s.ref)
   const bootResolved = useWorkspaceStore((s) => s.bootResolved)
-  const switchWorkspaceTo = useWorkspaceStore((s) => s.switchTo)
   const authStage = useAuthStore((s) => s.config?.stage)
   const drafts = useDraftsStore((s) => s.drafts)
   const loadDrafts = useDraftsStore((s) => s.load)
   const createDraft = useDraftsStore((s) => s.create)
+  const exitDraft = useDraftsStore((s) => s.exit)
   const draftBusy = useDraftsStore((s) => s.busy)
   const draftError = useDraftsStore((s) => s.error)
   const clearDraftError = useDraftsStore((s) => s.clearError)
@@ -254,7 +253,7 @@ export function EditorToolPill({ editReady = true }: EditorToolPillProps) {
               {t('diagramChrome.toolPill.draftLabel', { label: activeDraft.label })}
             </span>
             <button
-              onClick={() => switchWorkspaceTo(workspaceRef.landscapeId, CURRENT_VERSION_ID)}
+              onClick={() => void exitDraft(workspaceRef.landscapeId)}
               title={t('diagramChrome.toolPill.exitDraft')}
               className="rounded p-0.5 hover:opacity-70"
             >
