@@ -86,6 +86,23 @@ function peerWireMessage(value: unknown): PeerWireMessage | null {
     : null
 }
 
+/**
+ * DEV/E2E: the adapters alive in this page, so a test can drop the CURRENT
+ * socket the way an outage would. A Playwright WebSocket route only intercepts
+ * sockets opened AFTER it is installed, and `context.setOffline` does not end
+ * an open localhost socket either (measured 2026-10-15: sync frames kept
+ * arriving, the badge went back to 'ready') — so without this, "go offline"
+ * on a live page left the client connected.
+ */
+const liveAdaptersForTest = new Set<AdaptiveWebSocketClientAdapter>()
+if (import.meta.env.DEV && typeof window !== 'undefined') {
+  ;(window as unknown as { __dropSyncSocketsForTest?: () => number }).__dropSyncSocketsForTest = () => {
+    let dropped = 0
+    for (const adapter of liveAdaptersForTest) dropped += adapter.dropSocketForTest()
+    return dropped
+  }
+}
+
 /** Browser Automerge adapter with failover-aware reconnect semantics. It keeps
  * the upstream wire contract, but replaces the fixed 5 s retry interval with a
  * fast jittered 1012/1013 retry and bounded exponential backoff for outages. */
@@ -117,6 +134,17 @@ export class AdaptiveWebSocketClientAdapter extends NetworkAdapter {
     this.url = url
     this.delayOptions = delayOptions
     this.readyPromise = new Promise<void>((resolve) => { this.resolveReady = resolve })
+    if (import.meta.env.DEV) liveAdaptersForTest.add(this)
+  }
+
+  /** DEV/E2E: close the current socket as a network failure would (NOT an
+   *  intentional close), so the adapter reconnects with its outage backoff.
+   *  Returns 1 when there was a socket to drop. */
+  dropSocketForTest(): number {
+    const socket = this.socket
+    if (!socket || (socket.readyState !== WebSocket.OPEN && socket.readyState !== WebSocket.CONNECTING)) return 0
+    socket.close(4000, 'e2e: simulated outage')
+    return 1
   }
 
   isReady(): boolean {
@@ -198,6 +226,7 @@ export class AdaptiveWebSocketClientAdapter extends NetworkAdapter {
   }
 
   disconnect(): void {
+    liveAdaptersForTest.delete(this)
     this.intentionalClose = true
     this.handoffRetry = false
     this.clearTimers()

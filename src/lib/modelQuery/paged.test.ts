@@ -91,6 +91,89 @@ describe('pagedModelQuery — served from the index, equals resident', () => {
     expect(m.has('missing')).toBe(false)
   })
 
+  it('connectionsMany agrees with resident, absent ids omitted', async () => {
+    const ask = ['c1', 'c4', 'missing']
+    const paged = await pagedModelQuery.connectionsMany(ask)
+    const resident = await residentModelQuery.connectionsMany(ask)
+    expect([...paged.keys()].sort()).toEqual(['c1', 'c4'])
+    expect([...resident.keys()].sort()).toEqual(['c1', 'c4'])
+    expect(paged.get('c4')?.fromId).toBe('G1')
+  })
+
+  // An inline expansion asked for its connections one request each.
+  it('connectionsMany asks the server in ONE batch, and fills the gaps from the index', async () => {
+    vi.stubGlobal('localStorage', {
+      getItem: (key: string) => key === 'maplespire:serverReadModel' ? 'true' : null,
+    })
+    vi.stubGlobal('navigator', { onLine: true })
+    const remote = conn('remote', 'A', 'B')
+    const requests: string[] = []
+    __setServerFetchForTest(async (input) => {
+      requests.push(String(input))
+      return new Response(JSON.stringify({ projectionGeneration: 1, items: [{ connection: remote }] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    })
+
+    const result = await pagedModelQuery.connectionsMany(['remote', 'c1'])
+
+    expect(requests).toHaveLength(1)
+    expect(requests[0]).toContain('/api/model/cache/connections/by-ids')
+    expect(decodeURIComponent(requests[0])).toContain('ids=remote,c1')
+    expect(result.get('remote')).toEqual(remote)
+    expect(result.get('c1')?.fromId, 'the index answers for what the server did not').toBe('B')
+  })
+
+  // 100 per request, the change feed's batch on the same GET route: 500 long
+  // imported ids (UUIDs) would make a URL past nginx's 8 KB request line.
+  it('connectionsMany batches at 100 ids', async () => {
+    vi.stubGlobal('localStorage', {
+      getItem: (key: string) => key === 'maplespire:serverReadModel' ? 'true' : null,
+    })
+    vi.stubGlobal('navigator', { onLine: true })
+    const requested: number[] = []
+    __setServerFetchForTest(async (input) => {
+      const idsParam = new URL(String(input), 'http://x').searchParams.get('ids') ?? ''
+      requested.push(idsParam.split(',').length)
+      return new Response(JSON.stringify({ projectionGeneration: 1, items: [] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    })
+    await pagedModelQuery.connectionsMany(Array.from({ length: 1001 }, (_, i) => `k${i}`))
+    expect(requested).toEqual([...Array(10).fill(100), 1])
+  })
+
+  it('connectionsMany falls back to the index when the server fails', async () => {
+    vi.stubGlobal('localStorage', {
+      getItem: (key: string) => key === 'maplespire:serverReadModel' ? 'true' : null,
+    })
+    vi.stubGlobal('navigator', { onLine: true })
+    __setServerFetchForTest(async () => { throw new TypeError('Failed to fetch') })
+    const result = await pagedModelQuery.connectionsMany(['c1', 'c2'])
+    expect([...result.keys()].sort()).toEqual(['c1', 'c2'])
+  })
+
+  // QA lens, review 3: the index is a working set and may be older than the
+  // server — it fills gaps, it does not overwrite what the server answered.
+  it('connectionsMany keeps the server\'s answer over the index\'s for an id both know', async () => {
+    vi.stubGlobal('localStorage', {
+      getItem: (key: string) => key === 'maplespire:serverReadModel' ? 'true' : null,
+    })
+    vi.stubGlobal('navigator', { onLine: true })
+    const fresher = conn('c1', 'C', 'A', { label: 'renamed on the server' })
+    __setServerFetchForTest(async () => new Response(
+      JSON.stringify({ projectionGeneration: 1, items: [{ connection: fresher }] }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    ))
+
+    const result = await pagedModelQuery.connectionsMany(['c1', 'c2'])
+
+    expect(result.get('c1'), 'the index overwrote the server').toEqual(fresher)
+    expect(result.get('c2')?.fromId, 'the gap is still filled').toBe('A')
+  })
+
   it('resolves an off-window dependency focus from the server before the local index is complete', async () => {
     const emptyIndex = createMemoryKvStore()
     __setPagedStoreForTest(emptyIndex)

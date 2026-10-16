@@ -327,7 +327,10 @@ interface UIState {
 
   // Zoom-in navigation actions
   expandInline: (diagramId: string, objectId: string, targetDiagramId: string) => void
-  collapseInline: (objectId: string) => void
+  /** `nested`: entries left hostless by this collapse (`expansionsOrphanedByCollapse`). */
+  collapseInline: (objectId: string, nested?: readonly string[]) => void
+  /** Drop entries whose host is gone (`unreachableExpansions`). */
+  dropInlineExpansions: (objectIds: readonly string[]) => void
   setZoomedFromObjectId: (id: string | null) => void
   setPendingCanvasFocus: (focus: UIState['pendingCanvasFocus']) => void
   setPreviousDiagramId: (id: string | null) => void
@@ -817,9 +820,15 @@ export const useUIStore = create<UIState>()(
         state.inlineExpansions[objectId] = targetDiagramId
       }),
 
-    collapseInline: (objectId) =>
+    collapseInline: (objectId, nested = []) =>
       set((state) => {
         delete state.inlineExpansions[objectId]
+        for (const id of nested) delete state.inlineExpansions[id]
+      }),
+
+    dropInlineExpansions: (objectIds) =>
+      set((state) => {
+        for (const id of objectIds) delete state.inlineExpansions[id]
       }),
 
     setZoomedFromObjectId: (id) =>

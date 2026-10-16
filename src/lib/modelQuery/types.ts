@@ -344,6 +344,9 @@ export interface ModelQuery {
   group(id: string): Promise<Group | undefined>
   /** A single connection by id (whole model, not the windowed store). */
   connection(id: string): Promise<Connection | undefined>
+  /** Many connections by id in one round trip per batch — not one request per
+   *  id. Ids that resolve to nothing are absent from the map. */
+  connectionsMany(ids: string[]): Promise<Map<string, Connection>>
   /** Batch-resolve many peer ids (objects and/or groups) in one round-trip. */
   lookupMany(ids: string[]): Promise<Map<string, C4Object | Group>>
   /** Count of connections touching an id (object or group endpoint), self-loops once. */

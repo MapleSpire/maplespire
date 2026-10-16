@@ -13,7 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import { useModelStore, getDiagramIndex } from '../../stores/modelStore'
-import type { C4Object, Group } from '../../types'
+import type { C4Object, Connection, Group } from '../../types'
 import type { ModelQuery, PeerEdge } from './types'
 import { rankSearch, SEARCH_LIMIT, SEARCH_MIN_CHARS } from './search'
 import { connectionRowsFromStore, pickerEntriesFromStore, modelObjectRowsFromStore } from './heavyViews'
@@ -111,6 +111,16 @@ export const residentModelQuery: ModelQuery = {
   },
   async connection(id) {
     return getDiagramIndex().connectionById.get(id) ?? useModelStore.getState().connections.find((c) => c.id === id)
+  },
+  async connectionsMany(ids) {
+    const idx = getDiagramIndex()
+    const connections = useModelStore.getState().connections
+    const m = new Map<string, Connection>()
+    for (const id of ids) {
+      const c = idx.connectionById.get(id) ?? connections.find((candidate) => candidate.id === id)
+      if (c) m.set(id, c)
+    }
+    return m
   },
   async lookupMany(ids) {
     const idx = getDiagramIndex()

@@ -69,19 +69,86 @@ export async function reloadBootApp(page: Page): Promise<void> {
 // went away / lost connection" while the already-loaded client keeps running.
 
 const API_ORIGIN = (process.env.E2E_BOOT_API ?? 'http://localhost:3002').replace(/\/$/, '')
+// The sync socket is the API's host:port (`isSyncSocket` below). It was
+// hard-coded to localhost:3002, so on an isolated stack (E2E_BOOT_API on another
+// port) the socket was never blocked and "offline" tests kept syncing.
 
-/** Cut the client off from the server (HTTP + WebSocket to :3002). Set this BEFORE the
- * (re)load whose boot you want to be offline. */
-export async function goOffline(page: Page): Promise<void> {
-  await page.routeWebSocket(/localhost:3002/, () => {
-    /* swallow: never call connectToServer → the Automerge sync socket can't reach the server */
-  })
-  await page.route(`${API_ORIGIN}/**`, (route) => route.abort('connectionfailed'))
+/** Pages whose server is currently "down"; pages whose sync socket is routed,
+ *  and among them those routed BEFORE their document loaded. */
+const offlinePages = new WeakSet<Page>()
+const socketRoutedPages = new WeakSet<Page>()
+const routedBeforeLoad = new WeakSet<Page>()
+
+const LOOPBACK = new Set(['localhost', '127.0.0.1', '[::1]'])
+/** The API's socket, whichever loopback name either side uses (dev-boot opens
+ *  `ws://localhost:<port>` while E2E_BOOT_API may say 127.0.0.1). */
+function isSyncSocket(url: URL): boolean {
+  const api = new URL(API_ORIGIN)
+  if (url.port !== api.port) return false
+  return url.hostname === api.hostname || (LOOPBACK.has(url.hostname) && LOOPBACK.has(api.hostname))
 }
 
-/** Restore the server connection (used by reconnect-sync tests). A reload afterwards
- * re-opens a real WebSocket and re-fetches the render. */
+/** A close code nothing in the app means: the server uses 4001 for a revoked
+ *  session, and a future handler for it must not fire in offline tests. */
+const UNREACHABLE_CLOSE_CODE = 4999
+
+/**
+ * Route the page's sync socket through a switch `goOffline` / `goOnline` flip.
+ *
+ * Call it BEFORE the page's first navigation when a test takes a LIVE page
+ * offline (no reload): a Playwright WebSocket route installed on an already
+ * loaded document never sees the sockets that document opens later — measured
+ * 2026-10-15, the route predicate was not even called for the reconnection, so
+ * "offline" let the client reconnect straight to the server. Installed later,
+ * it still applies from the next (re)load on, which is what reload-style tests
+ * rely on.
+ *
+ * A WebSocket route cannot be removed (`unrouteAll` leaves it), hence one
+ * route per page that consults `offlinePages` for each new socket. Down, it
+ * refuses the socket as an unreachable server would, so the adapter backs off
+ * and retries; up, it passes through. (It used to swallow the socket instead:
+ * the page then sees it OPEN against a mock that never answers nor closes, and
+ * never retries.)
+ */
+export async function installServerRouting(page: Page): Promise<void> {
+  if (socketRoutedPages.has(page)) return
+  const beforeLoad = page.url() === 'about:blank'
+  await page.routeWebSocket(isSyncSocket, (ws) => {
+    if (offlinePages.has(page)) void ws.close({ code: UNREACHABLE_CLOSE_CODE, reason: 'e2e: server unreachable' }).catch(() => {})
+    else ws.connectToServer()
+  })
+  // Only once the route exists: a failed install must not read as routed.
+  socketRoutedPages.add(page)
+  if (beforeLoad) routedBeforeLoad.add(page)
+}
+
+/**
+ * Cut the client off from the server (HTTP + the Automerge WebSocket). Before a
+ * (re)load, or — with `{ live: true }` — on a LIVE page that stays loaded,
+ * which then requires `installServerRouting` before its first navigation and
+ * throws otherwise (see there): without it the page silently reconnects, and a
+ * test of "offline" would be testing an online page.
+ */
+export async function goOffline(page: Page, options: { live?: boolean } = {}): Promise<void> {
+  if (options.live && !routedBeforeLoad.has(page)) {
+    throw new Error('goOffline({ live: true }) needs installServerRouting(page) BEFORE the page first loads')
+  }
+  offlinePages.add(page)
+  await installServerRouting(page)
+  await page.route(`${API_ORIGIN}/**`, (route) => route.abort('connectionfailed'))
+  // A live page keeps its OPEN socket otherwise. Drop it as an outage would;
+  // its reconnections then meet the route. (No-op before the app loads.)
+  const dropped = await page.evaluate(() => (window as any).__dropSyncSocketsForTest?.() as number | undefined)
+    .catch(() => undefined)
+  if (options.live && typeof dropped !== 'number') {
+    throw new Error('goOffline({ live: true }): the app exposes no __dropSyncSocketsForTest (not a DEV build?)')
+  }
+}
+
+/** Restore the server connection. A live page reconnects on its own (its next
+ *  retry passes through); a reload re-opens a real socket as well. */
 export async function goOnline(page: Page): Promise<void> {
+  offlinePages.delete(page)
   await page.unroute(`${API_ORIGIN}/**`)
   await page.unrouteAll({ behavior: 'ignoreErrors' }).catch(() => {})
 }

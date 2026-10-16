@@ -15,7 +15,7 @@
 import { getDiagramIndex, useModelStore } from '../../stores/modelStore'
 import { workspaceKvStore, type KvStore } from './kvStore'
 import {
-  indexIncoming, indexOutgoing, indexObject, indexGroup, indexConnection, indexLookupMany,
+  indexIncoming, indexOutgoing, indexObject, indexGroup, indexConnection, indexConnectionsMany, indexLookupMany,
   indexConnectionCount, indexDescendants, indexSearch,
   indexModelObjectFacets,
 } from './modelIndex'
@@ -303,6 +303,22 @@ export const pagedModelQuery: ModelQuery = {
     return indexGroup(store(), id)
   },
   connection: (id) => indexConnection(store(), id),
+  connectionsMany: async (ids) => {
+    // Same tiering as `lookupMany`: the server knows connections the local
+    // index (a working set) may not; the index answers offline and fills gaps.
+    if (isServerReadModelEnabled() && (typeof navigator === 'undefined' || navigator.onLine)) {
+      try {
+        const remote = await serverModelQuery.connectionsMany(ids)
+        if (remote.size === ids.length) return remote
+        const local = await indexConnectionsMany(store(), ids.filter((id) => !remote.has(id)))
+        for (const [id, connection] of local) remote.set(id, connection)
+        return remote
+      } catch {
+        // Offline-first fallback below.
+      }
+    }
+    return indexConnectionsMany(store(), ids)
+  },
   lookupMany: async (ids) => {
     // The server tier is the zero-wait source for off-window entities. The
     // persisted index may contain only a working set (for example after opening

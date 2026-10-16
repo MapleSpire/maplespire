@@ -16,11 +16,13 @@ import { describe, expect, it } from 'vitest'
 
 import {
   expandDiagramsInline,
+  expansionsOrphanedByCollapse,
   GestureCutsLatch,
   inlineWrapperId,
   modelCommentsToView,
   shiftBox,
   shiftPoint,
+  unreachableExpansions,
   unshiftBox,
   unshiftPoint,
   viewPlacementsToModel,
@@ -1201,5 +1203,116 @@ describe('expandDiagramsInline', () => {
         expect(failures.slice(0, 15)).toEqual([])
       },
     )
+  })
+})
+
+// Collapsing an expansion used to leave the ones nested inside it in uiStore:
+// reported 'missing' every render, their targets still loaded, and back again
+// on re-expanding the outer shape.
+describe('expansionsOrphanedByCollapse', () => {
+  // A holds host; B (host's target) holds inner; C (inner's target) holds deep.
+  const members: Record<string, string[]> = { B: ['inner', 'x'], C: ['deep'], D: ['d1'] }
+  const membersOf = (id: string) => members[id]
+
+  it('drops the nested expansions, at any depth', () => {
+    expect(expansionsOrphanedByCollapse(
+      'host',
+      { host: 'B', inner: 'C', deep: 'D' },
+      ['host', 'peer'],
+      membersOf,
+    ).sort()).toEqual(['deep', 'inner'])
+  })
+
+  it('keeps a sibling expansion and its own nesting', () => {
+    expect(expansionsOrphanedByCollapse(
+      'host',
+      { host: 'B', inner: 'C', peer: 'D', d1: 'C' },
+      ['host', 'peer'],
+      membersOf,
+    )).toEqual(['inner'])
+  })
+
+  it('keeps a nested host that the diagram itself also draws', () => {
+    expect(expansionsOrphanedByCollapse('host', { host: 'B', inner: 'C' }, ['host', 'inner'], membersOf)).toEqual([])
+  })
+
+  it('keeps a nested host reachable through another expansion', () => {
+    // `x` is in B (collapsed) and in D (still expanded on `peer`).
+    const both = (id: string) => (id === 'D' ? ['x'] : membersOf(id))
+    expect(expansionsOrphanedByCollapse(
+      'host',
+      { host: 'B', peer: 'D', x: 'C' },
+      ['host', 'peer'],
+      both,
+    )).toEqual([])
+  })
+
+  it('does not report the collapsed entry itself', () => {
+    expect(expansionsOrphanedByCollapse('host', { host: 'B' }, ['host'], membersOf)).toEqual([])
+  })
+
+  // QA lens: kills a single-pass walk. `d1` is listed BEFORE the expansion
+  // (`peer`) that makes it reachable, so only a second pass can keep it.
+  it('keeps a nested host that becomes reachable only through a LATER entry', () => {
+    expect(expansionsOrphanedByCollapse(
+      'host',
+      { host: 'B', d1: 'C', peer: 'D' },
+      ['host', 'peer'],
+      membersOf,
+    )).toEqual([])
+  })
+
+  // Architect lens: an unknown membership (no stub in the index, offline cold)
+  // used to count as "no members", so collapsing one sibling dropped the
+  // nesting of ANOTHER sibling whose target the index could not describe.
+  // QA lens, round 2: narrowing to "inside the collapsed entry" was not sound
+  // either — a host inside it can ALSO sit in the unknown target. Nothing can
+  // be proven, so nothing beyond the collapsed entry is dropped.
+  it('with a membership unknown, drops nothing beyond the collapsed entry', () => {
+    // `peer` -> X, unknown to the index. `x1` may sit in X; so may `inner`.
+    const partly = (id: string) => (id === 'X' ? undefined : membersOf(id))
+    expect(expansionsOrphanedByCollapse(
+      'host',
+      { host: 'B', inner: 'C', deep: 'D', peer: 'X', x1: 'D' },
+      ['host', 'peer'],
+      partly,
+    )).toEqual([])
+  })
+
+  it('an unknown membership that is NOT reachable proves nothing either way, and is ignored', () => {
+    // X is only expanded on `inner`, which goes with the collapse: X is never
+    // consulted, so the answer is the ordinary one.
+    const partly = (id: string) => (id === 'X' ? undefined : membersOf(id))
+    expect(expansionsOrphanedByCollapse(
+      'host',
+      { host: 'B', inner: 'X' },
+      ['host', 'peer'],
+      partly,
+    )).toEqual(['inner'])
+  })
+})
+
+// The other ways a host disappears: deleted, or removed from this diagram or
+// from the target that pulled it in. Each used to leave its entry for good.
+describe('unreachableExpansions', () => {
+  const members: Record<string, string[]> = { B: ['inner'], C: ['deep'] }
+  const membersOf = (id: string) => members[id]
+
+  it('is empty when every host is reachable', () => {
+    expect(unreachableExpansions({ host: 'B', inner: 'C' }, ['host'], membersOf)).toEqual([])
+  })
+
+  it('drops an entry whose host left the diagram, and what was nested in it', () => {
+    expect(unreachableExpansions({ host: 'B', inner: 'C' }, ['peer'], membersOf).sort()).toEqual(['host', 'inner'])
+  })
+
+  it('drops a nested entry whose host left its target', () => {
+    const shrunk = (id: string) => (id === 'B' ? [] : membersOf(id))
+    expect(unreachableExpansions({ host: 'B', inner: 'C' }, ['host'], shrunk)).toEqual(['inner'])
+  })
+
+  it('drops nothing while a reachable membership is unknown', () => {
+    const unknownB = (id: string) => (id === 'B' ? undefined : membersOf(id))
+    expect(unreachableExpansions({ host: 'B', inner: 'C', stray: 'C' }, ['host'], unknownB)).toEqual([])
   })
 })

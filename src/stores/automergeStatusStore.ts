@@ -92,6 +92,18 @@ interface AutomergeStatusState {
    * to forget. Nothing here is persisted: a reload ends the hold on its own.
    */
   workspaceRepointNotice: { landscapeId: string; pinnedVersionId: string } | null
+  /**
+   * Bumped each time the sync transport comes BACK (not connected → connected).
+   *
+   * `status` cannot answer "did we just reconnect": it is a durability latch,
+   * and a failed durable-heads acknowledgement sets 'saving' while the backend is
+   * still down (the browser being online), so an edge into ready|saving fires
+   * during the outage and none fires on the real reconnect. Consumers that must
+   * re-read what they could not read offline key on this instead.
+   */
+  transportEpoch: number
+  /** The bridge saw the transport go from down to up. */
+  noteTransportRestored: () => void
   setStatus: (status: AutomergeStatus, error?: string | null) => void
   setBootFallbackActive: (active: boolean) => void
   /** The bridge saw the workspace contract change mid-session — ask for a reload. */
@@ -139,6 +151,8 @@ export const useAutomergeStatus = create<AutomergeStatusState>((set) => ({
   bootFallbackActive: false,
   workspaceContractStale: false,
   workspaceRepointNotice: null,
+  transportEpoch: 0,
+  noteTransportRestored: () => set((prev) => ({ transportEpoch: prev.transportEpoch + 1 })),
   setStatus: (status, error = null) =>
     // `ready` latches on once we've projected; it never drops back to false when
     // the connection blips (the app keeps working offline against local data).

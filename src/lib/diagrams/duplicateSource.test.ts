@@ -13,17 +13,20 @@
 // GNU Affero General Public License for more details.
 
 import { describe, expect, it, vi, beforeEach } from 'vitest'
+import { generateAutomergeUrl } from '@automerge/automerge-repo'
 import type { Diagram } from '../../types'
 import type { DiagramDoc } from '../automerge/types'
 
 const findDiagramHandle = vi.fn()
 const getRegistryShardHandles = vi.fn()
 const fetchDiagramMeta = vi.fn()
+const releaseDocumentRequest = vi.fn()
 const getState = vi.fn()
 
 vi.mock('../automerge/repo', () => ({
-  findDiagramHandle: (url: string) => findDiagramHandle(url),
+  findDiagramHandle: (...args: unknown[]) => findDiagramHandle(...args),
   getRegistryShardHandles: () => getRegistryShardHandles(),
+  releaseDocumentRequest: (...args: unknown[]) => releaseDocumentRequest(...args),
 }))
 vi.mock('../modelQuery/diagramMeta', () => ({
   fetchDiagramMeta: (id: string) => fetchDiagramMeta(id),
@@ -32,7 +35,7 @@ vi.mock('../../stores/modelStore', () => ({
   useModelStore: { getState: () => getState() },
 }))
 
-const { loadDiagramDuplicateSource, loadDiagramLayouts } = await import('./duplicateSource')
+const { loadDiagramDuplicateSource, loadDiagramLayouts, openDiagramPlacement, INLINE_EXPANSION_ROLE } = await import('./duplicateSource')
 
 const PLACED = {
   o1: { position: { x: 10, y: 20 }, size: { width: 160, height: 90 } },
@@ -230,5 +233,215 @@ describe('loadDiagramLayouts', () => {
     getRegistryShardHandles.mockResolvedValue([{ doc: () => ({ diagrams: { dg1: meta() } }) }])
     findDiagramHandle.mockRejectedValue(new Error('document unavailable'))
     expect(await loadDiagramLayouts('dg1')).toBeNull()
+  })
+})
+
+// An inline expansion holds its target open: one session, one find, one lease.
+describe('openDiagramPlacement', () => {
+  /** A handle whose 'change' listeners the test can fire and count. */
+  const liveHandle = (snapshot = doc()) => {
+    const listeners = new Set<() => void>()
+    return {
+      listeners,
+      doc: () => snapshot,
+      on: (event: string, fn: () => void) => { if (event === 'change') listeners.add(fn) },
+      off: (event: string, fn: () => void) => { if (event === 'change') listeners.delete(fn) },
+      fire: () => { for (const fn of [...listeners]) fn() },
+    }
+  }
+  const VALID_URL = generateAutomergeUrl()
+
+  it('reads the placement and asks for the document under its OWN lease role', async () => {
+    fetchDiagramMeta.mockResolvedValue({ meta: meta({ docUrl: VALID_URL }), diagram: meta(), comments: [], flows: [] })
+    findDiagramHandle.mockResolvedValue(liveHandle())
+
+    const session = openDiagramPlacement('dg1')
+    expect(await session.read()).toEqual(PLACED)
+    // Not the bridge's 'active-diagram': this one is given back on close, and
+    // giving back the bridge's would stop syncing the diagram on screen.
+    const role = findDiagramHandle.mock.calls[0][1] as string
+    expect(role.startsWith(`${INLINE_EXPANSION_ROLE}:`)).toBe(true)
+    expect(role).not.toBe('active-diagram')
+
+    session.close()
+    expect(releaseDocumentRequest).toHaveBeenCalledWith(VALID_URL, role)
+  })
+
+  // QA lens, round 2: the lease is one token per role, not counted — two
+  // sessions on one document shared it, and the first close released both.
+  it('two sessions on one document hold, and give back, a lease EACH', async () => {
+    const url = generateAutomergeUrl()
+    fetchDiagramMeta.mockResolvedValue({ meta: meta({ docUrl: url }), diagram: meta(), comments: [], flows: [] })
+    findDiagramHandle.mockResolvedValue(liveHandle())
+
+    const first = openDiagramPlacement('dg1')
+    const second = openDiagramPlacement('dg1')
+    await first.read()
+    await second.read()
+    const [firstRole, secondRole] = findDiagramHandle.mock.calls.map((call) => call[1] as string)
+    expect(firstRole, 'two sessions shared one lease token').not.toBe(secondRole)
+
+    first.close()
+    first.close() // twice: nothing more
+    expect(releaseDocumentRequest).toHaveBeenCalledOnce()
+    expect(releaseDocumentRequest).toHaveBeenCalledWith(url, firstRole)
+    second.close()
+    expect(releaseDocumentRequest).toHaveBeenLastCalledWith(url, secondRole)
+    expect(releaseDocumentRequest).toHaveBeenCalledTimes(2)
+  })
+
+  it('a session closed before it reached the document gives back nothing', async () => {
+    fetchDiagramMeta.mockRejectedValue(new Error('offline'))
+    const session = openDiagramPlacement('dg1')
+    await session.read()
+    session.close()
+    expect(releaseDocumentRequest).not.toHaveBeenCalled()
+  })
+
+  // QA lens, review 3: the count must go back to nothing, not stay at the
+  // last value, or the NEXT session on that document never gives it back.
+  it('a document opened again after its lease was given back gives it back again', async () => {
+    const url = generateAutomergeUrl()
+    fetchDiagramMeta.mockResolvedValue({ meta: meta({ docUrl: url }), diagram: meta(), comments: [], flows: [] })
+    findDiagramHandle.mockResolvedValue(liveHandle())
+
+    const first = openDiagramPlacement('dg1')
+    await first.read()
+    first.close()
+    expect(releaseDocumentRequest).toHaveBeenCalledTimes(1)
+
+    const again = openDiagramPlacement('dg1')
+    await again.read()
+    again.close()
+    expect(releaseDocumentRequest, 'the second session\'s lease was never given back').toHaveBeenCalledTimes(2)
+  })
+
+  // A read that timed out is retried by the next read of the SAME session: it
+  // must not count the session twice.
+  it('a session that read several times before the document came holds the lease once', async () => {
+    vi.useFakeTimers()
+    try {
+      const url = generateAutomergeUrl()
+      fetchDiagramMeta.mockResolvedValue({ meta: meta({ docUrl: url }), diagram: meta(), comments: [], flows: [] })
+      findDiagramHandle.mockReturnValue(new Promise(() => {}))
+      const session = openDiagramPlacement('dg1', 100)
+      for (let i = 0; i < 2; i++) {
+        const read = session.read()
+        await vi.advanceTimersByTimeAsync(150)
+        expect(await read).toBeNull()
+      }
+      session.close()
+      const role = findDiagramHandle.mock.calls[0][1] as string
+      expect(role.startsWith(`${INLINE_EXPANSION_ROLE}:`)).toBe(true)
+      expect(releaseDocumentRequest, 'the retried read left the lease held for good').toHaveBeenCalledWith(url, role)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('tells subscribers when the document changes, and stops on close', async () => {
+    fetchDiagramMeta.mockResolvedValue({ meta: meta(), diagram: meta(), comments: [], flows: [] })
+    const handle = liveHandle()
+    findDiagramHandle.mockResolvedValue(handle)
+
+    const session = openDiagramPlacement('dg1')
+    const onChange = vi.fn()
+    session.subscribe(onChange)
+    await session.read()
+    handle.fire()
+    expect(onChange).toHaveBeenCalledOnce()
+
+    session.close()
+    expect(handle.listeners.size, 'the document listener outlived the session').toBe(0)
+    handle.fire()
+    expect(onChange).toHaveBeenCalledOnce()
+  })
+
+  it('needs no network once the document was reached: one URL lookup, one find', async () => {
+    fetchDiagramMeta.mockResolvedValue({ meta: meta(), diagram: meta(), comments: [], flows: [] })
+    findDiagramHandle.mockResolvedValue(liveHandle())
+
+    const session = openDiagramPlacement('dg1')
+    await session.read()
+    fetchDiagramMeta.mockRejectedValue(new Error('offline now'))
+    expect(await session.read(), 'a reload offline must still read the held document').toEqual(PLACED)
+    expect(fetchDiagramMeta).toHaveBeenCalledOnce()
+    expect(findDiagramHandle).toHaveBeenCalledOnce()
+  })
+
+  // The document never synced here: the find outlives the read's timeout.
+  // Before, that find was abandoned and nothing re-read when it landed — the
+  // expansion kept its grid until something unrelated happened.
+  it('a document that arrives after the read gave up is announced, and read next time', async () => {
+    vi.useFakeTimers()
+    try {
+      fetchDiagramMeta.mockResolvedValue({ meta: meta(), diagram: meta(), comments: [], flows: [] })
+      let arrive!: (handle: ReturnType<typeof liveHandle>) => void
+      findDiagramHandle.mockReturnValue(new Promise((resolve) => { arrive = resolve }))
+
+      const session = openDiagramPlacement('dg1', 100)
+      const onChange = vi.fn()
+      session.subscribe(onChange)
+      const first = session.read()
+      await vi.advanceTimersByTimeAsync(150)
+      expect(await first).toBeNull()
+
+      // A second read while the first find is still running: no second find.
+      const second = session.read()
+      await vi.advanceTimersByTimeAsync(150)
+      expect(await second).toBeNull()
+      expect(findDiagramHandle).toHaveBeenCalledOnce()
+
+      arrive(liveHandle())
+      await vi.advanceTimersByTimeAsync(0)
+      expect(onChange, 'the late document was not announced').toHaveBeenCalledOnce()
+      expect(await session.read()).toEqual(PLACED)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not announce a document that arrives within the read', async () => {
+    fetchDiagramMeta.mockResolvedValue({ meta: meta(), diagram: meta(), comments: [], flows: [] })
+    findDiagramHandle.mockResolvedValue(liveHandle())
+    const session = openDiagramPlacement('dg1')
+    const onChange = vi.fn()
+    session.subscribe(onChange)
+    await session.read()
+    expect(onChange).not.toHaveBeenCalled()
+  })
+
+  it('retries a find that failed, and a URL it could not resolve', async () => {
+    fetchDiagramMeta.mockRejectedValue(new Error('offline'))
+    const session = openDiagramPlacement('dg1')
+    expect(await session.read()).toBeNull()
+    expect(findDiagramHandle).not.toHaveBeenCalled()
+
+    fetchDiagramMeta.mockResolvedValue({ meta: meta(), diagram: meta(), comments: [], flows: [] })
+    findDiagramHandle.mockRejectedValueOnce(new Error('unavailable'))
+    expect(await session.read()).toBeNull()
+
+    findDiagramHandle.mockResolvedValue(liveHandle())
+    expect(await session.read()).toEqual(PLACED)
+    expect(findDiagramHandle).toHaveBeenCalledTimes(2)
+  })
+
+  it('a document landing after close attaches nothing and announces nothing', async () => {
+    fetchDiagramMeta.mockResolvedValue({ meta: meta(), diagram: meta(), comments: [], flows: [] })
+    let arrive!: (handle: ReturnType<typeof liveHandle>) => void
+    findDiagramHandle.mockReturnValue(new Promise((resolve) => { arrive = resolve }))
+    const session = openDiagramPlacement('dg1', 10_000)
+    const onChange = vi.fn()
+    session.subscribe(onChange)
+    void session.read()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    session.close()
+
+    const handle = liveHandle()
+    arrive(handle)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(handle.listeners.size).toBe(0)
+    expect(onChange).not.toHaveBeenCalled()
+    expect(await session.read()).toBeNull()
   })
 })

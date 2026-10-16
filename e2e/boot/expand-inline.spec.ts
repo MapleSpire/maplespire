@@ -13,10 +13,10 @@
 // GNU Affero General Public License for more details.
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import { test, expect, type Page } from '@playwright/test'
+import { test, expect, type Browser, type Page, type WebSocketRoute } from '@playwright/test'
 import { submitDevLogin } from '../support/devLogin'
 import { waitForWorkspaceProjected } from '../support/workspaceReady'
-import { clickExpandIndicator, dragNewShapeToCanvas } from './helpers'
+import { clickExpandIndicator, dragNewShapeToCanvas, goOffline, goOnline, installServerRouting } from './helpers'
 
 /**
  * "Expand here" draws a linked diagram INSIDE the shape, in that diagram's own
@@ -89,7 +89,7 @@ interface ProbeDiagram {
 
 // ── UI drivers ───────────────────────────────────────────────────────────────
 
-async function signIn(page: Page): Promise<void> {
+async function signIn(page: Page, email: string): Promise<void> {
   await page.goto('/app')
   const devLogin = page.getByTestId('dev-login-email')
   await Promise.race([
@@ -97,7 +97,7 @@ async function signIn(page: Page): Promise<void> {
     page.waitForURL(/\/app\/landscape\/[^/]+\/version\/[^/]+/, { timeout: 45_000 }).catch(() => undefined),
   ])
   if (await devLogin.isVisible().catch(() => false)) {
-    await submitDevLogin(page, `e2e-expand-inline-${Date.now()}@example.com`)
+    await submitDevLogin(page, email)
   }
   await page.waitForURL(/\/app\/landscape\/[^/]+\/version\/[^/]+/, { timeout: 90_000 })
   await page.waitForFunction(() => Array.isArray((window as any).__modelStore?.getState?.().diagrams), undefined, {
@@ -273,11 +273,9 @@ const wrapperBox = (page: Page, hostId: string) =>
   page.evaluate((id) => (window as any).__canvasEngine.getGroupBoundsById(`inline-expand:${id}`), hostId) as
     Promise<{ x: number; y: number; width: number; height: number } | null>
 
-// Shared stateful backend — never run beside the rest.
-test.describe.configure({ mode: 'serial' })
-
-test('Expand here draws the linked diagram in its own arrangement, nested expansions included', async ({ page }) => {
-  test.setTimeout(300_000)
+/** Sign in, import the fixture into a new landscape, and read each diagram's
+ *  own layout while it is the active one — the ground truth for "where". */
+async function importFixture(page: Page, email = `e2e-expand-inline-${Date.now()}@example.com`) {
   page.on('request', (request) => {
     if (apiOrigin) return
     try {
@@ -286,7 +284,7 @@ test('Expand here draws the linked diagram in its own arrangement, nested expans
     } catch { /* not an http request */ }
   })
 
-  await signIn(page)
+  await signIn(page, email)
   const bootFromServer = await page.evaluate(() => (window as any).__bootFromServer?.enabled?.() ?? false)
   expect(bootFromServer, 'this spec targets the windowed boot-from-server stack').toBe(true)
   await createLandscape(page, `expand-inline-e2e-${Date.now()}`)
@@ -319,6 +317,91 @@ test('Expand here draws the linked diagram in its own arrangement, nested expans
   expect(pulledContainers.length, 'fixture: the system holds several containers').toBeGreaterThanOrEqual(4)
   const pulledComponents = components.objectIds.filter((id) => !context.objectIds.includes(id) && !containers.objectIds.includes(id))
   expect(pulledComponents.length, 'fixture: the service holds several components').toBeGreaterThanOrEqual(3)
+
+  return { email, context, containers, components, systemId, serviceId, pulledContainers, pulledComponents }
+}
+
+/** Open a diagram by URL in this workspace and wait for its first frame. */
+async function openDiagram(page: Page, workspace: string, diagramId: string): Promise<void> {
+  await page.goto(`${workspace}/diagram/${diagramId}`)
+  await page.waitForFunction(
+    (id) => (window as any).__modelStore?.getState?.().currentDiagramId === id
+      && ((window as any).__canvasEngine?.objectMap?.size ?? 0) > 0,
+    diagramId,
+    { timeout: 60_000 },
+  )
+}
+
+/** Click the collapse indicator of an inline expansion's wrapper. The engine's
+ *  own hit test picks the point, so this cannot click beside it and pass. */
+async function clickCollapseIndicator(page: Page, hostObjectId: string): Promise<void> {
+  const pt = await page.evaluate((host) => {
+    const eng = (window as any).__canvasEngine
+    const group = [...eng.groupMap.values()].find((g: any) => g.parentObjectId === host && g.id.startsWith('inline-expand:'))
+    // An auto-sized wrapper has no stored geometry; the engine derives it.
+    const bounds = group && eng.getGroupBounds(group)
+    if (!bounds) return null
+    const right = bounds.x + bounds.width
+    const top = bounds.y
+    for (let y = top; y <= top + 60; y += 2) {
+      for (let x = right - 60; x <= right; x += 2) {
+        // The point must also be the one a click resolves to this group.
+        if (eng.isClickOnGroupExpandIndicator(group, x, y) && eng.hitTestGroup(x, y)?.id === group.id) {
+          eng.panToWorld(x, y)
+          const rect = eng.canvas.getBoundingClientRect()
+          const vp = eng.viewport
+          return { x: x * vp.scale + vp.x + rect.left, y: y * vp.scale + vp.y + rect.top }
+        }
+      }
+    }
+    return null
+  }, hostObjectId)
+  expect(pt, `no collapse indicator found on the wrapper of ${hostObjectId}`).not.toBeNull()
+  await page.mouse.click(pt!.x, pt!.y)
+}
+
+/** Select the first shape of `type` by clicking its centre on the canvas, and
+ *  rename it in the side panel — the real selection and edit paths. */
+async function renameShapeOfType(page: Page, type: string, name: string): Promise<string> {
+  const pt = await page.evaluate((wanted) => {
+    const eng = (window as any).__canvasEngine
+    const o = [...eng.objectMap.values()].find((candidate: any) => candidate.type === wanted)
+    if (!o) return null
+    const wx = o.position.x + o.size.width / 2
+    const wy = o.position.y + o.size.height / 2
+    eng.panToWorld(wx, wy)
+    const rect = eng.canvas.getBoundingClientRect()
+    const vp = eng.viewport
+    return { id: o.id as string, x: wx * vp.scale + vp.x + rect.left, y: wy * vp.scale + vp.y + rect.top }
+  }, type)
+  expect(pt, `no ${type} on the canvas`).not.toBeNull()
+  await page.mouse.click(pt!.x, pt!.y)
+  const field = page.getByTestId('object-name')
+  await field.waitFor({ state: 'visible', timeout: 10_000 })
+  await field.fill(name)
+  await field.press('Enter')
+  await expect(field).toHaveValue(name)
+  return pt!.id
+}
+
+/** `expectArrangement` as a predicate, for polling and for preconditions. */
+function isArrangement(drawn: EnginePositions, layouts: Record<string, Placement>, ids: string[]): boolean {
+  const [first] = ids
+  if (!drawn[first]) return false
+  const dx = drawn[first].x - layouts[first].position.x
+  const dy = drawn[first].y - layouts[first].position.y
+  return ids.every((id) => drawn[id]
+    && drawn[id].x - layouts[id].position.x === dx
+    && drawn[id].y - layouts[id].position.y === dy)
+}
+
+// Shared stateful backend — never run beside the rest.
+test.describe.configure({ mode: 'serial' })
+
+test('Expand here draws the linked diagram in its own arrangement, nested expansions included', async ({ page }) => {
+  test.setTimeout(300_000)
+  const { context, containers, components, systemId, serviceId, pulledContainers, pulledComponents } =
+    await importFixture(page)
 
   // ── Cold reload on the context diagram: every other diagram is a stub ─────
   await waitForWorkspaceProjected(page)
@@ -542,4 +625,260 @@ test('Expand here draws the linked diagram in its own arrangement, nested expans
   await expect
     .poll(() => pinDrawn().then((at) => near(at, pinPreview) || at), { message: 'the pin jumped after the move' })
     .toBe(true)
+})
+
+// Collapsing an expansion used to leave the ones nested inside it in uiStore:
+// reported 'missing' on every render, their targets still loaded, and back on
+// screen when the outer shape was expanded again.
+test('collapsing an outer expansion drops the ones nested inside it', async ({ page }) => {
+  test.setTimeout(300_000)
+  const { context, containers, components, systemId, serviceId, pulledContainers, pulledComponents } =
+    await importFixture(page)
+  await waitForWorkspaceProjected(page)
+  const workspace = new URL(page.url()).pathname.match(/\/app\/landscape\/[^/]+\/version\/[^/]+/)![0]
+  await openDiagram(page, workspace, context.id)
+  await waitDrawn(page, [systemId], 'the system')
+  await clickExpandIndicator(page, systemId)
+  await page.getByTestId(`expand-here-${containers.id}`).click()
+  await waitDrawn(page, pulledContainers, 'the containers')
+  await expect
+    .poll(() => page.evaluate((id) => (window as any).__canvasEngine.relatedDiagramObjectIds.has(id) as boolean, serviceId), {
+      timeout: 15_000,
+    })
+    .toBe(true)
+  await clickExpandIndicator(page, serviceId)
+  await page.getByTestId(`expand-here-${components.id}`).click()
+  await waitDrawn(page, pulledComponents, 'the components')
+
+  // ── Collapse the OUTER one: the nested expansion goes with it ────────────
+  // It used to stay in uiStore: reported 'missing' on every render, its target
+  // still loaded, and, what a user sees, back again on re-expanding the
+  // system, reopening a tree they had just closed.
+  await clickCollapseIndicator(page, systemId)
+  await expect
+    .poll(async () => {
+      const drawn = await enginePositions(page)
+      return { system: !!drawn[systemId], leftovers: [...pulledContainers, ...pulledComponents].filter((id) => drawn[id]) }
+    }, { timeout: 15_000, message: 'collapsing the system did not restore it as a shape' })
+    .toEqual({ system: true, leftovers: [] })
+
+  await clickExpandIndicator(page, systemId)
+  await page.getByTestId(`expand-here-${containers.id}`).click()
+  // Not the service: whether it is drawn as a shape is the question below.
+  await waitDrawn(page, pulledContainers.filter((id) => id !== serviceId), 'the containers, re-expanded')
+  // Give a remembered nested entry time to apply (its target loads well under
+  // this on a local stack), then look.
+  await page.waitForTimeout(3_000)
+  const reExpanded = await enginePositions(page)
+  expect(reExpanded[serviceId], 'the service came back expanded: the nested entry outlived its collapse').toBeDefined()
+  expect(pulledComponents.filter((id) => reExpanded[id]), 'components drawn without being asked for').toEqual([])
+})
+
+// The reported follow-up: offline, a target's DiagramDoc that never synced to
+// this browser cannot be read, so the expansion is laid on a GRID. The load ran
+// only when the expansions changed, so reconnecting never replaced that grid
+// with the arrangement the user made; it stayed wrong until a reload.
+//
+// A SECOND, cold browser context is what makes the document unreadable: the
+// first one opened every diagram to read the ground truth, so it holds them all.
+//
+// Two outages, because they reach the reconnect signal differently:
+//  - 'browser-offline': `navigator.onLine` false, the badge says 'offline'
+//    until the transport is back;
+//  - 'backend-down': the browser stays online while the server is gone, and
+//    an edit made meanwhile leaves durable heads pending. Their failed
+//    acknowledgement sets the badge to 'saving' DURING the outage, and the
+//    real reconnect is then 'saving' -> 'ready': a consumer keyed on the badge
+//    reloads at the wrong moment and misses the reconnect (architect lens).
+type Outage = 'browser-offline' | 'backend-down'
+
+async function laidOutOfflineThenBack(page: Page, browser: Browser, outage: Outage): Promise<void> {
+  const { email, context, containers, systemId, pulledContainers } = await importFixture(page)
+  await waitForWorkspaceProjected(page)
+  const workspace = new URL(page.url()).pathname.match(/\/app\/landscape\/[^/]+\/version\/[^/]+/)![0]
+  expect(apiOrigin, 'the API origin is learnt from the first page\'s requests').not.toBeNull()
+
+  const cold = await browser.newContext()
+  try {
+    const other = await cold.newPage()
+    // `setOffline` alone does not end an OPEN localhost WebSocket: sync
+    // messages kept arriving on it and put the badge back to 'ready' within the
+    // poll (2 runs in 3 measured). A real outage kills the socket, so this does:
+    // the sync socket goes through a route that can close it and refuse
+    // reconnections until the server is back. The API goes through one too,
+    // for the outage where the browser itself stays online.
+    let serverReachable = true
+    /** Durable-heads acknowledgements refused while the rest still answers. */
+    let acksRefused = false
+    const sockets: WebSocketRoute[] = []
+    await other.routeWebSocket(/\/automerge/, (ws) => {
+      if (!serverReachable) {
+        void ws.close({ code: 1006 }).catch(() => {})
+        return
+      }
+      ws.connectToServer()
+      sockets.push(ws)
+    })
+    const setServerReachable = async (reachable: boolean) => {
+      serverReachable = reachable
+      if (reachable) acksRefused = false
+      if (outage === 'browser-offline') await cold.setOffline(!reachable)
+      if (!reachable) for (const ws of sockets.splice(0)) await ws.close({ code: 1006 }).catch(() => {})
+    }
+    await signIn(other, email)
+    // Installed after sign-in: only the outage needs it, and a route in front of
+    // the login redirects aborted the navigation (ERR_ABORTED, measured).
+    await other.route(`${apiOrigin}/**`, (route) => (
+      serverReachable && !(acksRefused && route.request().url().includes('/durable-heads'))
+        ? route.fallback()
+        : route.abort('connectionrefused')))
+    await openDiagram(other, workspace, context.id)
+    await waitDrawn(other, [systemId], 'the system (cold context)')
+    // Offline, the shapes come from the local index; wait for it so the test
+    // is about the PLACEMENT, not about the objects being unreachable.
+    await other.evaluate(() => (window as any).__indexReady?.whenReady?.())
+
+    if (outage === 'browser-offline') {
+      await setServerReachable(false)
+      await expect.poll(() => other.locator('#sync-status').getAttribute('data-status'), { timeout: 30_000 }).toBe('offline')
+    } else {
+      // Durable heads left pending: an edit made while connected whose
+      // acknowledgement is refused (an edit made DURING the outage is
+      // journaled and produces none — measured, the badge stayed 'offline').
+      acksRefused = true
+      await renameShapeOfType(other, 'actor', `Customer renamed ${Date.now()}`)
+      // Every badge transition from here on, so the precondition below can
+      // ask for the ORDER, not for a value that was already showing.
+      await other.evaluate(() => {
+        const seen: string[] = []
+        ;(window as any).__badgeTransitions = seen
+        let last: string | null = null
+        const look = () => {
+          const value = document.querySelector('#sync-status')?.getAttribute('data-status') ?? null
+          if (value && value !== last) { seen.push(value); last = value }
+        }
+        look()
+        new MutationObserver(look).observe(document.body, { attributes: true, subtree: true, attributeFilter: ['data-status'] })
+      })
+      await setServerReachable(false)
+      // Precondition: after the transport dropped, the acknowledgement retry
+      // fails with the browser online and puts the badge back to 'saving'
+      // while the server is still gone — the edge that fooled a badge-keyed
+      // consumer. Without it this variant would be the other one again.
+      await expect
+        .poll(async () => {
+          const seen: string[] = await other.evaluate(() => (window as any).__badgeTransitions)
+          const offlineAt = seen.indexOf('offline')
+          return offlineAt >= 0 && seen.slice(offlineAt + 1).includes('saving')
+        }, {
+          timeout: 15_000,
+          message: 'precondition: the badge must go offline, then back to saving, during the outage',
+        })
+        .toBe(true)
+    }
+
+    await clickExpandIndicator(other, systemId)
+    await other.getByTestId(`expand-here-${containers.id}`).click()
+    const offline = await waitDrawn(other, pulledContainers, 'the containers (offline)')
+    // Precondition: the placement really was unreadable. If this cold context
+    // could read the target's document offline, there is nothing to upgrade.
+    expect(
+      isArrangement(offline, containers.layouts!, pulledContainers),
+      'precondition: the offline expansion must be the grid fallback, not the real arrangement',
+    ).toBe(false)
+    const keys = pulledContainers.map((id) => `${offline[id].x},${offline[id].y}`)
+    expect(new Set(keys).size, 'the grid fallback still places every shape apart').toBe(pulledContainers.length)
+
+    await setServerReachable(true)
+    await expect.poll(() => other.locator('#sync-status').getAttribute('data-status'), { timeout: 45_000 }).toBe('ready')
+    // No click, no reload: reconnecting alone must bring the real arrangement.
+    await expect
+      .poll(async () => isArrangement(await enginePositions(other), containers.layouts!, pulledContainers), {
+        timeout: 30_000,
+        message: 'the expansion kept its offline grid after reconnecting',
+      })
+      .toBe(true)
+  } finally {
+    await cold.close()
+  }
+}
+
+test('an expansion laid out offline takes its real arrangement once back online', async ({ page, browser }) => {
+  test.setTimeout(300_000)
+  await laidOutOfflineThenBack(page, browser, 'browser-offline')
+})
+
+test('...and after a backend outage with the browser online and an edit pending', async ({ page, browser }) => {
+  test.setTimeout(300_000)
+  await laidOutOfflineThenBack(page, browser, 'backend-down')
+})
+
+// The first version followed the target's PLACEMENT only: a rename over there
+// lives in the model, not in the target's DiagramDoc, so the expansion kept
+// the old name until a reload. Another client renames; this one must follow.
+test('a rename in the expanded diagram, made by another client, reaches the expansion', async ({ page, browser }) => {
+  test.setTimeout(300_000)
+  const { email, context, containers, systemId, pulledContainers } = await importFixture(page)
+  await waitForWorkspaceProjected(page)
+  const workspace = new URL(page.url()).pathname.match(/\/app\/landscape\/[^/]+\/version\/[^/]+/)![0]
+
+  await openDiagram(page, workspace, context.id)
+  await waitDrawn(page, [systemId], 'the system')
+  // The expansion's connections used to be fetched one request each.
+  const connectionRequests = { single: 0, batch: 0 }
+  page.on('request', (request) => {
+    const url = request.url()
+    if (/\/api\/model\/connection\/[^/?]+/.test(url)) connectionRequests.single += 1
+    if (url.includes('/api/model/cache/connections/by-ids')) connectionRequests.batch += 1
+  })
+  await clickExpandIndicator(page, systemId)
+  await page.getByTestId(`expand-here-${containers.id}`).click()
+  await waitDrawn(page, pulledContainers, 'the containers')
+  expect(connectionRequests.single, 'an expansion fetched its connections one request each').toBe(0)
+  expect(connectionRequests.batch, 'the expansion\'s connections were not fetched in a batch').toBeGreaterThan(0)
+
+  const other = await browser.newContext()
+  try {
+    const editor = await other.newPage()
+    await signIn(editor, email)
+    await openDiagram(editor, workspace, containers.id)
+    const name = `Renamed elsewhere ${Date.now()}`
+    const renamedId = await renameShapeOfType(editor, 'app', name)
+    expect(pulledContainers, 'the renamed shape must be one the expansion shows').toContain(renamedId)
+
+    // No click, no reload here.
+    await expect
+      .poll(() => page.evaluate((id) => (window as any).__canvasEngine.objectMap.get(id)?.name, renamedId), {
+        timeout: 30_000,
+        message: 'the expansion kept the old name',
+      })
+      .toBe(name)
+  } finally {
+    await other.close()
+  }
+})
+
+// `goOffline()` installed routes that only catch sockets opened LATER: a live
+// page kept its open sync socket and stayed connected, so an "offline" test
+// that did not reload was not offline at all.
+test('goOffline() takes a LIVE page offline, and goOnline() brings it back', async ({ page }) => {
+  test.setTimeout(180_000)
+  // Before the first navigation: a socket route added to a loaded page never
+  // sees that page's later sockets (see installServerRouting).
+  await installServerRouting(page)
+  await signIn(page, `e2e-expand-inline-${Date.now()}@example.com`)
+  await waitForWorkspaceProjected(page)
+  const badge = () => page.locator('[data-testid="ws-sync-status"], #sync-status').first().getAttribute('data-status')
+  await expect.poll(badge, { timeout: 30_000 }).not.toBe('offline')
+
+  await goOffline(page, { live: true })
+  await expect.poll(badge, { timeout: 20_000, message: 'still connected after goOffline()' }).toBe('offline')
+  // ...and it STAYS offline: the adapter retries after ~0.5, 1, 2, 4 s, and each
+  // retry must meet the route. (A route on the wrong host — it was hard-coded
+  // to :3002 — let the first retry reconnect; measured, this caught it.)
+  await page.waitForTimeout(6_000)
+  expect(await badge(), 'a reconnection got through while offline').toBe('offline')
+
+  await goOnline(page)
+  await expect.poll(badge, { timeout: 45_000, message: 'not back after goOnline()' }).not.toBe('offline')
 })

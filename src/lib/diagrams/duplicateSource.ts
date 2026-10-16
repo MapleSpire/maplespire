@@ -14,9 +14,11 @@
 
 import type { Diagram, Flow } from '../../types'
 import { useModelStore } from '../../stores/modelStore'
-import { findDiagramHandle, getRegistryShardHandles } from '../automerge/repo'
+import { isValidAutomergeUrl, type AutomergeUrl, type DocHandle } from '@automerge/automerge-repo'
+import { findDiagramHandle, getRegistryShardHandles, releaseDocumentRequest } from '../automerge/repo'
 import { diagramDocFlows, diagramDocToDiagram, mergeShards } from '../automerge/projection'
 import { fetchDiagramMeta } from '../modelQuery/diagramMeta'
+import type { DiagramDoc } from '../automerge/types'
 
 /**
  * Resolving the diagram to copy is the whole difficulty of duplication.
@@ -115,6 +117,117 @@ export async function loadDiagramLayouts(
   const doc = handle?.doc()
   if (!doc) return null
   return structuredClone(diagramDocToDiagram(diagramId, doc).layouts ?? {})
+}
+
+/** The lease an inline expansion holds on its target's document. Its own role,
+ *  because it is RELEASED on close; the default role is the bridge's. */
+export const INLINE_EXPANSION_ROLE = 'inline-expansion'
+
+/**
+ * One lease ROLE per session (`inline-expansion:<n>`). The registry keeps one
+ * token per (session, role), not a count, so two sessions on one document under
+ * one role would share a token and the first close would stop syncing the
+ * other's. Distinct roles need no count of our own — and nothing of ours to
+ * outlive the registry, which is cleared on a workspace switch.
+ */
+let sessionSeq = 0
+
+/** A placement read that stays open: see `openDiagramPlacement`. */
+export interface DiagramPlacementSession {
+  /** The placement now: a record, or `null` while the document cannot be read. */
+  read(): Promise<NonNullable<Diagram['layouts']> | null>
+  /** Called when the document changes, and when it arrives after a `read`
+   *  gave up on it. Returns the unsubscribe. */
+  subscribe(onChange: () => void): () => void
+  /** Stop listening and give the lease back. Idempotent. */
+  close(): void
+}
+
+/**
+ * `loadDiagramLayouts` for something that stays on screen — an inline
+ * expansion, whose placement goes stale when the target is edited or when its
+ * bytes arrive after a reconnect.
+ *
+ * One session per target, opened before the first read, so a change can never
+ * fall between a read and the subscription that should have heard it: the
+ * document listener is attached the moment the handle resolves, before its
+ * contents are read. The URL and the handle are kept, so a later read needs no
+ * network once the document has been reached; and the one `find` per session is
+ * kept too, so repeated reads of an unreachable document do not stack retry
+ * loops. A `find` that outlives a read's timeout is not abandoned: when it
+ * lands, subscribers hear about it.
+ */
+export function openDiagramPlacement(diagramId: string, timeoutMs = 4000): DiagramPlacementSession {
+  let closed = false
+  let url: string | undefined
+  const role = `${INLINE_EXPANSION_ROLE}:${++sessionSeq}`
+  /** A find was started, so the lease under `role` is held. */
+  let leased = false
+  let finding: Promise<DocHandle<DiagramDoc>> | undefined
+  let handle: DocHandle<DiagramDoc> | undefined
+  /** A read timed out while the find was still running. */
+  let gaveUp = false
+  const listeners = new Set<() => void>()
+  // No `closed` check needed: both callers are already cut off by close
+  // (the document listener is removed, the find's handler returns).
+  const emit = () => {
+    for (const listener of [...listeners]) listener()
+  }
+  const onDocumentChange = () => emit()
+
+  const startFind = (documentUrl: string) => {
+    leased = true
+    finding = findDiagramHandle(documentUrl, role).then(
+      (resolved) => {
+        if (closed) return resolved
+        handle = resolved
+        resolved.on('change', onDocumentChange)
+        if (gaveUp) emit()
+        return resolved
+      },
+      (error: unknown) => {
+        // Forgotten, so the next read tries again rather than re-reading a
+        // rejection for the life of the session.
+        finding = undefined
+        throw error
+      },
+    )
+    finding.catch(() => {})
+  }
+
+  return {
+    async read() {
+      if (closed) return null
+      if (!handle) {
+        if (!url) url = await docUrlFor(diagramId, true)
+        if (closed || !url) return null
+        if (!finding) startFind(url)
+        const resolved = await withTimeout(finding!, timeoutMs)
+        if (!resolved) {
+          // A REJECTED find also reads as null here, but it reset `finding`:
+          // it did not outlive the read, so its successor landing inside the
+          // next read is not a late arrival (QA lens, reproduced).
+          gaveUp = finding !== undefined
+          return null
+        }
+      }
+      const doc = handle?.doc()
+      if (!doc) return null
+      return structuredClone(diagramDocToDiagram(diagramId, doc).layouts ?? {})
+    },
+    subscribe(onChange) {
+      listeners.add(onChange)
+      return () => {
+        listeners.delete(onChange)
+      }
+    },
+    close() {
+      closed = true
+      handle?.off('change', onDocumentChange)
+      if (leased && url && isValidAutomergeUrl(url)) releaseDocumentRequest(url as AutomergeUrl, role)
+      leased = false
+    },
+  }
 }
 
 /**

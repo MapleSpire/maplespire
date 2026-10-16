@@ -102,6 +102,11 @@ async function postJson<T>(path: string, body: unknown, signal?: AbortSignal): P
   return (await res.json()) as T
 }
 
+/** Ids per `/api/model/cache/connections/by-ids` request: the change feed's
+ *  batch on the same GET route. The server accepts 500, but 500 long imported
+ *  ids (UUIDs) make a ~20 KB URL, past nginx's default 8 KB request line. */
+const CONNECTIONS_BY_IDS_BATCH = 100
+
 /** Like getJson but maps a 404 to undefined (entity not found). */
 async function getJsonOr404<T>(path: string): Promise<T | undefined> {
   const res = await fetcher(`${API_BASE}${path}`)
@@ -305,6 +310,19 @@ export const serverModelQuery: ModelQuery = {
   // their 404 carries no projection freshness, so it cannot prove absence.
   connection: async (id) =>
     (await getJsonOr404<{ connection: Connection }>(`/api/model/connection/${enc(id)}?${withWorkspaceParams('')}`))?.connection,
+  // The read-cache batch route the change feed already uses, in batches the
+  // server's `boundedIdsParam` accepts.
+  connectionsMany: async (ids) => {
+    const out = new Map<string, Connection>()
+    for (let i = 0; i < ids.length; i += CONNECTIONS_BY_IDS_BATCH) {
+      const batch = ids.slice(i, i + CONNECTIONS_BY_IDS_BATCH)
+      const page = await getJson<{ items: Array<{ connection: Connection }> }>(
+        `/api/model/cache/connections/by-ids?${withWorkspaceParams(`ids=${enc(batch.join(','))}`)}`
+      )
+      for (const item of page.items) out.set(item.connection.id, item.connection)
+    }
+    return out
+  },
   lookupMany: async (ids) => {
     if (!ids.length) return new Map<string, C4Object | Group>()
     const { entities } = await getJson<{ entities: [string, C4Object | Group][] }>(

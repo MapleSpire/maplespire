@@ -14,7 +14,7 @@
 
 import { create } from 'zustand'
 import { workspaceKvStore } from './kvStore'
-import { buildModelIndex, applyModelChanges, diffModelChanges, type ModelIndexInput } from './modelIndex'
+import { buildModelIndex, applyModelChanges, diffModelChanges, type ModelIndexChanges, type ModelIndexInput } from './modelIndex'
 import { isModelPagingEnabled } from './flag'
 import { isServerReadModelEnabled } from './tierFlag'
 import type { C4Object, Connection } from '../../types'
@@ -34,8 +34,90 @@ export const useModelIndexVersion = create<{ version: number }>(() => ({ version
  * whole workspace into Zustand. It is shared by local Automerge index writes and
  * the durable server change-feed replay so same-cardinality remote edits (for
  * example a rename) are observable too. */
-export function notifyModelIndexChanged(): void {
-  useModelIndexVersion.setState((state) => ({ version: state.version + 1 }))
+export function notifyModelIndexChanged(change?: ModelIndexChange, source?: ModelIndexChangeSource): void {
+  const version = useModelIndexVersion.getState().version + 1
+  changeLog.push({ version, change: change ?? null, source })
+  if (changeLog.length > CHANGE_LOG_LIMIT) changeLog.shift()
+  useModelIndexVersion.setState({ version })
+}
+
+/**
+ * A server read-model invalidation (the SSE stream) — a revision with no ids,
+ * TAGGED, so a consumer that asks the server which ids changed can leave it out
+ * of `modelIndexChangesSince`. Its own name rather than a tag argument at the
+ * call site: dropping the argument there would silently turn every edit into
+ * "anything changed" for those consumers, with every test still green
+ * (QA lens, measured).
+ */
+export function notifyServerInvalidation(): void {
+  notifyModelIndexChanged(undefined, 'server-invalidation')
+}
+
+/**
+ * The entities a revision touched, when its producer knows them. A consumer
+ * holding a few entities (an inline expansion) re-reads only when one of
+ * THEIRS changed, instead of on every local edit anywhere.
+ */
+export interface ModelIndexChange {
+  objectIds: readonly string[]
+  connectionIds: readonly string[]
+}
+
+/** A revision that is a server read-model invalidation (the SSE stream). It
+ *  names no ids, but a consumer can ask the server which changed
+ *  (`changedIdsSince`) and then leave these out of `modelIndexChangesSince`. */
+export type ModelIndexChangeSource = 'server-invalidation'
+
+/** `null`: the producer could not say (a server invalidation, a rebuild). */
+const changeLog: Array<{ version: number; change: ModelIndexChange | null; source?: ModelIndexChangeSource }> = []
+const CHANGE_LOG_LIMIT = 64
+
+/**
+ * Everything that changed after revision `version`, up to the current one —
+ * or `null` when that cannot be told: some revision in between carried no ids,
+ * or the log no longer reaches back (it keeps the last 64), or the version was
+ * set without going through `notifyModelIndexChanged`. `null` means "assume
+ * anything changed".
+ */
+export function modelIndexChangesSince(
+  version: number,
+  options: { skipServerInvalidations?: boolean } = {},
+): ModelIndexChange | null {
+  const current = useModelIndexVersion.getState().version
+  if (current <= version) return { objectIds: [], connectionIds: [] }
+  const entries = changeLog.filter((entry) => entry.version > version && entry.version <= current)
+  if (entries.length !== current - version) return null
+  const objectIds = new Set<string>()
+  const connectionIds = new Set<string>()
+  for (const { change, source } of entries) {
+    if (!change && options.skipServerInvalidations && source === 'server-invalidation') continue
+    if (!change) return null
+    for (const id of change.objectIds) objectIds.add(id)
+    for (const id of change.connectionIds) connectionIds.add(id)
+  }
+  return { objectIds: [...objectIds], connectionIds: [...connectionIds] }
+}
+
+/** Tests: back to revision 0 with an empty change log. */
+export function __resetModelIndexVersionForTest(): void {
+  changeLog.length = 0
+  useModelIndexVersion.setState({ version: 0 })
+}
+
+/** The ids a delta touches — what `notifyModelIndexChanged` reports. */
+export function changedIds(changes: ModelIndexChanges): ModelIndexChange {
+  return {
+    objectIds: [
+      ...(changes.upsertObjects ?? []).map((o) => o.id),
+      ...(changes.removeObjectIds ?? []),
+      ...(changes.upsertGroups ?? []).map((g) => g.id),
+      ...(changes.removeGroupIds ?? []),
+    ],
+    connectionIds: [
+      ...(changes.addConnections ?? []).map((c) => c.id),
+      ...(changes.removeConnections ?? []).map((c) => c.id),
+    ],
+  }
 }
 
 /**
@@ -58,10 +140,16 @@ export function syncModelIndex(next: ModelIndexInput): void {
   const store = workspaceKvStore()
   chain = chain.then(async () => {
     try {
+      // A first build touches everything: no ids.
+      let change: ModelIndexChange | undefined
       if (!prev) await buildModelIndex(store, next)
-      else await applyModelChanges(store, diffModelChanges(prev, next))
+      else {
+        const delta = diffModelChanges(prev, next)
+        await applyModelChanges(store, delta)
+        change = changedIds(delta)
+      }
       prev = next
-      notifyModelIndexChanged()
+      notifyModelIndexChanged(change)
     } catch (err) {
       console.warn('model index sync failed:', err)
     }
@@ -120,7 +208,7 @@ export function applyOffWindowEditsToIndex(
         groups: [],
       }
       await applyModelChanges(store, diffModelChanges(prevModel, nextModel))
-      notifyModelIndexChanged()
+      notifyModelIndexChanged({ objectIds: objIds, connectionIds: connIds })
     } catch (err) {
       console.warn('off-window index edit failed:', err)
     }

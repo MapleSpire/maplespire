@@ -34,16 +34,18 @@ import { CanvasToolbar } from '../comments/CanvasToolbar'
 import { useDiagramReadyFit } from './useDiagramReadyFit'
 import {
   expandDiagramsInline,
+  expansionsOrphanedByCollapse,
   GestureCutsLatch,
   modelCommentsToView,
   shiftPoint,
+  unreachableExpansions,
   unshiftBox,
   unshiftPoint,
   viewPlacementsToModel,
   viewWaypointsToModel,
   type MakeRoomCut,
 } from '../../lib/diagrams/expandInline'
-import { loadDiagramLayouts } from '../../lib/diagrams/duplicateSource'
+import { useInlineExpansionContents } from './useInlineExpansionContents'
 import { collectRelatedDiagramObjectIds } from '../../canvas/relatedDiagramAffordances'
 import { resolveParentNavigation } from '../../lib/diagrams/parentNavigation'
 import { editorCanvasInsets, fitActiveCanvas, zoomActiveCanvas } from './canvasViewportControls'
@@ -117,6 +119,9 @@ function ZoomPercent() {
   const zoom = useUIStore((s) => s.zoom)
   return <>{`${Math.round(zoom * 100)}%`}</>
 }
+
+/** Stable, so leaving the expansions' diagram is one change, not one per render. */
+const NO_INLINE_EXPANSIONS: Record<string, string> = {}
 
 export function CanvasView() {
   const { t } = useTranslation()
@@ -420,6 +425,48 @@ export function CanvasView() {
     if (editReady) useModelStore.getState().reconcileTags()
   }, [editReady])
 
+  const inlineExpansions = useUIStore((s) => s.inlineExpansions)
+
+  /**
+   * The shapes of the diagrams currently expanded in place.
+   *
+   * They CANNOT come from the store or the diagram index: both are windowed to
+   * the active diagram, so another diagram's shapes are simply not in memory
+   * (every id would resolve to `undefined` and the planner would report the
+   * expansion as empty). Nor can the placement: the index holds a layout-less
+   * stub. The hook reads both per target, and re-reads when connectivity
+   * returns or the target changes — see `useInlineExpansionContents`.
+   *
+   * Only for the diagram on screen: the entries are keyed to the diagram they
+   * were made on, and nothing should be held (or watched) for one the user left.
+   */
+  const inlineExpansionsDiagramId = useUIStore((s) => s.inlineExpansionsDiagramId)
+  const activeInlineExpansions =
+    inlineExpansionsDiagramId === currentDiagramId ? inlineExpansions : NO_INLINE_EXPANSIONS
+  const { contentsRef: expandedContentsRef, version: expandedContentsVersion } =
+    useInlineExpansionContents(activeInlineExpansions, diagrams)
+
+  // An entry whose host is gone — deleted, or removed from this diagram or from
+  // the target that pulled it in — would otherwise stay for good: reported
+  // 'missing' on every render, its target still loaded and watched, and back on
+  // screen if the host ever returned. Re-checked whenever the expansions or
+  // the diagram registry change.
+  useEffect(() => {
+    if (activeInlineExpansions === NO_INLINE_EXPANSIONS) return
+    const diagram = useModelStore.getState().getCurrentDiagram()
+    // An empty composition is a diagram still loading (a stub reads `[]` until
+    // its meta lands) far more often than one emptied for real, and pruning on
+    // it would drop every entry. Nothing is lost by waiting.
+    if (!diagram || diagram.objectIds.length === 0) return
+    const index = getDiagramIndex()
+    const gone = unreachableExpansions(
+      activeInlineExpansions,
+      diagram.objectIds,
+      (diagramId) => index.diagramById.get(diagramId)?.objectIds,
+    )
+    if (gone.length) useUIStore.getState().dropInlineExpansions(gone)
+  }, [activeInlineExpansions, diagrams])
+
   // Pushes the current diagram's filtered + layout-merged data into the engine, and
   // zoom-fits the viewport the first time this diagram is shown. Shared by the
   // engine-creation effect (below) and the data-sync effect (further down) — both
@@ -456,11 +503,13 @@ export function CanvasView() {
           : [],
         {
           diagram: (id) => index.diagramById.get(id),
-          // NOT the diagram index: the store is WINDOWED to the active diagram,
-          // so another diagram's shapes are not in memory at all. They are
-          // fetched through the ModelQuery seam into .
-          object: (id) => expandedContentsRef.current.objects.get(id) ?? index.objectById.get(id),
-          connection: (id) => expandedContentsRef.current.connections.get(id) ?? index.connectionById.get(id),
+          // Mostly NOT from the diagram index: the store is WINDOWED to the
+          // active diagram, so another diagram's shapes are usually not in
+          // memory and come through the ModelQuery seam into
+          // `expandedContentsRef`. When the index DOES hold one (resident
+          // mode), it is the live copy and wins over that snapshot.
+          object: (id) => index.objectById.get(id) ?? expandedContentsRef.current.objects.get(id),
+          connection: (id) => index.connectionById.get(id) ?? expandedContentsRef.current.connections.get(id),
           // Nor the target's placement: `diagramById` holds a layout-less stub
           // for every diagram but the active one. Read from its document;
           // `undefined` until that read lands, so the expansion waits for it.
@@ -548,7 +597,7 @@ export function CanvasView() {
         }, 400)
       }
     }
-  }, [setZoom, pushComments])
+  }, [setZoom, pushComments, expandedContentsRef])
 
   useDiagramReadyFit(editReady, currentDiagramId, useCallback(() => {
     // The temporary server render may already have consumed the regular
@@ -812,7 +861,15 @@ export function CanvasView() {
         // here would find nothing and do nothing at all.
         const ui = useUIStore.getState()
         if (ui.inlineExpansions[objectId]) {
-          ui.collapseInline(objectId)
+          // The expansions nested inside it go with it — see
+          // `expansionsOrphanedByCollapse` for why they are not kept.
+          const index = getDiagramIndex()
+          ui.collapseInline(objectId, expansionsOrphanedByCollapse(
+            objectId,
+            ui.inlineExpansions,
+            useModelStore.getState().getCurrentDiagram()?.objectIds ?? [],
+            (diagramId) => index.diagramById.get(diagramId)?.objectIds,
+          ))
           return
         }
         const obj = useModelStore.getState().objects.find((o) => o.id === objectId)
@@ -887,7 +944,7 @@ export function CanvasView() {
       engine.destroy()
       engineRef.current = null
     }
-  }, [isLoading, selectObjects, selectGroup, updatePlacementsBatch, addConnection, updateConnection, setZoom, syncEngineFromStore])
+  }, [isLoading, selectObjects, selectGroup, updatePlacementsBatch, addConnection, updateConnection, setZoom, syncEngineFromStore, expandedContentsRef])
 
   // Sync lower connections whenever the current diagram changes
   useEffect(() => {
@@ -900,78 +957,10 @@ export function CanvasView() {
   // syncEngineFromStore (shared with the engine-creation effect above) so a
   // store update that arrives after the engine already exists re-applies the
   // exact same filter+merge+fit logic instead of a second, drift-prone copy.
-  //  is read imperatively inside syncEngineFromStore, so it
-  // has to be SUBSCRIBED here or expanding a shape would change nothing until
-  // the next unrelated store write happened to re-run this.
-  const inlineExpansions = useUIStore((s) => s.inlineExpansions)
-
-  /**
-   * The shapes of the diagrams currently expanded in place.
-   *
-   * They CANNOT come from the store or the diagram index: both are windowed to
-   * the active diagram, so another diagram's shapes are simply not in memory
-   * (every id would resolve to `undefined` and the planner would report the
-   * expansion as empty). They come through the
-   * ModelQuery seam instead, which reads the whole model on every backend.
-   *
-   * The same holds for each target's PLACEMENT, read from its own DiagramDoc
-   * (`loadDiagramLayouts`); `null` there means it could not be read.
-   *
-   * Held in a ref as well as state: `syncEngineFromStore` reads it imperatively,
-   * and the state copy is only there to re-run the sync once a load lands.
-   */
-  const expandedContentsRef = useRef<{
-    objects: Map<string, C4Object>
-    connections: Map<string, Connection>
-    layouts: Map<string, NonNullable<Diagram['layouts']> | null>
-  }>({ objects: new Map(), connections: new Map(), layouts: new Map() })
-  const [expandedContentsVersion, setExpandedContentsVersion] = useState(0)
-
-  useEffect(() => {
-    const targets = [...new Set(Object.values(inlineExpansions))]
-    const controller = new AbortController()
-    void (async () => {
-      const query = getModelQuery()
-      // Rebuilt from scratch every time, so collapsing drops the contents
-      // without a second code path that could forget to.
-      const objects = new Map<string, C4Object>()
-      const connections = new Map<string, Connection>()
-      const layouts = new Map<string, NonNullable<Diagram['layouts']> | null>()
-      for (const diagramId of targets) {
-        const diagram = getDiagramIndex().diagramById.get(diagramId)
-        if (!diagram) continue
-        // Started first: the document read is the slow leg, and it does not
-        // depend on the objects. A failed read is "unknown", never "pending".
-        const placement = loadDiagramLayouts(diagramId).catch((error: unknown) => {
-          console.warn(`inline expansion: placement of ${diagramId} unreadable`, error)
-          return null
-        })
-        // One target failing must not hold back the others: a throw here used
-        // to abandon the whole run, leaving every NEW expansion waiting forever.
-        try {
-          const resolved = await query.lookupMany(diagram.objectIds)
-          for (const [id, entity] of resolved) {
-            // `lookupMany` answers for objects AND groups; only a C4Object carries
-            // a scope, which is also the field the expansion filters on.
-            if (entity && 'scope' in entity) objects.set(id, entity as C4Object)
-          }
-          for (const connectionId of diagram.connectionIds) {
-            const connection = await query.connection(connectionId)
-            if (connection) connections.set(connectionId, connection)
-          }
-        } catch (error) {
-          // Its shapes stay unresolved, so the planner reports it 'empty' and
-          // the host stays a shape.
-          console.warn(`inline expansion: contents of ${diagramId} unavailable`, error)
-        }
-        layouts.set(diagramId, await placement)
-      }
-      if (controller.signal.aborted) return
-      expandedContentsRef.current = { objects, connections, layouts }
-      setExpandedContentsVersion((version) => version + 1)
-    })()
-    return () => controller.abort()
-  }, [inlineExpansions])
+  // `inlineExpansions` is read imperatively inside syncEngineFromStore, so it
+  // has to be SUBSCRIBED (above, beside the expanded contents) and listed here,
+  // or expanding a shape would change nothing until the next unrelated store
+  // write happened to re-run this.
 
   useEffect(() => {
     syncEngineFromStore()
@@ -1007,7 +996,7 @@ export function CanvasView() {
         if (!controller.signal.aborted) console.warn('relatedDiagramObjectIds failed:', error)
       })
     return () => controller.abort()
-  }, [canvasObjectIdsKey, currentDiagramId, diagrams, expandedContentsVersion])
+  }, [canvasObjectIdsKey, currentDiagramId, diagrams, expandedContentsVersion, expandedContentsRef])
 
   // Sync comments to engine
   useEffect(() => {

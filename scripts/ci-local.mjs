@@ -43,6 +43,10 @@
  *   node scripts/ci-local.mjs --static     # also lint/build (the other CI job)
  *   node scripts/ci-local.mjs --update-allowlist
  *   node scripts/ci-local.mjs --down       # remove the containers and exit
+ *   node scripts/ci-local.mjs --help       # usage; starts nothing
+ *
+ * Any other argument is refused, and one run at a time holds the containers
+ * (see `ci-local-guard.mjs` for the two runs this destroyed before).
  */
 
 import { spawn, spawnSync } from 'node:child_process'
@@ -50,17 +54,38 @@ import { copyFileSync, createWriteStream, existsSync, mkdirSync, readFileSync, r
 import path from 'node:path'
 import process from 'node:process'
 import { describeFailingFiles } from './failing-files.mjs'
+import {
+  DEFAULT_PG_PORT,
+  DEFAULT_REDIS_PORT,
+  USAGE,
+  acquireCiLocalLocks,
+  ciContainerNames,
+  lockPath,
+  parseCiLocalArgs,
+} from './ci-local-guard.mjs'
 
 const ROOT = path.resolve(import.meta.dirname, '..')
-const PG_PORT = process.env.CI_LOCAL_PG_PORT ?? '5462'
-const REDIS_PORT = process.env.CI_LOCAL_REDIS_PORT ?? '6389'
-const PG_CONTAINER = 'maplespire-ci-postgres'
-const REDIS_CONTAINER = 'maplespire-ci-redis'
+const PG_PORT = process.env.CI_LOCAL_PG_PORT ?? DEFAULT_PG_PORT
+const REDIS_PORT = process.env.CI_LOCAL_REDIS_PORT ?? DEFAULT_REDIS_PORT
+// Named after their ports: another port is another container, never these.
+const { postgres: PG_CONTAINER, redis: REDIS_CONTAINER } = ciContainerNames(PG_PORT, REDIS_PORT)
+
+/** Children still running: a signal must stop them before giving the lock
+ *  back, or the next run would drop the database under them. */
+const liveChildren = new Set()
 const DB_NAME = 'maplespire_ci'
 const DATABASE_URL = `postgres://maplespire:maplespire@localhost:${PG_PORT}/${DB_NAME}`
 const REDIS_URL = `redis://localhost:${REDIS_PORT}`
 
-const args = new Set(process.argv.slice(2))
+const args = parseCiLocalArgs(process.argv.slice(2))
+if ('error' in args) {
+  console.error(`${args.error}\n\n${USAGE}`)
+  process.exit(2)
+}
+if (args.help) {
+  console.log(USAGE)
+  process.exit(0)
+}
 
 /** One directory per run, so a run can never destroy the evidence of the last one. */
 const RUN_ID = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z')
@@ -104,6 +129,7 @@ function runStreamed(command, commandArgs, options = {}) {
       shell: process.platform === 'win32' && SHELL_COMMANDS.has(command),
       env: { ...process.env, ...options.env },
     })
+    liveChildren.add(child)
     const log = options.logFile ? createWriteStream(options.logFile) : null
     for (const [stream, sink] of [[child.stdout, process.stdout], [child.stderr, process.stderr]]) {
       stream.setEncoding('utf8')
@@ -129,6 +155,7 @@ function runStreamed(command, commandArgs, options = {}) {
       finish()
     })
     child.on('close', (code) => {
+      liveChildren.delete(child)
       status = code ?? 1
       finish()
     })
@@ -248,7 +275,25 @@ function reportFailingFiles(label, kind) {
 }
 
 async function main() {
-  if (args.has('--down')) {
+  // Before anything touches a container: --down removes them too.
+  const lock = acquireCiLocalLocks([lockPath(PG_CONTAINER), lockPath(REDIS_CONTAINER)])
+  if (!lock.ok) {
+    const { pid, cwd, startedAt } = lock.holder
+    console.error(`Another ci-local run holds ${PG_CONTAINER} / ${REDIS_CONTAINER} (pid ${pid ?? '?'}, ${cwd ?? '?'}, since ${startedAt ?? '?'}).`)
+    console.error('Starting would drop its database mid-suite. Wait for it, or set BOTH CI_LOCAL_PG_PORT and CI_LOCAL_REDIS_PORT for a pair of your own.')
+    console.error(`If no such run exists (a reused pid), delete ${lock.file}.`)
+    process.exit(3)
+  }
+  process.on('exit', lock.release)
+  for (const [signal, code] of [['SIGINT', 130], ['SIGTERM', 143]]) {
+    process.on(signal, () => {
+      for (const child of liveChildren) child.kill(signal)
+      lock.release()
+      process.exit(code)
+    })
+  }
+
+  if (args.down) {
     docker(['rm', '-f', PG_CONTAINER])
     docker(['rm', '-f', REDIS_CONTAINER])
     console.log('CI service containers removed.')
@@ -266,7 +311,7 @@ async function main() {
   await waitHealthy(REDIS_CONTAINER)
   freshDatabase()
 
-  if (args.has('--static')) {
+  if (args.static) {
     console.log('\n=== Lint, build, typecheck ===')
     run('npm', ['run', 'lint'])
     // CI builds with `VITE_SYNC_API_URL` UNSET on purpose, so that
@@ -370,7 +415,7 @@ async function main() {
   const checkArgs = ['scripts/check-test-skips.mjs',
     '--report', `reports/${RUN_ID}/vitest-frontend.json`,
     '--report', `reports/${RUN_ID}/vitest-server.json`]
-  if (args.has('--update-allowlist')) checkArgs.push('--update')
+  if (args.updateAllowlist) checkArgs.push('--update')
   // Same `env`, deliberately: an allowlist entry with `requiresEnv` is a claim
   // about the environment the SUITES ran in, so a checker that cannot see that
   // environment is judging a different run (it would report the backup drill

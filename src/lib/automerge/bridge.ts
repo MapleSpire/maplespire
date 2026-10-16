@@ -56,7 +56,7 @@ import {
   type WorkspaceBinding,
 } from './workspaceBinding'
 import { reconcile } from './reconcile'
-import { syncModelIndex, resetModelIndexSync, applyOffWindowEditsToIndex, notifyModelIndexChanged } from '../modelQuery/indexSync'
+import { syncModelIndex, resetModelIndexSync, applyOffWindowEditsToIndex, notifyServerInvalidation } from '../modelQuery/indexSync'
 import { isBootFromServerEnabled } from '../modelQuery/flag'
 import { isServerReadModelEnabled } from '../modelQuery/tierFlag'
 import { setWorkspaceSummaryActive } from '../modelQuery/summaryTier'
@@ -343,8 +343,16 @@ function resumePendingDurableDocuments(): void {
   }
 }
 
-function setDurableConnectionState(connected: boolean): void {
+/** EVERY write of `syncTransportConnected` goes through here, so the reconnect
+ *  signal (`transportEpoch`) cannot be forgotten at a new one: a direct write
+ *  of `true` once skipped the bump with every test green (QA lens). */
+function setSyncTransportConnected(connected: boolean): void {
+  if (connected && !syncTransportConnected) useAutomergeStatus.getState().noteTransportRestored()
   syncTransportConnected = connected
+}
+
+function setDurableConnectionState(connected: boolean): void {
+  setSyncTransportConnected(connected)
   // Weak evidence for the minted-id supply: the sync socket is a separately
   // configured endpoint (VITE_AUTOMERGE_URL) from the mint's own host
   // (VITE_SYNC_API_URL). Unconditional, and safe to be — the supply is a no-op
@@ -473,7 +481,7 @@ async function runDurableAcknowledgement(): Promise<void> {
     // origin the mint posts to — unlike the sync WebSocket, which is a
     // separately configured endpoint.
     notifyMintedIdSupplyHostReachable()
-    syncTransportConnected = true
+    setSyncTransportConnected(true)
     // Third 'ready' producer — the one a partial patch always misses: a
     // placement acknowledging must not flip the badge over journaled entity
     // intents that never reached a durable head.
@@ -485,7 +493,7 @@ async function runDurableAcknowledgement(): Promise<void> {
     // Never show Synced on an unavailable or rejecting durability endpoint.
     // Keep retrying as a connectivity probe while the browser itself is online.
     if (typeof navigator !== 'undefined' && !navigator.onLine) {
-      syncTransportConnected = false
+      setSyncTransportConnected(false)
       useAutomergeStatus.getState().setStatus('offline')
     } else {
       useAutomergeStatus.getState().setStatus('saving')
@@ -5733,11 +5741,11 @@ function startLiveSync(): void {
   // BEFORE the server has projected the change, so it revalidates against the
   // pre-write projection and the new row never appears (e.g. creating an
   // object on the Model Objects page would leave "Total objects: 0" until a
-  // reload). `notifyModelIndexChanged` is a revision counter, not data — consumers
+  // reload). The revision (`notifyServerInvalidation`) is a counter, not data — consumers
   // re-query their own authoritative endpoint.
   if (!bfsActive && !isServerReadModelEnabled()) return
   liveSyncInvalidationUnsubscribe = subscribeCurrentWorkspaceInvalidations((event) => {
-    notifyModelIndexChanged()
+    notifyServerInvalidation()
     if (bfsActive) scheduleLiveSyncRefresh(event.generation)
   })
   if (!bfsActive) return
@@ -5878,7 +5886,7 @@ function wireConnectionStatus(): void {
   const onDisconnected = () => setDurableConnectionState(false)
   const onOffline = () => setDurableConnectionState(false)
   const onOnline = () => {
-    syncTransportConnected = false
+    setSyncTransportConnected(false)
     setStatus('connecting')
     if (durableHeads.size > 0) scheduleDurableAcknowledgement(0)
     // Reset the mint backoff and top the id pool up now — the mint response
@@ -6068,7 +6076,7 @@ export async function startBridge(ref: WorkspaceRef = DEFAULT_WORKSPACE_REF): Pr
   // the per-session cap must not carry a previous workspace's refusals into one
   // that may be perfectly healthy.
   deniedRecovery.clear()
-  syncTransportConnected = false
+  setSyncTransportConnected(false)
   setLocalDocumentChangeListener((handle) => trackDurableHandle(handle))
   started = true
   currentRef = ref
@@ -6768,7 +6776,7 @@ export function stopBridge(): void {
   // the per-session cap must not carry a previous workspace's refusals into one
   // that may be perfectly healthy.
   deniedRecovery.clear()
-  syncTransportConnected = false
+  setSyncTransportConnected(false)
   setLocalDocumentChangeListener(null)
   unwireConnectionStatus()
   cancelDeferredOverlayHydration?.()

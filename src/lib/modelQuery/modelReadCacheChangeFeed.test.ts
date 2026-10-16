@@ -44,10 +44,12 @@ vi.mock('./tierFlag', () => ({ isServerReadModelEnabled: () => true }))
 
 import {
   __resetModelReadCacheChangeFeedForTests,
+  changedIdsSince,
+  currentServerGeneration,
   installModelReadCacheChangeFeed,
   pollCurrentWorkspaceChangeFeed,
 } from './modelReadCacheChangeFeed'
-import { useModelIndexVersion } from './indexSync'
+import { __resetModelIndexVersionForTest, modelIndexChangesSince, useModelIndexVersion } from './indexSync'
 
 const json = (value: unknown) => new Response(JSON.stringify(value), {
   status: 200,
@@ -70,7 +72,7 @@ const fullMeta = {
 describe('incremental model read cache feed', () => {
   beforeEach(() => {
     __resetModelReadCacheChangeFeedForTests()
-    useModelIndexVersion.setState({ version: 0 })
+    __resetModelIndexVersionForTest()
     setActiveWorkspaceRef({ landscapeId: 'large', versionId: 'v1' })
     for (const mock of Object.values(mocks)) mock.mockReset()
     mocks.storageStatus.mockResolvedValue([fullMeta])
@@ -143,6 +145,11 @@ describe('incremental model read cache feed', () => {
     expect(mocks.commitServerGeneration.mock.invocationCallOrder[0])
       .toBeGreaterThan(mocks.deleteEntities.mock.invocationCallOrder[0])
     expect(useModelIndexVersion.getState().version).toBe(1)
+    // The revision names what it touched, so a consumer holding other
+    // entities (an inline expansion) need not re-read.
+    const change = modelIndexChangesSince(0)
+    expect([...change!.objectIds].sort()).toEqual(['o1', 'o2'])
+    expect([...change!.connectionIds].sort()).toEqual(['c1', 'c2'])
   })
 
   it('rebuilds a complete copy on a retained-history gap instead of guessing', async () => {
@@ -261,5 +268,73 @@ describe('incremental model read cache feed', () => {
       vi.useRealTimers()
       vi.unstubAllGlobals()
     }
+  })
+})
+
+// What an SSE invalidation does not carry: which entities changed.
+describe('changedIdsSince', () => {
+  const workspace = { landscapeId: 'large', versionId: 'v1' }
+  beforeEach(() => mocks.apiFetch.mockReset())
+
+  it('unions the ids of one page of the change feed', async () => {
+    mocks.apiFetch.mockImplementation(async () => json({
+        projectionGeneration: 9,
+        events: [
+          { generation: 8, kind: 'objects', upsertIds: ['o1'], deleteIds: ['o2'] },
+          { generation: 9, kind: 'connections', upsertIds: ['c1'], deleteIds: [] },
+          { generation: 9, kind: 'objects', upsertIds: ['o1'], deleteIds: [] },
+        ],
+        nextGeneration: 9,
+        hasMore: false,
+        resetRequired: false,
+      }))
+    const change = await changedIdsSince(workspace, 7, 9)
+    // (Other suites' timers may call the mock too: find THIS request.)
+    const asked = mocks.apiFetch.mock.calls
+      .map(([url]) => (typeof url === 'string' ? new URL(url, 'http://localhost') : null))
+      .find((url) => url?.pathname === '/api/model/cache/changes')
+    expect(asked?.searchParams.get('afterGeneration')).toBe('7')
+    // One full page — the server's own maximum. A smaller page turns every
+    // busier window into "unknown" (a slow re-read of every expansion).
+    expect(asked?.searchParams.get('limit')).toBe('500')
+    expect([...change!.objectIds].sort()).toEqual(['o1', 'o2'])
+    expect(change!.connectionIds).toEqual(['c1'])
+  })
+
+  it('is unknown (null) past one page, on a reset, or on a history gap', async () => {
+    const page = (over: Record<string, unknown>) => json({
+      projectionGeneration: 9, events: [], nextGeneration: 9, hasMore: false, resetRequired: false, ...over,
+    })
+    mocks.apiFetch.mockResolvedValueOnce(page({ hasMore: true }))
+    expect(await changedIdsSince(workspace, 7, 9)).toBeNull()
+    mocks.apiFetch.mockResolvedValueOnce(page({ resetRequired: true }))
+    expect(await changedIdsSince(workspace, 7, 9)).toBeNull()
+    mocks.apiFetch.mockResolvedValueOnce(page({ events: [{ generation: 8, kind: 'reset', scope: 'groups' }] }))
+    expect(await changedIdsSince(workspace, 7, 9)).toBeNull()
+  })
+
+  // Reviewer lens: an empty page from a projection that has not reached the
+  // announced generation read as "nothing changed" — lost for good.
+  it('is unknown when the projection has not reached the announced generation', async () => {
+    mocks.apiFetch.mockResolvedValueOnce(json({
+      projectionGeneration: 8, events: [], nextGeneration: 8, hasMore: false, resetRequired: false,
+    }))
+    expect(await changedIdsSince(workspace, 7, 9)).toBeNull()
+  })
+
+  it('reads the current generation, asking past any generation', async () => {
+    mocks.apiFetch.mockImplementation(async () => json({
+      projectionGeneration: 42, events: [], nextGeneration: 42, hasMore: false, resetRequired: false,
+    }))
+    expect(await currentServerGeneration(workspace)).toBe(42)
+    const asked = mocks.apiFetch.mock.calls
+      .map(([url]) => (typeof url === 'string' ? new URL(url, 'http://localhost') : null))
+      .find((url) => url?.pathname === '/api/model/cache/changes')
+    expect(Number(asked?.searchParams.get('afterGeneration'))).toBe(Number.MAX_SAFE_INTEGER)
+  })
+
+  it('fails loudly on an HTTP error, so the caller can fall back', async () => {
+    mocks.apiFetch.mockResolvedValueOnce(new Response('down', { status: 503 }))
+    await expect(changedIdsSince(workspace, 7, 9)).rejects.toThrow(/503/)
   })
 })

@@ -297,6 +297,14 @@ export function indexConnection(store: KvStore, id: string): Promise<Connection 
   return store.get<Connection>(cKey(id))
 }
 
+export async function indexConnectionsMany(store: KvStore, ids: string[]): Promise<Map<string, Connection>> {
+  if (!ids.length) return new Map()
+  const found = await store.getMany<Connection>(ids.map(cKey))
+  const out = new Map<string, Connection>()
+  found.forEach((connection, i) => { if (connection) out.set(ids[i], connection) })
+  return out
+}
+
 export function indexDiagram(store: KvStore, id: string): Promise<Diagram | undefined> {
   return store.get<Diagram>(dKey(id))
 }

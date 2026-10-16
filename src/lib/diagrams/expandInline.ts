@@ -666,3 +666,60 @@ export function expandDiagramsInline(
     cuts,
   }
 }
+
+/**
+ * The entries that collapsing `objectId` leaves without a host — the
+ * expansions NESTED inside it, at any depth.
+ *
+ * They are dropped with it rather than kept. Kept, each one was reported
+ * `'missing'` on every render, its target was still loaded and watched for
+ * nothing, and re-expanding the outer shape silently reopened a tree the user
+ * had just closed.
+ *
+ * Reachability is by COMPOSITION (`membersOf`, the diagram index's stubs carry
+ * it), not by what was drawn: the planner pulls a subset of a target's members,
+ * so this keeps an entry whenever its host COULD still be on the canvas. It
+ * errs towards keeping, never towards dropping something visible — which is
+ * also why an UNKNOWN membership (a target the index has no stub for, e.g.
+ * offline and cold) drops nothing beyond the collapsed entry: any host could
+ * be sitting in the unknown target, including one inside the collapsed entry
+ * too, so no orphan can be proven. The leftovers go once the index knows
+ * (`unreachableExpansions`, which the canvas re-runs on every index change).
+ */
+export function expansionsOrphanedByCollapse(
+  objectId: string,
+  expansions: Readonly<Record<string, string>>,
+  baseObjectIds: Iterable<string>,
+  membersOf: (diagramId: string) => readonly string[] | undefined,
+): string[] {
+  const { [objectId]: _collapsed, ...remaining } = expansions
+  return unreachableExpansions(remaining, baseObjectIds, membersOf)
+}
+
+/**
+ * The entries whose host can no longer be on the canvas — by any route, not
+ * only a collapse: the host deleted, removed from this diagram, or removed from
+ * the target that pulled it in. Same rules as `expansionsOrphanedByCollapse`:
+ * reachability by composition, and nothing when a membership is unknown.
+ */
+export function unreachableExpansions(
+  expansions: Readonly<Record<string, string>>,
+  baseObjectIds: Iterable<string>,
+  membersOf: (diagramId: string) => readonly string[] | undefined,
+): string[] {
+  const remaining = Object.entries(expansions)
+  const reachable = new Set(baseObjectIds)
+  const applied = new Set<string>()
+  for (let grew = true; grew;) {
+    grew = false
+    for (const [host, diagramId] of remaining) {
+      if (applied.has(host) || !reachable.has(host)) continue
+      const members = membersOf(diagramId)
+      if (!members) return []
+      applied.add(host)
+      grew = true
+      for (const member of members) reachable.add(member)
+    }
+  }
+  return remaining.filter(([host]) => !applied.has(host)).map(([host]) => host)
+}

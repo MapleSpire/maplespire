@@ -145,6 +145,12 @@ export function prepareDocumentRequest(url: AutomergeUrl, role = 'requested'): v
   activeDocumentShare.pin(parseAutomergeUrl(url).documentId, role)
 }
 
+/** Give back the lease `prepareDocumentRequest` took under `role`. Other roles
+ *  holding the same document keep it shared. */
+export function releaseDocumentRequest(url: AutomergeUrl, role: string): void {
+  activeDocumentShare.unpin(parseAutomergeUrl(url).documentId, role)
+}
+
 // DEV/E2E: deterministically flush all pending Automerge changes to IndexedDB. Offline tests
 // (no server to confirm against) call this before reloading to prove LOCAL durability.
 if (import.meta.env.DEV && typeof window !== 'undefined') {
@@ -541,9 +547,14 @@ export function forgetWorkspaceHandles(ref: WorkspaceRef): void {
   modelHandlePromises.delete(key)
 }
 
-export async function findDiagramHandle(url: string): Promise<DocHandle<DiagramDoc>> {
+/**
+ * `role` names the lease the request takes. A caller that will RELEASE it
+ * (`releaseDocumentRequest`) must use its own role: the default is the
+ * bridge's, and giving that back would stop syncing the diagram on screen.
+ */
+export async function findDiagramHandle(url: string, role = 'active-diagram'): Promise<DocHandle<DiagramDoc>> {
   if (!isValidAutomergeUrl(url)) throw new Error(`Invalid diagram doc url: ${url}`)
-  prepareDocumentRequest(url, 'active-diagram')
+  prepareDocumentRequest(url, role)
   // Unbudgeted, peer-blind (see getModelShardHandles).
   return resolveReadyHandleWithRetry<DiagramDoc>(repo, url)
 }

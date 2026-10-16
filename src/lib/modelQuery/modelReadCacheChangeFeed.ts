@@ -25,7 +25,7 @@ import { downloadWorkspaceForOffline } from './modelReadCacheBootstrap'
 import { isServerReadModelEnabled } from './tierFlag'
 import { getModelReadCacheWorker } from './workerClient'
 import { subscribeCurrentWorkspaceInvalidations } from './workspaceInvalidation'
-import { notifyModelIndexChanged } from './indexSync'
+import { notifyModelIndexChanged, type ModelIndexChange } from './indexSync'
 
 import { API_BASE } from '../api/base'
 const FEED_LIMIT = 100
@@ -93,6 +93,52 @@ function coalesce(events: ReadModelChange[], kind: EntityChange['kind']): Map<st
     for (const id of event.deleteIds) if (id) actions.set(id, 'delete')
   }
   return actions
+}
+
+/** One page of the change feed answers it; past that, "unknown". */
+const CHANGED_IDS_LIMIT = 500
+
+/**
+ * The entities the server's read model changed after `afterGeneration` — what
+ * an SSE invalidation does not carry (it names a generation only). `null`
+ * when it cannot be told from one page: a reset, a history gap, or more
+ * changes than one page holds. A consumer holding a few entities (an inline
+ * expansion) uses it to re-read only when one of THEIRS changed.
+ */
+export async function changedIdsSince(
+  workspace: WorkspaceRef,
+  afterGeneration: number,
+  upToGeneration: number,
+  signal?: AbortSignal,
+): Promise<ModelIndexChange | null> {
+  const params = workspaceParams(workspace)
+  params.set('afterGeneration', String(afterGeneration))
+  params.set('limit', String(CHANGED_IDS_LIMIT))
+  const page = await getJson<ChangeFeedPage>('/api/model/cache/changes', params, signal)
+  if (page.resetRequired || page.hasMore || page.events.some((event) => event.kind === 'reset')) return null
+  // Answered by a projection that has not reached the generation the
+  // invalidation announced: an empty page would read "nothing changed" and
+  // the change would be lost for good. Unknown instead.
+  if (!(page.projectionGeneration >= upToGeneration)) return null
+  return {
+    objectIds: [...coalesce(page.events, 'objects').keys()],
+    connectionIds: [...coalesce(page.events, 'connections').keys()],
+  }
+}
+
+/** Asked AFTER a generation no projection reaches: the answer carries the
+ *  current generation and no events. */
+const BEYOND_ANY_GENERATION = Number.MAX_SAFE_INTEGER
+
+/** The read model's current generation for a workspace — the baseline a
+ *  consumer of `changedIdsSince` starts from. */
+export async function currentServerGeneration(workspace: WorkspaceRef, signal?: AbortSignal): Promise<number> {
+  const params = workspaceParams(workspace)
+  params.set('afterGeneration', String(BEYOND_ANY_GENERATION))
+  params.set('limit', '1')
+  const page = await getJson<ChangeFeedPage>('/api/model/cache/changes', params, signal)
+  if (!Number.isSafeInteger(page.projectionGeneration)) throw new Error('read model answered no generation')
+  return page.projectionGeneration
 }
 
 function requireGeneration(actual: number, expected: number): void {
@@ -240,7 +286,7 @@ async function applyChangePage(
     workspaceKey,
     serverGeneration: page.nextGeneration,
   }, signal)
-  notifyModelIndexChanged()
+  notifyModelIndexChanged({ objectIds: [...objectActions.keys()], connectionIds: [...connectionActions.keys()] })
 }
 
 async function runPoll(workspace: WorkspaceRef, signal?: AbortSignal): Promise<void> {
