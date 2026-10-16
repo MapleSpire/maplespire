@@ -90,6 +90,7 @@ import {
   type DocumentRetryAbandonReason,
 } from './documentRetryQueue.js'
 import { appendReadModelChange, type ReadModelChangePayload } from './changeFeed.js'
+import { servedObjectRowsChangedBy } from './objectExplorer.js'
 import { withReadModelProjectionTransaction } from './projectionTransaction.js'
 import { ReadModelPlaneError, isProjectionMutexTimeout, isReadModelAuthorityLoss } from './projectionAuthority.js'
 import {
@@ -786,7 +787,9 @@ export async function startReadModelProjector(
   const runTracked = <T>(
     kind: ProjectionKind,
     action: (tx: Queryable) => Promise<T>,
-    change: ReadModelChangePayload = { kind: 'reset', scope: 'all' },
+    /** A function when the ids are only known once the action has written —
+     * it receives the action's result, inside the same transaction. */
+    change: ReadModelChangePayload | ((result: T) => ReadModelChangePayload) = { kind: 'reset', scope: 'all' },
     /** What this projection knows about its own completeness and
      * about the id set it just wrote. Sealed in the SAME transaction as the rows,
      * which is the entire reason it can be trusted later. */
@@ -853,7 +856,7 @@ export async function startReadModelProjector(
         const activeToken = token
         return await withReadModelProjectionTransaction(db, key, 'ordinary', async (tx) => {
           const result = await action(tx)
-          await appendReadModelChange(tx, key, activeToken, change)
+          await appendReadModelChange(tx, key, activeToken, typeof change === 'function' ? change(result) : change)
           // BEFORE completeReadModelProjection, deliberately: the row must still
           // carry the generation this projection supersedes, because that is what
           // `unchanged` is measured against. Inside the same transaction, so the
@@ -2022,6 +2025,7 @@ export async function startReadModelProjector(
       : []
     if (applyInitial && initial.length) {
       const parentIds = initial.flatMap((object) => object.parentId ? [object.parentId] : [])
+      const candidateIds = [...initial.map((object) => object.id), ...parentIds]
       await repo.flush([h.documentId])
       const preparedWatermarks = await prepareShardWatermarks([h.documentId])
       await runTracked(
@@ -2033,10 +2037,13 @@ export async function startReadModelProjector(
             )
           }
           await acknowledgeOverlayBatches(tx, key, 'object', h.documentId, attachBatchIds, 'projected', 0, 0)
-          await applyObjectShardDelta(tx, key, orgId, [], initial)
+          const changedIds = await servedObjectRowsChangedBy(tx, key, candidateIds,
+            () => applyObjectShardDelta(tx, key, orgId, [], initial))
           await recordShardWatermark(tx, h, attachHeads, preparedWatermarks)
+          return changedIds
         },
-        { kind: 'objects', upsertIds: [...initial.map((object) => object.id), ...parentIds], deleteIds: [] },
+        // See projectLatest below: only the ids whose served row changed.
+        (changedIds) => ({ kind: 'objects', upsertIds: changedIds, deleteIds: [] }),
         // One shard's ids are not the workspace's, so `object` cannot be
         // re-sealed here and goes un-comparable until the next full extraction.
         // The other three are untouched and keep theirs.
@@ -2128,6 +2135,22 @@ export async function startReadModelProjector(
         ...[...snap.values()].flatMap((object) => object.parentId ? [object.parentId] : []),
       ]
       const batchIds = unacknowledged(source)
+      // The shard is rewritten whole, but the feed names only the candidates
+      // whose SERVED row (`roObjectCacheByIds`) differs after the write — read
+      // from the database, not from `snap`: an id can live in several shards
+      // (base + overlay heads) and the last shard written wins its row, so this
+      // closure's own snapshot cannot tell whether the row moved (the shared-id
+      // arm of `projectorService.integration.test.ts` goes red on that diff).
+      // Measured 2026-10-15 before this, 10-object workspace: one rename listed
+      // all 10 ids, and every consumer filtering on them (inline expansions,
+      // the offline cache's by-ids re-fetch) re-read for edits not theirs.
+      // The candidates are this shard's ids, the parents it names, the ids it
+      // deletes, and their neighbours read from the rows — children and groups
+      // in OTHER shards, which the old whole-shard listing happened to refresh
+      // on the shard's next edit and a precise feed would otherwise never name
+      // (`servedObjectRowsChangedBy`).
+      const candidateIds = [...objects.map((object) => object.id), ...parentIds, ...deletedIds]
+      const deleted = new Set(deletedIds)
       await runTracked(
         'object_shard',
         async (tx) => {
@@ -2137,10 +2160,16 @@ export async function startReadModelProjector(
             )
           }
           await acknowledgeOverlayBatches(tx, key, 'object', h.documentId, batchIds, 'projected', 0, 0)
-          await applyObjectShardDelta(tx, key, orgId, oldIds, objects)
+          const changedIds = await servedObjectRowsChangedBy(tx, key, candidateIds,
+            () => applyObjectShardDelta(tx, key, orgId, oldIds, objects))
           await recordShardWatermark(tx, h, sampledHeads, preparedWatermarks)
+          return changedIds
         },
-        { kind: 'objects', upsertIds: [...objects.map((object) => object.id), ...parentIds], deleteIds: deletedIds },
+        // A deleted id's row vanished, so it is "changed"; it is published as
+        // a delete, not also as an upsert.
+        (changedIds) => ({
+          kind: 'objects', upsertIds: changedIds.filter((id) => !deleted.has(id)), deleteIds: deletedIds,
+        }),
         { unchanged: ['connection', 'group', 'diagram'] },
       )
       // Advance only after rows + feed + generation commit atomically.

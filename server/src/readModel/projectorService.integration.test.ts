@@ -18,6 +18,7 @@ import { Repo } from '@automerge/automerge-repo'
 import { startReadModelProjector } from './projectorService.js'
 import { documentRetryRegistry } from './documentRetryQueue.js'
 import { roObject, roGroup, roConnectionCount } from './queries.js'
+import { roObjectCacheByIds } from './objectExplorer.js'
 import { verifyWorkspaceIntegrity } from './projectionIntegrity.js'
 import type { WorkspaceKey } from './projector.js'
 import { guardIdleClientErrors } from '../db/poolErrorGuard.js'
@@ -81,8 +82,166 @@ suite('read-model projector wiring (in-process Automerge → Postgres)', () => {
     }
   })
   beforeEach(async () => {
-    await pool!.query('TRUNCATE ro_objects, ro_connections, ro_groups, read_model_projection_state')
+    // The change feed too: the generation restarts with the state row, so a
+    // previous test's events would otherwise read as this test's.
+    await pool!.query('TRUNCATE ro_objects, ro_connections, ro_groups, read_model_projection_state, read_model_change_events')
   })
+
+  type ObjectsEvent = { generation: number; upsertIds: string[]; deleteIds: string[] }
+  const projectedGeneration = async (): Promise<number> => Number((await pool!.query<{ g: number }>(
+    `SELECT projected_generation::int AS g FROM read_model_projection_state
+     WHERE landscape_id = $1 AND version_id = $2`,
+    [WS.landscapeId, WS.versionId],
+  )).rows[0]?.g ?? 0)
+  const objectsEventsAfter = async (generation: number): Promise<ObjectsEvent[]> => (await pool!.query<{
+    generation: number; payload: { upsertIds: string[]; deleteIds: string[] }
+  }>(
+    `SELECT generation::int, payload FROM read_model_change_events
+     WHERE landscape_id = $1 AND version_id = $2 AND generation > $3 AND change_kind = 'objects'
+     ORDER BY generation`,
+    [WS.landscapeId, WS.versionId, generation],
+  )).rows.map((row) => ({
+    generation: row.generation,
+    upsertIds: [...row.payload.upsertIds].sort(),
+    deleteIds: [...row.payload.deleteIds].sort(),
+  }))
+  /** Run one edit and return the objects events it produced — waiting for the
+   *  first, then for the projection to be caught up, so a SECOND event from the
+   *  same edit would be seen rather than raced. */
+  const objectsEventsOf = async (edit: () => void): Promise<ObjectsEvent[]> => {
+    const baseline = await projectedGeneration()
+    edit()
+    await until(() => objectsEventsAfter(baseline), (events) => events.length > 0)
+    await until(
+      async () => (await pool!.query<{ observed: number; projected: number }>(
+        `SELECT observed_generation::int AS observed, projected_generation::int AS projected
+         FROM read_model_projection_state WHERE landscape_id = $1 AND version_id = $2`,
+        [WS.landscapeId, WS.versionId],
+      )).rows[0],
+      (value) => value.observed === value.projected,
+    )
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    return objectsEventsAfter(baseline)
+  }
+
+  it('lists in the objects feed only the ids whose served row changed, and every one of them', async () => {
+    // Measured 2026-10-15 before this fix: renaming ONE object listed every
+    // object of its shard, so every consumer filtering on the feed's ids — an
+    // inline expansion, the offline cache's by-ids re-fetch — re-read for an
+    // edit that was not theirs.
+    const repo = new Repo({})
+    const objects: Record<string, unknown> = {}
+    // o0..o7 only: o8 and o9 are CREATED below, so the multi arm tests a new
+    // id on the delta path rather than a replacement.
+    for (let index = 0; index < 8; index += 1) objects[`o${index}`] = { id: `o${index}`, name: `N${index}` }
+    objects.o1 = { id: 'o1', name: 'N1', parentId: 'o0' }
+    const os0 = repo.create({ objects })
+    // A second shard carrying `x` too — a base shard and an overlay head both
+    // hold an entity after a fold. The last shard written wins the ROW, which
+    // is what makes a per-shard snapshot diff unsound here.
+    // And `p`, a parent living in another shard than the child added below: it
+    // is a candidate only because it is named as a parent.
+    const os1 = repo.create({ objects: { x: { id: 'x', name: 'overlay' }, p: { id: 'p', name: 'P' } } })
+    const cs0 = repo.create({ connections: {} })
+    const meta = repo.create({ objectShardUrls: [os0.url, os1.url], connectionShardUrls: [cs0.url], groups: {} })
+    const root = repo.create({ modelMetaUrl: meta.url, modelUrl: '', shardUrls: [] })
+    await Promise.all([os0, os1, cs0, meta, root].map((h) => h.whenReady()))
+    type Shard = { objects: Record<string, { id: string; name: string; parentId?: string; description?: string }> }
+
+    const stop = await startReadModelProjector(repo, root.url, pool!, WS)
+    try {
+      // One rename → one id.
+      const rename = await objectsEventsOf(() => os0.change((d: Shard) => { d.objects.o3.name = 'renamed' }))
+      expect((await roObject(pool!, WS, 'o3'))?.name).toBe('renamed')
+      expect(rename).toEqual([{ generation: expect.any(Number), upsertIds: ['o3'], deleteIds: [] }])
+
+      // A real multi-object change in ONE pass still lists all of it: two
+      // renames, new children (whose parents' served child_count moves, so the
+      // parents are listed although their own entities did not change — `p`
+      // from another shard), a delete.
+      const multi = await objectsEventsOf(() => os0.change((d: Shard) => {
+        d.objects.o2.name = 'two'
+        d.objects.o5.name = 'five'
+        d.objects.o9 = { id: 'o9', name: 'child', parentId: 'o0' }
+        d.objects.o8 = { id: 'o8', name: 'N8', parentId: 'p' }
+        delete d.objects.o4
+      }))
+      expect(multi).toEqual([{
+        generation: expect.any(Number), upsertIds: ['o0', 'o2', 'o5', 'o8', 'o9', 'p'], deleteIds: ['o4'],
+      }])
+      // A field that lives only in `data` (no column of its own), edited while
+      // o8 sits under the cross-shard `p`: exactly o7 — not `p` again, whose
+      // row did not move.
+      const described = await objectsEventsOf(() => os0.change((d: Shard) => { d.objects.o7.description = 'd' }))
+      expect(described).toEqual([{ generation: expect.any(Number), upsertIds: ['o7'], deleteIds: [] }])
+      // And the child LEAVING moves the other parent's count back.
+      const moved = await objectsEventsOf(() => os0.change((d: Shard) => { delete d.objects.o8.parentId }))
+      expect(moved).toEqual([{ generation: expect.any(Number), upsertIds: ['o8', 'p'], deleteIds: [] }])
+      // A deleted parent moves its children's served parent (effective parent
+      // → root) without touching their `data`. o0 then dangles as a parent
+      // named by o1/o9 — a candidate with no row on either side, never listed.
+      const orphaned = await objectsEventsOf(() => os0.change((d: Shard) => { delete d.objects.o0 }))
+      expect(orphaned).toEqual([{ generation: expect.any(Number), upsertIds: ['o1', 'o9'], deleteIds: ['o0'] }])
+
+      // A shared id whose row another shard last wrote: os0 now writes `x`
+      // (unchanged in os0's own eyes) over os1's value, so the served row
+      // changes and the feed must say so. A diff against os0's previous
+      // snapshot would not list `x`, and a cache would keep `overlay`.
+      await objectsEventsOf(() => os0.change((d: Shard) => { d.objects.x = { id: 'x', name: 'base' } }))
+      await objectsEventsOf(() => os1.change((d: Shard) => { d.objects.x.name = 'overlay2' }))
+      // "Listed iff its served row changed" — NOT which shard should win: the
+      // ordinary path's last-shard-written-wins is its own (pre-existing)
+      // question, and this arm must not pin an answer to it.
+      const servedX = async () => JSON.stringify((await roObjectCacheByIds(pool!, WS, ['x'])).items)
+      const xBefore = await servedX()
+      const shared = await objectsEventsOf(() => os0.change((d: Shard) => { d.objects.o6.name = 'six' }))
+      const xMoved = (await servedX()) !== xBefore
+      // Today it does move; if precedence is ever fixed this arm keeps its
+      // meaning and only the vacuity guard below needs a new fixture.
+      expect(xMoved, 'fixture no longer moves the shared row; the arm would be vacuous').toBe(true)
+      expect(shared).toEqual([{ generation: expect.any(Number), upsertIds: ['o6', 'x'], deleteIds: [] }])
+
+      // A shard attached after boot goes through the initial apply, the other
+      // writer of this feed: its new rows, and the parent they land under.
+      const os2 = repo.create({ objects: { n1: { id: 'n1', name: 'new' }, n2: { id: 'n2', name: 'new', parentId: 'p' } } })
+      await os2.whenReady()
+      const attached = await objectsEventsOf(() => meta.change((d: { objectShardUrls: string[] }) => {
+        d.objectShardUrls.push(os2.url)
+      }))
+      expect(attached).toEqual([{ generation: expect.any(Number), upsertIds: ['n1', 'n2', 'p'], deleteIds: [] }])
+
+      // A parent deleted from ITS shard re-roots a child living in ANOTHER one:
+      // `n2`'s served parent moves although no shard naming `n2` changed. The
+      // old whole-shard listing never named it either; it only got refreshed by
+      // luck on os2's next edit, which a precise feed no longer provides.
+      expect((await roObjectCacheByIds(pool!, WS, ['n2'])).items[0]?.parentId).toBe('p')
+      const xBeforeReRoot = await servedX()
+      const reRooted = await objectsEventsOf(() => os1.change((d: Shard) => { delete d.objects.p }))
+      expect((await roObjectCacheByIds(pool!, WS, ['n2'])).items[0]?.parentId).toBeNull()
+      // os1 also re-writes its own `x` over the row os0 last wrote — the shared
+      // row moves again, so it is listed again (same rule as the shared arm).
+      expect(await servedX(), 'x must have moved for it to be expected below').not.toBe(xBeforeReRoot)
+      expect(reRooted).toEqual([{ generation: expect.any(Number), upsertIds: ['n2', 'x'], deleteIds: ['p'] }])
+
+      // Past the by-ids endpoint's 500: a model shard holds up to 512, and the
+      // digest must see every one of them, the last included.
+      const big: Record<string, unknown> = {}
+      for (let index = 0; index < 520; index += 1) {
+        const id = `b${String(index).padStart(3, '0')}`
+        big[id] = { id, name: id }
+      }
+      const os3 = repo.create({ objects: big })
+      await os3.whenReady()
+      const bigAttached = await objectsEventsOf(() => meta.change((d: { objectShardUrls: string[] }) => {
+        d.objectShardUrls.push(os3.url)
+      }))
+      expect(bigAttached[0]?.upsertIds).toHaveLength(520)
+      const lastRenamed = await objectsEventsOf(() => os3.change((d: Shard) => { d.objects.b519.name = 'last' }))
+      expect(lastRenamed).toEqual([{ generation: expect.any(Number), upsertIds: ['b519'], deleteIds: [] }])
+    } finally {
+      stop()
+    }
+  }, 60_000)
 
   it('seals a digest a REAL cold build can be verified against, and detects a row removed behind its back', async () => {
     // The seam nothing else covers. The unit tests drive the projector with a

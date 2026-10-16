@@ -224,6 +224,111 @@ function mapObjectCacheRow(row: {
   }
 }
 
+/** The row `roObjectCacheByIds` serves, for ids `$3` of workspace `$1`/`$2`.
+ * ONE text for two readers: the endpoint, and `objectCacheRowDigests`, which
+ * decides which ids the change feed lists. If they could drift, the feed could
+ * omit an id whose served row changed and a cache would keep the stale one. */
+const OBJECT_CACHE_ROWS_BY_IDS_SQL = `
+       SELECT g.id, 'group'::text AS kind, g.name, 'group'::text AS type,
+              NULL::text AS parent_id,
+              (SELECT count(*) FROM ro_group_objects go
+               WHERE go.landscape_id = g.landscape_id AND go.version_id = g.version_id
+                 AND go.group_id = g.id)::int AS child_count,
+              g.data
+       FROM ro_groups g
+       WHERE g.landscape_id = $1 AND g.version_id = $2 AND g.id = ANY($3::text[])
+       UNION ALL
+       SELECT o.id, 'object'::text AS kind, o.name, o.type,
+              o.effective_parent_id AS parent_id,
+              (SELECT count(*) FROM ro_objects child
+               WHERE child.landscape_id = o.landscape_id AND child.version_id = o.version_id
+                 AND child.effective_parent_id = o.id)::int AS child_count,
+              o.data
+       FROM ro_objects o
+       WHERE o.landscape_id = $1 AND o.version_id = $2 AND o.id = ANY($3::text[])`
+
+/** A digest of the served cache row of each id that has one, read through the
+ * caller's transaction. Taken before and after a projection's writes, it says
+ * which rows a client re-fetching by id would actually see differ. Unbounded on
+ * purpose: a shard is not capped at the endpoint's 500. */
+export async function objectCacheRowDigests(
+  db: Queryable,
+  key: WorkspaceKey,
+  ids: readonly string[],
+): Promise<Map<string, string>> {
+  const uniqueIds = [...new Set(ids.filter((id) => typeof id === 'string' && id.length > 0))]
+  if (!uniqueIds.length) return new Map()
+  const { rows } = await db.query<{ id: string; digest: string }>(
+    // Aggregated per id: a group and an object sharing an id are both served,
+    // and one digest must cover both, in an order that does not depend on the plan.
+    // sha256, not md5: md5() raises under a FIPS-mode OpenSSL (PostgreSQL 14+),
+    // which would fail every object-shard projection.
+    `SELECT served.id,
+            encode(sha256(convert_to(
+              string_agg(to_jsonb(served)::text, ',' ORDER BY to_jsonb(served)::text), 'UTF8')), 'hex') AS digest
+     FROM (${OBJECT_CACHE_ROWS_BY_IDS_SQL}) AS served
+     GROUP BY served.id`,
+    [key.landscapeId, key.versionId, uniqueIds],
+  )
+  return new Map(rows.map((row) => [row.id, row.digest]))
+}
+
+/** The ids whose served row a write to `ids` can move WITHOUT being one of
+ * them, read from the rows as they stand — so before the write:
+ *  - children (`parent_id` in `ids`, any shard): `refreshEffectiveParents`
+ *    re-roots them when a parent appears or goes;
+ *  - the current effective parents of `ids`: their `child_count` moves when
+ *    a child leaves, including a shared id another shard last parented;
+ *  - the groups holding `ids`: deleting a member drops their `child_count`.
+ * A projection's own snapshot cannot name these: they live in other shards. */
+export async function objectCacheNeighbourIds(
+  db: Queryable,
+  key: WorkspaceKey,
+  ids: readonly string[],
+): Promise<string[]> {
+  const uniqueIds = [...new Set(ids.filter((id) => typeof id === 'string' && id.length > 0))]
+  if (!uniqueIds.length) return []
+  const { rows } = await db.query<{ id: string }>(
+    `SELECT id FROM ro_objects
+     WHERE landscape_id = $1 AND version_id = $2 AND parent_id = ANY($3::text[])
+     UNION
+     SELECT effective_parent_id FROM ro_objects
+     WHERE landscape_id = $1 AND version_id = $2 AND id = ANY($3::text[]) AND effective_parent_id IS NOT NULL
+     UNION
+     SELECT group_id FROM ro_group_objects
+     WHERE landscape_id = $1 AND version_id = $2 AND object_id = ANY($3::text[])`,
+    [key.landscapeId, key.versionId, uniqueIds],
+  )
+  return rows.map((row) => row.id)
+}
+
+/** Run `write` through `tx` and return the ids whose served cache row it
+ * changed: `seeds` (what the write names) and their neighbours, digested
+ * before and after, in the caller's transaction. The ONE place the change feed
+ * of an object projection learns its ids, so the two projection paths cannot
+ * disagree about which rows they look at. */
+export async function servedObjectRowsChangedBy(
+  tx: Queryable,
+  key: WorkspaceKey,
+  seeds: readonly string[],
+  write: () => Promise<void>,
+): Promise<string[]> {
+  const candidates = [...seeds, ...await objectCacheNeighbourIds(tx, key, seeds)]
+  const before = await objectCacheRowDigests(tx, key, candidates)
+  await write()
+  return changedCacheRowIds(candidates, before, await objectCacheRowDigests(tx, key, candidates))
+}
+
+/** The candidates whose served row differs between two digests — appeared,
+ * disappeared or changed. An id with no row on either side is not a change. */
+export function changedCacheRowIds(
+  candidates: readonly string[],
+  before: ReadonlyMap<string, string>,
+  after: ReadonlyMap<string, string>,
+): string[] {
+  return [...new Set(candidates)].filter((id) => before.get(id) !== after.get(id))
+}
+
 /** Fetch a bounded set of changed object/group identities for the incremental
  * browser cache. Missing IDs are intentional tombstones and are therefore not
  * represented in the result. Child counts are recomputed here so parent rows
@@ -247,23 +352,7 @@ export async function roObjectCacheByIds(
       child_count: string | number
       data: Record<string, unknown>
     }>(
-      `SELECT g.id, 'group'::text AS kind, g.name, 'group'::text AS type,
-              NULL::text AS parent_id,
-              (SELECT count(*) FROM ro_group_objects go
-               WHERE go.landscape_id = g.landscape_id AND go.version_id = g.version_id
-                 AND go.group_id = g.id)::int AS child_count,
-              g.data
-       FROM ro_groups g
-       WHERE g.landscape_id = $1 AND g.version_id = $2 AND g.id = ANY($3::text[])
-       UNION ALL
-       SELECT o.id, 'object'::text AS kind, o.name, o.type,
-              o.effective_parent_id AS parent_id,
-              (SELECT count(*) FROM ro_objects child
-               WHERE child.landscape_id = o.landscape_id AND child.version_id = o.version_id
-                 AND child.effective_parent_id = o.id)::int AS child_count,
-              o.data
-       FROM ro_objects o
-       WHERE o.landscape_id = $1 AND o.version_id = $2 AND o.id = ANY($3::text[])
+      `${OBJECT_CACHE_ROWS_BY_IDS_SQL}
        ORDER BY id`,
       [key.landscapeId, key.versionId, boundedIds],
     ),
