@@ -17,8 +17,13 @@ import { describe, expect, it } from 'vitest'
 import {
   expandDiagramsInline,
   inlineWrapperId,
+  modelCommentsToView,
+  shiftBox,
   shiftPoint,
+  unshiftBox,
   unshiftPoint,
+  viewPlacementsToModel,
+  viewWaypointsToModel,
   type InlineExpansionResult,
   type MakeRoomCut,
 } from './expandInline'
@@ -420,14 +425,14 @@ describe('expandDiagramsInline', () => {
     const foodDash = () => {
       const w = world({
         objects: [
-          object('customer', { type: 'person', position: { x: 310, y: 40 }, size: sz }),
+          object('customer', { type: 'actor', position: { x: 310, y: 40 }, size: sz }),
           object('foodDash', { name: 'FoodDash', type: 'system', shortDescription: 'Food delivery', position: { x: 310, y: 280 }, size: sz }),
-          object('courier', { type: 'person', position: { x: 620, y: 280 }, size: sz }),
+          object('courier', { type: 'actor', position: { x: 620, y: 280 }, size: sz }),
           object('stripe', { scope: 'external', position: { x: 60, y: 510 }, size: sz }),
           object('maps', { scope: 'external', position: { x: 330, y: 510 }, size: sz }),
           object('portal', { name: 'Restaurant Portal', size: sz }),
           object('web', { size: sz }), object('mobile', { size: sz }),
-          object('orders', { name: 'Order Service', type: 'container', size: sz }),
+          object('orders', { name: 'Order Service', type: 'app', size: sz }),
           object('payments', { name: 'Payment Service', size: sz }),
           object('db', { size: sz }),
           object('api', { size: sz }), object('checkout', { size: sz }), object('machine', { size: sz }),
@@ -613,6 +618,23 @@ describe('expandDiagramsInline', () => {
       expect(moved.objectIds).toEqual(['peer'])
     })
 
+    // Found by the review lenses: a manual-size boundary around the host stayed
+    // its size while the members past the cut moved out of it.
+    it('grows a manually sized group around the host so its members stay inside', () => {
+      const w = world()
+      const boundary = {
+        id: 'g1', name: 'g', objectIds: ['host', 'peer'], autoSize: false,
+        position: { x: 470, y: 370 }, size: { width: 560, height: 120 },
+      } as unknown as Group
+      const result = expandDiagramsInline({ ...w.base, groups: [boundary] }, 'A', [{ objectId: 'host', diagramId: 'B' }], w.lookup)
+      const grown = result.groups.find((g) => g.id === 'g1')!
+      const box = { ...grown.position!, ...grown.size! }
+      const peer = pos(result, 'peer')
+      expect(contains(box, { ...peer, width: 100, height: 60 })).toBe(true)
+      expect(contains(box, drawnWrapperBox(result, 'host'))).toBe(true)
+      expect(boundary.size).toEqual({ width: 560, height: 120 })
+    })
+
     it('does not move anything it was given', () => {
       const { w, lookup } = foodDash()
       const before = JSON.stringify(w.base)
@@ -678,6 +700,78 @@ describe('expandDiagramsInline', () => {
 
     it('stores a shape dropped in an opened gap at the cut line', () => {
       expect(unshiftPoint(cuts.slice(0, 1), { x: 700, y: 480 })).toEqual({ x: 600, y: 460 })
+    })
+
+    // A manually sized group the cut passes through grows, as a spreadsheet
+    // range spanning an inserted column does — and the inverse gives the
+    // model box back, so a resize or a frozen size never stores the growth.
+    it('grows a stored box a cut passes through, and gives the model box back', () => {
+      const one = cuts.slice(0, 1)
+      const straddling = { x: 400, y: 100, width: 400, height: 200 }
+      expect(shiftBox(one, straddling)).toEqual({ x: 400, y: 100, width: 660, height: 200 })
+      expect(unshiftBox(one, shiftBox(one, straddling))).toEqual(straddling)
+      const past = { x: 700, y: 500, width: 100, height: 50 }
+      expect(shiftBox(one, past)).toEqual({ x: 960, y: 599, width: 100, height: 50 })
+      expect(unshiftBox(one, shiftBox(one, past))).toEqual(past)
+      const before = { x: 0, y: 0, width: 600, height: 460 }
+      expect(shiftBox(one, before)).toEqual(before)
+      for (const box of [straddling, past, before, { x: 590, y: 450, width: 900, height: 900 }]) {
+        expect(unshiftBox(cuts, shiftBox(cuts, box)), JSON.stringify(box)).toEqual(box)
+      }
+    })
+
+    // The three ways the canvas writes back, as CanvasView calls them. Each was
+    // a CanvasView-only mutant no test could see (QA lens, 2026-10-15).
+    it('maps a drag / resize commit to the model frame, and drops what was pulled in', () => {
+      const one = cuts.slice(0, 1)
+      const mapped = viewPlacementsToModel(one, new Set(['pulled', 'inline-expand:host']), {
+        objects: [
+          { id: 'past', position: { x: 1160, y: 400 } },
+          { id: 'before', position: { x: 100, y: 100 } },
+          { id: 'resized', position: { x: 960, y: 599 }, size: { width: 300, height: 90 } },
+          { id: 'pulled', position: { x: 700, y: 700 } },
+        ],
+        groups: [
+          { id: 'moved', position: { x: 960, y: 100 } },
+          { id: 'boxed', position: { x: 400, y: 100 }, size: { width: 660, height: 200 } },
+          { id: 'flagOnly', autoSize: true },
+          { id: 'inline-expand:host', position: { x: 0, y: 0 } },
+        ],
+      })
+      expect(mapped.objects).toEqual([
+        { id: 'past', position: { x: 900, y: 400 } },
+        { id: 'before', position: { x: 100, y: 100 } },
+        // An object's size is its own, never stretched by a cut.
+        { id: 'resized', position: { x: 700, y: 500 }, size: { width: 300, height: 90 } },
+      ])
+      expect(mapped.groups).toEqual([
+        { id: 'moved', position: { x: 700, y: 100 } },
+        { id: 'boxed', position: { x: 400, y: 100 }, size: { width: 400, height: 200 } },
+        { id: 'flagOnly', autoSize: true },
+      ])
+      // No cuts: untouched, but pulled items are STILL not written.
+      expect(viewPlacementsToModel([], new Set(['pulled']), {
+        objects: [{ id: 'pulled', position: { x: 1, y: 1 } }, { id: 'own', position: { x: 2, y: 2 } }],
+        groups: [],
+      }).objects).toEqual([{ id: 'own', position: { x: 2, y: 2 } }])
+    })
+
+    it('maps edited waypoints to the model frame, and refuses a pulled edge\'s', () => {
+      const one = cuts.slice(0, 1)
+      expect(viewWaypointsToModel(one, new Set(), 'c', [{ x: 1000, y: 700 }, { x: 100, y: 100 }]))
+        .toEqual([{ x: 740, y: 601 }, { x: 100, y: 100 }])
+      expect(viewWaypointsToModel(one, new Set(['c']), 'c', [{ x: 1000, y: 700 }])).toBeNull()
+      expect(viewWaypointsToModel(one, new Set(), 'c', [])).toEqual([])
+    })
+
+    it('draws comment pins displaced, and leaves the model comments alone', () => {
+      const one = cuts.slice(0, 1)
+      const comments = [{ id: 'a', position: { x: 900, y: 700 } }, { id: 'b', position: { x: 10, y: 10 } }]
+      expect(modelCommentsToView(one, comments)).toEqual([
+        { id: 'a', position: { x: 1160, y: 799 } }, { id: 'b', position: { x: 10, y: 10 } },
+      ])
+      expect(comments[0].position).toEqual({ x: 900, y: 700 })
+      expect(modelCommentsToView([], comments)).toEqual(comments)
     })
 
     it('is the identity with nothing expanded', () => {
@@ -885,5 +979,188 @@ describe('expandDiagramsInline', () => {
     it('names the wrapper\'s type the way the renderer labels it', () => {
       expect(expandHostIntoB(world()).groups[0].type).toBe('App')
     })
+  })
+
+  // Independent QA lens, 2026-10-15 (make-room step, 60 mutants): each of these
+  // kills a mutant the suite above let survive.
+  describe('make-room edges the first suite missed', () => {
+    const at = (r: InlineExpansionResult, id: string) => r.objects.find((o) => o.id === id)!.position
+
+    // shiftPoint is what CanvasView draws pins with and inverts to write back;
+    // it must be EXACTLY the displacement the planner applied, edges included.
+    it('shiftPoint reproduces the planner\'s displacement, edges included', () => {
+      const model: Record<string, { x: number; y: number }> = {
+        touchRight: { x: 600, y: 400 }, touchBelow: { x: 500, y: 460 }, corner: { x: 600, y: 460 },
+        left: { x: 300, y: 400 }, above: { x: 500, y: 200 },
+      }
+      const w = world({
+        objects: [
+          object('host', { name: 'Billing', position: { x: 500, y: 400 } }),
+          ...Object.entries(model).map(([id, position]) => object(id, { position })),
+          object('inner1', { position: { x: 20, y: 10 } }), object('inner2', { position: { x: 220, y: 10 } }),
+        ],
+        diagrams: [diagram('A', { objectIds: ['host', ...Object.keys(model)] }), diagram('B', { objectIds: ['inner1', 'inner2'] })],
+        connections: [],
+      })
+      const result = expandHostIntoB(w)
+      for (const [id, p] of Object.entries(model)) expect(at(result, id), id).toEqual(shiftPoint(result.cuts, p))
+      expect(at(result, 'touchBelow')).toEqual({ x: 500, y: 559 })
+      expectNothingOverlaps(result)
+    })
+
+    // An earlier block (above-right) must move with a later sibling's column.
+    it('moves an already-placed block past a later sibling\'s cut', () => {
+      const w = world({
+        objects: [
+          object('h1', { position: { x: 500, y: 0 } }), object('l', { position: { x: 300, y: 0 } }),
+          object('h', { position: { x: 0, y: 100 } }),
+          object('a1', { position: { x: 0, y: 0 } }), object('a2', { position: { x: 300, y: 300 } }),
+          object('d1', { position: { x: 0, y: 0 } }), object('d2', { position: { x: 300, y: 0 } }),
+        ],
+        diagrams: [
+          diagram('A', { objectIds: ['h1', 'l', 'h'] }),
+          diagram('B', { objectIds: ['a1', 'a2'] }), diagram('C', { objectIds: ['d1', 'd2'] }),
+        ],
+        connections: [],
+      })
+      const result = expandDiagramsInline(w.base, 'A', [
+        { objectId: 'h1', diagramId: 'B' }, { objectId: 'h', diagramId: 'C' },
+      ], w.lookup)
+      expect(result.skipped).toEqual([])
+      expectNothingOverlaps(result)
+    })
+
+    it('makes room on one axis when the block grows on only that one', () => {
+      const w = world({
+        objects: [
+          object('host', { position: { x: 0, y: 0 }, size: { width: 100, height: 1000 } }),
+          object('right', { position: { x: 200, y: 0 } }),
+          object('inner1', { position: { x: 20, y: 10 } }), object('inner2', { position: { x: 220, y: 10 } }),
+        ],
+        diagrams: [diagram('A', { objectIds: ['host', 'right'] }), diagram('B', { objectIds: ['inner1', 'inner2'] })],
+        connections: [],
+      })
+      const result = expandHostIntoB(w)
+      expect(result.cuts).toEqual([{ atX: 100, byX: 260, atY: 1000, byY: 0 }])
+      expect(at(result, 'right')).toEqual({ x: 460, y: 0 })
+      expectNothingOverlaps(result)
+    })
+
+    it('moves the outer block\'s waypoints when a nested block makes room', () => {
+      const w = world({
+        objects: [
+          object('sys', { position: { x: 0, y: 0 } }),
+          object('svc', { size: { width: 200, height: 100 } }), object('db', { size: { width: 200, height: 100 } }),
+          object('k1'), object('k2'),
+        ],
+        diagrams: [
+          diagram('ctx', { objectIds: ['sys'] }),
+          diagram('cont', { objectIds: ['svc', 'db'], connectionIds: ['svc-db'] }),
+          diagram('comp', { objectIds: ['k1', 'k2'] }),
+        ],
+        connections: [{ ...conn('svc-db', 'svc', 'db'), waypoints: [{ x: 250, y: 300 }] }],
+      })
+      const placements: Record<string, Diagram['layouts']> = {
+        cont: {
+          svc: { position: { x: 0, y: 180 }, size: { width: 200, height: 100 } },
+          db: { position: { x: 660, y: 360 }, size: { width: 200, height: 100 } },
+        },
+        comp: {
+          k1: { position: { x: 0, y: 0 }, size: { width: 100, height: 60 } },
+          k2: { position: { x: 600, y: 300 }, size: { width: 100, height: 60 } },
+        },
+      }
+      const result = expandDiagramsInline(w.base, 'ctx', [
+        { objectId: 'sys', diagramId: 'cont' }, { objectId: 'svc', diagramId: 'comp' },
+      ], { ...w.lookup, layouts: (id) => placements[id] })
+      expect(result.skipped).toEqual([])
+      // (250,300) and db (660,360) are both past svc's two edges: they move together.
+      const wp = result.connections.find((c) => c.id === 'svc-db')!.waypoints![0]
+      const db = at(result, 'db')
+      expect({ x: wp.x - db.x, y: wp.y - db.y }).toEqual({ x: 250 - 660, y: 300 - 360 })
+    })
+
+    it('does not move a positioned group it was given', () => {
+      const w = world()
+      const fixed = { id: 'g1', name: 'g', objectIds: ['peer'], position: { x: 880, y: 380 }, size: { width: 200, height: 120 }, autoSize: false } as unknown as Group
+      expandDiagramsInline({ ...w.base, groups: [fixed] }, 'A', [{ objectId: 'host', diagramId: 'B' }], w.lookup)
+      expect(fixed.position).toEqual({ x: 880, y: 380 })
+    })
+
+    it('reserves a header band for every line the header can draw', () => {
+      // icon 20+8, title round(17.5)=18, type 4+13, description 6+16; insets 24 + 12.
+      expect(parentWrapperHeaderBand({ icon: 'x', name: 'n', type: 't', description: 'd' })).toBe(121)
+      expect(parentWrapperHeaderBand({ name: 'n' })).toBe(54)
+      expect(parentWrapperHeaderBand({})).toBe(46)
+    })
+
+    // The order tests above sit their hosts on a grid, where cuts commute: they
+    // pass with NO reading-order sort at all. Off-grid hosts do not commute.
+    it.each([['on a grid', false], ['off the grid', true]])(
+      'never overlaps, never depends on entry order, and inverts exactly (%s, 400 seeds)',
+      (_label, jitter) => {
+        const rng = (seed: number) => {
+          let s = seed >>> 0
+          return () => {
+            s = (s * 1664525 + 1013904223) >>> 0
+            return s / 2 ** 32
+          }
+        }
+        const failures: string[] = []
+        for (let seed = 1; seed <= 400; seed++) {
+          const r = rng(seed)
+          const objects: C4Object[] = []
+          const baseIds: string[] = []
+          const diagrams: Diagram[] = []
+          const entries: Array<{ objectId: string; diagramId: string }> = []
+          const taken = new Set<string>()
+          const n = 3 + Math.floor(r() * 5)
+          for (let i = 0; i < n; i++) {
+            let cx: number
+            let cy: number
+            do { cx = Math.floor(r() * 5); cy = Math.floor(r() * 4) } while (taken.has(`${cx},${cy}`))
+            taken.add(`${cx},${cy}`)
+            const id = `s${i}`
+            const jx = jitter ? Math.floor(r() * 150) : 0
+            const jy = jitter ? Math.floor(r() * 90) : 0
+            objects.push(object(id, { position: { x: cx * 260 + jx, y: cy * 160 + jy } }))
+            baseIds.push(id)
+            if (r() < 0.6) {
+              const members: string[] = []
+              const k = 1 + Math.floor(r() * 3)
+              for (let j = 0; j < k; j++) {
+                const mid = `${id}m${j}`
+                objects.push(object(mid, { position: { x: j * 140 + Math.floor(r() * 3) * 10, y: Math.floor(r() * 3) * 100 } }))
+                members.push(mid)
+              }
+              diagrams.push(diagram(`D${i}`, { objectIds: members }))
+              entries.push({ objectId: id, diagramId: `D${i}` })
+            }
+          }
+          if (entries.length < 2) continue
+          diagrams.unshift(diagram('A', { objectIds: baseIds }))
+          const byId = <T extends { id: string }>(items: T[]) => (id: string) => items.find((i) => i.id === id)
+          const lookup = { diagram: byId(diagrams), object: byId(objects), connection: () => undefined, wrapperMinWidth: () => 0 }
+          const base = { objects: objects.filter((o) => baseIds.includes(o.id)), connections: [], groups: [] as Group[] }
+          const fwd = expandDiagramsInline(base, 'A', entries, lookup)
+          const bwd = expandDiagramsInline(base, 'A', [...entries].reverse(), lookup)
+          const positions = (res: InlineExpansionResult) =>
+            JSON.stringify(Object.fromEntries([...res.objects].sort((a, b) => (a.id < b.id ? -1 : 1)).map((o) => [o.id, o.position])))
+          if (positions(fwd) !== positions(bwd)) failures.push(`seed ${seed}: order-dependent`)
+          try {
+            expectNothingOverlaps(fwd)
+          } catch (error) {
+            failures.push(`seed ${seed}: ${(error as Error).message.split('\n')[0]}`)
+          }
+          for (const o of base.objects) {
+            const drawn = fwd.objects.find((x) => x.id === o.id)
+            if (!drawn) continue
+            if (JSON.stringify(shiftPoint(fwd.cuts, o.position)) !== JSON.stringify(drawn.position)) failures.push(`seed ${seed}: shiftPoint≠planner for ${o.id}`)
+            if (JSON.stringify(unshiftPoint(fwd.cuts, drawn.position)) !== JSON.stringify(o.position)) failures.push(`seed ${seed}: unshift not inverse for ${o.id}`)
+          }
+        }
+        expect(failures.slice(0, 15)).toEqual([])
+      },
+    )
   })
 })

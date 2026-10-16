@@ -32,7 +32,16 @@ import { Canvas3DView } from './Canvas3DView'
 import { CanvasEmptyState } from './CanvasEmptyState'
 import { CanvasToolbar } from '../comments/CanvasToolbar'
 import { useDiagramReadyFit } from './useDiagramReadyFit'
-import { expandDiagramsInline, shiftPoint, unshiftPoint, type MakeRoomCut } from '../../lib/diagrams/expandInline'
+import {
+  expandDiagramsInline,
+  modelCommentsToView,
+  shiftPoint,
+  unshiftBox,
+  unshiftPoint,
+  viewPlacementsToModel,
+  viewWaypointsToModel,
+  type MakeRoomCut,
+} from '../../lib/diagrams/expandInline'
 import { loadDiagramLayouts } from '../../lib/diagrams/duplicateSource'
 import { collectRelatedDiagramObjectIds } from '../../canvas/relatedDiagramAffordances'
 import { resolveParentNavigation } from '../../lib/diagrams/parentNavigation'
@@ -346,6 +355,32 @@ export function CanvasView() {
   const setOpenCommentId = useUIStore((s) => s.setOpenCommentId)
   const addComment = useModelStore((s) => s.addComment)
 
+  /**
+   * The make-room steps of the inline expansions currently drawn (rule 5 in
+   * `expandInline.ts`). The engine draws this diagram's own shapes, waypoints
+   * and comment pins DISPLACED by them; everything it reports back is in those
+   * view coordinates, and goes through `unshiftPoint` before it is written.
+   * Empty with nothing expanded, which makes both maps the identity.
+   */
+  const viewCutsRef = useRef<MakeRoomCut[]>([])
+  /** View point -> model point, through the cuts drawn right now. */
+  const toModel = useCallback((point: { x: number; y: number }) => unshiftPoint(viewCutsRef.current, point), [])
+  /**
+   * What an inline expansion PULLED IN (shapes, its wrappers, edges): drawn
+   * here, but not this diagram's to place. An edit of one is dropped rather
+   * than written through this diagram's frame — in resident mode the store
+   * holds those objects too, and the write would land.
+   */
+  const viewOnlyIdsRef = useRef<Set<string>>(new Set())
+  const pushedCommentsEngineRef = useRef<unknown>(null)
+  const pushComments = useCallback((comments: readonly Comment[], diagramId: string | null) => {
+    pushedCommentsEngineRef.current = engineRef.current
+    engineRef.current?.setComments(modelCommentsToView(
+      viewCutsRef.current,
+      comments.filter((comment) => comment.diagramId === diagramId),
+    ))
+  }, [])
+
   const handlePresencePointerMove = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
     if (canvasViewMode === '3d') {
       const point = scene3dRef.current?.presencePointAt(event.clientX, event.clientY)
@@ -356,16 +391,18 @@ export function CanvasView() {
     const engine = engineRef.current
     if (!canvas || !engine) return
     const rect = canvas.getBoundingClientRect()
-    const point = engine.screenToWorld(event.clientX - rect.left, event.clientY - rect.top)
+    // Published in the MODEL frame: a peer has its own expansions, or none.
+    const point = toModel(engine.screenToWorld(event.clientX - rect.left, event.clientY - rect.top))
     publishDiagramCursor({ x: point.x, y: point.y, view: '2d', visible: true })
-  }, [canvasViewMode])
+  }, [canvasViewMode, toModel])
 
   const projectPresenceCursor = useCallback((cursor: { x: number; y: number }) => {
     if (canvasViewMode === '3d') return scene3dRef.current?.projectPresencePoint(cursor.x, cursor.y) ?? null
     const canvas = canvasRef.current
     const engine = engineRef.current
     if (!canvas || !engine) return null
-    const point = engine.worldToScreen(cursor.x, cursor.y)
+    const drawn = shiftPoint(viewCutsRef.current, cursor)
+    const point = engine.worldToScreen(drawn.x, drawn.y)
     return {
       x: point.x,
       y: point.y,
@@ -378,21 +415,6 @@ export function CanvasView() {
   useEffect(() => {
     if (editReady) useModelStore.getState().reconcileTags()
   }, [editReady])
-
-  /**
-   * The make-room steps of the inline expansions currently drawn (rule 5 in
-   * `expandInline.ts`). The engine draws this diagram's own shapes, waypoints
-   * and comment pins DISPLACED by them; everything it reports back is in those
-   * view coordinates, and goes through `unshiftPoint` before it is written.
-   * Empty with nothing expanded, which makes both maps the identity.
-   */
-  const viewCutsRef = useRef<MakeRoomCut[]>([])
-  const pushComments = useCallback((comments: readonly Comment[], diagramId: string | null) => {
-    const cuts = viewCutsRef.current
-    engineRef.current?.setComments(comments
-      .filter((comment) => comment.diagramId === diagramId)
-      .map((comment) => (cuts.length === 0 ? comment : { ...comment, position: shiftPoint(cuts, comment.position) })))
-  }, [])
 
   // Pushes the current diagram's filtered + layout-merged data into the engine, and
   // zoom-fits the viewport the first time this diagram is shown. Shared by the
@@ -445,9 +467,21 @@ export function CanvasView() {
       )
     const cutsChanged = JSON.stringify(expanded.cuts) !== JSON.stringify(viewCutsRef.current)
     viewCutsRef.current = expanded.cuts
+    const ownIds = new Set<string>([
+      ...merged.filteredObjects.map((o) => o.id),
+      ...merged.filteredConnections.map((c) => c.id),
+      ...merged.filteredGroups.map((g) => g.id),
+    ])
+    viewOnlyIdsRef.current = new Set(
+      [...expanded.objects, ...expanded.connections, ...expanded.groups]
+        .map((item) => item.id)
+        .filter((id) => !ownIds.has(id)),
+    )
     // The pins move with everything else past a cut; their own effect only
-    // runs when the comments change.
-    if (cutsChanged) pushComments(store.comments, store.currentDiagramId)
+    // runs when the comments change. A recreated engine has none at all.
+    if (cutsChanged || pushedCommentsEngineRef.current !== engine) {
+      pushComments(store.comments, store.currentDiagramId)
+    }
     const { objects: filteredObjects, connections: filteredConnections, groups: filteredGroups } = expanded
     const relatedDiagramObjectIds = collectRelatedDiagramObjectIds(
       filteredObjects,
@@ -598,17 +632,14 @@ export function CanvasView() {
           : []
         // The engine reports where it DRAWS them; with an expansion open that is
         // displaced from the model (`viewCutsRef`). Never write the displacement.
-        const cuts = viewCutsRef.current
+        const viewOnly = viewOnlyIdsRef.current
+        const modelPlacements = viewPlacementsToModel(viewCutsRef.current, viewOnly, {
+          objects: objectUpdates,
+          groups: groupUpdates,
+        })
         updatePlacementsBatch({
-          objects: cuts.length === 0
-            ? objectUpdates
-            : objectUpdates.map((update) => ({ ...update, position: unshiftPoint(cuts, update.position) })),
-          groups: cuts.length === 0
-            ? groupUpdates
-            : groupUpdates.map((update) => (update.position
-              ? { ...update, position: unshiftPoint(cuts, update.position) }
-              : update)),
-          connections: connectionUpdates,
+          ...modelPlacements,
+          connections: connectionUpdates.filter((update) => !viewOnly.has(update.id)),
         })
       },
       onObjectDoubleClick: (id, band) => {
@@ -679,6 +710,10 @@ export function CanvasView() {
         }
       },
       onConnectionAnchorMove: (connId, end, targetId, anchorIndex) => {
+        // A wrapper or a shape pulled in by an inline expansion exists only in
+        // this view: an endpoint written onto one would dangle in the model.
+        const viewOnly = viewOnlyIdsRef.current
+        if (viewOnly.has(connId) || viewOnly.has(targetId)) return
         if (end === 'source') {
           updateConnection(connId, {
             fromId: targetId,
@@ -697,8 +732,8 @@ export function CanvasView() {
         updateConnection(connId, { labelPosition: position, labelOffset: offset })
       },
       onConnectionWaypointsChange: (connId, waypoints) => {
-        const cuts = viewCutsRef.current
-        const modelWaypoints = cuts.length === 0 ? waypoints : waypoints.map((point) => unshiftPoint(cuts, point))
+        const modelWaypoints = viewWaypointsToModel(viewCutsRef.current, viewOnlyIdsRef.current, connId, waypoints)
+        if (!modelWaypoints) return
         updateConnection(connId, { waypoints: modelWaypoints.length > 0 ? modelWaypoints : undefined })
       },
       onGroupSelect: (id) => {
@@ -725,7 +760,11 @@ export function CanvasView() {
           // By id, NOT by handing the store's group to `getGroupBounds` — the
           // store's copy has create-time geometry, the engine's has the
           // diagram's layout merged in.
-          groupBounds: (id) => engineRef.current?.getGroupBoundsById(id) ?? null,
+          // In the MODEL frame: the engine's box is displaced past a cut.
+          groupBounds: (id) => {
+            const bounds = engineRef.current?.getGroupBoundsById(id)
+            return bounds ? unshiftBox(viewCutsRef.current, bounds) : null
+          },
           objectExists: (id) => store.objects.some((o) => o.id === id),
         })
         if (writes.length === 0) return false
@@ -988,8 +1027,10 @@ export function CanvasView() {
       // A parent wrapper ignores the flag by design; a member-less group has no
       // member box to freeze. Both already fall back to stored geometry.
       if (group.parentObjectId || group.objectIds.length === 0) continue
-      const bounds = engine.getGroupBounds?.(group)
-      if (!bounds) continue
+      const drawn = engine.getGroupBounds?.(group)
+      if (!drawn) continue
+      // The engine's box is in the VIEW frame (displaced by an open expansion).
+      const bounds = unshiftBox(viewCutsRef.current, drawn)
       store.updateGroup(group.id, {
         position: { x: bounds.x, y: bounds.y },
         size: { width: bounds.width, height: bounds.height },
@@ -1076,13 +1117,15 @@ export function CanvasView() {
     }
     const vw = canvasRef.current?.clientWidth ?? 0
     const vh = canvasRef.current?.clientHeight ?? 0
-    let screen = engine.worldToScreen(comment.position.x, comment.position.y)
+    // Where the pin is DRAWN, which an open expansion may have displaced.
+    const pin = engine.getCommentPosition(comment.id) ?? comment.position
+    let screen = engine.worldToScreen(pin.x, pin.y)
     const margin = 48
     const onScreen =
       screen.x >= margin && screen.x <= vw - margin && screen.y >= margin && screen.y <= vh - margin
     if (!onScreen) {
-      engine.panToWorld(comment.position.x, comment.position.y)
-      screen = engine.worldToScreen(comment.position.x, comment.position.y)
+      engine.panToWorld(pin.x, pin.y)
+      screen = engine.worldToScreen(pin.x, pin.y)
     }
     // Keep the box on-canvas (it's 340px wide) so it stays reachable near edges.
     const boxW = 340
@@ -1364,7 +1407,8 @@ export function CanvasView() {
       const rect = canvas.getBoundingClientRect()
       const offsetX = e.clientX - rect.left
       const offsetY = e.clientY - rect.top
-      const worldPos = engine.screenToWorld(offsetX, offsetY)
+      // Model frame: with an expansion open the canvas is displaced past a cut.
+      const worldPos = toModel(engine.screenToWorld(offsetX, offsetY))
 
       const diagram = useModelStore.getState().getCurrentDiagram()
       if (!diagram || isReadonly) return
@@ -1579,7 +1623,7 @@ export function CanvasView() {
           y={draftCommentPos.y}
           onSubmit={(type, text) => {
             if (currentDiagramId && engineRef.current) {
-              const worldPos = engineRef.current.screenToWorld(draftCommentPos.x, draftCommentPos.y)
+              const worldPos = toModel(engineRef.current.screenToWorld(draftCommentPos.x, draftCommentPos.y))
               addComment({
                 diagramId: currentDiagramId,
                 type,

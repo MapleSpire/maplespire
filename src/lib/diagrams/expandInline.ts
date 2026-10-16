@@ -66,22 +66,26 @@ import {
  *    would: everything whose left edge is at or past the host's right edge moves
  *    right by the extra width, everything whose top edge is at or past the
  *    host's bottom edge moves down by the extra height (both, for a shape below
- *    and to the right). Applied to shapes, positioned groups, connection
- *    waypoints and — through `shiftPoint`, by the caller — comment pins. Every
- *    gap only grows and the order on each axis is kept, so a displaced shape
- *    never lands on another one, and whatever still touches the wrapper was
- *    already touching the host. Nested expansions make room INSIDE their outer
+ *    and to the right). Applied to shapes, positioned groups (a stored box the
+ *    cut passes through grows instead, `shiftBox`), connection waypoints and —
+ *    through `shiftPoint`, by the caller — comment pins. Every gap between
+ *    shapes only grows and the order on each axis is kept, so a displaced shape
+ *    never lands on another one, and whatever shape still touches the wrapper
+ *    was already touching the host. Nested expansions make room INSIDE their outer
  *    block the same way, before the outer block's size is known, so the outer
  *    block makes room for its final size.
  *
  * ## Writing back through a displaced view
  *
- * The displaced coordinates are the view's, never the model's. A drag, a
- * waypoint edit or a comment move on this canvas reports VIEW coordinates, so
- * the caller maps them back with `unshiftPoint(result.cuts, …)` before writing:
- * a shape dragged by d is stored at its model position + d, and stays where it
- * was dropped once the view is recomputed — unless it was dropped in the gap a
- * cut opened, which has no model coordinate of its own and snaps to the cut.
+ * The displaced coordinates are the view's, never the model's. EVERY write
+ * taken from this canvas — a drag or resize, a waypoint edit, a drop from the
+ * palette, a new or moved comment, a group size read off the engine — is in
+ * VIEW coordinates, so the caller maps it back (`unshiftPoint`, `unshiftBox`
+ * with `result.cuts`) before writing. A shape then stays where it was dropped
+ * once the view is recomputed (on the same side of every cut, that is its model
+ * position + the drag) — unless it was dropped inside the gap a cut opened,
+ * which has no model coordinate of its own and snaps to the cut. Shapes and
+ * edges PULLED IN are not this diagram's to place: their edits are dropped.
  *
  * ## Where the other diagram's coordinates come from
  *
@@ -194,6 +198,95 @@ export function unshiftPoint(cuts: readonly MakeRoomCut[], point: Position): Pos
   return { x, y }
 }
 
+/**
+ * Where a BOX with stored geometry (a manually sized group) is drawn once
+ * `cuts` are applied. Its top-left moves as a point does; a box a cut passes
+ * THROUGH grows by the cut's width instead of staying behind — a spreadsheet
+ * range spanning an inserted column widens — so the members pushed past the
+ * cut stay inside it.
+ */
+export function shiftBox(cuts: readonly MakeRoomCut[], box: Box): Box {
+  let { x, y, width, height } = box
+  for (const cut of cuts) {
+    if (x >= cut.atX) x += cut.byX
+    else if (x + width > cut.atX) width += cut.byX
+    if (y >= cut.atY) y += cut.byY
+    else if (y + height > cut.atY) height += cut.byY
+  }
+  return { x, y, width, height }
+}
+
+/**
+ * The model geometry of a box drawn at `box` through `cuts`: the inverse of
+ * `shiftBox`, edge by edge (a far edge inside an opened gap maps to the cut).
+ */
+export function unshiftBox(cuts: readonly MakeRoomCut[], box: Box): Box {
+  const topLeft = unshiftPoint(cuts, box)
+  let right = box.x + box.width
+  let bottom = box.y + box.height
+  for (let index = cuts.length - 1; index >= 0; index--) {
+    const cut = cuts[index]
+    if (right > cut.atX + cut.byX) right -= cut.byX
+    else if (right > cut.atX) right = cut.atX
+    if (bottom > cut.atY + cut.byY) bottom -= cut.byY
+    else if (bottom > cut.atY) bottom = cut.atY
+  }
+  return {
+    x: topLeft.x,
+    y: topLeft.y,
+    width: Math.max(0, right - topLeft.x),
+    height: Math.max(0, bottom - topLeft.y),
+  }
+}
+
+/**
+ * A placement commit the engine reported (drag, resize), mapped into the MODEL
+ * frame: positions through `unshiftPoint`, a group carrying a size through
+ * `unshiftBox`, and anything in `viewOnly` (shapes and wrappers an expansion
+ * pulled in) dropped — those are not this diagram's to place.
+ */
+export function viewPlacementsToModel<
+  O extends { id: string; position: Position },
+  G extends { id: string; position?: Position; size?: { width: number; height: number } },
+>(
+  cuts: readonly MakeRoomCut[],
+  viewOnly: ReadonlySet<string>,
+  updates: { objects: readonly O[]; groups: readonly G[] },
+): { objects: O[]; groups: G[] } {
+  return {
+    objects: updates.objects
+      .filter((update) => !viewOnly.has(update.id))
+      .map((update) => (cuts.length === 0 ? update : { ...update, position: unshiftPoint(cuts, update.position) })),
+    groups: updates.groups
+      .filter((update) => !viewOnly.has(update.id))
+      .map((update) => {
+        if (cuts.length === 0 || !update.position) return update
+        if (!update.size) return { ...update, position: unshiftPoint(cuts, update.position) }
+        const box = unshiftBox(cuts, { ...update.position, ...update.size })
+        return { ...update, position: { x: box.x, y: box.y }, size: { width: box.width, height: box.height } }
+      }),
+  }
+}
+
+/** A connection's edited waypoints in the MODEL frame; `null` when the edge was
+ *  pulled in by an expansion and the edit must be dropped. */
+export function viewWaypointsToModel(
+  cuts: readonly MakeRoomCut[],
+  viewOnly: ReadonlySet<string>,
+  connectionId: string,
+  waypoints: readonly Position[],
+): Position[] | null {
+  if (viewOnly.has(connectionId)) return null
+  return waypoints.map((point) => unshiftPoint(cuts, point))
+}
+
+/** Comment pins as DRAWN: moved with everything else past a cut. */
+export function modelCommentsToView<C extends { position: Position }>(cuts: readonly MakeRoomCut[], comments: readonly C[]): C[] {
+  return cuts.length === 0
+    ? [...comments]
+    : comments.map((comment) => ({ ...comment, position: shiftPoint(cuts, comment.position) }))
+}
+
 /** Space between grid cells when the target's own arrangement is unknown. */
 const GRID_GAP = 40
 
@@ -277,8 +370,12 @@ function makeRoom(level: Level, host: Box, size: { width: number; height: number
   }
   for (const group of level.groups) {
     if (!group.position) continue
-    const { dx, dy } = shift(group.position)
-    group.position = { x: group.position.x + dx, y: group.position.y + dy }
+    const box = shiftBox([cut], {
+      x: group.position.x, y: group.position.y,
+      width: group.size?.width ?? 0, height: group.size?.height ?? 0,
+    })
+    group.position = { x: box.x, y: box.y }
+    if (group.size) group.size = { width: box.width, height: box.height }
   }
   return cut
 }

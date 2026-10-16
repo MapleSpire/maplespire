@@ -59,7 +59,7 @@ export const PARENT_WRAPPER_MAX_MIN_WIDTH = HDR_MAX_TEXT_W + HDR_PAD_X * 2
  *  overlaps the members. No text measurement — presence + base line heights
  *  only — so it's cheap and identical between bounds and render. */
 export function parentWrapperHeaderBand(
-  group: Pick<Group, 'icon' | 'name' | 'type' | 'description'>,
+  group: Partial<Pick<Group, 'icon' | 'name' | 'type' | 'description'>>,
 ): number {
   let stack = 0
   if (group.icon) stack += HDR_ICON + HDR_GAP_ICON

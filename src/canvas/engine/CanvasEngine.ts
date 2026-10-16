@@ -1241,6 +1241,13 @@ export class CanvasEngine {
     setCyberpunkAnimationsEnabled(enabled)
   }
 
+  /** Where a comment's pin is DRAWN — its caller may have displaced it from the
+   *  model position (an open inline expansion, see `expandInline.ts`). */
+  getCommentPosition(id: string): Position | null {
+    const comment = this.commentMap.get(id)
+    return comment ? { ...comment.position } : null
+  }
+
   setComments(comments: Comment[]) {
     this.comments = comments
     this.commentMap = new Map(comments.map((comment) => [comment.id, comment]))

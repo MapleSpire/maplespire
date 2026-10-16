@@ -99,6 +99,25 @@ describe('CanvasEngine parent-wrapper box', () => {
     expect(outerBox.y + outerBox.height).toBeGreaterThan(innerBox.y + innerBox.height)
   })
 
+  // QA lens 2026-10-15: the member boxes above are always wider than the header
+  // floor, so a box drawn WITHOUT the floor passed. A long name makes it bind.
+  it('widens a narrow wrapper to the header floor the planner was told', () => {
+    const outer = wrapper('sys', ['a'], { name: 'x'.repeat(300) })
+    const engine = engineWith([object('a', 0, 0)], [outer])
+    expect(engine.inlineWrapperMinWidth(outer)).toBe(300 + 32)
+    expect(engine.getGroupBoundsById(outer.id)!.width).toBe(332)
+  })
+
+  // The planner measures BEFORE setData, while the engine may still hold the
+  // host shape (with links) from the previous frame; once drawn, it does not.
+  it('measures the floor as if the host were already gone', () => {
+    const w = wrapper('host', ['a'])
+    const host = { ...object('host', 500, 0), links: [{ id: 'l', url: 'https://x' }] } as unknown as C4Object
+    const withHost = engineWith([host, object('a', 0, 0)], [w])
+    const without = engineWith([object('a', 0, 0)], [w])
+    expect(withHost.inlineWrapperMinWidth(w)).toBe(without.inlineWrapperMinWidth(w))
+  })
+
   it('ignores a nesting it cannot resolve rather than failing', () => {
     const outer = wrapper('sys', ['a'], { innerWrapperIds: ['inline-expand:gone', 'inline-expand:sys'] })
     const engine = engineWith([object('a', 0, 0)], [outer])

@@ -67,9 +67,16 @@ export function CommentsPanel() {
   }, [diagramComments, filter])
 
   const handleSelectComment = (comment: Comment) => {
-    const engine = (window as unknown as { __canvasEngine?: { panToWorld: (x: number, y: number) => void } }).__canvasEngine
+    const engine = (window as unknown as {
+      __canvasEngine?: {
+        panToWorld: (x: number, y: number) => void
+        getCommentPosition?: (id: string) => { x: number; y: number } | null
+      }
+    }).__canvasEngine
     if (engine) {
-      engine.panToWorld(comment.position.x, comment.position.y)
+      // Where the pin is DRAWN: an open inline expansion may have displaced it.
+      const pin = engine.getCommentPosition?.(comment.id) ?? comment.position
+      engine.panToWorld(pin.x, pin.y)
     }
     setOpenCommentId(comment.id)
   }

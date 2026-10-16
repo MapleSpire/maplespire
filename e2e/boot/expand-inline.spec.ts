@@ -16,7 +16,7 @@
 import { test, expect, type Page } from '@playwright/test'
 import { submitDevLogin } from '../support/devLogin'
 import { waitForWorkspaceProjected } from '../support/workspaceReady'
-import { clickExpandIndicator } from './helpers'
+import { clickExpandIndicator, dragNewShapeToCanvas } from './helpers'
 
 /**
  * "Expand here" draws a linked diagram INSIDE the shape, in that diagram's own
@@ -327,6 +327,28 @@ test('Expand here draws the linked diagram in its own arrangement, nested expans
 
   // ── ⤢ → Expand here, on the system ──────────────────────────────────────
   const beforeOuter = await enginePositions(page)
+  // A comment pinned past where the cuts will fall, BEFORE expanding: when the
+  // expansion opens only the cuts change, not the comments — the pin must still
+  // move with everything else (QA lens 2026-10-15: no test saw it).
+  const systemSize = await page.evaluate((id) => ({ ...(window as any).__canvasEngine.objectMap.get(id).size }), systemId)
+  const pinScreen = await page.evaluate(({ x, y }) => {
+    const engine = (window as any).__canvasEngine
+    engine.panToWorld(x, y)
+    const rect = engine.canvas.getBoundingClientRect()
+    return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }
+  }, { x: beforeOuter[systemId].x + systemSize.width + 700, y: beforeOuter[systemId].y + systemSize.height + 700 })
+  await page.getByTestId('comment-mode-toggle').click()
+  await page.mouse.click(pinScreen.x, pinScreen.y)
+  await page.getByTestId('comment-input').fill('pinned before expanding')
+  await page.getByTestId('comment-submit').click()
+  const pinModel = () => page.evaluate(() => {
+    const s = (window as any).__modelStore.getState()
+    const c = s.comments.find((x: any) => x.diagramId === s.currentDiagramId && x.text === 'pinned before expanding')
+    return c ? { id: c.id as string, position: { ...c.position } as { x: number; y: number } } : null
+  })
+  await expect.poll(pinModel, { message: 'the comment was not created' }).not.toBeNull()
+  const pin = (await pinModel())!
+  await page.keyboard.press('Escape')
   await clickExpandIndicator(page, systemId)
   await page.getByTestId(`expand-here-${containers.id}`).click()
   const afterOuter = await waitDrawn(page, pulledContainers, 'the containers')
@@ -339,6 +361,15 @@ test('Expand here draws the linked diagram in its own arrangement, nested expans
   expect(outerBox, 'the wrapper is drawn').not.toBeNull()
   expect({ x: outerBox!.x, y: outerBox!.y }, 'the wrapper starts where the system was').toEqual(beforeOuter[systemId])
   expect(await drawnOverlaps(page), 'the expanded block is drawn over other shapes').toEqual([])
+  // The pin moved with the rest — by exactly the room made — and the model
+  // comment did not.
+  const pinDrawn = () => page.evaluate((id) => (window as any).__canvasEngine.getCommentPosition(id), pin.id) as
+    Promise<{ x: number; y: number } | null>
+  await expect.poll(pinDrawn, { message: 'the pin was not moved out of the way with the rest' }).toEqual({
+    x: pin.position.x + outerBox!.width - systemSize.width,
+    y: pin.position.y + outerBox!.height - systemSize.height,
+  })
+  expect((await pinModel())!.position, 'the displacement reached the stored comment').toEqual(pin.position)
 
   // ── Nested: ⤢ on a container the first expansion pulled in ──────────────
   // The ⤢ must be DRAWN on it — clicking alone cannot tell: in edit mode the
@@ -429,5 +460,77 @@ test('Expand here draws the linked diagram in its own arrangement, nested expans
   // ...and the recomputed view still draws it where it was dropped: no jump.
   await expect
     .poll(() => drawnNow(displaced!.id).then((at) => near(at, preview) || at), { message: 'the shape jumped after the drop' })
+    .toBe(true)
+
+  // ── Every OTHER writer from this canvas, past a cut ──────────────────────
+  // Found by the review lenses (2026-10-15): the palette drop and the comment
+  // composer wrote the view point as is, so the next render displaced it a
+  // second time — the new shape / pin appeared hundreds of units away.
+  const outerNow = (await wrapperBox(page, systemId))!
+  /** Pan a world point beyond (right of and below) the whole block to the
+   *  canvas centre; return the world point actually under the centre. */
+  const centreBeyondBlock = (dy: number) => page.evaluate(({ x, y }) => {
+    const engine = (window as any).__canvasEngine
+    engine.panToWorld(x, y)
+    const rect = engine.canvas.getBoundingClientRect()
+    return {
+      world: engine.screenToWorld(rect.width / 2, rect.height / 2) as { x: number; y: number },
+      screen: { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 },
+    }
+  }, { x: outerNow.x + outerNow.width + 400, y: outerNow.y + outerNow.height + 400 + dy })
+
+  const dropAt = await centreBeyondBlock(0)
+  expect(dropAt.world.y, 'precondition: the drop point is past the cut').toBeGreaterThan(outerNow.y + outerNow.height)
+  const created = await dragNewShapeToCanvas(page, 'app', 0.5, 0.5)
+  await expect
+    .poll(() => page.evaluate((id) => {
+      const o = (window as any).__canvasEngine.objectMap.get(id)
+      return o ? { x: o.position.x + o.size.width / 2, y: o.position.y + o.size.height / 2 } : null
+    }, created).then((centre) => near(centre, dropAt.world) || centre), {
+      message: `the dropped shape is not drawn where it was dropped (${JSON.stringify(dropAt.world)})`,
+    })
+    .toBe(true)
+
+  const pinAt = await centreBeyondBlock(500)
+  await page.keyboard.press('Escape')
+  await page.getByTestId('comment-mode-toggle').click()
+  await page.mouse.click(pinAt.screen.x, pinAt.screen.y)
+  await page.getByTestId('comment-input').fill('pinned past the cut')
+  await page.getByTestId('comment-submit').click()
+  await expect
+    .poll(() => page.evaluate(() => {
+      const s = (window as any).__modelStore.getState()
+      const c = s.comments.find((x: any) => x.diagramId === s.currentDiagramId && x.text === 'pinned past the cut')
+      return c ? (window as any).__canvasEngine.getCommentPosition(c.id) : null
+    }).then((drawn) => near(drawn, pinAt.world) || drawn), { message: 'the new pin is not drawn where it was placed' })
+    .toBe(true)
+
+  // ── Moving a DISPLACED pin stores model position + move ──────────────────
+  await page.keyboard.press('Escape')
+  const pinBefore = (await pinDrawn())!
+  const pinModelBefore = (await pinModel())!.position
+  expect(pinBefore, 'precondition: the pin is drawn displaced').not.toEqual(pinModelBefore)
+  const pinGrab = await page.evaluate(({ x, y }) => {
+    const engine = (window as any).__canvasEngine
+    engine.panToWorld(x, y)
+    const rect = engine.canvas.getBoundingClientRect()
+    const s = engine.worldToScreen(x, y)
+    return { x: rect.left + s.x, y: rect.top + s.y }
+  }, pinBefore)
+  await page.mouse.move(pinGrab.x, pinGrab.y)
+  await page.mouse.down()
+  for (let step = 1; step <= 8; step++) await page.mouse.move(pinGrab.x + step * 10, pinGrab.y + step * 6)
+  const pinPreview = (await pinDrawn())!
+  await page.mouse.up()
+  const pinMoved = { x: pinPreview.x - pinBefore.x, y: pinPreview.y - pinBefore.y }
+  expect(Math.hypot(pinMoved.x, pinMoved.y), 'the drag moved the pin').toBeGreaterThan(0)
+  const pinTarget = { x: pinModelBefore.x + pinMoved.x, y: pinModelBefore.y + pinMoved.y }
+  await expect
+    .poll(() => pinModel().then((c) => near(c?.position ?? null, pinTarget) || c?.position), {
+      message: `the moved pin must be stored at model position + move (${JSON.stringify(pinTarget)})`,
+    })
+    .toBe(true)
+  await expect
+    .poll(() => pinDrawn().then((at) => near(at, pinPreview) || at), { message: 'the pin jumped after the move' })
     .toBe(true)
 })
