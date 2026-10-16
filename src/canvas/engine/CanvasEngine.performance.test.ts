@@ -15,7 +15,7 @@
 // @vitest-environment jsdom
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { C4Object, Connection, Group } from '../../types'
+import type { C4Object, Connection, Flow, Group } from '../../types'
 import { CanvasEngine } from './CanvasEngine'
 import type { SpatialGridIndex } from './spatialGrid'
 
@@ -134,6 +134,82 @@ describe('CanvasEngine dense-scene rendering', () => {
     const leftPanelOnly = engine.getViewport()
     const worldCenterX = 600
     expect(worldCenterX * leftPanelOnly.scale + leftPanelOnly.x).toBeCloseTo(970, 5)
+  })
+
+  // The share viewer keeps both 312 px panels open on a phone. Fitting into
+  // the sliver they leave (or none: 375 - 680 < 0) used to be clamped to 1 px,
+  // shrinking the diagram to a dot that stayed a dot once the panels closed.
+  it('ignores panels that leave no usable span on an axis', () => {
+    const fitAt = (width: number, insets: { left?: number; right?: number }) => {
+      const canvas = document.createElement('canvas')
+      canvas.width = width
+      canvas.height = 800
+      const engine = new CanvasEngine(canvas, callbacks())
+      engine.setData([object('left', 0), object('right', 1040)], [], [])
+      engine.zoomToFit(insets)
+      const fit = engine.getViewport()
+      engine.focusOnFlowStep({ id: 'f', name: 'f', diagramId: 'd', steps: [{ id: 'i', order: 0, title: '', type: 'introduction' }] }, 0, insets)
+      expect(engine.getViewport(), 'a flow step frames like the fit').toEqual(fit)
+      return fit
+    }
+    const both = { left: 340, right: 340 }
+
+    expect(fitAt(375, both)).toEqual(fitAt(375, {}))
+    // 1024 - 680 = 344 px is still a usable span: the panels are honoured.
+    const tablet = fitAt(1024, both)
+    expect(600 * tablet.scale + tablet.x).toBeCloseTo(340 + 344 / 2, 5)
+  })
+
+  // Defect 2026-10-16: playing a flow with the left sidebar open framed the
+  // introduction and conclusion steps on the WHOLE canvas, so the diagram's
+  // left part (the actors) sat under the 312 px sidebar. Every step type must
+  // centre its subject inside the visible rect, as the Fit button does.
+  it('frames every flow step type inside the viewport insets', () => {
+    const canvas = document.createElement('canvas')
+    canvas.width = 1600
+    canvas.height = 900
+    const engine = new CanvasEngine(canvas, callbacks())
+    const left = object('left', 0)
+    const right = object('right', 1040)
+    const connection = { id: 'l-r', fromId: left.id, toId: right.id, type: 'solid' } as Connection
+    engine.setData([left, right], [connection], [])
+    const base = { order: 0, title: '' }
+    const flow: Flow = {
+      id: 'flow',
+      name: 'flow',
+      diagramId: 'd',
+      steps: [
+        { ...base, id: 'intro', type: 'introduction' },
+        { ...base, id: 'process', type: 'process', objectId: left.id },
+        { ...base, id: 'message', type: 'message', fromObjectId: left.id, toObjectId: right.id, connectionId: connection.id },
+        { ...base, id: 'fallback', type: 'message', fromObjectId: left.id, toObjectId: right.id, connectionId: '' },
+        { ...base, id: 'info', type: 'information' },
+        { ...base, id: 'outro', type: 'conclusion' },
+      ],
+    }
+    // World x-extent of each step's subject: the whole diagram, one shape, or
+    // the two shapes a message joins.
+    const subject: Record<string, [number, number]> = {
+      intro: [0, 1200], process: [0, 160], message: [0, 1200], fallback: [0, 1200], info: [0, 1200], outro: [0, 1200],
+    }
+    const insets = { left: 340, right: 120 }
+    const visibleCenterX = 340 + (1600 - 340 - 120) / 2
+
+    flow.steps.forEach((step, index) => {
+      engine.focusOnFlowStep(flow, index, insets)
+      const v = engine.getViewport()
+      const [minX, maxX] = subject[step.id]
+      expect(((minX + maxX) / 2) * v.scale + v.x, step.id).toBeCloseTo(visibleCenterX, 5)
+      // The whole subject clears both panels, not just its centre.
+      expect(minX * v.scale + v.x, `${step.id} left edge`).toBeGreaterThanOrEqual(340)
+      expect(maxX * v.scale + v.x, `${step.id} right edge`).toBeLessThanOrEqual(1600 - 120)
+    })
+
+    // Without insets the step still centres on the whole canvas (share export,
+    // panel-less callers).
+    engine.focusOnFlowStep(flow, 0)
+    const full = engine.getViewport()
+    expect(600 * full.scale + full.x).toBeCloseTo(800, 5)
   })
 
   it('queries object, group and connection candidates from the visible scene', () => {

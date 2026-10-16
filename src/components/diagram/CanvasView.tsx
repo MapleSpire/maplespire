@@ -107,8 +107,8 @@ function fitOrFocusPending(engine: CanvasEngine, diagramId: string, insets: Canv
   const focus = useUIStore.getState().pendingCanvasFocus
   if (focus && focus.diagramId === diagramId) {
     const focused = focus.kind === 'connection'
-      ? engine.focusOnConnection(focus.id)
-      : engine.focusOnObject(focus.id)
+      ? engine.focusOnConnection(focus.id, undefined, insets)
+      : engine.focusOnObject(focus.id, undefined, insets)
     if (focused) return
   }
   engine.zoomToFit(insets)
@@ -1258,7 +1258,7 @@ export function CanvasView() {
     if (!engine || !currentFlowId || flowEditMode) return
     const flow = flows.find((f) => f.id === currentFlowId)
     if (flow) {
-      engine.focusOnFlowStep(flow, currentFlowStepIndex)
+      engine.focusOnFlowStep(flow, currentFlowStepIndex, viewportInsetsRef.current)
     }
   }, [currentFlowId, currentFlowStepIndex, flowEditMode, flows])
 

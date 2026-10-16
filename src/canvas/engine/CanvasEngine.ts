@@ -211,6 +211,10 @@ export interface CanvasViewportInsets {
   bottom?: number
 }
 
+/** The narrowest span, in CSS pixels, a fit still frames between the panels;
+ *  below it the panels are ignored on that axis (see visibleCanvasRect). */
+const MIN_FIT_SPAN = 320
+
 /** One cubic-Bézier segment of a (possibly multi-segment) connection path. */
 interface CubicSeg {
   x0: number
@@ -1322,20 +1326,37 @@ export class CanvasEngine {
     }
     const bounds = this.getBounds()
     const padding = 100
+    const visible = this.visibleCanvasRect(insets)
+    const scaleX = visible.width / (bounds.width + padding * 2)
+    const scaleY = visible.height / (bounds.height + padding * 2)
+    this.viewport.scale = Math.min(scaleX, scaleY, 1.5)
+    this.viewport.x = visible.left + visible.width / 2 - (bounds.x + bounds.width / 2) * this.viewport.scale
+    this.viewport.y = visible.top + visible.height / 2 - (bounds.y + bounds.height / 2) * this.viewport.scale
+    this.scheduleRender()
+  }
+
+  /** The part of the canvas, in CSS pixels, that the side panels overlaying it
+   *  leave uncovered. Every fit and focus centres inside this rect.
+   *
+   *  When the panels leave less than MIN_FIT_SPAN on an axis (a phone, where
+   *  the share viewer's two 312 px panels cover the whole canvas), that axis
+   *  ignores them: fitting into a sliver would shrink the diagram to a dot that
+   *  stays a dot once the panels are closed. */
+  private visibleCanvasRect(insets: CanvasViewportInsets) {
     const canvasWidth = this.canvas.width / this.dpr
     const canvasHeight = this.canvas.height / this.dpr
-    const left = Math.max(0, insets.left ?? 0)
-    const right = Math.max(0, insets.right ?? 0)
-    const top = Math.max(0, insets.top ?? 0)
-    const bottom = Math.max(0, insets.bottom ?? 0)
-    const visibleWidth = Math.max(1, canvasWidth - left - right)
-    const visibleHeight = Math.max(1, canvasHeight - top - bottom)
-    const scaleX = visibleWidth / (bounds.width + padding * 2)
-    const scaleY = visibleHeight / (bounds.height + padding * 2)
-    this.viewport.scale = Math.min(scaleX, scaleY, 1.5)
-    this.viewport.x = left + visibleWidth / 2 - (bounds.x + bounds.width / 2) * this.viewport.scale
-    this.viewport.y = top + visibleHeight / 2 - (bounds.y + bounds.height / 2) * this.viewport.scale
-    this.scheduleRender()
+    let left = Math.max(0, insets.left ?? 0)
+    let right = Math.max(0, insets.right ?? 0)
+    let top = Math.max(0, insets.top ?? 0)
+    let bottom = Math.max(0, insets.bottom ?? 0)
+    if (canvasWidth - left - right < MIN_FIT_SPAN) left = right = 0
+    if (canvasHeight - top - bottom < MIN_FIT_SPAN) top = bottom = 0
+    return {
+      left,
+      top,
+      width: Math.max(1, canvasWidth - left - right),
+      height: Math.max(1, canvasHeight - top - bottom),
+    }
   }
 
   setZoom(zoom: number) {
@@ -1366,25 +1387,29 @@ export class CanvasEngine {
     this.scheduleRender()
   }
 
-  focusOnBounds(bounds: { x: number; y: number; width: number; height: number }, padding = 120) {
-    const canvasWidth = this.canvas.width / this.dpr
-    const canvasHeight = this.canvas.height / this.dpr
-    const scaleX = canvasWidth / (bounds.width + padding * 2)
-    const scaleY = canvasHeight / (bounds.height + padding * 2)
+  focusOnBounds(
+    bounds: { x: number; y: number; width: number; height: number },
+    padding = 120,
+    insets: CanvasViewportInsets = {},
+  ) {
+    const visible = this.visibleCanvasRect(insets)
+    const scaleX = visible.width / (bounds.width + padding * 2)
+    const scaleY = visible.height / (bounds.height + padding * 2)
     this.viewport.scale = Math.max(0.1, Math.min(scaleX, scaleY, 1.5))
-    this.viewport.x = canvasWidth / 2 - (bounds.x + bounds.width / 2) * this.viewport.scale
-    this.viewport.y = canvasHeight / 2 - (bounds.y + bounds.height / 2) * this.viewport.scale
+    this.viewport.x = visible.left + visible.width / 2 - (bounds.x + bounds.width / 2) * this.viewport.scale
+    this.viewport.y = visible.top + visible.height / 2 - (bounds.y + bounds.height / 2) * this.viewport.scale
     this.scheduleRender()
   }
 
   /** Centre on a shape or group. Returns false (viewport untouched) when the
    *  id is not drawn on this diagram. */
-  focusOnObject(objectId: string, padding = 120): boolean {
+  focusOnObject(objectId: string, padding = 120, insets: CanvasViewportInsets = {}): boolean {
     const obj = this.objects.find((o) => o.id === objectId)
     if (obj) {
       this.focusOnBounds(
         { x: obj.position.x, y: obj.position.y, width: obj.size.width, height: obj.size.height },
-        padding
+        padding,
+        insets,
       )
       return true
     }
@@ -1392,7 +1417,7 @@ export class CanvasEngine {
     if (group) {
       const bounds = this.getGroupBounds(group)
       if (bounds) {
-        this.focusOnBounds(bounds, padding)
+        this.focusOnBounds(bounds, padding, insets)
         return true
       }
     }
@@ -1401,7 +1426,7 @@ export class CanvasEngine {
 
   /** Centre on a connection's two endpoints. Returns false (viewport untouched)
    *  when the connection or an endpoint is not drawn on this diagram. */
-  focusOnConnection(connectionId: string, padding = 120): boolean {
+  focusOnConnection(connectionId: string, padding = 120, insets: CanvasViewportInsets = {}): boolean {
     const conn = this.connections.find((c) => c.id === connectionId)
     if (!conn) return false
     const from = this.getConnectionEndpoint(conn.fromId, conn.lockedToAnchors ? conn.fromAnchor : undefined)
@@ -1415,21 +1440,25 @@ export class CanvasEngine {
     const maxY = Math.max(from.cy, to.cy) + Math.max(from.height, to.height) / 2
     this.focusOnBounds(
       { x: minX, y: minY, width: maxX - minX, height: maxY - minY },
-      padding
+      padding,
+      insets,
     )
     return true
   }
 
-  focusOnFlowStep(flow: Flow, stepIndex: number) {
+  /** Frame a flow step's subject. `insets` are the side panels overlaying the
+   *  canvas: without them the subject is centred on the WHOLE canvas and its
+   *  left part lands under an open sidebar. */
+  focusOnFlowStep(flow: Flow, stepIndex: number, insets: CanvasViewportInsets = {}) {
     if (stepIndex < 0 || stepIndex >= flow.steps.length) return
     const step = flow.steps[stepIndex]
     if (!step) return
 
     if (step.type === 'process') {
-      this.focusOnObject(step.objectId)
+      this.focusOnObject(step.objectId, undefined, insets)
     } else if (step.type === 'message') {
       if (step.connectionId) {
-        this.focusOnConnection(step.connectionId)
+        this.focusOnConnection(step.connectionId, undefined, insets)
       } else if (step.fromObjectId && step.toObjectId) {
         // Fallback: focus on the two objects
         const fromObj = this.objects.find((o) => o.id === step.fromObjectId)
@@ -1439,16 +1468,16 @@ export class CanvasEngine {
           const minY = Math.min(fromObj.position.y, toObj.position.y)
           const maxX = Math.max(fromObj.position.x + fromObj.size.width, toObj.position.x + toObj.size.width)
           const maxY = Math.max(fromObj.position.y + fromObj.size.height, toObj.position.y + toObj.size.height)
-          this.focusOnBounds({ x: minX, y: minY, width: maxX - minX, height: maxY - minY })
+          this.focusOnBounds({ x: minX, y: minY, width: maxX - minX, height: maxY - minY }, undefined, insets)
         } else if (fromObj) {
-          this.focusOnObject(step.fromObjectId)
+          this.focusOnObject(step.fromObjectId, undefined, insets)
         } else if (toObj) {
-          this.focusOnObject(step.toObjectId)
+          this.focusOnObject(step.toObjectId, undefined, insets)
         }
       }
     } else if (step.type === 'introduction' || step.type === 'information' || step.type === 'conclusion') {
       // Show the whole diagram
-      this.zoomToFit()
+      this.zoomToFit(insets)
     }
   }
 

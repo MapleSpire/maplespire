@@ -13,7 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import { useEffect, useRef, useState, type MutableRefObject } from 'react'
-import { CanvasEngine } from '../canvas/engine/CanvasEngine'
+import { CanvasEngine, type CanvasViewportInsets } from '../canvas/engine/CanvasEngine'
 import { useSkinStore } from '../stores/skinStore'
 import { useThemeStore } from '../stores/themeStore'
 import { filterAndMergeDiagramData } from '../lib/viewLayouts'
@@ -185,6 +185,7 @@ export function ViewerCanvas({
   sceneRef,
   onRendererReady,
   onZoomChange,
+  fitInsets = {},
 }: {
   snapshot: ShareSnapshot
   diagramId: string
@@ -204,16 +205,22 @@ export function ViewerCanvas({
   sceneRef?: MutableRefObject<Scene3D | null>
   onRendererReady?: () => void
   onZoomChange?: (zoom: number) => void
+  /** The parent's panels overlaying the canvas; the first fit frames between them. */
+  fitInsets?: CanvasViewportInsets
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const appTheme = useThemeStore((s) => s.resolved)
   const [selected, setSelected] = useState<SelectedItem[]>([])
   const onSelectRef = useRef(onSelect)
   const onZoomChangeRef = useRef(onZoomChange)
+  // Read through a ref: a panel toggle changes the insets only for the NEXT
+  // fit, and must not re-run the feed effect (which would re-fit the view).
+  const fitInsetsRef = useRef(fitInsets)
   useEffect(() => {
     onSelectRef.current = onSelect
     onZoomChangeRef.current = onZoomChange
-  }, [onSelect, onZoomChange])
+    fitInsetsRef.current = fitInsets
+  }, [onSelect, onZoomChange, fitInsets])
 
   const sd = snapshot.diagrams.find((d) => d.id === diagramId) ?? snapshot.diagrams[0]
   const resolvedSkin = useSkinStore((s) => s.getResolvedSkin(sd?.skinId, appTheme))
@@ -289,7 +296,7 @@ export function ViewerCanvas({
     setSelected([])
     onSelectRef.current(null)
     requestAnimationFrame(() => {
-      engine.zoomToFit()
+      engine.zoomToFit(fitInsetsRef.current)
       onZoomChangeRef.current?.(engine.getZoom())
     })
     // eslint-disable-next-line react-hooks/exhaustive-deps

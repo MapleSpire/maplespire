@@ -44,7 +44,7 @@ describe('ViewerFlowPanel', () => {
     const engineRef = createRef<CanvasEngine>()
     engineRef.current = engine
 
-    render(<ViewerFlowPanel flows={flows} engineRef={engineRef} />)
+    render(<ViewerFlowPanel flows={flows} engineRef={engineRef} insets={{}} />)
 
     const selector = screen.getByRole('combobox', { name: 'Choose a flow' }) as HTMLSelectElement
     expect(selector.value).toBe('flow-1')
@@ -62,9 +62,37 @@ describe('ViewerFlowPanel', () => {
       <ViewerFlowPanel
         flows={[{ id: 'flow-1', name: 'Checkout', diagramId: 'diagram-1', steps: [] }]}
         engineRef={engineRef}
+        insets={{}}
       />,
     )
 
     expect(screen.getByTestId('viewer-flow-select')).toBeTruthy()
+  })
+
+  // Defect 2026-10-16: Play framed the introduction step on the whole canvas,
+  // so the diagram's left part sat under the open flow sidebar.
+  it('frames each played step between the panels overlaying the canvas', () => {
+    const flows: Flow[] = [{
+      id: 'flow-1',
+      name: 'Checkout',
+      diagramId: 'diagram-1',
+      steps: [
+        { type: 'introduction', id: 'intro', order: 0, title: 'Intro', description: '' },
+        { type: 'conclusion', id: 'outro', order: 1, title: 'Outro', description: '' },
+      ],
+    }]
+    const engine = {
+      setFlowEditMode: vi.fn(),
+      setFlowState: vi.fn(),
+      focusOnFlowStep: vi.fn(),
+    } as unknown as CanvasEngine
+    const engineRef = createRef<CanvasEngine>()
+    engineRef.current = engine
+    const insets = { left: 340, right: 340 }
+
+    render(<ViewerFlowPanel flows={flows} engineRef={engineRef} insets={insets} />)
+    fireEvent.click(screen.getByRole('button', { name: /Play flow/ }))
+
+    expect(engine.focusOnFlowStep).toHaveBeenLastCalledWith(flows[0], 0, insets)
   })
 })

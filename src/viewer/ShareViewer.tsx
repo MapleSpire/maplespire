@@ -21,7 +21,8 @@ import { getShare } from '../lib/share/api'
 import { readUrlViewMode, writeUrlViewMode } from '../lib/deepLinkView'
 import type { ShareSnapshot } from '../lib/share/types'
 import type { SelectedItem } from '../types'
-import type { CanvasEngine } from '../canvas/engine/CanvasEngine'
+import type { CanvasEngine, CanvasViewportInsets } from '../canvas/engine/CanvasEngine'
+import { editorCanvasInsets } from '../components/diagram/canvasViewportControls'
 import { ViewerCanvas } from './ViewerCanvas'
 import { ViewerDetailsPanel } from './ViewerDetailsPanel'
 import { ViewerFlowPanel } from './ViewerFlowPanel'
@@ -114,6 +115,10 @@ function RestrictedNotice({ token, needsAuth }: { token: string; needsAuth: bool
   )
 }
 
+/** The embed layout's right aside: `w-72` (288 px) at `right-2`, plus the same
+ *  8 px gap on its canvas side. */
+const EMBED_ASIDE_INSETS: CanvasViewportInsets = { right: 8 + 288 + 8 }
+
 /**
  * Public, INTERACTIVE read-only viewer. Renders the shared snapshot via
  * CanvasEngine (read-only but selectable): focusing a shape animates its
@@ -204,6 +209,11 @@ export function ShareViewer({ token, mode }: ShareViewerProps) {
   const activeName = snapshot.diagrams.find((d) => d.id === activeDiagramId)?.name ?? t('viewer.sharedDiagramFallback')
   const diagramFlows = snapshot.flowsByDiagram[activeDiagramId] ?? []
   const multiDiagram = snapshot.diagrams.length > 1
+  // The panels overlaying the canvas, for every fit and flow-step focus. The
+  // standalone panels have the editor's geometry (312 px at a 14 px margin).
+  const viewerInsets = mode === 'standalone'
+    ? editorCanvasInsets(flowSidebarOpen, detailsSidebarOpen)
+    : EMBED_ASIDE_INSETS
 
   const zoomBy = (factor: number) => {
     if (allow3d && view === '3d') {
@@ -222,12 +232,12 @@ export function ShareViewer({ token, mode }: ShareViewerProps) {
 
   const fitCanvas = () => {
     if (allow3d && view === '3d') {
-      sceneRef.current?.frame(false)
+      sceneRef.current?.frame(false, viewerInsets)
       return
     }
     const engine = engineRef.current
     if (!engine) return
-    engine.zoomToFit()
+    engine.zoomToFit(viewerInsets)
     setZoom(engine.getZoom())
   }
 
@@ -265,6 +275,7 @@ export function ShareViewer({ token, mode }: ShareViewerProps) {
       sceneRef={sceneRef}
       onRendererReady={onRendererReady}
       onZoomChange={setZoom}
+      fitInsets={viewerInsets}
       onSelect={onSelect}
       view={allow3d ? view : '2d'}
       cameraPreset={cameraPreset}
@@ -433,7 +444,7 @@ export function ShareViewer({ token, mode }: ShareViewerProps) {
                 </button>
               </div>
               <div className="min-h-0 flex-1">
-                <ViewerFlowPanel key={activeDiagramId} flows={diagramFlows} engineRef={engineRef} />
+                <ViewerFlowPanel key={activeDiagramId} flows={diagramFlows} engineRef={engineRef} insets={viewerInsets} />
               </div>
             </aside>
           </div>
@@ -523,7 +534,7 @@ export function ShareViewer({ token, mode }: ShareViewerProps) {
           {tab === 'details' ? (
             <ViewerDetailsPanel snapshot={snapshot} selected={selected} diagramId={activeDiagramId} />
           ) : (
-            <ViewerFlowPanel key={activeDiagramId} flows={diagramFlows} engineRef={engineRef} />
+            <ViewerFlowPanel key={activeDiagramId} flows={diagramFlows} engineRef={engineRef} insets={viewerInsets} />
           )}
         </div>
       </aside>

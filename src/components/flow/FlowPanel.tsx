@@ -33,6 +33,8 @@ import { useTranslation } from 'react-i18next'
 import type { TFunction } from 'i18next'
 import { cn } from '../../lib/utils'
 import { useUIStore } from '../../stores/uiStore'
+import type { CanvasViewportInsets } from '../../canvas/engine/CanvasEngine'
+import { editorCanvasInsets } from '../diagram/canvasViewportControls'
 import { useModelStore } from '../../stores/modelStore'
 import type { Flow, FlowStep, FlowStepType, MessageStep, ProcessStep } from '../../types'
 import { MarkdownEditor } from './MarkdownEditor'
@@ -269,9 +271,14 @@ export function FlowPanel() {
     setCurrentFlow(currentFlow.id)
     setFlowStepIndex(index)
     // Focus canvas on this step's subject
-    const engine = (window as unknown as { __canvasEngine?: { focusOnFlowStep?: (flow: Flow, stepIndex: number) => void } }).__canvasEngine
+    const engine = (window as unknown as {
+      __canvasEngine?: { focusOnFlowStep?: (flow: Flow, stepIndex: number, insets?: CanvasViewportInsets) => void }
+    }).__canvasEngine
     if (engine?.focusOnFlowStep) {
-      engine.focusOnFlowStep(currentFlow, index)
+      // This panel sits in the left sidebar that overlays the canvas: frame the
+      // step between the open panels, as the canvas Fit button does.
+      const { leftSidebarOpen, rightSidebarOpen } = useUIStore.getState()
+      engine.focusOnFlowStep(currentFlow, index, editorCanvasInsets(leftSidebarOpen, rightSidebarOpen))
     }
   }
 

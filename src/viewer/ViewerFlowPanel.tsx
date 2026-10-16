@@ -18,7 +18,7 @@ import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 import { useTranslation } from 'react-i18next'
 import { cn } from '../lib/utils'
-import type { CanvasEngine } from '../canvas/engine/CanvasEngine'
+import type { CanvasEngine, CanvasViewportInsets } from '../canvas/engine/CanvasEngine'
 import type { Flow } from '../types'
 
 /** Read-only flow playback: lists the diagram's flows and steps through them,
@@ -26,9 +26,12 @@ import type { Flow } from '../types'
 export function ViewerFlowPanel({
   flows,
   engineRef,
+  insets,
 }: {
   flows: Flow[]
   engineRef: MutableRefObject<CanvasEngine | null>
+  /** The viewer panels overlaying the canvas; each step is framed between them. */
+  insets: CanvasViewportInsets
 }) {
   const { t } = useTranslation()
   const [flowId, setFlowId] = useState<string | null>(flows[0]?.id ?? null)
@@ -51,7 +54,7 @@ export function ViewerFlowPanel({
     const clamped = Math.max(0, Math.min(idx, f.steps.length - 1))
     setStepIndex(clamped)
     engineRef.current?.setFlowState(f.id, clamped)
-    engineRef.current?.focusOnFlowStep(f, clamped)
+    engineRef.current?.focusOnFlowStep(f, clamped, insets)
   }
 
   const play = () => {

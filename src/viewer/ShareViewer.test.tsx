@@ -18,12 +18,14 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { ShareSnapshot } from '../lib/share/types'
 import { ShareViewer } from './ShareViewer'
 
-const { viewerEngine } = vi.hoisted(() => ({
+const { viewerEngine, canvasFitInsets } = vi.hoisted(() => ({
   viewerEngine: {
     getZoom: vi.fn(() => 1),
     setZoom: vi.fn(),
     zoomToFit: vi.fn(),
   },
+  /** The `fitInsets` prop of the latest ViewerCanvas render. */
+  canvasFitInsets: { current: undefined as unknown },
 }))
 
 const snapshot: ShareSnapshot = {
@@ -60,8 +62,9 @@ vi.mock('../lib/share/api', () => ({
 }))
 
 vi.mock('./ViewerCanvas', () => ({
-  ViewerCanvas: ({ engineRef }: { engineRef: { current: unknown } }) => {
+  ViewerCanvas: ({ engineRef, fitInsets }: { engineRef: { current: unknown }; fitInsets?: unknown }) => {
     engineRef.current = viewerEngine
+    canvasFitInsets.current = fitInsets
     return <div data-testid="viewer-canvas" />
   },
 }))
@@ -75,7 +78,10 @@ vi.mock('./ViewerPerspectiveBar', () => ({
   ViewerPerspectiveBar: () => <div data-testid="viewer-perspective-bar" />,
 }))
 
-afterEach(cleanup)
+afterEach(() => {
+  cleanup()
+  vi.clearAllMocks()
+})
 
 describe('ShareViewer standalone shell', () => {
   it('mirrors the editor chrome with flows left, properties right and perspectives over a readonly canvas', async () => {
@@ -111,5 +117,33 @@ describe('ShareViewer standalone shell', () => {
     fireEvent.click(darkTheme)
     expect(darkTheme.getAttribute('aria-pressed')).toBe('true')
     expect(document.documentElement.getAttribute('data-theme')).toBe('dark')
+  })
+
+  // Defect 2026-10-16: the viewer's first fit and its Fit button framed the
+  // diagram on the WHOLE canvas, so its left part sat under the 312 px flow
+  // panel (content edge measured at x 221, panel edge at 326).
+  it('fits between the panels that are open, and follows a panel being closed', async () => {
+    render(<ShareViewer token="existing-share" mode="standalone" />)
+    await screen.findByTestId('viewer-flow-sidebar-shell')
+
+    expect(canvasFitInsets.current).toEqual({ left: 340, right: 340 })
+    fireEvent.click(screen.getByTestId('viewer-center-diagram'))
+    expect(viewerEngine.zoomToFit).toHaveBeenLastCalledWith({ left: 340, right: 340 })
+
+    fireEvent.click(screen.getByTestId('viewer-flow-sidebar-shell').querySelector('button[title="layoutChrome.leftSidebar.collapsePanel"]')!)
+    expect(screen.queryByTestId('viewer-flow-sidebar-shell')).toBeNull()
+    expect(canvasFitInsets.current).toEqual({ left: 0, right: 340 })
+    fireEvent.click(screen.getByTestId('viewer-center-diagram'))
+    expect(viewerEngine.zoomToFit).toHaveBeenLastCalledWith({ left: 0, right: 340 })
+  })
+})
+
+describe('ShareViewer embed', () => {
+  // The embed has no Fit button; its first fit is the one that must clear the aside.
+  it('fits beside the right-hand aside', async () => {
+    render(<ShareViewer token="existing-share" mode="embed" />)
+    await screen.findByTestId('viewer-canvas')
+
+    expect(canvasFitInsets.current).toEqual({ right: 304 })
   })
 })
