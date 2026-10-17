@@ -34,6 +34,15 @@ export interface ModelCachePage<T> {
   total?: number
 }
 
+export interface ModelCacheEntities {
+  /** The active generation's coverage. A 'working-set' generation holds explorer
+   *  PLACEHOLDER payloads (server.ts cacheExplorerWorkingSet: empty properties,
+   *  zero size, grey groups) — never hand those to an editor. */
+  coverage: OfflineCoverage
+  entities: CachedModelEntityRecord['payload'][]
+  connections: CachedConnectionRecord['connection'][]
+}
+
 export interface ModelCacheSearchItem extends CachedModelEntityRecord {
   matchKind: 'exact' | 'prefix' | 'contains'
 }
@@ -91,6 +100,7 @@ export type ModelReadCacheRequest =
   | { id: number; op: 'putDiagramRender'; record: CachedDiagramRenderRecord }
   | { id: number; op: 'getDiagramRender'; workspaceKey: string; diagramId: string; generation?: number; allowLatest?: boolean }
   | { id: number; op: 'buildDiagramRender'; workspaceKey: string; diagramId: string }
+  | { id: number; op: 'getEntities'; workspaceKey: string; ids: string[]; connectionIds: string[] }
   | { id: number; op: 'setOfflineDownloadState'; workspaceKey: string; ownerId: string; status: Exclude<OfflineDownloadStatus, 'running'>; errorCode?: string; errorMessage?: string }
   | { id: number; op: 'completeOfflineDownload'; workspaceKey: string; ownerId: string; generation: number }
   | { id: number; op: 'discardOfflineDownload'; workspaceKey: string }
@@ -127,6 +137,9 @@ export interface ModelReadCacheApi {
   putDiagramRender(input: Omit<Extract<ModelReadCacheCommand, { op: 'putDiagramRender' }>, 'id' | 'op'>, signal?: AbortSignal): Promise<{ stored: true }>
   getDiagramRender(input: Omit<Extract<ModelReadCacheCommand, { op: 'getDiagramRender' }>, 'id' | 'op'>, signal?: AbortSignal): Promise<CachedDiagramRenderRecord | null>
   buildDiagramRender(input: Omit<Extract<ModelReadCacheCommand, { op: 'buildDiagramRender' }>, 'id' | 'op'>, signal?: AbortSignal): Promise<CachedDiagramRenderRecord | null>
+  /** Point read of the ACTIVE generation by id, with that generation's coverage (see
+   *  ModelCacheEntities — a working set holds placeholders). Missing ids are simply absent. */
+  getEntities(input: Omit<Extract<ModelReadCacheCommand, { op: 'getEntities' }>, 'id' | 'op'>, signal?: AbortSignal): Promise<ModelCacheEntities>
   setOfflineDownloadState(input: Omit<Extract<ModelReadCacheCommand, { op: 'setOfflineDownloadState' }>, 'id' | 'op'>, signal?: AbortSignal): Promise<ModelCacheWorkspaceMeta>
   completeOfflineDownload(input: Omit<Extract<ModelReadCacheCommand, { op: 'completeOfflineDownload' }>, 'id' | 'op'>, signal?: AbortSignal): Promise<ModelCacheWorkspaceMeta>
   discardOfflineDownload(input: Omit<Extract<ModelReadCacheCommand, { op: 'discardOfflineDownload' }>, 'id' | 'op'>, signal?: AbortSignal): Promise<{ discarded: boolean }>

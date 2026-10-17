@@ -43,16 +43,15 @@ export async function enterBootApp(page: Page): Promise<void> {
   // Confirm we're really in boot-from-server mode (windowed), not the full-model fallback.
   const bootFromServer = await page.evaluate(() => (window as any).__bootFromServer?.enabled?.() ?? false)
   expect(bootFromServer, 'tests must run against the boot-from-server stack (:5180)').toBe(true)
-  // Let the per-boot index build SETTLE before the test interacts. It runs in the background and
-  // competes for the main thread (it re-renders every seam consumer — tables, dependencies,
-  // bottom bar — on completion), which drops clicks and delays renders. Under the full serial
-  // suite that contention is the single biggest source of load-induced flakiness: a test that
-  // passes in isolation fails when an earlier boot's build lands inside its interaction window.
-  // Waiting here means every test starts on an IDLE thread. Best-effort (swallow the timeout) so
-  // a boot path that never exposes the hook still proceeds as before.
-  await page
-    .waitForFunction(() => (window as any).__indexReady?.ready?.() === true, undefined, { timeout: 30_000 })
-    .catch(() => {})
+  // The FLAG is not the mode: the bridge's write-head guard downgrades a flagged boot to
+  // resident when the workspace has no overlay write heads. Measured 2026-10-16: every
+  // `seed-workspace.ts real` stack booted resident while the line above stayed green, so
+  // this whole suite was exercising the resident app.
+  const bfsActive = await page.evaluate(() => (window as any).__bridgeDebug?.().bfsActive ?? null)
+  expect(bfsActive, 'boot-from-server was refused (see the "boot-from-server refused" console warning) — reseed or repair the overlay heads').toBe(true)
+  // (A wait for the legacy background index build used to sit here. Nothing starts that
+  // build any more — the complete offline copy is the explicit "Make available
+  // offline" action — so it only burned its 30 s timeout on every boot.)
 }
 
 /** Reload and re-enter — the persistence checkpoint every scenario ends with. */
@@ -170,14 +169,34 @@ export async function enterBootAppOffline(page: Page): Promise<void> {
   )
 }
 
-/** Wait for the background index build (offlineIndex.ensureIndexReady) to finish so the
- * OFFLINE render fallback has a COMPLETE local read model to rebuild the active
- * diagram from. Must be called while still ONLINE (the cold build pages the server read
- * model). Polls the __indexReady DEV hook. */
-export async function waitForIndexReady(page: Page): Promise<void> {
-  await page.waitForFunction(() => (window as any).__indexReady?.ready?.() === true, undefined, {
-    timeout: 90_000,
-  })
+/** Wait, while ONLINE, until the active diagram's server render has been written to the
+ * Worker's diagram-render cache — what `readCachedDiagramRender` serves when the render
+ * fetch fails offline. The write is deliberately scheduled after paint and never awaited
+ * by the open, so going offline right after `enterBootApp` can beat it. Reads the
+ * `diagram.render.cache` measure from the DEV client timeline (successful writes only).
+ *
+ * This replaced `waitForIndexReady`, which polled for the legacy background index build:
+ * nothing starts that build any more, so it could only time out. */
+export async function waitForDiagramRenderCached(page: Page): Promise<void> {
+  await page.waitForFunction(() => {
+    const m = (window as any).__maplespireDiagnostics?.timeline?.().measures?.['diagram.render.cache']
+    return !!m && m.calls - m.failures >= 1
+  }, undefined, { timeout: 30_000 })
+}
+
+/** Make the active landscape version available offline through the REAL Settings UI
+ * (editor tool pill → Settings → "Make available offline"), and wait for the complete
+ * copy. Must run ONLINE. This is the product's only route to a complete local model for
+ * the global pages (Model Objects / Dependencies / Connections) — the automatic build
+ * after boot was removed. */
+export async function makeAvailableOffline(page: Page): Promise<void> {
+  await page.getByTitle('Settings', { exact: true }).click()
+  const section = page.getByTestId('settings-offline-section')
+  await expect(section).toBeVisible()
+  await section.getByRole('button', { name: 'Make available offline' }).click()
+  await expect(section.getByText('Available offline', { exact: true })).toBeVisible({ timeout: 90_000 })
+  await page.getByRole('button', { name: 'Close settings' }).click()
+  await expect(section).toBeHidden()
 }
 
 /** Navigate to a non-diagram view through the REAL breadcrumb mega-menu (Model Objects /
@@ -949,7 +968,7 @@ export async function pickEndpointObject(
       if (!o) throw new Error('no eligible endpoint object found')
       return { id: o.id, name: o.name }
     },
-    ['http://localhost:3002', excludeIds] as const
+    [API_BASE, excludeIds] as const
   )
 }
 

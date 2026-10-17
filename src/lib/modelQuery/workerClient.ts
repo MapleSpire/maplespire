@@ -17,6 +17,7 @@ import type {
   ModelCacheConnectionPage,
   ModelCacheDependencyPage,
   ModelCacheViewerLevel,
+  ModelCacheEntities,
   ModelCacheSearchItem,
   ModelReadCacheApi,
   ModelReadCacheCommandInput,
@@ -173,6 +174,10 @@ export class ModelReadCacheWorkerClient implements ModelReadCacheApi {
 
   buildDiagramRender(input: Parameters<ModelReadCacheApi['buildDiagramRender']>[0], signal?: AbortSignal): Promise<CachedDiagramRenderRecord | null> {
     return this.send({ op: 'buildDiagramRender', ...input }, signal)
+  }
+
+  getEntities(input: Parameters<ModelReadCacheApi['getEntities']>[0], signal?: AbortSignal): Promise<ModelCacheEntities> {
+    return this.send({ op: 'getEntities', ...input }, signal)
   }
 
   setOfflineDownloadState(input: Parameters<ModelReadCacheApi['setOfflineDownloadState']>[0], signal?: AbortSignal): Promise<ModelCacheWorkspaceMeta> {

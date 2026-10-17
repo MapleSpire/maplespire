@@ -15,13 +15,14 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { useModelStore } from '../../stores/modelStore'
 import { residentModelQuery } from './resident'
-import { pagedModelQuery, __setPagedStoreForTest } from './paged'
+import { pagedModelQuery, __setPagedStoreForTest, __setPagedEntityCacheForTest } from './paged'
 import { __setServerFetchForTest } from './server'
 import { createMemoryKvStore } from './kvStore'
 import { buildModelIndex, indexRelatedDiagrams } from './modelIndex'
 import type { C4Object, Connection, Group, Diagram } from '../../types'
 import type { SearchHit } from './types'
 import { seededTechnologyUsages } from '../technologyUsage'
+import { currentWorkspaceRef, workspaceRefKey } from '../automerge/workspace'
 
 function obj(id: string, over: Partial<C4Object> = {}): C4Object {
   return {
@@ -214,6 +215,101 @@ describe('pagedModelQuery — served from the index, equals resident', () => {
     const result = await pagedModelQuery.object(remote.id)
 
     expect(result?.name).toBe('Double-entry Ledger / 10')
+  })
+
+  describe('offline point lookups fall back to the COMPLETE offline copy in the Worker', () => {
+    // Regression, 2026-10-16 (e2e/boot/offline-readmodel.spec.ts): after "Make
+    // available offline", the offline Model Objects table listed an off-window
+    // object (page ladders read the Worker), but selecting it opened no editor —
+    // the point lookups fell back to the legacy index only, which nothing fills
+    // under boot-from-server any more.
+    const remote = obj('off-window', { name: 'Only in the Worker cache' })
+    const remoteGroup = grp('off-group', { name: 'Group in the Worker cache' })
+    const remoteConnection = conn('off-conn', 'A', 'off-window')
+    let calls: Array<{ workspaceKey: string; ids: string[]; connectionIds: string[] }> = []
+    let coverage: 'full' | 'working-set' = 'full'
+    beforeEach(() => {
+      calls = []
+      coverage = 'full'
+      vi.stubGlobal('navigator', { onLine: false })
+      __setPagedEntityCacheForTest({
+        getEntities: async ({ workspaceKey, ids, connectionIds }) => {
+          calls.push({ workspaceKey, ids, connectionIds })
+          return {
+            coverage,
+            entities: [remote, remoteGroup, obj('A', { name: 'stale server copy of A' })]
+              .filter((e) => ids.includes(e.id)),
+            connections: [remoteConnection].filter((c) => connectionIds.includes(c.id)),
+          }
+        },
+      })
+    })
+    afterEach(() => __setPagedEntityCacheForTest(null))
+
+    it('lookupMany / object / group / connectionsMany answer from the Worker for ids the index lacks', async () => {
+      const many = await pagedModelQuery.lookupMany(['A', remote.id, remoteGroup.id, 'absent'])
+      expect(many.get(remote.id)?.name).toBe('Only in the Worker cache')
+      expect(many.get(remoteGroup.id)?.name).toBe('Group in the Worker cache')
+      expect(many.has('absent')).toBe(false)
+      expect((await pagedModelQuery.object(remote.id))?.name).toBe('Only in the Worker cache')
+      expect(await pagedModelQuery.object(remoteGroup.id)).toBeUndefined() // a group is not an object
+      expect(await pagedModelQuery.group(remote.id)).toBeUndefined() // …nor an object a group
+      // The ACTIVE workspace's copy, keyed exactly as the explorers and the render cache key it.
+      expect(new Set(calls.map((c) => c.workspaceKey))).toEqual(new Set([workspaceRefKey(currentWorkspaceRef())]))
+      expect((await pagedModelQuery.group(remoteGroup.id))?.name).toBe('Group in the Worker cache')
+      expect((await pagedModelQuery.connectionsMany([remoteConnection.id])).get(remoteConnection.id)?.toId).toBe('off-window')
+    })
+
+    it('the index wins over the Worker (it alone carries this browser\'s off-window edits), and is asked first', async () => {
+      const many = await pagedModelQuery.lookupMany(['A', remote.id])
+      expect(many.get('A')?.name).toBe('A')
+      // The Worker is asked only for what the index could not answer.
+      expect(calls.at(-1)?.ids).toEqual([remote.id])
+      // …and even a Worker that over-answers cannot replace an index record.
+      __setPagedEntityCacheForTest({
+        getEntities: async () => ({ coverage: 'full' as const, entities: [remote, obj('A', { name: 'stale server copy of A' })], connections: [] }),
+      })
+      expect((await pagedModelQuery.lookupMany(['A', remote.id])).get('A')?.name).toBe('A')
+    })
+
+    it('a WORKING-SET generation is refused: its payloads are explorer placeholders, not entities', async () => {
+      // 2026-10-16: the editor seeds what a lookup returns into the
+      // editable window, so a placeholder (empty properties, zero size) would be
+      // written over the real entity by the first keystroke.
+      coverage = 'working-set'
+      const many = await pagedModelQuery.lookupMany([remote.id, remoteGroup.id])
+      expect(calls.length).toBeGreaterThan(0) // void-run guard: the Worker WAS asked
+      expect(many.size).toBe(0)
+      expect(await pagedModelQuery.object(remote.id)).toBeUndefined()
+      expect(await pagedModelQuery.group(remoteGroup.id)).toBeUndefined()
+      expect((await pagedModelQuery.connectionsMany([remoteConnection.id])).size).toBe(0)
+    })
+
+    it('ONLINE, a server miss stays index-only: a stale copy cannot bring back what the server deleted', async () => {
+      vi.stubGlobal('localStorage', {
+        getItem: (key: string) => key === 'maplespire:serverReadModel' ? 'true' : null,
+      })
+      vi.stubGlobal('navigator', { onLine: true })
+      __setServerFetchForTest(async (input) => {
+        const url = String(input)
+        const body = url.includes('/api/model/lookup') ? { entities: [] }
+          : url.includes('/connections') ? { connections: [] }
+            : { object: null, group: null }
+        return new Response(JSON.stringify(body), { status: url.includes('/api/model/lookup') || url.includes('/connections') ? 200 : 404, headers: { 'content-type': 'application/json' } })
+      })
+      expect((await pagedModelQuery.lookupMany([remote.id])).has(remote.id)).toBe(false)
+      expect(await pagedModelQuery.object(remote.id)).toBeUndefined()
+      expect(await pagedModelQuery.group(remoteGroup.id)).toBeUndefined()
+      expect(calls).toEqual([])
+    })
+
+    it('a failing Worker leaves the index answer intact', async () => {
+      __setPagedEntityCacheForTest({ getEntities: async () => { throw new Error('worker gone') } })
+      vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+      const many = await pagedModelQuery.lookupMany(['A', remote.id])
+      expect(many.get('A')?.id).toBe('A')
+      expect(many.has(remote.id)).toBe(false)
+    })
   })
 
   describe('an access refusal is final — never answered from this browser\'s caches', () => {

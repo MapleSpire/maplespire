@@ -21,7 +21,10 @@ import {
 } from './modelIndex'
 import { connectionRowsFromIndex, pickerEntriesFromIndex, modelObjectRowsFromIndex, cachedIndexObjects, cachedIndexConnections } from './heavyViews'
 import { warnWholeModelRead } from './wholeModelGuard'
-import type { Diagram } from '../../types'
+import type { C4Object, Connection, Diagram, Group } from '../../types'
+import { currentWorkspaceRef, workspaceRefKey } from '../automerge/workspace'
+import type { ModelReadCacheApi } from './modelReadCacheProtocol'
+import { getModelReadCacheWorker } from './workerClient'
 import type { ModelQuery } from './types'
 import { isServerReadModelEnabled } from './tierFlag'
 import { isAuthoritativeReadModelRefusal, serverModelQuery } from './server'
@@ -86,6 +89,90 @@ function stopsFallback(error: unknown, signal: AbortSignal | undefined): boolean
 
 let storeOverride: KvStore | null = null
 const store = (): KvStore => storeOverride ?? workspaceKvStore()
+
+type EntityCache = Pick<ModelReadCacheApi, 'getEntities'>
+let entityCache = (): EntityCache => getModelReadCacheWorker()
+
+/** Test hook: back the point lookups' Worker rung with a fake (null restores the Worker). */
+export function __setPagedEntityCacheForTest(cache: EntityCache | null): void {
+  entityCache = cache ? () => cache : () => getModelReadCacheWorker()
+}
+
+/** A Worker that does not answer (IndexedDB blocked by another tab's upgrade)
+ *  must not hang a lookup the index used to answer at once (paged.ts's callers
+ *  leave rejections unhandled — see `stopsFallback`). */
+const COMPLETE_COPY_DEADLINE_MS = 3_000
+
+/**
+ * The OFFLINE floor under the legacy index: the Worker model cache, but ONLY
+ * the complete copy the user asked for ("Make available offline", coverage
+ * 'full'). Nothing fills the legacy index under boot-from-
+ * server and that copy lands in the Worker — so with the index alone, a row the
+ * offline Model Objects table listed resolved to nothing when selected
+ * (measured 2026-10-16, e2e/boot/offline-readmodel.spec.ts).
+ *
+ * A 'working-set' generation is refused: it holds explorer PLACEHOLDERS
+ * (server.ts cacheExplorerWorkingSet — empty properties, zero size, grey
+ * groups), and the editor seeds what a lookup returns into the editable
+ * window, so one keystroke would write the placeholder over the real entity
+ * (2026-10-16).
+ *
+ * NOT covered: an entity deleted locally while offline. The complete copy holds
+ * the server's view, so it can still answer for it — the same view the offline
+ * page ladders already list.
+ */
+async function completeCopy(ids: string[], connectionIds: string[]): Promise<{
+  entities: Array<C4Object | Group>
+  connections: Connection[]
+}> {
+  const none = { entities: [], connections: [] }
+  if (ids.length === 0 && connectionIds.length === 0) return none
+  try {
+    const answer = await entityCache().getEntities(
+      { workspaceKey: workspaceRefKey(currentWorkspaceRef()), ids, connectionIds },
+      AbortSignal.timeout(COMPLETE_COPY_DEADLINE_MS),
+    )
+    return answer.coverage === 'full' ? answer : none
+  } catch (error) {
+    console.warn('offline lookup from the complete offline copy failed:', error)
+    return none
+  }
+}
+
+/** The local floor of the point lookups: the legacy index first (it alone
+ *  carries this browser's off-window edits, `applyOffWindowEditsToIndex`), then
+ *  the complete offline copy for whatever the index lacks. Offline only — an
+ *  ONLINE server miss stays index-only, so a stale copy cannot bring back an
+ *  entity the server has deleted. */
+async function localLookupMany(ids: string[]): Promise<Map<string, C4Object | Group>> {
+  const found = await indexLookupMany(store(), ids)
+  const { entities } = await completeCopy(ids.filter((id) => !found.has(id)), [])
+  for (const entity of entities) if (!found.has(entity.id)) found.set(entity.id, entity)
+  return found
+}
+
+/** `localLookupMany` for connections. */
+async function localConnectionsMany(ids: string[]): Promise<Map<string, Connection>> {
+  const found = await indexConnectionsMany(store(), ids)
+  const { connections } = await completeCopy([], ids.filter((id) => !found.has(id)))
+  for (const connection of connections) if (!found.has(connection.id)) found.set(connection.id, connection)
+  return found
+}
+
+/** One id through the local floor, narrowed to the kind the caller asked for. */
+async function localObject(id: string): Promise<C4Object | undefined> {
+  const indexed = await indexObject(store(), id)
+  if (indexed) return indexed
+  const entity = (await completeCopy([id], [])).entities.find((e) => e.id === id)
+  return entity && 'type' in entity ? entity as C4Object : undefined
+}
+
+async function localGroup(id: string): Promise<Group | undefined> {
+  const indexed = await indexGroup(store(), id)
+  if (indexed) return indexed
+  const entity = (await completeCopy([id], [])).entities.find((e) => e.id === id)
+  return entity && !('type' in entity) ? entity as Group : undefined
+}
 
 /** Test hook: back the paged query with an in-memory store (pass null to restore
  * the per-workspace IndexedDB store). */
@@ -284,23 +371,24 @@ export const pagedModelQuery: ModelQuery = {
     if (isServerReadModelEnabled() && (typeof navigator === 'undefined' || navigator.onLine)) {
       try {
         const remote = await serverModelQuery.object(id)
-        if (remote) return remote
+        // The server ANSWERED: a miss stays index-only (see localLookupMany).
+        return remote ?? await indexObject(store(), id)
       } catch {
         // Offline-first fallback below.
       }
     }
-    return indexObject(store(), id)
+    return localObject(id)
   },
   group: async (id) => {
     if (isServerReadModelEnabled() && (typeof navigator === 'undefined' || navigator.onLine)) {
       try {
         const remote = await serverModelQuery.group(id)
-        if (remote) return remote
+        return remote ?? await indexGroup(store(), id)
       } catch {
         // Offline-first fallback below.
       }
     }
-    return indexGroup(store(), id)
+    return localGroup(id)
   },
   connection: (id) => indexConnection(store(), id),
   connectionsMany: async (ids) => {
@@ -317,7 +405,7 @@ export const pagedModelQuery: ModelQuery = {
         // Offline-first fallback below.
       }
     }
-    return indexConnectionsMany(store(), ids)
+    return localConnectionsMany(ids)
   },
   lookupMany: async (ids) => {
     // The server tier is the zero-wait source for off-window entities. The
@@ -332,11 +420,11 @@ export const pagedModelQuery: ModelQuery = {
         for (const [id, entity] of local) remote.set(id, entity)
         return remote
       } catch {
-        // Offline-first fallback: the local index remains authoritative whenever
-        // the server is unavailable.
+        // Offline-first fallback: the local floor (index, then the complete
+        // offline copy) answers whenever the server is unavailable.
       }
     }
-    return indexLookupMany(store(), ids)
+    return localLookupMany(ids)
   },
   connectionCount: (id) => indexConnectionCount(store(), id),
   descendants: (objectId) => indexDescendants(store(), objectId),

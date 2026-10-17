@@ -295,6 +295,21 @@ const durableHeads = new DurableHeadLedger()
  *  only population this may ever touch. See deniedDocumentRecovery.ts. */
 const deniedRecovery = new DeniedDocumentRecovery()
 let syncTransportConnected = false
+/** EVIDENCE that the server cannot be reached: this session's render fetch
+ *  failed at the network level. Distinct from `!syncTransportConnected`, which
+ *  is also the state of every boot before its end — online ones included — so
+ *  it cannot tell "offline" from "not finished booting" (review,
+ *  2026-10-16). Set only by `loadDiagramRenderForProjection`; cleared by any
+ *  connected transition (`setDurableConnectionState(true)`) and by `startBridge`. */
+let serverUnreachable = false
+
+/** A failure that says the server was not REACHED — the fetch never got an HTTP
+ *  answer (`TypeError`) or ran out of time. An HTTP error status, or a payload
+ *  that failed validation, came from a live server. */
+function isServerUnreachableError(error: unknown): boolean {
+  if (error instanceof TypeError) return true
+  return error instanceof DOMException && (error.name === 'TimeoutError' || error.name === 'AbortError')
+}
 let durableAckTimer: ReturnType<typeof setTimeout> | null = null
 let durableAckInFlight = false
 let durableAckFollowUp = false
@@ -352,6 +367,7 @@ function setSyncTransportConnected(connected: boolean): void {
 }
 
 function setDurableConnectionState(connected: boolean): void {
+  if (connected) serverUnreachable = false
   setSyncTransportConnected(connected)
   // Weak evidence for the minted-id supply: the sync socket is a separately
   // configured endpoint (VITE_AUTOMERGE_URL) from the mint's own host
@@ -492,7 +508,20 @@ async function runDurableAcknowledgement(): Promise<void> {
   } catch (error) {
     // Never show Synced on an unavailable or rejecting durability endpoint.
     // Keep retrying as a connectivity probe while the browser itself is online.
-    if (typeof navigator !== 'undefined' && !navigator.onLine) {
+    // 'saving' is for a server we believe reachable that failed or refused the
+    // ack. Under boot-from-server navigator.onLine stays true when only the
+    // backend is gone, so a server already known UNREACHABLE (a render fetch
+    // that failed at the network level) stays 'offline' — measured 2026-10-16
+    // (bridgeOfflineBoot.test.ts): the first edit after an outage flipped the
+    // badge from Offline to Saving. Not `!syncTransportConnected`: that flag is
+    // false for the whole of every boot, online ones included.
+    // Session-scoped: an ack a previous session left in flight must not write
+    // THIS session's badge (2026-10-16; measured in
+    // bridgeOfflineBoot.test.ts as an offline session's late writes pinning the
+    // next session's transport down).
+    if (epoch !== durableAckEpoch) {
+      // (stale session: nothing to report)
+    } else if ((typeof navigator !== 'undefined' && !navigator.onLine) || serverUnreachable) {
       setSyncTransportConnected(false)
       useAutomergeStatus.getState().setStatus('offline')
     } else {
@@ -2171,8 +2200,11 @@ async function maybeReplayEntityIntents(options?: { withoutHandles?: boolean }):
   if (entityIntentReplaying) {
     // Remember the request instead of dropping it (durableAckFollowUp's
     // pattern): a normal replay arriving while a degraded one still awaits
-    // hydration must run afterwards, not vanish.
-    entityIntentReplayFollowUp = options ?? {}
+    // hydration must run afterwards, not vanish. And never DOWNGRADE a queued
+    // normal request to a degraded one: the degraded pass is latched, so the
+    // normal replay would be lost until a reconnect.
+    const queuedNormal = entityIntentReplayFollowUp !== null && !entityIntentReplayFollowUp.withoutHandles
+    if (!queuedNormal) entityIntentReplayFollowUp = options ?? {}
     return
   }
   entityIntentReplaying = true
@@ -3765,12 +3797,18 @@ function rebuildRegistryIndex(): void {
 async function loadDiagramRenderForProjection(
   diagramId: string,
 ): Promise<DiagramRenderResult | undefined> {
+  // The badge and the reachability evidence belong to the session that ASKED: a
+  // render a previous session left in flight must not write this one's
+  // (measured 2026-10-16, bridgeOfflineBoot.test.ts — see `serverUnreachable`).
+  const epoch = durableAckEpoch
   try {
     const render = await fetchDiagramRender(diagramId)
     // The render fetch reaching the server (200 OR 404) means we're connected. If the
     // badge was showing offline (the server had been unreachable in boot-from-server
     // mode, where navigator.onLine can't see a dead :3002), reflect the reconnection.
-    if (useAutomergeStatus.getState().status === 'offline') setDurableConnectionState(true)
+    if (epoch === durableAckEpoch && (serverUnreachable || useAutomergeStatus.getState().status === 'offline')) {
+      setDurableConnectionState(true)
+    }
     // Same origin as the mint, and OUTSIDE the `offline` guard above on
     // purpose: this path is how a boot-from-server client learns the backend is
     // back, and the badge may already read connected (bridge.ts asserts that at
@@ -3780,14 +3818,30 @@ async function loadDiagramRenderForProjection(
   } catch (e) {
     // OFFLINE / backend down (Bug B): the server render is unreachable. Surface it in the
     // sync badge (the HTTP failure is the only offline signal in boot-from-server mode —
-    // navigator.onLine stays true when only the backend is gone), then rebuild the SAME
-    // render from the local IndexedDB index (the complete model a warm client holds on
-    // disk) so the active diagram's existing content stays visible + editable offline.
+    // navigator.onLine stays true when only the backend is gone), then serve the render
+    // from the Worker's diagram-render cache (written by every online open), and only
+    // failing that rebuild it from the legacy IndexedDB index — which nothing builds
+    // automatically any more (the complete copy is the explicit "Make available
+    // offline" action), so that last rung is normally skipped by isIndexReady.
     // Only the OFFLINE path runs this — a successful/404 fetch above never reaches here, so
-    // the online boot path is unchanged. Gated on a complete index (isIndexReady): a cold
-    // client that never built one keeps the empty render.
+    // the online boot path is unchanged.
     console.warn('diagram-render fetch failed; trying local index fallback:', e)
-    useAutomergeStatus.getState().setStatus('offline')
+    if (epoch !== durableAckEpoch) {
+      // A previous session's request: not this session's evidence.
+    } else if (isServerUnreachableError(e)) {
+      // The TRANSPORT flag too, not just the status: with the flag left true, the
+      // next empty durable-ack tick re-claimed 'ready' ("Synced") within a second
+      // of this line, and the end-of-boot assertion did the same (measured
+      // 2026-10-16, e2e/boot/offline.spec.ts "badge Offline"). A later successful
+      // render fetch, or a sync-socket peer, is the evidence that lifts it again.
+      serverUnreachable = true
+      setDurableConnectionState(false)
+    } else {
+      // The server ANSWERED (an HTTP error status, an invalid payload): it is
+      // reachable, so this is not transport evidence (2026-10-16) —
+      // the status-only signal it always had.
+      useAutomergeStatus.getState().setStatus('offline')
+    }
     const cached = await readCachedDiagramRender(diagramId)
     if (cached) return cached
     if (isIndexReady()) {
@@ -6074,6 +6128,30 @@ function scheduleOverlayHydration(): void {
     void maybeReplayEntityIntents({ withoutHandles: true })
     return
   }
+  // OFFLINE boot: a head this browser never fetched cannot resolve until the
+  // server is back, and `ensureOverlayHandles` reaches its degraded replay only
+  // when the resolve gives up — 9 min 33 s (the unbudgeted retry in repo.ts).
+  // Until then the journaled edits stayed invisible: an edit made offline looked
+  // reverted after an offline reload (measured 2026-10-16, 4 runs in 6,
+  // e2e/boot/offline.spec.ts "edit an EXISTING shape OFFLINE"). Put them back on
+  // screen now; the degraded replay is the designed first half of the sequence —
+  // the normal replay still runs (via the follow-up latch) once heads resolve.
+  // The replay only fills `editsObjects`; the projection is what overlays it on
+  // the rendered window — as `runDeferredHydration` does after its own replay.
+  // Gated on EVIDENCE the server is unreachable, not on `!syncTransportConnected`
+  // (false for the whole of every boot, so a mid-boot ModelMeta change ran this
+  // on ONLINE boots), and once per session (this runs on every
+  // ModelMeta change and the degraded replay is latched anyway).
+  // NOT covered: it also fires offline when the heads ARE resolvable locally; the
+  // degraded pass then runs before the overlay is materialized, so an unstamped
+  // intent's whole snapshot can be flushed before the normal replay merges it
+  // per field — the order the 9-minute give-up already produced, now the
+  // ordinary one.
+  if (serverUnreachable && !entityIntentsDegradedReplayed) {
+    void maybeReplayEntityIntents({ withoutHandles: true })
+      .then(() => (started && bfsActive ? projectActiveFromServer(activeDiagramId) : undefined))
+      .catch((error) => { console.error('offline journal re-projection failed', error) })
+  }
 
   const runDeferredHydration = async () => {
     cancelDeferredOverlayHydration = null
@@ -6105,6 +6183,7 @@ export async function startBridge(ref: WorkspaceRef = DEFAULT_WORKSPACE_REF): Pr
   bootFallbackReentryPending = false
   durableAckEpoch += 1
   durableHeads.clear()
+  serverUnreachable = false
   // Same lifetime as the ledger it shadows. A new session gets a fresh budget:
   // the per-session cap must not carry a previous workspace's refusals into one
   // that may be perfectly healthy.
@@ -6628,7 +6707,11 @@ export async function startBridge(ref: WorkspaceRef = DEFAULT_WORKSPACE_REF): Pr
       }
     }
 
-    setDurableConnectionState(true)
+    // Asserted connected because the status listeners are wired only below, so a
+    // socket that connected DURING boot was never heard — unless this boot already
+    // learned the opposite: a render fetch that could not reach the server
+    // (`serverUnreachable`, reset by `startBridge`).
+    setDurableConnectionState(!serverUnreachable)
     // Published from HERE — after the documents are attached, the store projected and
     // `useModelStore.subscribe(onStoreChange)` wired — because that is the first
     // instant at which a write into the store reaches this workspace's documents.

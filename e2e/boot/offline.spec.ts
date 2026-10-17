@@ -21,7 +21,7 @@ import {
   goOffline,
   goOnline,
   flushLocal,
-  waitForIndexReady,
+  waitForDiagramRenderCached,
   dragNewShapeToCanvas,
   serverObject,
   storeObject,
@@ -175,16 +175,17 @@ test.describe('offline-first — reconnect', () => {
 })
 
 // ── The active diagram's EXISTING (server-rendered) content offline ───────────────────
-// fetchDiagramRender falls back to buildLocalDiagramRender (the local IndexedDB index)
-// when the server is unreachable, so the active diagram's pre-existing objects/connections
-// stay visible AND editable offline. The fallback fires ONLY on the offline catch path —
-// the online render is untouched (no regression). These tests REQUIRE a warm index (the
-// fallback is gated on isIndexReady), so each waits for the background build before going
-// offline.
+// When the server is unreachable, loadDiagramRenderForProjection serves the render from the
+// Worker's diagram-render cache (readCachedDiagramRender — written by every online open), so
+// the active diagram's pre-existing objects/connections stay visible AND editable offline.
+// The fallback fires ONLY on the offline catch path — the online render is untouched. Each
+// test waits, online, for that cache write to land: it is scheduled after paint and never
+// awaited. (These used to wait for the legacy background index build, which nothing starts
+// any more, so they could only time out.)
 test.describe('offline-first — existing diagram content (Bug B fixed)', () => {
   test('existing shapes ARE visible offline, an EXACT match for the online render', async ({ page }) => {
     await enterBootApp(page)
-    await waitForIndexReady(page) // the offline fallback needs the complete local index
+    await waitForDiagramRenderCached(page) // the offline fallback serves the cached render
     const onlineIds = await residentObjectIds(page)
     test.skip(onlineIds.length === 0, 'active diagram had no server-rendered objects to begin with')
 
@@ -192,7 +193,7 @@ test.describe('offline-first — existing diagram content (Bug B fixed)', () => 
     await page.reload()
     await enterBootAppOffline(page)
 
-    // Was 0 before the fix; now the existing content is rebuilt from the local index, and it's
+    // Was 0 before the fix; now the existing content is served from the render cache, and it's
     // the SAME object set the server render produced (no missing, no spurious extras).
     await expect
       .poll(async () => (await residentObjectIds(page)).length, { timeout: 20_000 })
@@ -202,7 +203,7 @@ test.describe('offline-first — existing diagram content (Bug B fixed)', () => 
 
   test('edit an EXISTING (server-rendered) shape OFFLINE; persists across an offline reload', async ({ page }) => {
     await enterBootApp(page)
-    await waitForIndexReady(page)
+    await waitForDiagramRenderCached(page)
     const onlineIds = await residentObjectIds(page)
     test.skip(onlineIds.length === 0, 'active diagram had no server-rendered objects to begin with')
     const id = onlineIds[0]
@@ -213,7 +214,7 @@ test.describe('offline-first — existing diagram content (Bug B fixed)', () => 
     await page.reload()
     await enterBootAppOffline(page)
 
-    // The pre-existing shape is rebuilt into the windowed store from the local index.
+    // The pre-existing shape is projected into the windowed store from the cached render.
     await expect.poll(async () => await storeObject(page, id).then((o: any) => !!o), { timeout: 20_000 }).toBe(true)
 
     // Select it through the real store action the canvas uses (selectedItems) → the RightSidebar
@@ -237,7 +238,7 @@ test.describe('offline-first — existing diagram content (Bug B fixed)', () => 
 
   test('existing content survives an online→offline→online round-trip with no duplication', async ({ page }) => {
     await enterBootApp(page)
-    await waitForIndexReady(page)
+    await waitForDiagramRenderCached(page)
     const onlineIds = await residentObjectIds(page)
     test.skip(onlineIds.length === 0, 'active diagram had no server-rendered objects to begin with')
 

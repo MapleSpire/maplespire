@@ -17,7 +17,7 @@ import {
   enterBootApp,
   enterBootAppOffline,
   goOffline,
-  waitForIndexReady,
+  makeAvailableOffline,
   pickOffWindowObject,
   gotoModelObjects,
   moSelectRow,
@@ -28,25 +28,27 @@ import {
 
 // Off-window hydration + the read-model PAGES, OFFLINE. Under boot-from-server the resident
 // store holds only the active-diagram window; the global pages (Model Objects / Dependencies /
-// Connections) and any off-window resolve route through getModelQuery(), which serves from the
-// COMPLETE local IndexedDB index once the background build finished (isIndexReady). That index
-// is durable, so a warm client answers these WITHOUT the server. We prove an OFF-WINDOW object
-// (genuinely not resident) still lists + resolves + opens its editor offline.
+// Connections) and any off-window resolve route through getModelQuery(). Offline, they are
+// answered from the Worker's model cache — COMPLETE only once the user made the version
+// available offline (Settings → "Make available offline"; there is no automatic whole-model
+// build any more). That copy is durable, so a warm client answers these WITHOUT the
+// server. We prove an OFF-WINDOW object (genuinely not resident) still lists + resolves + opens
+// its editor offline.
 //
-// Each test picks the off-window object while ONLINE (pickOffWindowObject reads the server), then
-// blocks :3002 and reloads OFFLINE before exercising the page.
+// Each test makes the version available offline and picks the off-window object while ONLINE
+// (pickOffWindowObject reads the server), then blocks the API and reloads OFFLINE before
+// exercising the page.
 
 test.describe('offline-first — read-model pages + off-window resolve', () => {
   test('the Model Objects table lists + opens an OFF-WINDOW object offline (from the local index)', async ({ page }) => {
     await enterBootApp(page)
-    await waitForIndexReady(page) // build the complete local index (sets the warm marker)
+    await makeAvailableOffline(page) // the complete offline copy, through the real Settings UI
     const off = await pickOffWindowObject(page)
     expect(await serverObject(page, off.id)).toBeTruthy() // a real persisted, off-window object
 
     await goOffline(page)
     await page.reload()
     await enterBootAppOffline(page)
-    await waitForIndexReady(page) // warm marker present ⇒ ready instantly, no server
 
     // The whole-model table renders offline; search-pin the off-window row and select it. Selecting
     // it hydrates the full entity through the seam (index) into the editor — all offline.
@@ -57,14 +59,13 @@ test.describe('offline-first — read-model pages + off-window resolve', () => {
 
   test('the Dependencies page focuses an OFF-WINDOW object offline (seam → local index)', async ({ page }) => {
     await enterBootApp(page)
-    await waitForIndexReady(page)
+    await makeAvailableOffline(page)
     const off = await pickOffWindowObject(page)
     expect(await serverObject(page, off.id)).toBeTruthy()
 
     await goOffline(page)
     await page.reload()
     await enterBootAppOffline(page)
-    await waitForIndexReady(page)
 
     // The FocusPicker is a whole-model seam list; focusing an off-window id resolves it from the
     // index and opens its editor — proving the Dependencies read-model page works offline.

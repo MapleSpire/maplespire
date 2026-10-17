@@ -43,6 +43,7 @@ import type {
   ModelCacheDependencyPage,
   ModelCacheViewerLevel,
   ModelCachePage,
+  ModelCacheEntities,
   ModelCacheSearchItem,
   ModelReadCacheRequest,
   ModelReadCacheResponse,
@@ -1597,6 +1598,25 @@ async function readCachedConnectionRecords(
   return new Map(rows.filter((row): row is CachedConnectionRecord => Boolean(row)).map((row) => [row.id, row]))
 }
 
+async function getEntities(
+  request: Extract<ModelReadCacheRequest, { op: 'getEntities' }>,
+): Promise<OperationResult<ModelCacheEntities>> {
+  const meta = await getMeta(request.workspaceKey)
+  const generation = meta.activeGeneration
+  const [entityRecords, connectionRecords] = await Promise.all([
+    request.ids.length ? readCachedEntityRecords(request.workspaceKey, generation, request.ids) : new Map<string, CachedModelEntityRecord>(),
+    request.connectionIds.length ? readCachedConnectionRecords(request.workspaceKey, generation, request.connectionIds) : new Map<string, CachedConnectionRecord>(),
+  ])
+  return {
+    result: {
+      coverage: meta.coverage,
+      entities: [...entityRecords.values()].map((row) => row.payload),
+      connections: [...connectionRecords.values()].map((row) => row.connection),
+    },
+    rowsRead: 1 + entityRecords.size + connectionRecords.size,
+  }
+}
+
 async function scanObjectHierarchy(
   workspaceKey: string,
   generation: number,
@@ -2175,6 +2195,7 @@ async function execute(request: Exclude<ModelReadCacheRequest, { op: 'cancel' }>
     case 'putDiagramRender': return putDiagramRender(request)
     case 'getDiagramRender': return getDiagramRender(request)
     case 'buildDiagramRender': return buildDiagramRender(request)
+    case 'getEntities': return getEntities(request)
     case 'setOfflineDownloadState': return setOfflineDownloadState(request)
     case 'completeOfflineDownload': return completeOfflineDownload(request)
     case 'discardOfflineDownload': return discardOfflineDownload(request)

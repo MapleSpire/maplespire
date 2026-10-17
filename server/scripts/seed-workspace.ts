@@ -21,8 +21,10 @@
  *
  * Topology (matches the client/bridge exactly — see src/lib/automerge/types.ts):
  *   Root        { modelUrl:'', modelMetaUrl, shardUrls:[registry…] }
- *   ModelMeta   { objectShardUrls[], connectionShardUrls[], groups, domains, tags,
- *                 decisionRecords, deletedObjectIds:[], deletedConnectionIds:[] }
+ *   ModelMeta   buildModelMeta(…) — base shards with the overlay write heads last,
+ *                 groups, domains, tagSnapshots, decisionRecords — plus
+ *                 deletedObjectIds:[], deletedConnectionIds:[]
+ *   Overlay heads    { objects|connections: {}, writeHeadVersion }  (empty)
  *   ObjectShard      { objects:    Record<id, C4Object> }     (≤ MODEL_SHARD_SIZE)
  *   ConnectionShard  { connections:Record<id, Connection> }   (≤ MODEL_SHARD_SIZE)
  *   RegistryShard    { diagrams:   Record<id, DiagramMeta> }  (≤ SHARD_SIZE)
@@ -34,6 +36,7 @@ import { Repo } from '@automerge/automerge-repo'
 import { PostgresStorageAdapter } from '../src/automergeStorage.js'
 import { pool } from '../src/db.js'
 import { copyRootShape } from '../src/rootShape.js'
+import { buildModelMeta, OVERLAY_WRITE_HEAD_VERSION } from '../src/modelMeta.js'
 import { generateRichWorkspace, type RichWorkspace } from '../../src/lib/devSeed/richWorkspace.ts'
 import { generateRealWorkspace } from '../../src/lib/devSeed/realWorkspace.ts'
 
@@ -75,13 +78,28 @@ async function main(): Promise<void> {
   if (objectShardUrls.length === 0) objectShardUrls.push(repo.create({ objects: {} }).url)
   if (connectionShardUrls.length === 0) connectionShardUrls.push(repo.create({ connections: {} }).url)
 
+  // The empty overlay write heads every edit is written into. Without them the
+  // client's write-head boot guard (`planBfsWriteMode`) refuses boot-from-server
+  // and boots RESIDENT — online and offline — so a "boot" e2e run against this
+  // seed silently exercised the resident app (measured 2026-10-16:
+  // `boot-from-server refused (no overlay write heads and no overlay content)`).
+  const objectWriteHead = repo.create({ objects: {}, writeHeadVersion: OVERLAY_WRITE_HEAD_VERSION }).url
+  const connectionWriteHead = repo.create({ connections: {}, writeHeadVersion: OVERLAY_WRITE_HEAD_VERSION }).url
+
+  // Through `buildModelMeta`, never a literal: the literal this replaces had no
+  // write heads AND spelled the tag map `tags` keyed by a nonexistent `id`,
+  // so the client (which reads `tagSnapshots`, keyed by `tagId`) saw no tags.
   const metaHandle = repo.create({
-    objectShardUrls,
-    connectionShardUrls,
-    groups: byId(ws.groups),
-    domains: byId(ws.domains),
-    tags: byId(ws.tags),
-    decisionRecords: byId(ws.decisionRecords),
+    ...buildModelMeta({
+      objectShardUrls,
+      connectionShardUrls,
+      objectWriteHead,
+      connectionWriteHead,
+      groups: byId(ws.groups),
+      domains: byId(ws.domains),
+      tagSnapshots: Object.fromEntries(ws.tags.map((tag) => [tag.tagId, tag])),
+      decisionRecords: byId(ws.decisionRecords),
+    }),
     deletedObjectIds: [],
     deletedConnectionIds: [],
   })
