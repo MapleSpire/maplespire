@@ -25,8 +25,9 @@
  *     stop/starts, two extra `resetWorkspaceProjection()` wipes of the model store.
  *
  *  2. The import waited on the GLOBAL `useAutomergeStatus.ready` latch. The bounce
- *     above flipped it true on the previous workspace's behalf, and it never flips for
- *     a brand-new landscape at all (fresh documents keep the status at 'saving').
+ *     above flipped it true on the previous workspace's behalf, and for a brand-new
+ *     landscape it lags the load (fresh documents keep the status at 'saving' until
+ *     acknowledged — forever on an AUTH-off server, before 2026-10-16).
  *
  * Both are exercised end to end in the last test with a stand-in for WorkspaceRoute
  * that reproduces the real guard.

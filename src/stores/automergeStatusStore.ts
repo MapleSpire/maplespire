@@ -56,9 +56,10 @@ interface AutomergeStatusState {
    * Exists because `ready` cannot answer "is THIS workspace loaded?". `ready` is a
    * global durability latch with no workspace identity, so it is satisfied by ANY
    * workspace that reaches 'ready' — including the previous one being re-booted by a
-   * mid-switch route bounce — and on a brand-new landscape, whose freshly created
-   * documents PostgreSQL has not acknowledged yet, it stays false indefinitely
-   * (`durableConnectionStatus` reports 'saving'). Anything that must write into a
+   * mid-switch route bounce — and on a brand-new landscape it stays false until
+   * PostgreSQL acknowledges the freshly created documents (`durableConnectionStatus`
+   * reports 'saving'; on an AUTH-off server that was "forever" until 2026-10-16,
+   * when the server began claiming documents at every stage). Anything that must write into a
    * SPECIFIC workspace waits on this, never on `ready`.
    */
   projectedWorkspace: string | null

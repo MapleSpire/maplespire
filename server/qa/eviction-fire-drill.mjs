@@ -280,7 +280,8 @@ async function runArm({ label, port, inject }) {
       //     `documentsWithPeers` reads 3 instead of 2 — root + viewed + the
       //     orphan.
       //
-      //     WHERE IT ACTS: NOT in `automergeServer.ts`'s `needsShareConfig`.
+      //     WHERE IT ACTS: NOT in `automergeServer.ts`'s share configuration
+      //     (installed unconditionally since 2026-10-16).
       //     It is read directly by the VENDORED PATCH, in
       //     `CollectionSynchronizer.addPeer`
       //     (`patch-automerge-peer-sync-state.mjs`, installed into
@@ -294,7 +295,7 @@ async function runArm({ label, port, inject }) {
       //
       //     The distinction is load-bearing: because the patched `addPeer`
       //     reads the variable directly, the eager attach is NOT gated by
-      //     `needsShareConfig`, so turning `AUTH=on` would not restore the
+      //     the share configuration, so turning `AUTH=on` would not restore the
       //     scenario. It also means the scenario depends on the vendored patch
       //     being applied — see the witness below.
       //   READ_MODEL — a resident projector leases root/ModelMeta/registry,

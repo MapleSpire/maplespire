@@ -130,7 +130,8 @@ async function registerWorkspaceScope(
  * Claim failures PROPAGATE — `foreign` on freshly minted ids is corruption
  * and the create must fail loudly, not half-publish. The marker write alone
  * is best-effort: covered-later costs one walk, a lying marker costs
- * correctness. And when no doc index is registered (AUTH=off boots) the batch
+ * correctness. And when no doc index is registered (DB-free tests; every
+ * server boot registers one since 2026-10-16, AUTH=off included) the batch
  * hook returns false — no claims recorded, so no marker either; the workspace
  * stays on the legacy lazy path, in exact parity with the walk that does not
  * run in that mode.

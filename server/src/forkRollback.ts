@@ -55,7 +55,7 @@ import { StaleSyncCellWriteError } from './automergeStorageErrors.js'
  * workspace-bound id, the publisher claims it in the same step as the
  * `versions` row, and a minted id with no claim and no existing version is
  * reaped by `mintedOrphanReaper.ts` about an hour after its birth; when it
- * could not (an AUTH=off process), the id is a legacy random one and the only
+ * could not (a process with no AUTH_SECRET), the id is a legacy random one and the only
  * net is `gcOrphanedDocs`, 24 h best and ~47 h worst, computed.
  *
  * ## `removeFromCache`, not `delete`
@@ -342,7 +342,7 @@ export function forkRollbackMetricSamples(): MetricSample[] {
   return [
     {
       name: 'maplespire_fork_rollback_undeleted_documents_total',
-      help: 'Documents a failed fork\'s rollback could not remove or did not reach (typically the pool exhaustion that failed the fork, its wall-clock budget, or an unexpected error in the rollback itself). They are unreachable from any version. Which net reclaims one depends on its id: a workspace-bound minted id (created while this process had a mint key and the documents-registration hook) is the minted-orphan reaper\'s, about an hour; a legacy random id (AUTH=off) is gcOrphanedDocs\', 24-48 h. The fork log names the ids and says which. Non-zero means a fork failed AND its cleanup failed. This counter says nothing about documents written back by an Automerge save armed before the failure — nothing can count those at rollback time.',
+      help: 'Documents a failed fork\'s rollback could not remove or did not reach (typically the pool exhaustion that failed the fork, its wall-clock budget, or an unexpected error in the rollback itself). They are unreachable from any version. Which net reclaims one depends on its id: a workspace-bound minted id (created while this process had a mint key and the documents-registration hook) is the minted-orphan reaper\'s, about an hour; a legacy random id (no AUTH_SECRET) is gcOrphanedDocs\', 24-48 h. The fork log names the ids and says which. Non-zero means a fork failed AND its cleanup failed. This counter says nothing about documents written back by an Automerge save armed before the failure — nothing can count those at rollback time.',
       type: 'counter',
       values: [{ value: undeletedTotal }],
     },

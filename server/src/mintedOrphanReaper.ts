@@ -164,7 +164,7 @@ let reapedTotal = 0
 let strandedTotal = 0
 let lastRunCandidates = 0
 /** The refusal is worth one line per process, not one per hour on every
- *  AUTH=off deployment. */
+ *  deployment without an AUTH_SECRET. */
 let refusalLogged = false
 
 function refused(reportOnly: boolean): MintedOrphanReaperResult {

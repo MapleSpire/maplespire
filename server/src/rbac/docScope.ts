@@ -149,9 +149,11 @@ const registrationObservers = new Set<WorkspaceRegistration>()
 
 /**
  * Whether server-created documents will be CLAIMED when their publisher calls
- * `notifyWorkspaceDocumentsCreated`. False on an AUTH=off boot, where no
- * `WorkspaceDocIndex` is constructed and the hook returns `false` without
- * recording anything.
+ * `notifyWorkspaceDocumentsCreated`. False only where no `WorkspaceDocIndex`
+ * has been constructed (DB-free tests), and the hook then returns `false`
+ * without recording anything. Since 2026-10-16 every server boot constructs
+ * one whatever the auth stage (automergeServer.ts § shareConfig); before that,
+ * an AUTH=off boot with routing unset did not.
  *
  * `bootstrapMint.ts` reads this before naming a document with a
  * workspace-bound id: a minted id whose claim would never be recorded is the
@@ -199,8 +201,9 @@ export async function notifyWorkspaceDocumentCreated(args: {
  * round trip per 1,000 ids instead of one per document, and the in-process
  * `byDoc` is fed alongside, saving the same N `resolveDurable`s.
  *
- * Returns false when no doc index is registered (AUTH=off boots), matching the
- * walk, which does not run in that mode either. The return value is the
+ * Returns false when no doc index is registered (DB-free tests; every server
+ * boot registers one since 2026-10-16), matching the walk, which does not run
+ * in that mode either. The return value is the
  * caller's licence for the coverage marker: no claims recorded means no marker
  * may claim they were.
  *
@@ -285,7 +288,7 @@ export async function createClaimedDocument<T>(
   // unclaimed document.
   await repo.flush([handle.documentId])
   // The return value is discarded deliberately: it is `false` only when no
-  // document index is registered (auth off), and in that mode the catalog walk
+  // document index is registered (DB-free tests), and in that mode the catalog walk
   // does not run either. So "claimed" here means "claimed wherever a document
   // index is registered". `landscapes.ts` does honour the boolean before writing
   // its coverage marker.
@@ -303,8 +306,8 @@ export function observeWorkspaceCreation(fn: WorkspaceRegistration): () => void 
 }
 
 /** Called by landscapes.ts after persisting a new version's root. No-op until
- * `registerWorkspaceCreation` has been called (e.g. in tests, or AUTH=off boots
- * that never construct a WorkspaceDocIndex) — registration is best-effort. */
+ * `registerWorkspaceCreation` has been called (e.g. in tests that never
+ * construct a WorkspaceDocIndex) — registration is best-effort. */
 export function notifyWorkspaceCreated(args: { landscapeId: string; versionId: string; rootUrl: string }): void {
   // Every creation path funnels through this hook after its scope row is
   // durable. Drop this process's negative cache immediately; sibling server

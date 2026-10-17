@@ -29,8 +29,9 @@ import { workspaceRefKey, type WorkspaceRef } from './workspace'
  *      into a new landscape" producing an empty landscape).
  *   2. It is a DURABILITY latch, not a load signal — `durableConnectionStatus` reports
  *      'saving' while any local document is still unacknowledged by PostgreSQL. A
- *      brand-new landscape always has some, so `ready` can stay false indefinitely and
- *      the caller times out even though the workspace is perfectly usable.
+ *      brand-new landscape always has some, so `ready` lags the load — and on an
+ *      AUTH-off server it stayed false for good until 2026-10-16 — while the
+ *      workspace is already perfectly usable.
  *
  * `projectedWorkspace` answers the question actually being asked, and only for the
  * workspace being asked about.

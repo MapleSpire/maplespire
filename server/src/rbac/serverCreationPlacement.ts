@@ -73,7 +73,7 @@ import type { MetricSample } from '../runtime/metrics.js'
  *
  * ## Bounded, and it says when it dropped something
  *
- * A process whose claims never land (e.g. AUTH=off, where
+ * A process whose claims never land (e.g. one with no doc index, where
  * `notifyWorkspaceDocumentsCreated` returns false and nothing purges) would
  * grow an unbounded map forever. The bound caps memory; overflow counters are
  * exported to `/metrics` (`maplespire_server_creation_placement_overflows_total`

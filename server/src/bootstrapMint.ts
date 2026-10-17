@@ -52,8 +52,9 @@ import type { MetricSample } from './runtime/metrics.js'
  * `hasMintKey`, which counts retired keys minting cannot use; a blank
  * `AUTH_SECRET=` beside a populated `AUTH_SECRET_PREVIOUS` would otherwise make
  * every creation throw) AND the documents-registration hook the publishers
- * claim through is installed (`hasWorkspaceDocumentsRegistration`). On an
- * AUTH=off boot neither is, and this function is `repo.create` — the 16-byte
+ * claim through is installed (`hasWorkspaceDocumentsRegistration`). The hook
+ * is installed on every server boot since 2026-10-16, so in practice the
+ * switch is the key: with no `AUTH_SECRET` this function is `repo.create` — the 16-byte
  * legacy id the reaper never looks at. A minted id whose claim would never be
  * recorded is precisely the shape the reaper would later mistake for an
  * orphan, so the two cannot be on independently. The fallback is counted, not
@@ -192,7 +193,7 @@ export function bootstrapMintMetricSamples(): MetricSample[] {
     },
     {
       name: 'maplespire_bootstrap_documents_unminted_total',
-      help: 'Bootstrap-family documents created with a legacy random id because no mint key or no documents-registration hook was present (AUTH=off boots). Expected non-zero only where AUTH is off; on an AUTH=on process it means a workspace was created before the doc index was constructed.',
+      help: 'Bootstrap-family documents created with a legacy random id because no mint key or no documents-registration hook was present (a process with no AUTH_SECRET). Expected non-zero only where AUTH_SECRET is unset; otherwise it means a workspace was created before the doc index was constructed.',
       type: 'counter',
       values: [{ value: unmintedTotal }],
     },

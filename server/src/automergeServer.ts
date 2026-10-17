@@ -35,6 +35,7 @@ import { authenticateUpgrade, createCachedUpgradeSessionVerifier, rejectUpgrade,
 import { createSessionEpochValidator } from './auth/sessionEpoch.js'
 import type { SessionClaims } from './auth/tokens.js'
 import { WorkspaceDocIndex, buildAccessCheck, buildWorkspaceRouteCheck, buildWriteCheck, buildBaselineWriteFence, resolveDocumentPlacement, allowedWorkspaceKeys, invalidateAllowedWorkspaceKeysCache, type GateFaultReporter } from './rbac/docScope.js'
+import { accessCheckMode, createClaimOnlyAccessCheck } from './rbac/claimOnlyAccessCheck.js'
 import { createDenyLedger, type DenyLedger, type DenyLedgerSnapshot } from './rbac/denyLedger.js'
 import { installDenyLedgerReleaseGuard } from './readModel/documentReleaseGuard.js'
 import { installProvisionalPlacementSource } from './rbac/provisionalPlacementSource.js'
@@ -807,11 +808,10 @@ export function buildOwnershipWriteCheck(deps: {
  *   - A `WorkspaceDocIndex` (rbac/docScope.ts) resolves any doc id to its
  *     `(landscapeId, versionId)`, and `buildAccessCheck` + `stageAwareAccessCheck`
  *     compose that into the `accessCheck` passed to `createSelectiveSync`.
- *   - `shareConfig` (vs. the legacy `sharePolicy: async () => true`) is used
- *     whenever EITHER `AM_SELECTIVE_SYNC=on` OR `authStage() !== 'off'` — the
- *     latter because `sharePolicy` only controls `announce` and has no `access`
- *     gate, so RBAC enforcement requires `shareConfig`. With BOTH off, the repo
- *     uses the legacy `sharePolicy`.
+ *   - `shareConfig` is always used (the legacy `sharePolicy: async () => true`
+ *     has no `access` gate). Its `access` hook runs the workspace route gate at
+ *     every stage, because that gate writes `automerge_document_workspace`, the
+ *     table the durable-heads acknowledgement reads.
  *   - `startEpochRevocation` terminates live connections whose session epoch
  *     falls behind a grant-change-triggered bump (stage 'on' only; 'dual' logs).
  *
@@ -836,7 +836,8 @@ export async function startAutomergeSync(
   transportTelemetry: AutomergeTransportTelemetry
   storageFenceSnapshot: () => StorageFenceSnapshot
   storageFenceRejectionCount: () => number
-  /** Null when no doc index is configured (AUTH off and routing not required). */
+  /** Null when no doc index is configured — which no boot does since
+   * 2026-10-16 (the index is built at every stage); kept nullable for callers. */
   denyLedgerSnapshot: () => DenyLedgerSnapshot | null
   residency: AutomergeResidencyLeases
   setPinnedCoreDocument: (owner: string, documentId?: string) => void
@@ -893,10 +894,28 @@ export async function startAutomergeSync(
   // Selective sync (AM_SELECTIVE_SYNC=on, default off): announce only the CORE boot
   // docs (root + model + ModelMeta + registry shards) and serve everything else on
   // demand, instead of pushing all ~300 docs to every client on connect (a ~52s
-  // boot at 20k). Default off ⇒ `sharePolicy: async () => true`, UNLESS auth or
-  // workspace routing needs `shareConfig` (see the function doc comment above).
+  // boot at 20k).
+  //
+  // `shareConfig` is installed in EVERY configuration, not only when selective
+  // sync, auth or required routing asks for it: its `access` hook is where the
+  // workspace route gate runs, and the route gate is the only writer of
+  // `automerge_document_workspace` on the sync path. That table is what
+  // `POST /api/automerge/durable-heads` acknowledges against, so a server
+  // without the gate (AUTH off, AM_WORKSPACE_ROUTING unset — `npm start`,
+  // `dev:server`, `dev:boot`) answered `durable:false` for every document it
+  // stored and the client badge never left "saving" (measured 2026-10-16: five
+  // documents in `automerge_storage`, zero manifest rows; regression in
+  // e2e/boot/new-landscape-durable.spec.ts). Every container and IaC launcher
+  // already sets AM_WORKSPACE_ROUTING=on, so this is what they ran.
+  //
+  // `createSelectiveSync` announces only the core docs whatever
+  // AM_SELECTIVE_SYNC says, which is what every auth-on or routed deployment
+  // already did. The flag still selects the peer-binding behaviour: the
+  // vendored automerge-repo patch reads it directly in
+  // `CollectionSynchronizer.addPeer` (see server/qa/eviction-fire-drill.mjs).
+  // Measured 2026-10-16 with it OFF on this code: the regression spec above
+  // passes; on the previous code it stayed "saving".
   const selectiveOn = process.env.AM_SELECTIVE_SYNC === 'on'
-  const needsShareConfig = selectiveOn || stage !== 'off' || workspaceRoutingRequired
   let rootHandle: DocHandle<unknown> | null = null
 
   // The doc index needs `repo` to walk doc graphs (`repo.find`), but `repo`'s
@@ -907,12 +926,10 @@ export async function startAutomergeSync(
   const accessCheckRef: { current: ((peerId: string, documentId: string) => Promise<boolean>) | null } = {
     current: null,
   }
-  const selective = needsShareConfig
-    ? createSelectiveSync(
-        () => rootHandle,
-        async (peerId, documentId) => (accessCheckRef.current ? accessCheckRef.current(peerId, documentId) : true)
-      )
-    : null
+  const selective = createSelectiveSync(
+    () => rootHandle,
+    async (peerId, documentId) => (accessCheckRef.current ? accessCheckRef.current(peerId, documentId) : true)
+  )
 
   const adapter = new AuthenticatedWSServerAdapter(wss as unknown as WssParam, transportTelemetry)
   adapter.setPeerCandidateBinder((peerId, socket) => connectionRegistry.bindPeer(peerId, socket))
@@ -934,16 +951,17 @@ export async function startAutomergeSync(
     network: [adapter],
     storage: storageAdapter,
     saveDebounceRate: automergeSaveDebounceRate(),
-    ...(selective ? { shareConfig: selective.shareConfig } : { sharePolicy: async () => true }),
+    shareConfig: selective.shareConfig,
   })
 
   // The doc index needs the real repo to walk doc graphs (`repo.find`), which
   // only exists once `repo` is constructed above — hence `accessCheckRef`'s
   // indirection: `shareConfig` is wired into `repo`'s constructor before the
   // index/check can be built, so it reads through the ref instead.
-  const docIndex = stage !== 'off' || workspaceRoutingRequired
-    ? new WorkspaceDocIndex(repo, pool)
-    : null
+  //
+  // Built whatever the auth stage: see the `shareConfig` comment above — the
+  // manifest the durability acknowledgement reads is written by this index.
+  const docIndex = new WorkspaceDocIndex(repo, pool)
   // THE WIRE between the route gate's placement and the storage fence. The
   // fence consults it only when its own durable SELECT missed, so the mapping
   // row stays the sole operand wherever it exists; this covers the window
@@ -1064,7 +1082,17 @@ export async function startAutomergeSync(
   gateFaultRef.current = denyLedger
     ? (peerId, documentId, workspace) => denyLedger.recordDeny(peerId, documentId, 'gate-fault', workspace)
     : null
-  if (docIndex && (stage !== 'off' || workspaceRoutingRequired)) {
+  // With AUTH off and routing optional nothing is enforced, as before — but the
+  // route gate still RUNS for its claim into `automerge_document_workspace`,
+  // the table the durable-heads acknowledgement reads. Its verdict is
+  // discarded and it reports no faults, so the deny ledger never sees this
+  // configuration (rbac/claimOnlyAccessCheck.ts says why a deny here would be
+  // a data-loss path, not a fix).
+  if (accessCheckMode(stage, workspaceRoutingRequired) === 'claim-only') {
+    accessCheckRef.current = createClaimOnlyAccessCheck(
+      buildWorkspaceRouteCheck(docIndex, connectionRegistry, false),
+    )
+  } else {
     const authCheck = stage !== 'off'
       ? stageAwareAccessCheck(
         buildAccessCheck(pool, docIndex, connectionRegistry, { onFault: reportGateFault }),

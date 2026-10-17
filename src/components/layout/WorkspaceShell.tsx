@@ -361,9 +361,9 @@ function ShellFooter({ stats }: { stats?: ShellFooterStat[] }) {
   const retriesInFlight = useRoutedRetriesInFlight()
   const status = effectiveSyncStatus(durabilityStatus, retriesInFlight)
   const error = useAutomergeStatus((s) => s.error)
-  // Test hook only. `status` is a DURABILITY latch and sits at 'saving'
-  // indefinitely on a brand-new landscape (see awaitWorkspaceProjection.ts), so
-  // it cannot answer "is THIS workspace loaded?". `projectedWorkspace` can, and
+  // Test hook only. `status` is a DURABILITY latch with no workspace identity
+  // (see awaitWorkspaceProjection.ts), so it cannot answer "is THIS workspace
+  // loaded?". `projectedWorkspace` can, and
   // e2e specs that write into a freshly created workspace must gate on it.
   const projectedWorkspace = useAutomergeStatus((s) => s.projectedWorkspace)
   // A cached-root fallback session serves LOCAL content while the server warms

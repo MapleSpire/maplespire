@@ -230,7 +230,8 @@ function SyncState({ compact = false }: { compact?: boolean }) {
   const status = effectiveSyncStatus(durabilityStatus, useRoutedRetriesInFlight())
   const error = useAutomergeStatus((state) => state.error)
   // Test hook only — see the note on WorkspaceShell's ws-sync-status. `status`
-  // is a durability latch and never reaches 'ready' on a brand-new landscape;
+  // is a durability latch with no workspace identity (and until 2026-10-16 it
+  // never reached 'ready' on a brand-new landscape of an AUTH-off server);
   // `projectedWorkspace` is the signal that names the loaded workspace.
   const projectedWorkspace = useAutomergeStatus((state) => state.projectedWorkspace)
   // A cached-root fallback session serves LOCAL content — surface it as a title

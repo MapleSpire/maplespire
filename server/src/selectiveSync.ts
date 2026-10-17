@@ -146,7 +146,9 @@ export interface SelectiveSync {
  *
  * `accessCheck` (optional): layered onto BOTH gates.
  *   - `access`: `hasAccess = await accessCheck(peerId, documentId)`; when absent,
- *     the default is "never refuse" (AUTH=off behaviour).
+ *     the default is "never refuse" (the server always passes one since
+ *     2026-10-16; at AUTH=off it is the claim-only check, which never refuses
+ *     either — rbac/claimOnlyAccessCheck.ts).
  *   - `announce`: the doc must be in the core set AND pass `accessCheck` — a
  *     connection that can't access a workspace must not be proactively pushed
  *     its core docs either. `accessCheck` is expected to already be
