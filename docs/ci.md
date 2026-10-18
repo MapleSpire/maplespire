@@ -100,6 +100,14 @@ the one-stack-per-worktree rule). `--static` adds the lint/build job; `--down` r
 the containers; `--update-allowlist` regenerates the allowlist after a
 *deliberate* change.
 
+One deliberate difference from the runner: every `ci:local` run reloads its
+Postgres container with `fsync`, `synchronous_commit` and `full_page_writes`
+off (`scripts/ci-local-postgres.mjs`). They change only how long Postgres waits
+on the disk, never a result, and the DB-gated suites' per-file `DROP DATABASE`
+checkpoints were slow enough on a busy Docker disk (165 s vs 50 s for the same
+178 files, measured) to risk hook timeouts. The GitHub service container keeps
+the defaults.
+
 Each run keeps its console output and its reports under `reports/<run-id>/`, so a
 red run can still be read after the next one has gone green.
 

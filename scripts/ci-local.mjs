@@ -63,6 +63,7 @@ import {
   lockPath,
   parseCiLocalArgs,
 } from './ci-local-guard.mjs'
+import { tunePostgresForTests } from './ci-local-postgres.mjs'
 
 const ROOT = path.resolve(import.meta.dirname, '..')
 const PG_PORT = process.env.CI_LOCAL_PG_PORT ?? DEFAULT_PG_PORT
@@ -309,6 +310,9 @@ async function main() {
   startServices()
   await waitHealthy(PG_CONTAINER)
   await waitHealthy(REDIS_CONTAINER)
+  // Before freshDatabase(): its DROP/CREATE DATABASE already pays the checkpoint.
+  tunePostgresForTests((sql) => run('docker', ['exec', PG_CONTAINER, 'psql', '-U', 'maplespire',
+    '-d', 'postgres', '-v', 'ON_ERROR_STOP=1', '-c', sql], { capture: true }))
   freshDatabase()
 
   if (args.static) {
