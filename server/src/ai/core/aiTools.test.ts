@@ -24,6 +24,7 @@ import { buildSystemPrompt } from './systemPrompt.js'
 import {
   aiToolRegistry, executeAiTool, exportToolSpecs, mcpToolSchema, splitMcpArgs, toolInputJsonSchema,
 } from './toolRegistry.js'
+import { objects } from './tools/shapes.js'
 
 /**
  * Shared-core tool tests against a REAL in-memory Automerge repo (fixture
@@ -323,6 +324,50 @@ describe('read tools (monolith)', () => {
       hits: { id: string }[]
     }
     expect(compact.hits.map((hit) => hit.id)).toContain('legacy')
+  })
+
+  // Reported 2026-10-18: set then clear shortDescription on a legacy object
+  // left the card with no label. That is the contract (src/lib/objectDescription.ts):
+  // deleting the key instead would demote the Markdown `description` to the
+  // card label and hide it from the Documentation field.
+  it('update_model_object shortDescription: null stores an explicit empty label', async () => {
+    const repo = new Repo({})
+    const rootUrl = await seedMonolith(repo, {
+      objects: {
+        order: obj('order', 'Order Service', { description: 'Order lifecycle, from cart to doorstep.' }),
+      },
+    })
+    const ctx = ctxFor(repo, rootUrl)
+    const stored = async () => objects(await ctx.session.snapshot()).order
+
+    await executeAiTool(ctx, 'update_model_object', {
+      id: 'order', shortDescription: 'Publishes OrderPlaced events to Kafka.',
+    })
+    expect(await stored()).toMatchObject({
+      shortDescription: 'Publishes OrderPlaced events to Kafka.',
+      description: 'Order lifecycle, from cart to doorstep.',
+    })
+
+    await executeAiTool(ctx, 'update_model_object', { id: 'order', shortDescription: null })
+    const cleared = await stored()
+    expect(Object.prototype.hasOwnProperty.call(cleared, 'shortDescription')).toBe(true)
+    expect(cleared.shortDescription).toBe('')
+    expect(cleared.description).toBe('Order lifecycle, from cart to doorstep.')
+  })
+
+  it('update_model_object keeps a shortDescription set alongside description on a legacy object', async () => {
+    const repo = new Repo({})
+    const rootUrl = await seedMonolith(repo, {
+      objects: { legacy: obj('legacy', 'Legacy', { description: 'Old label' }) },
+    })
+    const ctx = ctxFor(repo, rootUrl)
+    await executeAiTool(ctx, 'update_model_object', {
+      id: 'legacy', shortDescription: 'New label', description: '# Docs',
+    })
+    expect(objects(await ctx.session.snapshot()).legacy).toMatchObject({
+      shortDescription: 'New label',
+      description: '# Docs',
+    })
   })
 
   it('gets object detail with relations, diagrams and groups', async () => {

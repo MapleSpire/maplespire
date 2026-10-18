@@ -32,6 +32,15 @@ describe('objectShortDescription', () => {
     expect(objectShortDescription({ shortDescription: '', description: '# Detailed' })).toBeUndefined()
   })
 
+  // The stored shape update_model_object leaves after `shortDescription: null`
+  // on a legacy object (reported 2026-10-18): the card shows no label, and the
+  // old text stays reachable as documentation rather than coming back as the label.
+  it('renders no card label for a cleared short description and keeps the documentation', () => {
+    const cleared = { shortDescription: '', description: 'Order lifecycle, from cart to doorstep.' }
+    expect(objectShortDescription(cleared)).toBeUndefined()
+    expect(objectDetailedDescription(cleared)).toBe('Order lifecycle, from cart to doorstep.')
+  })
+
   it('materializes the legacy compact label before the first detailed edit', () => {
     expect(separateObjectDescription({ description: 'Legacy summary' }, '# New details')).toEqual({
       shortDescription: 'Legacy summary',

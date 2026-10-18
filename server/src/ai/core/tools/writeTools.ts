@@ -244,7 +244,7 @@ export const writeTools: AiToolDef[] = [
     name: 'update_model_object',
     title: 'Update model object',
     description:
-      'Update fields of a model object. shortDescription is the 120-character diagram label; description is unbounded Markdown documentation. Pass null to clear either field. Governed Tag and Technology assignments are managed through their catalog UIs.',
+      'Update fields of a model object. shortDescription is the 120-character diagram label; description is unbounded Markdown documentation. Pass null to clear either field: a cleared shortDescription leaves the diagram card with NO label (it never falls back to description). Governed Tag and Technology assignments are managed through their catalog UIs.',
     mode: 'write',
     schema: z.object({
       id: z.string(),
@@ -275,12 +275,17 @@ export const writeTools: AiToolDef[] = [
       }
       const next: ObjView = { ...current }
       if (input.name !== undefined) next.name = input.name
+      // null stores '' rather than deleting the key: an absent key puts the
+      // object back in the legacy shape, where `description` IS the card label
+      // and is hidden from the Documentation field (src/lib/objectDescription.ts).
       if (input.shortDescription !== undefined) {
         if (input.shortDescription === null) next.shortDescription = ''
         else next.shortDescription = input.shortDescription
       }
       if (input.description !== undefined) {
-        if (!Object.prototype.hasOwnProperty.call(current, 'shortDescription')) {
+        // Materialize the legacy label only when this call does not set one.
+        if (input.shortDescription === undefined
+          && !Object.prototype.hasOwnProperty.call(current, 'shortDescription')) {
           next.shortDescription = current.description ?? ''
         }
         if (input.description === null) delete next.description
