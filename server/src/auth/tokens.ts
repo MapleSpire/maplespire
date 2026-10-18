@@ -33,6 +33,36 @@ export const SESSION_COOKIE_NAME = 'maplespire_session'
  * always 3600s — never longer-lived than the impersonation session itself. */
 export const ADMIN_STASH_COOKIE_NAME = 'maplespire_admin_session'
 
+const COOKIE_NAME_PATTERN = /^[A-Za-z0-9_-]{1,64}$/
+
+/**
+ * The session cookie's name: `AUTH_COOKIE_NAME`, or `maplespire_session`.
+ *
+ * Browsers scope cookies by HOST and ignore the port, so every stack on
+ * `localhost` shares one `maplespire_session`. A login on one worktree's stack
+ * overwrote another's with a token signed by a different `AUTH_SECRET`, and
+ * the next request there answered 401 "Invalid or expired session" —
+ * reproduced 2026-10-17 (a login on :3999 logged :3013 out). Separate hosts
+ * (every real deployment) never collide, so the default is unchanged;
+ * `scripts/dev-boot.mjs` names it per server port. Throws on an invalid name
+ * rather than falling back: a silently different cookie is a login loop.
+ */
+export function sessionCookieName(): string {
+  const configured = process.env.AUTH_COOKIE_NAME
+  if (configured === undefined || configured === '') return SESSION_COOKIE_NAME
+  if (!COOKIE_NAME_PATTERN.test(configured)) {
+    throw new Error(`AUTH_COOKIE_NAME must match ${COOKIE_NAME_PATTERN} (got ${JSON.stringify(configured)})`)
+  }
+  return configured
+}
+
+/** The impersonation stash cookie, named after the session cookie so a
+ * renamed session never shares its stash with another stack's. */
+export function adminStashCookieName(): string {
+  const session = sessionCookieName()
+  return session === SESSION_COOKIE_NAME ? ADMIN_STASH_COOKIE_NAME : `${session}_admin`
+}
+
 const DEFAULT_SESSION_MAX_AGE_S = 30 * 24 * 60 * 60 // 30 days
 
 /** Claims carried in the session JWT. `epoch` pins the org's auth_epochs
@@ -167,7 +197,7 @@ function parseCookies(header: string | undefined): Record<string, string> {
 /** Read the session token from the request's `Cookie` header, or null if absent. */
 export function readSessionCookie(req: Request): string | null {
   const cookies = parseCookies(req.headers.cookie)
-  return cookies[SESSION_COOKIE_NAME] ?? null
+  return cookies[sessionCookieName()] ?? null
 }
 
 /** Read an arbitrary named cookie (e.g. `ADMIN_STASH_COOKIE_NAME`) from the
@@ -204,12 +234,12 @@ function cookieAttrs(maxAgeS?: number): string {
 
 /** Set the session cookie on the response, honoring `AUTH_SESSION_MAX_AGE_S`. */
 export function setSessionCookie(res: Response, token: string): void {
-  res.append('Set-Cookie', `${SESSION_COOKIE_NAME}=${encodeURIComponent(token)}; ${cookieAttrs(sessionMaxAgeS())}`)
+  res.append('Set-Cookie', `${sessionCookieName()}=${encodeURIComponent(token)}; ${cookieAttrs(sessionMaxAgeS())}`)
 }
 
 /** Clear the session cookie (logout) — same attributes, immediate expiry. */
 export function clearSessionCookie(res: Response): void {
-  res.append('Set-Cookie', `${SESSION_COOKIE_NAME}=; ${cookieAttrs(0)}; Expires=Thu, 01 Jan 1970 00:00:00 GMT`)
+  res.append('Set-Cookie', `${sessionCookieName()}=; ${cookieAttrs(0)}; Expires=Thu, 01 Jan 1970 00:00:00 GMT`)
 }
 
 /** Set an arbitrary named cookie with the same attributes (HttpOnly,

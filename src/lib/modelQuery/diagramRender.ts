@@ -254,3 +254,19 @@ export async function fetchDiagramDocHeads(diagramId: string): Promise<string[] 
     return undefined
   }
 }
+
+/** Whether the ACTIVE workspace's own registry lists `diagramId`, per the
+ * server (see server registryHasDiagram), or undefined when it cannot tell
+ * (offline, refused, too large, malformed). */
+export async function fetchRegistryHasDiagram(diagramId: string): Promise<boolean | undefined> {
+  try {
+    const res = await fetcher(
+      `${API_BASE}/api/automerge/registry-diagram?${withWorkspaceParams(`id=${encodeURIComponent(diagramId)}`)}`,
+    )
+    if (!res.ok) return undefined
+    const { present } = (await res.json()) as { present?: unknown }
+    return typeof present === 'boolean' ? present : undefined
+  } catch {
+    return undefined
+  }
+}

@@ -28,7 +28,7 @@ import {
   clearNamedCookie,
   readSessionCookie,
   readNamedCookie,
-  ADMIN_STASH_COOKIE_NAME,
+  adminStashCookieName,
 } from './tokens.js'
 
 /**
@@ -591,7 +591,7 @@ export function registerPlatformRoutes(app: Express): void {
       const stashToken =
         currentToken ??
         (await signSession({ userId: auth.userId, orgId: req.auth!.orgId, isPlatformAdmin: true, epoch: req.auth!.epoch }))
-      setNamedCookie(res, ADMIN_STASH_COOKIE_NAME, stashToken, IMPERSONATION_MAX_AGE_S)
+      setNamedCookie(res, adminStashCookieName(), stashToken, IMPERSONATION_MAX_AGE_S)
 
       // isPlatformAdmin is ALWAYS false during impersonation — the "read-only
       // WYSIWYG debugging" contract means the impersonated view must
@@ -641,7 +641,7 @@ export function registerPlatformRoutes(app: Express): void {
       return
     }
 
-    const stashToken = readNamedCookie(req, ADMIN_STASH_COOKIE_NAME)
+    const stashToken = readNamedCookie(req, adminStashCookieName())
     if (!stashToken) {
       res.status(400).json({ error: 'no-stashed-session' })
       return
@@ -654,7 +654,7 @@ export function registerPlatformRoutes(app: Express): void {
 
     try {
       setSessionCookie(res, stashToken)
-      clearNamedCookie(res, ADMIN_STASH_COOKIE_NAME)
+      clearNamedCookie(res, adminStashCookieName())
 
       await pool.query(
         `UPDATE impersonations SET ended_at = now()

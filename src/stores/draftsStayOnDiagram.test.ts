@@ -22,6 +22,11 @@
  * hands the diagram being viewed to `switchWorkspace` as a PREFERENCE (the
  * bridge's half — fall back to the default when the target version lacks it —
  * is pinned in bridgePreferredDiagram.test.ts).
+ *
+ * `switchWorkspace` is mocked here, so these tests prove only that the diagram
+ * is HANDED to the switch — never that the canvas lands on it. They stayed
+ * green through the 2026-10-17 regression (empty canvas on a fresh Draft);
+ * the drawn-canvas proof is e2e/boot/draft-stays-on-diagram.spec.ts.
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { useDraftsStore } from './draftsStore'

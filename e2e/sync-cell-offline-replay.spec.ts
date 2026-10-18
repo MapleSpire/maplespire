@@ -94,7 +94,8 @@ async function shareSession(
 async function cookieHeader(context: BrowserContext): Promise<string> {
   const cookies = await context.cookies()
   const header = cookies.map(({ name, value }) => `${name}=${value}`).join('; ')
-  if (!header.includes('maplespire_session=')) throw new Error('authenticated session cookie is missing')
+  // AUTH_COOKIE_NAME may rename it (scripts/dev-boot.mjs suffixes the port).
+  if (!/(^|; )maplespire_session[\w-]*=/.test(header)) throw new Error('authenticated session cookie is missing')
   return header
 }
 

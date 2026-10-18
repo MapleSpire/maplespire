@@ -303,6 +303,9 @@ export class CanvasEngine {
   private ctx: CanvasRenderingContext2D
   private dpr: number
   private viewport: Viewport = { x: 0, y: 0, scale: 1 }
+  /** The last fit or focus asked for while the canvas had no size; resize()
+   *  replays it (see holdFitUntilSized). */
+  private pendingFit: (() => void) | null = null
   private objects: C4Object[] = []
   private connections: Connection[] = []
   private groups: Group[] = []
@@ -1320,6 +1323,7 @@ export class CanvasEngine {
   }
 
   zoomToFit(insets: CanvasViewportInsets = {}) {
+    if (this.holdFitUntilSized(() => this.zoomToFit(insets))) return
     if (this.objects.length === 0) {
       this.viewport = { x: 0, y: 0, scale: 1 }
       this.scheduleRender()
@@ -1334,6 +1338,21 @@ export class CanvasEngine {
     this.viewport.x = visible.left + visible.width / 2 - (bounds.x + bounds.width / 2) * this.viewport.scale
     this.viewport.y = visible.top + visible.height / 2 - (bounds.y + bounds.height / 2) * this.viewport.scale
     this.scheduleRender()
+  }
+
+  /** A canvas with no size has no visible rect: visibleCanvasRect clamps it to
+   *  1 px, so a fit lands at scale ≈0.0007 (measured once in the desktop
+   *  browser pane, 2026-10-17) and a focus at the 0.1 floor — and CanvasView's
+   *  fit-once-per-diagram guard is spent on it. Hold the request instead;
+   *  resize() replays the latest one when the canvas gets a size. Returns true
+   *  when held. Any fit or focus on a sized canvas drops an older held one. */
+  private holdFitUntilSized(replay: () => void): boolean {
+    if (this.canvas.width === 0 || this.canvas.height === 0) {
+      this.pendingFit = replay
+      return true
+    }
+    this.pendingFit = null
+    return false
   }
 
   /** The part of the canvas, in CSS pixels, that the side panels overlaying it
@@ -1361,6 +1380,7 @@ export class CanvasEngine {
   }
 
   setZoom(zoom: number) {
+    this.pendingFit = null // an explicit zoom outranks an older held fit
     const centerX = this.canvas.width / this.dpr / 2
     const centerY = this.canvas.height / this.dpr / 2
     const worldX = (centerX - this.viewport.x) / this.viewport.scale
@@ -1383,6 +1403,7 @@ export class CanvasEngine {
   /** Set the viewport wholesale — the 3D board hands its final framing back
    * through this on exit, so the flat canvas resumes where the camera looked. */
   setViewport(v: { x: number; y: number; scale: number }) {
+    this.pendingFit = null // an explicit framing outranks an older held fit
     this.viewport = { x: v.x, y: v.y, scale: Math.max(0.1, Math.min(4, v.scale)) }
     this.callbacks.onZoom(this.viewport.scale)
     this.scheduleRender()
@@ -1393,6 +1414,7 @@ export class CanvasEngine {
     padding = 120,
     insets: CanvasViewportInsets = {},
   ) {
+    if (this.holdFitUntilSized(() => this.focusOnBounds(bounds, padding, insets))) return
     const visible = this.visibleCanvasRect(insets)
     const scaleX = visible.width / (bounds.width + padding * 2)
     const scaleY = visible.height / (bounds.height + padding * 2)
@@ -1701,6 +1723,13 @@ export class CanvasEngine {
     this.canvas.style.height = `${height}px`
     this.ctx.scale(this.dpr, this.dpr)
     this.scheduleRender()
+    const pending = this.pendingFit
+    if (pending && width > 0 && height > 0) {
+      pending()
+      // The caller that asked for this fit has long read getZoom(); the
+      // readout follows the replayed one through the ordinary zoom callback.
+      this.callbacks.onZoom(this.viewport.scale)
+    }
   }
 
   /** Override the raster density (offscreen export supersampling — 1×/2×/3×).

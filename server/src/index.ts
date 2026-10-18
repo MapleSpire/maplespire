@@ -58,6 +58,7 @@ import type { DenyLedgerSnapshot } from './rbac/denyLedger.js'
 import { collectAutomergeGarbage, type AutomergeResidencyLeases } from './automergeResidency.js'
 import {
   diagramDocHeads,
+  registryHasDiagram,
   resolveDiagramDocUrlFromReadModel,
   resolveDiagramDocUrlFromRegistry,
 } from './diagramHeads.js'
@@ -177,6 +178,7 @@ import {
 import { registerOrgAdminRoutes } from './rbac/orgRoutes.js'
 import { registerPlatformRoutes } from './auth/platformRoutes.js'
 import { authStage, requireAuth } from './auth/middleware.js'
+import { sessionCookieName } from './auth/tokens.js'
 import { registerAuthRoutes } from './auth/devLogin.js'
 import { registerPasswordAuthRoutes } from './auth/passwordAuth.js'
 import { registerOidcRoutes } from './auth/oidc.js'
@@ -395,6 +397,8 @@ registerPlatformRoutes(app)
 registerTechnologyRoutes(app, pool)
 registerTagRoutes(app, pool)
 registerLinkMetadataRoutes(app)
+// An invalid AUTH_COOKIE_NAME must stop the boot, not 401 every request.
+if (authStage() !== 'off') sessionCookieName()
 app.get('/api/auth/config', (_req, res) => {
   res.json({
     stage: authStage(),
@@ -3210,6 +3214,49 @@ async function main() {
     } catch (err) {
       console.error('doc-heads error:', err)
       res.status(500).json({ error: 'failed to read diagram heads' })
+    }
+  })
+
+  // Whether a workspace's OWN registry lists a diagram (see registryHasDiagram):
+  // a booting client's answer to "does this version have the diagram I was
+  // viewing?" when its own registry copy may be stale. Same stage-aware
+  // workspace gate as doc-heads; the root is resolved server-side.
+  app.get('/api/automerge/registry-diagram', async (req, res) => {
+    const landscapeId = typeof req.query.landscapeId === 'string' ? req.query.landscapeId : undefined
+    const versionId = typeof req.query.versionId === 'string' ? req.query.versionId : undefined
+    const id = typeof req.query.id === 'string' ? req.query.id : ''
+    if (!id) {
+      res.status(400).json({ error: 'missing diagram id' })
+      return
+    }
+    try {
+      const canonical = await canonicalWorkspaceKey(pool, {
+        landscapeId: landscapeId ?? DEFAULT_WORKSPACE_KEY.landscapeId,
+        versionId: versionId ?? DEFAULT_WORKSPACE_KEY.versionId,
+      })
+      if (canonical && !(await checkWorkspaceAccess(pool, req, canonical))) {
+        res.status(403).json({ error: 'forbidden' })
+        return
+      }
+      const url = canonical ? await resolveRootUrl(landscapeId, versionId, rootUrl) : null
+      if (!url) {
+        res.status(404).json({ error: `unknown workspace ${landscapeId ?? 'default'}/${versionId ?? 'current'}` })
+        return
+      }
+      const result = await registryHasDiagram(repo, url, id)
+      if (result.state === 'not-found') {
+        res.status(404).json({ error: 'registry not found' })
+        return
+      }
+      if (result.state === 'too-large') {
+        res.status(422).json({ error: 'registry too large for a presence probe', shardCount: result.shardCount })
+        return
+      }
+      res.setHeader('Cache-Control', 'private, no-store')
+      res.json({ present: result.present })
+    } catch (err) {
+      console.error('registry-diagram error:', err)
+      res.status(500).json({ error: 'failed to read the registry' })
     }
   })
 

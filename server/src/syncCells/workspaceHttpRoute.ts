@@ -67,6 +67,7 @@ function isWorkspaceHttpPath(rawPathname: string, method: string): boolean {
     return pathname.startsWith('/api/model/')
       || pathname === '/api/automerge/root'
       || pathname === '/api/automerge/doc-heads'
+      || pathname === '/api/automerge/registry-diagram'
       // projector-fleet stays process-local: its handler reads this cell's
       // counters without ensureWorkspace. Routing it attributes an owner's
       // fleet to a reserve.

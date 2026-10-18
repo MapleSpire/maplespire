@@ -16,7 +16,7 @@ import type { IncomingMessage } from 'node:http'
 import type { Pool, PoolClient } from 'pg'
 import type WebSocket from 'ws'
 import { decodeJwt } from 'jose'
-import { verifySession, type SessionClaims } from './tokens.js'
+import { sessionCookieName, verifySession, type SessionClaims } from './tokens.js'
 import { authStage } from './middleware.js'
 import type { WorkspaceKey } from '../rbac/docScope.js'
 
@@ -152,8 +152,6 @@ function parseCookieHeader(header: string | undefined): Record<string, string> {
   return out
 }
 
-const SESSION_COOKIE_NAME = 'maplespire_session'
-
 let lastDualWarnAt = 0
 const DUAL_WARN_THROTTLE_MS = 60_000
 function logDualMiss(reason: string): void {
@@ -181,7 +179,7 @@ export async function authenticateUpgrade(
   if (stage === 'off') return { claims: null }
 
   const cookies = parseCookieHeader(req.headers.cookie)
-  const token = cookies[SESSION_COOKIE_NAME]
+  const token = cookies[sessionCookieName()]
   if (!token) {
     if (stage === 'dual') logDualMiss('missing session cookie')
     return { claims: null }

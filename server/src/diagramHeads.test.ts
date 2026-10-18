@@ -17,6 +17,7 @@ import { Repo, type AutomergeUrl } from '@automerge/automerge-repo'
 import { createEmptyRoot } from './automergeServer.js'
 import {
   diagramDocHeads,
+  registryHasDiagram,
   resolveDiagramDocUrlFromReadModel,
   resolveDiagramDocUrlFromRegistry,
 } from './diagramHeads.js'
@@ -129,5 +130,42 @@ describe('diagramDocHeads', () => {
     const { rootUrl } = await createEmptyRoot(repo, openBootstrapScope({ landscapeId: 'L-test', versionId: 'V-test' }, { kind: 'unfenced', reason: 'no-forker' }), { starterDiagram: true })
     const { id, docUrl } = await starterDiagram(repo, rootUrl)
     await expect(resolveDiagramDocUrlFromRegistry(repo, rootUrl, id)).resolves.toBe(docUrl)
+  })
+})
+
+describe('registryHasDiagram', () => {
+  it('finds a diagram in whichever shard of the root lists it', async () => {
+    const repo = new Repo({ network: [] })
+    const shards = [repo.create({ diagrams: { a: { docUrl: '' } } }), repo.create({ diagrams: { b: { docUrl: '' } } })]
+    const root = repo.create({ shardUrls: shards.map((shard) => shard.url) })
+    await expect(registryHasDiagram(repo, root.url, 'b')).resolves.toEqual({ state: 'ok', present: true })
+    await expect(registryHasDiagram(repo, root.url, 'missing')).resolves.toEqual({ state: 'ok', present: false })
+  })
+
+  it('sees a diagram added to the shard in place — what a merge does to live', async () => {
+    const repo = new Repo({ network: [] })
+    const shard = repo.create<{ diagrams: Record<string, { docUrl: string }> }>({ diagrams: {} })
+    const root = repo.create({ shardUrls: [shard.url] })
+    await expect(registryHasDiagram(repo, root.url, 'merged')).resolves.toEqual({ state: 'ok', present: false })
+    shard.change((doc) => { doc.diagrams.merged = { docUrl: '' } })
+    await expect(registryHasDiagram(repo, root.url, 'merged')).resolves.toEqual({ state: 'ok', present: true })
+  })
+
+  it('does not mistake an inherited property for a diagram', async () => {
+    const repo = new Repo({ network: [] })
+    const root = repo.create({ shardUrls: [repo.create({ diagrams: {} }).url] })
+    await expect(registryHasDiagram(repo, root.url, 'toString')).resolves.toEqual({ state: 'ok', present: false })
+  })
+
+  it('refuses a registry above the shard ceiling instead of walking it', async () => {
+    const repo = new Repo({ network: [] })
+    const shards = Array.from({ length: 3 }, () => repo.create({ diagrams: {} }))
+    const root = repo.create({ shardUrls: shards.map((shard) => shard.url) })
+    await expect(registryHasDiagram(repo, root.url, 'x', 2)).resolves.toEqual({ state: 'too-large', shardCount: 3 })
+  })
+
+  it('says not-found for an unknown root rather than "absent"', async () => {
+    const repo = new Repo({ network: [] })
+    await expect(registryHasDiagram(repo, 'not-an-automerge-url', 'x')).resolves.toEqual({ state: 'not-found' })
   })
 })

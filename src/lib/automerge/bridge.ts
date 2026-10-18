@@ -39,6 +39,7 @@ import {
   lastAttemptedRootUrlFor,
   preferCachedRootForNextResolve,
   abandonPreferredCachedRoot,
+  BOOT_DOCUMENT_RESOLUTION,
 } from './repo'
 import {
   startMintedIdSupply,
@@ -66,6 +67,7 @@ import { getModelQuery } from '../modelQuery'
 import {
   fetchDiagramRender,
   fetchDiagramDocHeads,
+  fetchRegistryHasDiagram,
   readCachedDiagramRender,
   type DiagramRenderResult,
 } from '../modelQuery/diagramRender'
@@ -700,6 +702,108 @@ async function takeParkedInitialDiagram(
   if (now !== parked) return now
   withRemote(() => useModelStore.setState({ currentDiagramId: null }))
   return null
+}
+
+let deferredPickTeardown: Array<() => void> = []
+/** Bumped by every disarm, so a queued open or an in-flight heads probe from a
+ * session that has since been stopped (or re-armed) lands nowhere. */
+let deferredPickGeneration = 0
+
+function disarmDeferredInitialPick(): void {
+  deferredPickGeneration += 1
+  for (const teardown of deferredPickTeardown) teardown()
+  deferredPickTeardown = []
+}
+
+/** The loaded registry of the booted version — the authority on which diagrams
+ * it has. Under boot-from-server the STORE's diagram list is not projected yet
+ * at the boot's choice (measured 2026-10-17: store 0, registry shard 4, in 8 of
+ * 8 draft boots, e2e/boot/draft-stays-on-diagram.spec.ts), so it cannot be. */
+function loadedRegistryMetas(): DiagramMeta[] {
+  return mergeShards(shardHandles.map((handle) => handle.doc() ?? { diagrams: {} }))
+}
+
+/**
+ * The boot was asked to PREFER a diagram (a Draft create/open/exit/merge keeps
+ * the one being viewed) and the loaded registry does not list it. That proves
+ * nothing on its own: a warm tab resolves its shards from IndexedDB before the
+ * WebSocket delivers changes, and a merge is applied to live IN PLACE — so the
+ * diagram just merged can be missing from a perfectly "ready" shard. The
+ * SERVER answers for the version's own registry (registry-diagram):
+ *  - absent → the default pick, at once;
+ *  - present → wait for the registry to bring it, then open it. The wait is
+ *    for DELIVERY only (presence is settled), bounded by the same budget a
+ *    document gets to arrive at boot; past it the sync is not delivering, and
+ *    the user gets the default diagram with a warning rather than a blank
+ *    canvas for good;
+ *  - the server cannot tell (offline, refused, too large) → the loaded registry
+ *    is the best knowledge there is; decide on it.
+ * The registry bringing the diagram opens it whenever that happens, even
+ * before the server answers. A diagram chosen meanwhile — by the user or a
+ * deep link — wins; stopBridge disarms.
+ */
+function armRegistryConfirmedPick(preferred: string): void {
+  disarmDeferredInitialPick()
+  const generation = deferredPickGeneration
+  const live = () => generation === deferredPickGeneration
+  let server: 'asking' | 'present' | 'absent' | 'unknown' = 'asking'
+  let deliveryOverdue = false
+
+  const open = (id: string) => {
+    disarmDeferredInitialPick()
+    const opened = deferredPickGeneration
+    // Outside any withRemote on purpose: onStoreChange sees an ordinary
+    // navigation and opens it through the same path as a user's pick.
+    setTimeout(() => {
+      if (opened !== deferredPickGeneration) return
+      if (useModelStore.getState().currentDiagramId === null) useModelStore.setState({ currentDiagramId: id })
+    }, 0)
+  }
+
+  const decide = () => {
+    if (!live()) return
+    if (useModelStore.getState().currentDiagramId !== null) {
+      disarmDeferredInitialPick()
+      return
+    }
+    const metas = loadedRegistryMetas()
+    if (metas.some((meta) => meta.id === preferred)) {
+      open(preferred)
+      return
+    }
+    if (server === 'asking') return
+    if (server === 'present' && !deliveryOverdue) return
+    if (server === 'present') {
+      console.warn(
+        `deferred initial pick: the server's registry lists diagram ${preferred} but this client's copy did not `
+          + `receive it within ${BOOT_DOCUMENT_RESOLUTION.budgetMs} ms; opening the default diagram instead`,
+      )
+    }
+    const fallback = (metas.find((meta) => meta.objectIds.length > 0) ?? metas[0])?.id
+    if (fallback) open(fallback)
+  }
+
+  for (const handle of shardHandles) {
+    handle.on('change', decide)
+    deferredPickTeardown.push(() => handle.off('change', decide))
+  }
+  // Also re-decide on projections: a root change can bring shards this
+  // listener set was not attached to.
+  deferredPickTeardown.push(useModelStore.subscribe(decide))
+
+  // decide() is the one session guard: a stopped or re-armed session ignores
+  // the answer there.
+  void fetchRegistryHasDiagram(preferred).then((present) => {
+    server = present === undefined ? 'unknown' : present ? 'present' : 'absent'
+    if (server === 'present' && live()) {
+      const timer = setTimeout(() => {
+        deliveryOverdue = true
+        decide()
+      }, BOOT_DOCUMENT_RESOLUTION.budgetMs)
+      deferredPickTeardown.push(() => clearTimeout(timer))
+    }
+    decide()
+  })
 }
 
 /** TEST-ONLY: clear the one-shot boot-fallback guard between tests. The guard
@@ -6560,14 +6664,43 @@ export async function startBridge(ref: WorkspaceRef = DEFAULT_WORKSPACE_REF): Pr
     // blank diagram can sort first and become diagrams[0]. Prefer the first diagram that
     // actually has content so a fresh boot never lands the user (or a test) in an empty canvas.
     const initialDiagrams = useModelStore.getState().diagrams
-    const parked = await takeParkedInitialDiagram(
-      useModelStore.getState().currentDiagramId,
-      (id) => initialDiagrams.some((d) => d.id === id),
-    )
-    const initial =
-      parked ??
-      (initialDiagrams.find((d) => d.objectIds.length > 0) ?? initialDiagrams[0])?.id ??
-      null
+    const parkedAtChoice = useModelStore.getState().currentDiagramId
+    // A PREFERENCE (a Draft transition keeping the viewed diagram) is judged
+    // against the booted version's loaded REGISTRY, never this store list:
+    // under boot-from-server the list is not projected yet here, and reading
+    // its emptiness as "absent" is the 2026-10-17 empty-canvas defect. A deep
+    // link keeps its request; a summary workspace has no loaded registry and
+    // made its choice above (where the preference was consumed).
+    const prefersParked = !registrySummaryOnly
+      && parkedAtChoice !== null
+      && parkedAtChoice === preferredInitialDiagramId
+    let parked: string | null
+    let awaitingRegistryVerdict = false
+    if (prefersParked && loadedRegistryMetas().some((meta) => meta.id === parkedAtChoice)) {
+      preferredInitialDiagramId = null
+      parked = parkedAtChoice
+    } else if (prefersParked) {
+      preferredInitialDiagramId = null
+      // Unparked while the registry copy's currency is checked: a current
+      // diagram this version may not have would put the not-found overlay up.
+      withRemote(() => useModelStore.setState({ currentDiagramId: null }))
+      armRegistryConfirmedPick(parkedAtChoice)
+      awaitingRegistryVerdict = true
+      parked = null
+    } else {
+      parked = await takeParkedInitialDiagram(
+        parkedAtChoice,
+        (id) => initialDiagrams.some((d) => d.id === id),
+      )
+    }
+    // While the registry verdict is out, open nothing: taking the default pick
+    // here (the store is populated on a resident boot) is exactly losing the
+    // user's place.
+    const initial = awaitingRegistryVerdict
+      ? null
+      : parked ??
+        (initialDiagrams.find((d) => d.objectIds.length > 0) ?? initialDiagrams[0])?.id ??
+        null
     if (initial) {
       if (useModelStore.getState().currentDiagramId !== initial) {
         withRemote(() => useModelStore.setState({ currentDiagramId: initial }))
@@ -6903,6 +7036,7 @@ export function stopBridge(): void {
   // No bridge, no projected workspace. Cleared FIRST so nothing waiting on a specific
   // workspace can be satisfied by a session that is being torn down.
   useAutomergeStatus.getState().clearWorkspaceProjection()
+  disarmDeferredInitialPick()
   flushPendingWritesForLifecycle()
   // AFTER the final lifecycle flush, never before: that flush legitimately
   // creates documents that must still be named with the OUTGOING workspace's

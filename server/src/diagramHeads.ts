@@ -114,3 +114,45 @@ export async function diagramDocHeads(repo: Repo, docUrl: string): Promise<strin
   if (!doc) return null
   return getHeads(doc as never)
 }
+
+/** Above this many registry shards `registryHasDiagram` refuses: a summary-only
+ * registry (30k diagrams) is not meant to be walked server-side for a presence
+ * probe, and its clients never ask (they boot without the registry). */
+export const REGISTRY_PROBE_MAX_SHARDS = 256
+
+export type RegistryDiagramPresence =
+  | { state: 'ok'; present: boolean }
+  | { state: 'not-found' }
+  | { state: 'too-large'; shardCount: number }
+
+/**
+ * Whether a workspace's OWN registry lists a diagram — the server's answer to
+ * "does this version have diagram X?", read from the shard documents the root
+ * names, not from the read model: the read model maps a sparse Draft onto its
+ * parent's query plane, so a diagram made in the Draft would read as absent,
+ * and it lags a merge (applied to live in place).
+ *
+ * A booting client asks this instead of trusting its own registry copy, which
+ * a warm tab resolves from IndexedDB before the WebSocket delivers changes.
+ */
+export async function registryHasDiagram(
+  repo: Repo,
+  rootUrl: string,
+  diagramId: string,
+  maxShards = REGISTRY_PROBE_MAX_SHARDS,
+): Promise<RegistryDiagramPresence> {
+  const root = (await readDoc(repo, rootUrl)) as RootLike | null
+  if (!root) return { state: 'not-found' }
+  const urls = (root.shardUrls ?? []).filter((url) => isValidAutomergeUrl(url))
+  if (urls.length > maxShards) return { state: 'too-large', shardCount: urls.length }
+  for (const url of urls) {
+    const shard = (await readDoc(repo, url)) as ShardLike | null
+    // A shard the root names but this server cannot read is not "empty": the
+    // caller would read the absence as proof. Say not-found instead.
+    if (!shard) return { state: 'not-found' }
+    if (shard.diagrams && Object.prototype.hasOwnProperty.call(shard.diagrams, diagramId)) {
+      return { state: 'ok', present: true }
+    }
+  }
+  return { state: 'ok', present: false }
+}

@@ -63,6 +63,7 @@ only governs HTTP-layer rejection.
 | `AUTH` | `off` | `off` \| `dual` \| `on` — see stages above. |
 | `AUTH_SECRET` | — (required when `AUTH != off`) | HS256 secret for session JWTs. Generate: `openssl rand -base64 48`. |
 | `AUTH_SESSION_MAX_AGE_S` | `2592000` (30d) | Session lifetime in seconds. |
+| `AUTH_COOKIE_NAME` | `maplespire_session` | Session cookie name (`[A-Za-z0-9_-]{1,64}`; an invalid value stops the boot). Browsers ignore the PORT when scoping cookies, so two stacks on `localhost` share one cookie and a login on one logs the other out ("Invalid or expired session"). `scripts/dev-boot.mjs` sets `maplespire_session_<server port>`; leave it unset on a deployment with its own host. The impersonation stash cookie becomes `<name>_admin`. |
 | `AUTH_DEV_LOGIN` | `off` | `on` enables `POST /api/auth/dev-login` (email-only login, no password). DEV/TEST ONLY — never enable in prod. |
 | `ORG_SEED` | `off` | `on` enables `POST /api/orgs/:orgId/seed` (org admin) — seeds a complete demo environment (demo landscape + versions + diagrams, teams with grants, 5 fake members) into the org. DEV/TEST ONLY. |
 | `PERFORMANCE_SEED` | `off` | `on` permits the distinct offline `seed:performance` CLI. It can create hundreds of thousands of test records and must never be enabled in production. |

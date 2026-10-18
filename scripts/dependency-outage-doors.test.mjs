@@ -340,7 +340,7 @@ test('every self-terminating handler that can be fenced consults the shared mapp
   assert.equal(
     SELF_TERMINATING_HANDLERS.length,
     5,
-    'the five fenceable self-terminating handlers are a MEASURED population (a survey of all 29 '
+    'the five fenceable self-terminating handlers are a MEASURED population (a survey of all 30 '
     + '`res.status(500)` sites in index.ts). Changing this number means re-running that survey, not editing a literal.',
   )
 
@@ -355,11 +355,21 @@ test('every self-terminating handler that can be fenced consults the shared mapp
   // only thing that throws `StaleSyncCellWriteError` — and touches no Redis
   // client at all, so `RedisUnavailableError` has no path to it. No guard, no
   // entry above.
+  //
+  // Second surveyed site that needs no guard (2026-10-17):
+  // `GET /api/automerge/registry-diagram` reaches NEITHER error. It awaits
+  // `canonicalWorkspaceKey`, `checkWorkspaceAccess` (rbac/workspaceGate.ts — app
+  // Postgres, no Redis client) and `resolveRootUrl` (app Postgres), then
+  // `registryHasDiagram`, which only READS documents (`findReadyDocument`)
+  // — the same shape as doc-heads, already among the read-only
+  // Automerge sites. `StaleSyncCellWriteError` is raised only inside the
+  // storage adapter's `withFencedMutation` (save / remove / removeRange), which
+  // no read in that handler awaits. No guard, no entry above.
   const terminations = (index.body.match(/res\.status\(500\)/g) ?? []).length
   assert.equal(
     terminations,
-    29,
-    `index.ts now has ${terminations} \`res.status(500)\` sites, not the 29 the five-handler survey covered. `
+    30,
+    `index.ts now has ${terminations} \`res.status(500)\` sites, not the 30 the five-handler survey covered. `
     + 'Re-run the survey: can the new one reach StaleSyncCellWriteError or RedisUnavailableError? '
     + 'If it can, it needs a guard and an entry above; if it cannot, update this number with the reason.',
   )

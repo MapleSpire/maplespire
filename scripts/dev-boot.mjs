@@ -42,7 +42,13 @@ const VITE_PORT = process.env.BOOT_VITE_PORT ?? '5180'
 const dbProc = { name: 'db', cmd: 'node', args: ['scripts/embedded-db.mjs'], cwd: 'server', env: {} }
 const serverProc = {
   name: 'server', cmd: 'npx', args: ['tsx', 'src/index.ts'], cwd: 'server',
-  env: { PORT: SERVER_PORT, READ_MODEL: 'on', AM_SELECTIVE_SYNC: 'on' },
+  env: {
+    PORT: SERVER_PORT, READ_MODEL: 'on', AM_SELECTIVE_SYNC: 'on',
+    // Cookies ignore the port: every stack on localhost would share one
+    // session cookie, and a login on another worktree's stack logs this one
+    // out ("Invalid or expired session"). One cookie per server port.
+    AUTH_COOKIE_NAME: process.env.AUTH_COOKIE_NAME || `maplespire_session_${SERVER_PORT}`,
+  },
 }
 const viteProc = {
   name: 'vite', cmd: 'npx', args: ['vite', '--port', VITE_PORT, '--strictPort'], cwd: '.',
