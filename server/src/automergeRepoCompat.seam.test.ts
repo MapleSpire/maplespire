@@ -13,7 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import { describe, it, expect } from 'vitest'
-import { Repo, type DocumentId } from '@automerge/automerge-repo'
+import { Repo, type DocumentId, type StorageAdapterInterface } from '@automerge/automerge-repo'
 import * as compat from './automergeRepoCompat.js'
 import { syncedHandle, cachedHandles, drainEntries } from './automergeRepoCompat.js'
 
@@ -180,6 +180,27 @@ describe('T11.3bis — la couture repo.handles', () => {
     expect(handle.state).toBe('deleted')
     expect(cachedHandles(repo)[handle.documentId], 'toujours dans le cache').toBe(handle)
     expect(syncedHandle(repo, handle.documentId), 'et toujours vu par la couture').toBe(handle)
+  })
+
+  it('les sources d\'une requete s\'appellent storage et automerge-sync', async () => {
+    // `durableHeads.ts` waits on `peek().sources.storage` and on nothing else.
+    // `sources` is typed `Record<string, SourceState>`, so tsc cannot see a
+    // rename upstream: `sources.storage` would read `undefined`, the wait would
+    // end at once, and a document held only in storage would answer
+    // `durable:false` until a retry. Pin the names on the library contract.
+    const storage: StorageAdapterInterface = {
+      load: async () => undefined,
+      save: async () => {},
+      remove: async () => {},
+      loadRange: async () => [],
+      removeRange: async () => {},
+    }
+    const repo = new Repo({ storage, network: [] })
+    const absent = new Repo({ network: [] }).create<{ n: number }>({ n: 1 })
+    const query = repo.findWithProgress(absent.url)
+    expect(Object.keys(query.peek().sources).sort()).toEqual(['automerge-sync', 'storage'])
+    expect(query.peek().sources.storage, 'storage starts pending').toBe('pending')
+    await until(() => query.peek().sources.storage === 'unavailable')
   })
 })
 
