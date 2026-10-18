@@ -42,10 +42,12 @@ import { guardIdleClientErrors } from '../db/poolErrorGuard.js'
  * platform admins, or backfill scopes without touching anything shared, and
  * parallel workers never contend on the same DDL locks.
  *
- * Known cross-schema leak: `pg_notify` channels are database-global, so
- * `bump_auth_epoch`'s NOTIFY reaches a live server listening on the same
- * database. Payloads are test-schema org ids that match no real org, so the
- * listener no-ops — acceptable noise. If even that must go, point
+ * Known cross-schema leak: `pg_notify` channels are database-global, so the
+ * NOTIFYs of `bump_auth_epoch`, `bump_auth_user_epoch` and `note_auth_grant`
+ * reach a live server listening on the same database. Payloads carry
+ * test-schema org/user ids that match no real row, so the listener's reads
+ * find nothing (a grant notify still drops that server's allowed-workspace
+ * cache, which costs a re-read) — acceptable noise. If even that must go, point
  * TEST_DATABASE_URL at a dedicated database.
  *
  * The schema name is fixed per suite (not random) so a crashed run leaves at

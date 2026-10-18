@@ -70,8 +70,9 @@ export type DenyReason =
    * document message, so reaching this means something is wrong that a
    * re-evaluation cannot fix. */
   | 'missing-peer-route'
-  /** No RBAC grant. Changing it changes the session's epoch, which forces a
-   * reconnect and a fresh share-policy resolution anyway. */
+  /** No RBAC grant. Revoking one changes the session's epoch, which forces a
+   * reconnect and a fresh share-policy resolution; GRANTING one does not (see
+   * ensureEpochTriggers in auth/wsAuth.ts) — the grantee sees it after a reload. */
   | 'rbac'
   /** A server-owned manifest the browser may never write. Permanent by design. */
   | 'server-managed-root'

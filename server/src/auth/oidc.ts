@@ -15,7 +15,8 @@
 import * as client from 'openid-client'
 import { pool } from '../db.js'
 import { findOrCreateUser, bootstrapPlatformAdmin } from './users.js'
-import { signSession, setSessionCookie } from './tokens.js'
+import { setSessionCookie } from './tokens.js'
+import { SessionMintRefusedError, signCurrentSession } from './sessionEpoch.js'
 import { appendAudit } from './audit.js'
 import { resolveLoginOrg } from './provisioning.js'
 import { isCurrentLegalVersion, legalRequestAccepted, recordLegalAcceptance } from './legal.js'
@@ -139,16 +140,6 @@ function appUrl(): string {
   return process.env.APP_URL || 'http://localhost:5173'
 }
 
-/** Mirrors devLogin.ts's `currentOrgEpoch` — a session must carry the org's
- * CURRENT epoch at issuance, not a hardcoded 0, or an org that has already
- * bumped its epoch (e.g. right after backfill) would mint sessions that look
- * pre-revoked. No row yet means epoch 1 (see schema.ts auth_epochs). */
-async function currentOrgEpoch(orgId: string): Promise<number> {
-  // BIGINT comes back from node-pg as a STRING — coerce, or the JWT carries a
-  // string epoch that verifySession rejects (mirrors devLogin.ts).
-  const { rows } = await pool.query<{ epoch: number | string }>('SELECT epoch FROM auth_epochs WHERE org_id = $1', [orgId])
-  return rows[0] ? Number(rows[0].epoch) : 1
-}
 
 function callbackUrl(providerId: string): string {
   // Built from the incoming request's own origin would be spoofable; the
@@ -168,6 +159,7 @@ type OidcErrorCode =
   | 'server_error'
   | 'org_suspended'
   | 'legal_required'
+  | 'account_inactive'
 
 function failureRedirect(code: OidcErrorCode): string {
   return `${appUrl()}/login?error=${code}`
@@ -391,16 +383,24 @@ export function registerOidcRoutes(app: import('express').Express): void {
         detail: { provider: def.id },
       })
 
-      const epoch = orgId ? await currentOrgEpoch(orgId) : 1
-      const token = await signSession({
-        userId: user.id,
-        orgId,
-        isPlatformAdmin,
-        epoch,
-      })
+      // The CURRENT epochs at issuance (signCurrentSession), or an org or user
+      // whose epoch already moved would get a session that looks pre-revoked —
+      // and it refuses a deactivated user, who could otherwise sign straight
+      // back in through a live IdP session.
+      const token = await signCurrentSession(pool, { userId: user.id, orgId, isPlatformAdmin })
       setSessionCookie(res, token)
       res.redirect(`${appUrl()}/auth/complete`)
     } catch (err) {
+      if (err instanceof SessionMintRefusedError) {
+        // Only a deactivated user reads as "account deactivated"; a refusal
+        // reached through a race (not_a_member) is a failed sign-in, not that.
+        res.redirect(failureRedirect(
+          err.reason === 'user_inactive' ? 'account_inactive'
+            : err.reason === 'org_suspended' ? 'org_suspended'
+              : 'exchange_failed',
+        ))
+        return
+      }
       console.error(`[oidc] callback failed for provider "${def.id}":`, err)
       res.redirect(failureRedirect('exchange_failed'))
     }

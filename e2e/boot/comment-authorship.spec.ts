@@ -88,12 +88,9 @@ test.describe('comment authorship — two signed-in users', () => {
       await sarah.goto(new URL(invite.body.acceptUrl).pathname)
       await sarah.getByTestId('invite-accept').click()
       await sarah.waitForURL(/\/app/, { timeout: 30_000 })
-      // The membership insert bumps the org's auth epoch, which revokes every
-      // live session in the org — Olivier's included — so he signs in again.
+      // Olivier's page is left exactly as it was: an accepted invite revokes
+      // nobody (session-revocation.spec.ts pins that on its own).
       const diagramPath = new URL(olivier.url()).pathname
-      await devLogin(olivier, olivierEmail)
-      await olivier.goto(diagramPath)
-      expect(await waitForDiagram(olivier)).toBe(diagramId)
       await sarah.goto(diagramPath)
       expect(await waitForDiagram(sarah)).toBe(diagramId)
 

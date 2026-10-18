@@ -149,4 +149,41 @@ describe('email/password auth routes', () => {
     })
     expect(mocks.signSession).not.toHaveBeenCalled()
   })
+
+  // QA lens round 2 (2026-10-17): the 403 mapping survived its deletion. The
+  // credential check read the user as active; the mint's own read finds them
+  // deactivated since — a refusal, answered as one, and no session.
+  it('a user deactivated between the credential check and the mint gets a 403 user_inactive and no session', async () => {
+    const passwordHash = await hashPassword('a secure password')
+    mocks.resolveLoginOrg.mockResolvedValue({ kind: 'org', orgId: 'org-1' })
+    mocks.bootstrapPlatformAdmin.mockResolvedValue(undefined)
+    mocks.query.mockImplementation(async (sql: string) => {
+      const s = String(sql)
+      if (s.includes('FROM users u JOIN local_auth_credentials')) {
+        return { rows: [{
+          id: 'user-1', email: 'person@example.com', is_platform_admin: false,
+          status: 'active', given_name: null, family_name: null,
+          password_hash: passwordHash, email_verified_at: new Date(),
+        }], rowCount: 1 }
+      }
+      if (s.includes('SELECT is_platform_admin FROM users')) return { rows: [{ is_platform_admin: false }], rowCount: 1 }
+      if (s.includes('LEFT JOIN auth_global_epochs')) {
+        return { rows: [{ id: 'user-1', is_platform_admin: false, status: 'deactivated', gepoch: '2' }], rowCount: 1 }
+      }
+      if (s.includes('FROM orgs o')) return { rows: [{ status: 'active', epoch: '1', uepoch: '1', member: true }], rowCount: 1 }
+      return { rows: [], rowCount: 0 }
+    })
+
+    await withServer(async (url) => {
+      const response = await fetch(`${url}/api/auth/password-login`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ email: 'person@example.com', password: 'a secure password' }),
+      })
+      expect(response.status).toBe(403)
+      expect(await response.json()).toEqual({ error: 'user_inactive' })
+    })
+    expect(mocks.signSession).not.toHaveBeenCalled()
+    expect(mocks.setSessionCookie).not.toHaveBeenCalled()
+  })
 })

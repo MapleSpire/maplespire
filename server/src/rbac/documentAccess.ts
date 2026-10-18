@@ -103,8 +103,11 @@ export function createDocumentAccessCheck(deps: DocumentAccessDeps): AccessVerdi
       }
 
       if (deps.authCheck && !(await deps.authCheck(peerId, documentId))) {
-        // An RBAC denial is usually permanent — a grant change bumps the session
-        // epoch, which forces a reconnect and a fresh resolution anyway. But
+        // An RBAC denial is usually permanent for the socket. A REVOCATION bumps
+        // the session epoch, which forces a reconnect and a fresh resolution;
+        // a GRANT no longer does (ensureEpochTriggers in auth/wsAuth.ts), so a
+        // grant reaches a document this socket was already refused only after
+        // a reload — accepted, it used to need a fresh sign-in. But
         // `buildAccessCheck` also denies an unindexed document, and THAT is
         // recoverable and schedules nothing of its own. One index lookup on the
         // deny path is what tells the two apart; without it the recoverable case

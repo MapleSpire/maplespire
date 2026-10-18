@@ -570,6 +570,43 @@ describe('POST /api/platform/impersonate', () => {
       await close()
     }
   })
+
+  // QA lens round 2 (2026-10-17): the 403 mapping survived its deletion. The
+  // gate read the admin as active; the mint's own read (one statement with the
+  // epoch) finds them deactivated since — it must refuse, and say why.
+  it('403s with the mint refusal when the impersonator is deactivated between the gate and the mint', async () => {
+    queryMock.mockImplementation(async (sql: string) => {
+      const s = String(sql)
+      if (s.includes('SELECT is_platform_admin, status FROM users')) return { rows: [{ is_platform_admin: true, status: 'active' }] }
+      if (s.includes('SELECT id, email, status FROM users')) return { rows: [{ id: 'u2', email: 'b@example.com', status: 'active' }] }
+      if (s.includes('FROM org_members WHERE user_id')) return { rows: [{ org_id: 'org1' }] }
+      if (s.includes('LEFT JOIN auth_global_epochs')) {
+        return { rows: [
+          { id: 'u2', is_platform_admin: false, status: 'active', gepoch: '1' },
+          { id: 'platform-1', is_platform_admin: true, status: 'deactivated', gepoch: '2' },
+        ] }
+      }
+      if (s.includes('FROM orgs o')) return { rows: [{ status: 'active', epoch: '1', uepoch: '1', member: true }] }
+      return { rows: [] }
+    })
+    vi.resetModules()
+    const { registerPlatformRoutes } = await import('./platformRoutes.js')
+    const { url, close } = await startServer(registerPlatformRoutes, platformAdminAuth)
+    try {
+      const res = await fetch(`${url}/api/platform/impersonate`, {
+        method: 'POST',
+        // A current cookie, so the stash reuses it rather than minting.
+        headers: { 'Content-Type': 'application/json', Cookie: 'maplespire_session=the-admins-own-cookie' },
+        body: JSON.stringify({ userId: 'u2' }),
+      })
+      expect(res.status).toBe(403)
+      expect(await res.json()).toEqual({ error: 'impersonator_not_admin' })
+      expect((res.headers.getSetCookie?.() ?? []).filter((c) => c.startsWith('maplespire_session='))).toEqual([])
+      expect(queryMock.mock.calls.some(([sql]) => String(sql).includes('INSERT INTO impersonations'))).toBe(false)
+    } finally {
+      await close()
+    }
+  })
 })
 
 describe('POST /api/auth/impersonate/exit', () => {
@@ -731,17 +768,28 @@ describe.skipIf(!TEST_DATABASE_URL)('platform routes (live Postgres)', () => {
     }
   })
 
-  it('deactivating a user bumps the epoch of every org they belong to', async () => {
+  it("deactivating a user revokes THEIR sessions in every org they belong to — not their colleagues'", async () => {
     const platformAdminId = await makeUser('deactivate-platform-admin@example.com', { isPlatformAdmin: true })
     const targetUserId = await makeUser('multi-org-member@example.com')
+    const colleagueId = await makeUser('deactivate-colleague@example.com')
     const orgA = await makeOrg()
     const orgB = await makeOrg()
     try {
       await addOrgMember(orgA, targetUserId, 'member')
       await addOrgMember(orgB, targetUserId, 'member')
+      await addOrgMember(orgA, colleagueId, 'member')
 
-      const epochBeforeA = 1 // auth_epochs has no row yet — implicit epoch 1 (see auth/schema.ts)
-      const epochBeforeB = 1
+      const epochOf = async (table: 'auth_epochs' | 'auth_user_epochs', orgId: string, userId?: string) => {
+        const { rows } = table === 'auth_epochs'
+          ? await realPool.query<{ epoch: string }>('SELECT epoch FROM auth_epochs WHERE org_id = $1', [orgId])
+          : await realPool.query<{ epoch: string }>('SELECT epoch FROM auth_user_epochs WHERE org_id = $1 AND user_id = $2', [orgId, userId])
+        return rows[0] ? Number(rows[0].epoch) : 1 // no row = implicit epoch 1 (see auth/schema.ts)
+      }
+      const before = {
+        orgA: await epochOf('auth_epochs', orgA),
+        orgB: await epochOf('auth_epochs', orgB),
+        colleague: await epochOf('auth_user_epochs', orgA, colleagueId),
+      }
 
       await withServer({ userId: platformAdminId, orgId: null, isPlatformAdmin: true, epoch: 1 }, async (url) => {
         const res = await fetch(`${url}/api/platform/users/${targetUserId}`, {
@@ -755,14 +803,18 @@ describe.skipIf(!TEST_DATABASE_URL)('platform routes (live Postgres)', () => {
       const { rows: statusRows } = await realPool.query('SELECT status FROM users WHERE id = $1', [targetUserId])
       expect(statusRows[0].status).toBe('deactivated')
 
-      const { rows: epochRowsA } = await realPool.query<{ epoch: string }>('SELECT epoch FROM auth_epochs WHERE org_id = $1', [orgA])
-      const { rows: epochRowsB } = await realPool.query<{ epoch: string }>('SELECT epoch FROM auth_epochs WHERE org_id = $1', [orgB])
-      expect(Number(epochRowsA[0].epoch)).toBeGreaterThan(epochBeforeA)
-      expect(Number(epochRowsB[0].epoch)).toBeGreaterThan(epochBeforeB)
+      // The target's epoch moved in BOTH orgs…
+      expect(await epochOf('auth_user_epochs', orgA, targetUserId)).toBeGreaterThan(1)
+      expect(await epochOf('auth_user_epochs', orgB, targetUserId)).toBeGreaterThan(1)
+      // …and neither org's epoch nor a colleague's did.
+      expect(await epochOf('auth_epochs', orgA)).toBe(before.orgA)
+      expect(await epochOf('auth_epochs', orgB)).toBe(before.orgB)
+      expect(await epochOf('auth_user_epochs', orgA, colleagueId)).toBe(before.colleague)
     } finally {
       await dropOrg(orgA)
       await dropOrg(orgB)
       await dropUser(targetUserId)
+      await dropUser(colleagueId)
       await dropUser(platformAdminId)
     }
   })
@@ -824,6 +876,388 @@ describe.skipIf(!TEST_DATABASE_URL)('platform routes (live Postgres)', () => {
     } finally {
       await dropUser(admin1)
       await dropUser(admin2)
+    }
+  })
+
+  /**
+   * The cookie gates a revoked session must fail, as production wires them:
+   * the HTTP gate (requireAuth + the session epoch validator), GET
+   * /api/auth/me, and the sync upgrade check. `upgrade` is the burst-cached
+   * validator the upgrade calls (automergeServer.ts), against the live
+   * triggers, and must agree with the uncached isSessionEpochCurrent that
+   * /api/auth/me runs (QA lens, 2026-10-16: the validator had only ever met
+   * fake databases).
+   */
+  async function withCookieGates<T>(fn: (check: (token: string) => Promise<{ http: number; httpCleared: boolean; me: number; meCode?: string; meCleared: boolean; upgrade: boolean }>) => Promise<T>): Promise<T> {
+    const savedAuth = process.env.AUTH
+    process.env.AUTH = 'on'
+    const { requireAuth } = await import('./middleware.js')
+    const { registerAuthRoutes } = await import('./devLogin.js')
+    const { createSessionEpochValidator, isSessionEpochCurrent } = await import('./sessionEpoch.js')
+    const { verifySession } = await import('./tokens.js')
+    const validator = createSessionEpochValidator(realPool, { cacheTtlMs: 0 })
+    const app = express()
+    app.use(express.json())
+    app.use('/api', requireAuth({ isSessionCurrent: validator }))
+    registerAuthRoutes(app)
+    app.get('/api/probe', (req, res) => {
+      res.json({ isPlatformAdmin: req.auth?.isPlatformAdmin })
+    })
+    const server: Server = await new Promise((resolve) => {
+      const s = app.listen(0, () => resolve(s))
+    })
+    const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
+    try {
+      return await fn(async (token) => {
+        const headers = { Cookie: `maplespire_session=${encodeURIComponent(token)}` }
+        const http = await fetch(`${url}/api/probe`, { headers })
+        const me = await fetch(`${url}/api/auth/me`, { headers })
+        const meBody = (await me.json()) as { code?: string }
+        const claims = await verifySession(token)
+        const cleared = (r: Response) => (r.headers.get('set-cookie') ?? '').startsWith('maplespire_session=;')
+        return {
+          http: http.status,
+          httpCleared: cleared(http),
+          me: me.status,
+          meCode: meBody.code,
+          meCleared: cleared(me),
+          upgrade: await (async () => {
+            const [cached, uncached] = await Promise.all([validator(claims!), isSessionEpochCurrent(realPool, claims!)])
+            expect(cached).toBe(uncached)
+            return cached
+          })(),
+        }
+      })
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+      if (savedAuth === undefined) delete process.env.AUTH
+      else process.env.AUTH = savedAuth
+    }
+  }
+  const accepted = { http: 200, httpCleared: false, me: 200, meCode: undefined, meCleared: false, upgrade: true }
+  const revoked = { http: 401, httpCleared: true, me: 401, meCode: 'session_stale', meCleared: true, upgrade: false }
+
+  // Regression (architect lens, 2026-10-16): the revoke bumped no epoch, so the
+  // old cookie — whose signed isPlatformAdmin the sync gate and HTTP routes
+  // trust across every org — stayed good for its 30-day life.
+  it("revoking platform admin ends the revoked admin's sessions on every gate — org-less, org-pinned, and impersonations they started — and nobody else's", async () => {
+    const actor = await makeUser('revoking-admin@example.com', { isPlatformAdmin: true })
+    const revokedAdmin = await makeUser('revoked-admin@example.com', { isPlatformAdmin: true })
+    const target = await makeUser('revoked-admin-target@example.com')
+    const orgId = await makeOrg()
+    try {
+      await addOrgMember(orgId, revokedAdmin, 'admin')
+      await addOrgMember(orgId, target, 'member')
+      const { signCurrentSession } = await import('./sessionEpoch.js')
+      const sessions = {
+        orgless: await signCurrentSession(realPool, { userId: revokedAdmin, orgId: null, isPlatformAdmin: true }),
+        inOrg: await signCurrentSession(realPool, { userId: revokedAdmin, orgId, isPlatformAdmin: true }),
+        impersonation: await signCurrentSession(realPool, { userId: target, orgId, isPlatformAdmin: false, imp: { by: revokedAdmin } }),
+        actor: await signCurrentSession(realPool, { userId: actor, orgId: null, isPlatformAdmin: true }),
+        target: await signCurrentSession(realPool, { userId: target, orgId, isPlatformAdmin: false }),
+      }
+
+      await withCookieGates(async (check) => {
+        for (const token of Object.values(sessions)) expect(await check(token)).toEqual(accepted)
+
+        await withServer({ userId: actor, orgId: null, isPlatformAdmin: true, epoch: 1 }, async (url) => {
+          const res = await fetch(`${url}/api/platform/users/${revokedAdmin}/platform-admin`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ grant: false }),
+          })
+          expect(res.status).toBe(200)
+        })
+
+        expect(await check(sessions.orgless)).toEqual(revoked)
+        expect(await check(sessions.inOrg)).toEqual(revoked)
+        expect(await check(sessions.impersonation)).toEqual(revoked)
+        expect(await check(sessions.actor)).toEqual(accepted)
+        expect(await check(sessions.target)).toEqual(accepted)
+
+        // Signing in again works, and carries the truth.
+        const fresh = await signCurrentSession(realPool, { userId: revokedAdmin, orgId: null, isPlatformAdmin: false })
+        expect(await check(fresh)).toEqual(accepted)
+      })
+    } finally {
+      await dropOrg(orgId)
+      for (const id of [target, revokedAdmin, actor]) await dropUser(id)
+    }
+  })
+
+  it('granting platform admin revokes nothing: the grantee keeps working', async () => {
+    const actor = await makeUser('granting-admin@example.com', { isPlatformAdmin: true })
+    const grantee = await makeUser('grantee@example.com')
+    try {
+      const { signCurrentSession } = await import('./sessionEpoch.js')
+      const session = await signCurrentSession(realPool, { userId: grantee, orgId: null, isPlatformAdmin: false })
+      await withCookieGates(async (check) => {
+        await withServer({ userId: actor, orgId: null, isPlatformAdmin: true, epoch: 1 }, async (url) => {
+          const res = await fetch(`${url}/api/platform/users/${grantee}/platform-admin`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ grant: true }),
+          })
+          expect(res.status).toBe(200)
+        })
+        expect(await check(session)).toEqual(accepted)
+      })
+    } finally {
+      await dropUser(grantee)
+      await dropUser(actor)
+    }
+  })
+
+  // Regression (architect lens, 2026-10-16): deactivation bumped only the
+  // (org, user) epochs of the user's CURRENT memberships, which an org-less
+  // session never checks; and the user could simply sign in again (dev-login
+  // and OIDC never read `users.status`).
+  it('deactivating a user ends their org-less and org sessions, and they cannot sign straight back in', async () => {
+    const actor = await makeUser('deactivating-admin@example.com', { isPlatformAdmin: true })
+    const email = `deactivated-${rid('u').toLowerCase()}@example.com`
+    const { rows: [{ id: user }] } = await realPool.query<{ id: string }>(
+      `INSERT INTO users (id, issuer, subject, email, name) VALUES ($1, 'dev', $2, $2, $2) RETURNING id`,
+      [rid('user'), email],
+    )
+    const orgId = await makeOrg()
+    try {
+      await addOrgMember(orgId, user, 'member')
+      const { signCurrentSession } = await import('./sessionEpoch.js')
+      const orgless = await signCurrentSession(realPool, { userId: user, orgId: null, isPlatformAdmin: false })
+      const inOrg = await signCurrentSession(realPool, { userId: user, orgId, isPlatformAdmin: false })
+
+      await withCookieGates(async (check) => {
+        expect(await check(orgless)).toEqual(accepted)
+        expect(await check(inOrg)).toEqual(accepted)
+
+        await withServer({ userId: actor, orgId: null, isPlatformAdmin: true, epoch: 1 }, async (url) => {
+          const res = await fetch(`${url}/api/platform/users/${user}`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ status: 'deactivated' }),
+          })
+          expect(res.status).toBe(200)
+        })
+
+        expect(await check(orgless)).toEqual(revoked)
+        expect(await check(inOrg)).toEqual(revoked)
+      })
+
+      // Signing in again through dev-login is refused, and mints nothing.
+      const savedDevLogin = process.env.AUTH_DEV_LOGIN
+      process.env.AUTH_DEV_LOGIN = 'on'
+      try {
+        const { registerAuthRoutes } = await import('./devLogin.js')
+        const { url, close } = await startServer(registerAuthRoutes)
+        try {
+          const res = await fetch(`${url}/api/auth/dev-login`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email }),
+          })
+          expect(res.status).toBe(403)
+          expect(await res.json()).toEqual({ error: 'user_inactive' })
+          expect(res.headers.getSetCookie?.() ?? []).toEqual([])
+        } finally {
+          await close()
+        }
+      } finally {
+        if (savedDevLogin === undefined) delete process.env.AUTH_DEV_LOGIN
+        else process.env.AUTH_DEV_LOGIN = savedDevLogin
+      }
+    } finally {
+      await dropOrg(orgId)
+      await dropUser(user)
+      await dropUser(actor)
+    }
+  })
+
+  // Regression (reviewer + architect lenses, 2026-10-16): the mint read the
+  // epoch AFTER the caller had decided the facts. switch-org copied
+  // `isPlatformAdmin` from the old cookie; a switch that ran after the revoke
+  // committed minted `{ isPlatformAdmin: true, gepoch: <bumped> }`, a fresh
+  // 30-day admin cookie current on every gate.
+  it('switch-org after a revoke, still carrying the old admin claim, mints a session that is NOT platform admin', async () => {
+    const actor = await makeUser('race-actor@example.com', { isPlatformAdmin: true })
+    const revokedAdmin = await makeUser('race-revoked@example.com', { isPlatformAdmin: true })
+    const [orgA, orgB] = [await makeOrg(), await makeOrg()]
+    try {
+      await addOrgMember(orgA, revokedAdmin, 'member')
+      await addOrgMember(orgB, revokedAdmin, 'member')
+      await withServer({ userId: actor, orgId: null, isPlatformAdmin: true, epoch: 1 }, async (url) => {
+        const res = await fetch(`${url}/api/platform/users/${revokedAdmin}/platform-admin`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ grant: false }),
+        })
+        expect(res.status).toBe(200)
+      })
+
+      // The request passed the gate before the revoke: req.auth is the OLD claim.
+      const { registerOrgRoutes } = await import('./orgs.js')
+      const { verifySession } = await import('./tokens.js')
+      const { isSessionEpochCurrent } = await import('./sessionEpoch.js')
+      const { url, close } = await startServer(registerOrgRoutes, {
+        userId: revokedAdmin, orgId: orgA, isPlatformAdmin: true, epoch: 1,
+      })
+      try {
+        const res = await fetch(`${url}/api/auth/switch-org`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ orgId: orgB }),
+        })
+        expect(res.status).toBe(200)
+        const cookie = (res.headers.getSetCookie?.() ?? []).find((c) => c.startsWith('maplespire_session='))
+        const minted = await verifySession(decodeURIComponent(cookie!.split(';')[0].slice('maplespire_session='.length)))
+        expect(minted).toMatchObject({ userId: revokedAdmin, orgId: orgB, isPlatformAdmin: false, gepoch: 2 })
+        await expect(isSessionEpochCurrent(realPool, minted!)).resolves.toBe(true)
+      } finally {
+        await close()
+      }
+    } finally {
+      await dropOrg(orgA)
+      await dropOrg(orgB)
+      await dropUser(revokedAdmin)
+      await dropUser(actor)
+    }
+  })
+
+  it('the mint re-checks each fact with its epoch: refuses an inactive user, a non-member, a suspended org, a revoked impersonator', async () => {
+    const admin = await makeUser('mint-admin@example.com', { isPlatformAdmin: true })
+    const exAdmin = await makeUser('mint-ex-admin@example.com', { isPlatformAdmin: true })
+    const member = await makeUser('mint-member@example.com')
+    const inactive = await makeUser('mint-inactive@example.com')
+    const [orgId, otherOrg, suspendedOrg] = [await makeOrg(), await makeOrg(), await makeOrg()]
+    try {
+      await addOrgMember(orgId, member, 'member')
+      await addOrgMember(suspendedOrg, member, 'member')
+      await realPool.query("UPDATE orgs SET status = 'suspended' WHERE id = $1", [suspendedOrg])
+      await realPool.query("UPDATE users SET status = 'deactivated' WHERE id = $1", [inactive])
+      await realPool.query('UPDATE users SET is_platform_admin = false WHERE id = $1', [exAdmin])
+      const { signCurrentSession, SessionMintRefusedError } = await import('./sessionEpoch.js')
+      const refusal = (p: Promise<unknown>) => p.then(() => 'minted', (e: unknown) => e instanceof SessionMintRefusedError ? e.reason : `threw ${String(e)}`)
+
+      expect(await refusal(signCurrentSession(realPool, { userId: inactive, orgId: null, isPlatformAdmin: false }))).toBe('user_inactive')
+      expect(await refusal(signCurrentSession(realPool, { userId: 'no-such-user', orgId: null, isPlatformAdmin: false }))).toBe('user_inactive')
+      expect(await refusal(signCurrentSession(realPool, { userId: member, orgId: otherOrg, isPlatformAdmin: false }))).toBe('not_a_member')
+      expect(await refusal(signCurrentSession(realPool, { userId: member, orgId: 'no-such-org', isPlatformAdmin: false }))).toBe('not_a_member')
+      expect(await refusal(signCurrentSession(realPool, { userId: member, orgId: suspendedOrg, isPlatformAdmin: false }))).toBe('org_suspended')
+      expect(await refusal(signCurrentSession(realPool, { userId: member, orgId, isPlatformAdmin: false, imp: { by: exAdmin } }))).toBe('impersonator_not_admin')
+      expect(await refusal(signCurrentSession(realPool, { userId: member, orgId, isPlatformAdmin: false, imp: { by: admin } }))).toBe('minted')
+      // Never elevated past the database, nor past the caller.
+      const { verifySession } = await import('./tokens.js')
+      const asAdmin = await verifySession(await signCurrentSession(realPool, { userId: member, orgId, isPlatformAdmin: true }))
+      expect(asAdmin?.isPlatformAdmin).toBe(false)
+      const callerSaysNo = await verifySession(await signCurrentSession(realPool, { userId: admin, orgId: null, isPlatformAdmin: false }))
+      expect(callerSaysNo?.isPlatformAdmin).toBe(false)
+
+      // QA lens round 2 (2026-10-17): each line below killed a surviving mutant.
+      // A DEACTIVATED platform admin (the flag is still true) cannot impersonate,
+      // nor can an impersonator whose row is gone.
+      const deactivatedAdmin = await makeUser('mint-deactivated-admin@example.com', { isPlatformAdmin: true })
+      try {
+        await realPool.query("UPDATE users SET status = 'deactivated' WHERE id = $1", [deactivatedAdmin])
+        expect(await refusal(signCurrentSession(realPool, { userId: member, orgId, isPlatformAdmin: false, imp: { by: deactivatedAdmin } }))).toBe('impersonator_not_admin')
+      } finally {
+        await dropUser(deactivatedAdmin)
+      }
+      expect(await refusal(signCurrentSession(realPool, { userId: member, orgId, isPlatformAdmin: false, imp: { by: 'no-such-admin' } }))).toBe('impersonator_not_admin')
+      // Membership is THIS user's in THIS org: an org with other members is still refused.
+      await addOrgMember(otherOrg, admin, 'admin')
+      expect(await refusal(signCurrentSession(realPool, { userId: member, orgId: otherOrg, isPlatformAdmin: false }))).toBe('not_a_member')
+    } finally {
+      for (const id of [orgId, otherOrg, suspendedOrg]) await dropOrg(id)
+      for (const id of [admin, exAdmin, member, inactive]) await dropUser(id)
+    }
+  })
+
+  // QA lens round 2 (2026-10-17): every session minted in the suite so far
+  // carried epoch = uepoch = gepoch = 1 for both users, so the mint could read
+  // any epoch from the wrong row (or none) and nothing noticed.
+  it('the mint signs each epoch from ITS row: the org, this user in this org, this user, and the impersonator', async () => {
+    const admin = await makeUser('mint-epochs-admin@example.com', { isPlatformAdmin: true })
+    const target = await makeUser('mint-epochs-target@example.com')
+    const [orgId, elsewhere] = [await makeOrg(), await makeOrg()]
+    try {
+      await addOrgMember(orgId, target, 'member')
+      await addOrgMember(elsewhere, target, 'member')
+      // Raw rows (no trigger, no notify), every value distinct. The target's
+      // epoch in ANOTHER org is written first, so a join that lost its org key
+      // meets it before the right one.
+      await realPool.query('INSERT INTO auth_user_epochs (org_id, user_id, epoch) VALUES ($1, $2, 9)', [elsewhere, target])
+      await realPool.query('INSERT INTO auth_user_epochs (org_id, user_id, epoch) VALUES ($1, $2, 4)', [orgId, target])
+      await realPool.query('INSERT INTO auth_epochs (org_id, epoch) VALUES ($1, 6)', [orgId])
+      await realPool.query('INSERT INTO auth_global_epochs (user_id, epoch) VALUES ($1, 5), ($2, 3)', [target, admin])
+      const { signCurrentSession, isSessionEpochCurrent } = await import('./sessionEpoch.js')
+      const { verifySession } = await import('./tokens.js')
+
+      const own = await verifySession(await signCurrentSession(realPool, { userId: target, orgId, isPlatformAdmin: false }))
+      expect(own).toMatchObject({ epoch: 6, uepoch: 4, gepoch: 5 })
+      await expect(isSessionEpochCurrent(realPool, own!)).resolves.toBe(true)
+
+      const imp = await verifySession(await signCurrentSession(realPool, { userId: target, orgId, isPlatformAdmin: false, imp: { by: admin } }))
+      expect(imp).toMatchObject({ epoch: 6, uepoch: 4, gepoch: 5, imp: { by: admin, gepoch: 3 } })
+      await expect(isSessionEpochCurrent(realPool, imp!)).resolves.toBe(true)
+    } finally {
+      await dropOrg(orgId)
+      await dropOrg(elsewhere)
+      await dropUser(target)
+      await dropUser(admin)
+    }
+  })
+
+  it('switch-org by a user deactivated since their cookie was signed is a 403 user_inactive, with no session', async () => {
+    const user = await makeUser('switch-deactivated@example.com')
+    const [orgA, orgB] = [await makeOrg(), await makeOrg()]
+    try {
+      await addOrgMember(orgA, user, 'member')
+      await addOrgMember(orgB, user, 'member')
+      await realPool.query("UPDATE users SET status = 'deactivated' WHERE id = $1", [user])
+      const { registerOrgRoutes } = await import('./orgs.js')
+      // The request passed the gate before the deactivation: req.auth is the old claim.
+      const { url, close } = await startServer(registerOrgRoutes, { userId: user, orgId: orgA, isPlatformAdmin: false, epoch: 1 })
+      try {
+        const res = await fetch(`${url}/api/auth/switch-org`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ orgId: orgB }),
+        })
+        expect(res.status).toBe(403)
+        expect(await res.json()).toEqual({ error: 'user_inactive' })
+        expect((res.headers.getSetCookie?.() ?? []).filter((c) => c.startsWith('maplespire_session='))).toEqual([])
+      } finally {
+        await close()
+      }
+    } finally {
+      await dropOrg(orgA)
+      await dropOrg(orgB)
+      await dropUser(user)
+    }
+  })
+
+  // Regression (architect lens, 2026-10-16): cookie HTTP checked only the
+  // global epoch, but workspaceGate.ts requireLandscapeInOrg admits on the
+  // signed `orgId` with no membership read — a removed member's cookie kept
+  // reading the org's landscape snapshots.
+  it("a member removed from the org is refused on cookie HTTP, and a colleague is not", async () => {
+    const [removed, colleague] = [await makeUser('removed-member@example.com'), await makeUser('stays-member@example.com')]
+    const orgId = await makeOrg()
+    try {
+      await addOrgMember(orgId, removed, 'member')
+      await addOrgMember(orgId, colleague, 'member')
+      const { signCurrentSession } = await import('./sessionEpoch.js')
+      const removedSession = await signCurrentSession(realPool, { userId: removed, orgId, isPlatformAdmin: false })
+      const colleagueSession = await signCurrentSession(realPool, { userId: colleague, orgId, isPlatformAdmin: false })
+      await withCookieGates(async (check) => {
+        expect(await check(removedSession)).toEqual(accepted)
+        await realPool.query('DELETE FROM org_members WHERE org_id = $1 AND user_id = $2', [orgId, removed])
+        expect(await check(removedSession)).toEqual(revoked)
+        expect(await check(colleagueSession)).toEqual(accepted)
+      })
+    } finally {
+      await dropOrg(orgId)
+      await dropUser(removed)
+      await dropUser(colleague)
     }
   })
 

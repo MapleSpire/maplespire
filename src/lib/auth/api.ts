@@ -96,10 +96,30 @@ export async function getProviders(surface?: 'public' | 'sso'): Promise<AuthProv
 /** Returns null on 401 (not signed in) instead of throwing — that's the expected
  * "logged out" response, not an error. */
 export async function me(): Promise<MeResult | null> {
+  const session = await meWithReason()
+  return session.kind === 'signed-in' ? session.result : null
+}
+
+/** Why a session is not (or no longer) usable. `permissions-changed` is the
+ * server's `session_stale`: the org's auth epoch moved past the cookie's (a
+ * demotion, a removal, a suspension). The server clears that cookie as it answers. */
+export type SessionEndReason = 'permissions-changed' | 'signed-out'
+
+export type MeOutcome =
+  | { kind: 'signed-in'; result: MeResult }
+  | { kind: 'signed-out'; reason: SessionEndReason }
+
+/** `me()` with the 401's reason kept. Throws on anything that is not an answer
+ * about the session (network failure, 5xx) — callers must not read an
+ * unreachable server as a signed-out user. */
+export async function meWithReason(): Promise<MeOutcome> {
   const res = await fetch(`${API_BASE}/api/auth/me`, { credentials: 'include' })
-  if (res.status === 401) return null
+  if (res.status === 401) {
+    const body = (await res.json().catch(() => null)) as { code?: string } | null
+    return { kind: 'signed-out', reason: body?.code === 'session_stale' ? 'permissions-changed' : 'signed-out' }
+  }
   if (!res.ok) throw new Error(`auth me failed: HTTP ${res.status}`)
-  return (await res.json()) as MeResult
+  return { kind: 'signed-in', result: (await res.json()) as MeResult }
 }
 
 export async function devLogin(email: string, intent?: 'invite'): Promise<{ user: AuthUser; orgId: string | null }> {

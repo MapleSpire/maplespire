@@ -14,7 +14,8 @@
 
 import type { Express, Request, Response } from 'express'
 import { pool } from '../db.js'
-import { signSession, setSessionCookie } from './tokens.js'
+import { setSessionCookie } from './tokens.js'
+import { mintRefusalBody, signCurrentSession } from './sessionEpoch.js'
 import { appendAudit } from './audit.js'
 import { provisionOrgWithLandscape } from './provisioning.js'
 import { createDistributedRateLimiter } from '../runtime/rateLimiter.js'
@@ -45,14 +46,6 @@ async function checkOrgCreateRateLimit(userId: string) {
   })
 }
 
-async function currentOrgEpoch(orgId: string): Promise<number> {
-  // BIGINT → string from node-pg; coerce (mirrors devLogin.ts).
-  const { rows } = await pool.query<{ epoch: number | string }>(
-    'SELECT epoch FROM auth_epochs WHERE org_id = $1',
-    [orgId]
-  )
-  return rows[0] ? Number(rows[0].epoch) : 1
-}
 
 export function registerOrgRoutes(app: Express): void {
   app.get('/api/me/orgs', async (req: Request, res: Response) => {
@@ -187,12 +180,10 @@ export function registerOrgRoutes(app: Express): void {
       }
 
       await pool.query('UPDATE users SET last_org_id = $2 WHERE id = $1', [auth.userId, orgId])
-      const epoch = await currentOrgEpoch(orgId)
-      const token = await signSession({
+      const token = await signCurrentSession(pool, {
         userId: auth.userId,
         orgId,
         isPlatformAdmin: auth.isPlatformAdmin,
-        epoch,
       })
       setSessionCookie(res, token)
 
@@ -207,6 +198,11 @@ export function registerOrgRoutes(app: Express): void {
 
       res.json({ orgId })
     } catch (err) {
+      const refused = mintRefusalBody(err)
+      if (refused) {
+        res.status(403).json(refused)
+        return
+      }
       console.error('POST /api/auth/switch-org error:', err)
       res.status(500).json({ error: 'Failed to switch organization' })
     }

@@ -19,9 +19,9 @@ import { pool } from '../db.js'
 import { appendAudit } from './audit.js'
 import { explainAccess } from '../rbac/access.js'
 import { liveConnectionCount } from './wsAuth.js'
+import { mintRefusalBody, signCurrentSession } from './sessionEpoch.js'
 import { getPlatformSettingsState, updatePlatformSettings } from '../platform/settings.js'
 import {
-  signSession,
   verifySession,
   setSessionCookie,
   setNamedCookie,
@@ -38,10 +38,10 @@ import {
  * every call — `req.auth.isPlatformAdmin` is signed by us and therefore
  * trustworthy at the moment of issuance, but a platform admin can be demoted
  * mid-session (PATCH .../platform-admin) and that demotion must take effect
- * immediately, not merely once the token expires or the org's epoch bumps
- * (platform-admin status isn't epoch-scoped — it's not an org membership).
- * Trusting only the cookie here would let a just-revoked operator keep using
- * god-mode endpoints for up to the session's remaining lifetime.
+ * immediately, not merely once the token expires. A demotion also bumps the
+ * user's GLOBAL epoch (trg_epoch_users, wsAuth.ts ensureEpochTriggers), which
+ * ends the old session on the sync path and on cookie HTTP; this fresh read
+ * stays as the check that does not depend on that trigger existing.
  *
  * Pagination/validation/audit conventions mirror `rbac/orgRoutes.ts` exactly
  * (keyset `?after=`, `?limit=` capped at 100, `randomBytes` ids, `fail()`
@@ -432,8 +432,10 @@ export function registerPlatformRoutes(app: Express): void {
 
   // -------------------------------------------------------------------
   // PATCH /api/platform/users/:userId  { status: 'active' | 'deactivated' }
-  // Bumps the epoch of every org the user belongs to (their live
-  // sessions/sockets in EVERY org must drop, not just one).
+  // Deactivating bumps the user's global epoch (trg_epoch_users, in the
+  // UPDATE's own commit), which ends every session they hold — in any org,
+  // org-less, or pinned to an org they have left. The per-org bumps below
+  // also drop each org's cached allowed-workspace sets (their notify).
   // -------------------------------------------------------------------
   app.patch('/api/platform/users/:userId', async (req, res) => {
     const auth = await requirePlatformAdmin(req, res)
@@ -459,8 +461,10 @@ export function registerPlatformRoutes(app: Express): void {
         'SELECT org_id FROM org_members WHERE user_id = $1',
         [targetUserId]
       )
+      // Revokes THIS user's sessions in each of their orgs — not their
+      // colleagues' (bump_auth_user_epoch, wsAuth.ts ensureEpochTriggers).
       for (const r of orgRows) {
-        await pool.query('SELECT bump_auth_epoch($1)', [r.org_id])
+        await pool.query('SELECT bump_auth_user_epoch($1, $2)', [r.org_id, targetUserId])
       }
 
       await appendAudit(pool, {
@@ -482,6 +486,11 @@ export function registerPlatformRoutes(app: Express): void {
   // PATCH /api/platform/users/:userId/platform-admin  { grant: boolean }
   // Last-platform-admin protection enforced in SQL (FOR UPDATE lock over
   // every platform-admin row, mirroring orgRoutes.ts's last-org-admin guard).
+  // A revoke bumps the target's global epoch in this transaction
+  // (trg_epoch_users): their sessions end everywhere, since the sync gate
+  // and HTTP routes trust the signed `isPlatformAdmin` claim. A grant bumps
+  // nothing: these routes read the flag fresh at once, while claim-trusting
+  // paths elevate the grantee only from their next sign-in.
   // -------------------------------------------------------------------
   app.patch('/api/platform/users/:userId/platform-admin', async (req, res) => {
     const auth = await requirePlatformAdmin(req, res)
@@ -573,15 +582,6 @@ export function registerPlatformRoutes(app: Express): void {
       )
       const targetOrgId = membershipRows[0]?.org_id ?? null
 
-      let epoch = 1
-      if (targetOrgId) {
-        const { rows: epochRows } = await pool.query<{ epoch: number | string }>(
-          'SELECT epoch FROM auth_epochs WHERE org_id = $1',
-          [targetOrgId]
-        )
-        epoch = epochRows[0] ? Number(epochRows[0].epoch) : 1
-      }
-
       // Stash the CALLER's current session BEFORE overwriting the cookie —
       // if the caller's own cookie is somehow missing/invalid at this point
       // (shouldn't happen, requirePlatformAdmin already verified req.auth),
@@ -590,18 +590,18 @@ export function registerPlatformRoutes(app: Express): void {
       const currentToken = readSessionCookie(req)
       const stashToken =
         currentToken ??
-        (await signSession({ userId: auth.userId, orgId: req.auth!.orgId, isPlatformAdmin: true, epoch: req.auth!.epoch }))
+        (await signCurrentSession(pool, { userId: auth.userId, orgId: req.auth!.orgId, isPlatformAdmin: true }))
       setNamedCookie(res, adminStashCookieName(), stashToken, IMPERSONATION_MAX_AGE_S)
 
       // isPlatformAdmin is ALWAYS false during impersonation — the "read-only
       // WYSIWYG debugging" contract means the impersonated view must
       // behave exactly like the target's own session, never elevated.
-      const impSession = await signSession(
+      const impSession = await signCurrentSession(
+        pool,
         {
           userId: targetUserId,
           orgId: targetOrgId,
           isPlatformAdmin: false,
-          epoch,
           imp: { by: auth.userId },
         },
         IMPERSONATION_MAX_AGE_S
@@ -626,6 +626,11 @@ export function registerPlatformRoutes(app: Express): void {
 
       res.json({ target: { id: targetRows[0].id, email: targetRows[0].email } })
     } catch (err) {
+      const refused = mintRefusalBody(err)
+      if (refused) {
+        res.status(403).json(refused)
+        return
+      }
       fail(res, 'Failed to start impersonation', err)
     }
   })

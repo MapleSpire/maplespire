@@ -179,6 +179,7 @@ import { registerOrgAdminRoutes } from './rbac/orgRoutes.js'
 import { registerPlatformRoutes } from './auth/platformRoutes.js'
 import { authStage, requireAuth } from './auth/middleware.js'
 import { sessionCookieName } from './auth/tokens.js'
+import { sharedSessionEpochValidator } from './auth/sessionEpoch.js'
 import { registerAuthRoutes } from './auth/devLogin.js'
 import { registerPasswordAuthRoutes } from './auth/passwordAuth.js'
 import { registerOidcRoutes } from './auth/oidc.js'
@@ -382,7 +383,11 @@ app.use('/api', aiBearerBridge())
 // in registration order). Stage 'off' (the default) is a pure pass-through, so an
 // un-configured server behaves byte-identically to before auth existed. See
 // docs/auth-setup.md for the off|dual|on rollout stages + allowlist.
-app.use('/api', requireAuth())
+// `isSessionCurrent`: a revoked cookie is refused here too, not only on the
+// sync path — every epoch, the same per-process validator, so a bump's notify
+// clears both. HTTP gates trust signed claims (`isPlatformAdmin`, and `orgId`
+// in workspaceGate.ts requireLandscapeInOrg, which reads no membership).
+app.use('/api', requireAuth({ isSessionCurrent: sharedSessionEpochValidator(pool) }))
 
 // Auth + email routes (all default-off/no-op without their env vars; the client's
 // login page reads /api/auth/config to know what to render).

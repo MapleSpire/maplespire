@@ -166,6 +166,36 @@ describe('tokens: impersonation claims (imp)', () => {
   })
 })
 
+describe('tokens: per-user epoch (uepoch)', () => {
+  beforeEach(() => {
+    resetEnv()
+    process.env.AUTH_SECRET = 'test-secret-1234567890'
+  })
+  afterEach(resetEnv)
+
+  it('round-trips uepoch through sign then verify', async () => {
+    const withUser: SessionClaims = { userId: 'u1', orgId: 'org1', isPlatformAdmin: false, epoch: 4, uepoch: 2 }
+    await expect(verifySession(await signSession(withUser))).resolves.toEqual(withUser)
+  })
+
+  it('a cookie minted before uepoch existed still verifies, with no uepoch (read as 1 by the epoch checks)', async () => {
+    const verified = await verifySession(await signSession(claims))
+    expect(verified).not.toBeNull()
+    expect(verified).not.toHaveProperty('uepoch')
+  })
+
+  it('rejects a token whose uepoch is not a number', async () => {
+    const { SignJWT } = await import('jose')
+    const secret = new TextEncoder().encode(process.env.AUTH_SECRET!)
+    const bogus = await new SignJWT({ userId: 'u1', orgId: 'org1', isPlatformAdmin: false, epoch: 1, uepoch: '2' })
+      .setProtectedHeader({ alg: 'HS256' })
+      .setIssuedAt()
+      .setExpirationTime(Math.floor(Date.now() / 1000) + 3600)
+      .sign(secret)
+    await expect(verifySession(bogus)).resolves.toBeNull()
+  })
+})
+
 describe('tokens: cookie read/write', () => {
   beforeEach(() => {
     resetEnv()
@@ -460,6 +490,187 @@ describe('middleware: requireAuth', () => {
     handler(req, res, next)
     await vi.waitFor(() => expect(next).toHaveBeenCalledTimes(1))
     expect(req.auth).toEqual(claims)
+  })
+})
+
+describe('tokens: global epoch (gepoch, imp.gepoch)', () => {
+  beforeEach(() => {
+    resetEnv()
+    process.env.AUTH_SECRET = 'test-secret-1234567890'
+  })
+  afterEach(resetEnv)
+
+  it("round-trips gepoch and the impersonator's imp.gepoch", async () => {
+    const full: SessionClaims = { ...claims, uepoch: 2, gepoch: 3, imp: { by: 'admin-1', gepoch: 4 } }
+    await expect(verifySession(await signSession(full))).resolves.toEqual(full)
+  })
+
+  it('a cookie minted before gepoch existed verifies with none (read as 1), and an old imp keeps only `by`', async () => {
+    const verified = await verifySession(await signSession({ ...claims, imp: { by: 'admin-1' } }))
+    expect(verified).not.toHaveProperty('gepoch')
+    expect(verified?.imp).toEqual({ by: 'admin-1' })
+  })
+
+  it('rejects a token whose gepoch or imp.gepoch is not a number', async () => {
+    const { SignJWT } = await import('jose')
+    const secret = new TextEncoder().encode(process.env.AUTH_SECRET!)
+    const sign = (payload: Record<string, unknown>) => new SignJWT(payload)
+      .setProtectedHeader({ alg: 'HS256' })
+      .setIssuedAt()
+      .setExpirationTime(Math.floor(Date.now() / 1000) + 3600)
+      .sign(secret)
+    const base = { userId: 'u1', orgId: 'org1', isPlatformAdmin: false, epoch: 1 }
+    await expect(verifySession(await sign({ ...base, gepoch: '2' }))).resolves.toBeNull()
+    await expect(verifySession(await sign({ ...base, imp: { by: 'a', gepoch: '2' } }))).resolves.toBeNull()
+  })
+})
+
+describe('middleware: requireAuth isSessionCurrent (a revoked session on cookie HTTP)', () => {
+  beforeEach(() => {
+    resetEnv()
+    process.env.AUTH_SECRET = 'test-secret-1234567890'
+  })
+  afterEach(resetEnv)
+
+  function fakeReqRes(opts: { path: string; cookie?: string }) {
+    const req = { path: opts.path, method: 'GET', headers: { cookie: opts.cookie } } as unknown as Request
+    const res = {
+      statusCode: undefined as number | undefined,
+      jsonBody: undefined as unknown,
+      setCookies: [] as string[],
+      status(code: number) {
+        this.statusCode = code
+        return this
+      },
+      json(body: unknown) {
+        this.jsonBody = body
+        return this
+      },
+      append(name: string, value: string) {
+        if (name === 'Set-Cookie') this.setCookies.push(value)
+        return this
+      },
+    }
+    return { req, res }
+  }
+  async function run(opts: {
+    stage: 'on' | 'dual'
+    path?: string
+    isSessionCurrent: (c: SessionClaims) => Promise<boolean>
+    preAuth?: SessionClaims
+  }) {
+    process.env.AUTH = opts.stage
+    const token = await signSession(claims)
+    const { req, res } = fakeReqRes({ path: opts.path ?? '/landscapes', cookie: `${SESSION_COOKIE_NAME}=${token}` })
+    if (opts.preAuth) req.auth = opts.preAuth
+    const next = vi.fn()
+    requireAuth({ isSessionCurrent: opts.isSessionCurrent })(req, res as never, next)
+    await vi.waitFor(() => expect(next.mock.calls.length > 0 || res.statusCode !== undefined).toBe(true))
+    return { req, res, next }
+  }
+
+  it('a stale session is a 401 session_stale, clears the cookie, and never reaches the route', async () => {
+    const { req, res, next } = await run({ stage: 'on', isSessionCurrent: async () => false })
+    expect(next).not.toHaveBeenCalled()
+    expect(res.statusCode).toBe(401)
+    expect(res.jsonBody).toMatchObject({ code: 'session_stale' })
+    expect(res.setCookies.some((c) => c.startsWith(`${SESSION_COOKIE_NAME}=;`))).toBe(true)
+    expect(req.auth).toBeUndefined()
+  })
+
+  it('a current session proceeds with req.auth set, and the check saw its claims', async () => {
+    const isSessionCurrent = vi.fn(async () => true)
+    const { req, next } = await run({ stage: 'on', isSessionCurrent })
+    expect(next).toHaveBeenCalledTimes(1)
+    expect(req.auth).toEqual(claims)
+    expect(isSessionCurrent).toHaveBeenCalledWith(claims)
+  })
+
+  it('a stale session on an allowlisted path proceeds UNauthenticated (logout and /auth/me still answer)', async () => {
+    const { req, res, next } = await run({ stage: 'on', path: '/auth/me', isSessionCurrent: async () => false })
+    expect(next).toHaveBeenCalledTimes(1)
+    expect(res.statusCode).toBeUndefined()
+    expect(req.auth).toBeUndefined()
+  })
+
+  it('a failed check on an allowlisted path proceeds unauthenticated (logout still answers with the DB down)', async () => {
+    const { req, res, next } = await run({ stage: 'on', path: '/auth/logout', isSessionCurrent: async () => { throw new Error('db down') } })
+    expect(next).toHaveBeenCalledTimes(1)
+    expect(res.statusCode).toBeUndefined()
+    expect(req.auth).toBeUndefined()
+  })
+
+  it('a failed check fails closed with a 503, never admitted', async () => {
+    const { req, res, next } = await run({ stage: 'on', isSessionCurrent: async () => { throw new Error('db down') } })
+    expect(next).not.toHaveBeenCalled()
+    expect(res.statusCode).toBe(503)
+    expect(req.auth).toBeUndefined()
+  })
+
+  // QA lens round 2 (2026-10-17): each of the cases below survived a mutant.
+  it('/auth/me proceeds unauthenticated on a failed check too (it reads the cookie itself)', async () => {
+    const { req, res, next } = await run({ stage: 'on', path: '/auth/me', isSessionCurrent: async () => { throw new Error('db down') } })
+    expect(next).toHaveBeenCalledTimes(1)
+    expect(res.statusCode).toBeUndefined()
+    expect(req.auth).toBeUndefined()
+  })
+
+  it('an ALLOWLISTED route other than logout and /auth/me still answers a failed check with 503', async () => {
+    for (const path of ['/auth/switch-org', '/auth/invite/tok/accept']) {
+      const { req, res, next } = await run({ stage: 'on', path, isSessionCurrent: async () => { throw new Error('db down') } })
+      expect(next).not.toHaveBeenCalled()
+      expect(res.statusCode).toBe(503)
+      expect(req.auth).toBeUndefined()
+    }
+  })
+
+  it('/health, /health/* and /ready never consult the session check — not even with the database down', async () => {
+    for (const path of ['/health', '/health/deep', '/ready']) {
+      const isSessionCurrent = vi.fn(async (): Promise<boolean> => { throw new Error('db down') })
+      const { req, res, next } = await run({ stage: 'on', path, isSessionCurrent })
+      expect(isSessionCurrent).not.toHaveBeenCalled()
+      expect(next).toHaveBeenCalledTimes(1)
+      expect(res.statusCode).toBeUndefined()
+      expect(req.auth).toEqual(claims)
+    }
+    // Control: a path merely STARTING with "health" is not a probe, so the
+    // check runs (it is allowlisted by prefix, so a stale session proceeds
+    // unauthenticated rather than 401).
+    const isSessionCurrent = vi.fn(async () => false)
+    const { req } = await run({ stage: 'on', path: '/healthy-landscapes', isSessionCurrent })
+    expect(isSessionCurrent).toHaveBeenCalledTimes(1)
+    expect(req.auth).toBeUndefined()
+  })
+
+  it('a failed check is logged, at most once a minute', async () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+    vi.useFakeTimers({ toFake: ['Date'] })
+    try {
+      // Far past any failure an earlier test logged: the throttle is open.
+      vi.setSystemTime(Date.now() + 3_600_000)
+      const fail = async () => { throw new Error('db down') }
+      const logged = () => error.mock.calls.filter(([m]) => String(m).includes('session epoch check failed')).length
+      await run({ stage: 'on', isSessionCurrent: fail })
+      expect(logged()).toBe(1)
+      await run({ stage: 'on', isSessionCurrent: fail })
+      expect(logged()).toBe(1)
+      vi.setSystemTime(Date.now() + 61_000)
+      await run({ stage: 'on', isSessionCurrent: fail })
+      expect(logged()).toBe(2)
+    } finally {
+      vi.useRealTimers()
+      error.mockRestore()
+    }
+  })
+
+  it("stage 'dual' does not enforce it, and a bearer identity set upstream is not re-checked", async () => {
+    const isSessionCurrent = vi.fn(async () => false)
+    const dual = await run({ stage: 'dual', isSessionCurrent })
+    expect(dual.next).toHaveBeenCalledTimes(1)
+    expect(dual.req.auth).toEqual(claims)
+    const bearer = await run({ stage: 'on', isSessionCurrent, preAuth: { ...claims, userId: 'bearer-user' } })
+    expect(bearer.next).toHaveBeenCalledTimes(1)
+    expect(isSessionCurrent).not.toHaveBeenCalled()
   })
 })
 

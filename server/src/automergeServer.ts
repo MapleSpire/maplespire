@@ -32,7 +32,7 @@ import { createSyncWriteGate, throttledOnce, type GateMessage, type SyncWriteGat
 import type { WorkspaceKey } from './readModel/projector.js'
 import { authStage } from './auth/middleware.js'
 import { authenticateUpgrade, createCachedUpgradeSessionVerifier, rejectUpgrade, ConnectionRegistry, startEpochRevocation } from './auth/wsAuth.js'
-import { createSessionEpochValidator } from './auth/sessionEpoch.js'
+import { sharedSessionEpochValidator } from './auth/sessionEpoch.js'
 import type { SessionClaims } from './auth/tokens.js'
 import { WorkspaceDocIndex, buildAccessCheck, buildWorkspaceRouteCheck, buildWriteCheck, buildBaselineWriteFence, resolveDocumentPlacement, allowedWorkspaceKeys, invalidateAllowedWorkspaceKeysCache, type GateFaultReporter } from './rbac/docScope.js'
 import { accessCheckMode, createClaimOnlyAccessCheck } from './rbac/claimOnlyAccessCheck.js'
@@ -813,7 +813,8 @@ export function buildOwnershipWriteCheck(deps: {
  *     every stage, because that gate writes `automerge_document_workspace`, the
  *     table the durable-heads acknowledgement reads.
  *   - `startEpochRevocation` terminates live connections whose session epoch
- *     falls behind a grant-change-triggered bump (stage 'on' only; 'dual' logs).
+ *     falls behind an access-REDUCING bump (stage 'on' only; 'dual' logs); a
+ *     pure grant only drops the allowed-workspace cache (ensureEpochTriggers).
  *
  * Returns the repo and the shared root document URL (clients fetch the latter via
  * `GET /api/automerge/root`).
@@ -859,7 +860,7 @@ export async function startAutomergeSync(
   type WssParam = ConstructorParameters<typeof NodeWSServerAdapter>[0]
 
   const stage = authStage()
-  const validateSessionEpoch = createSessionEpochValidator(pool)
+  const validateSessionEpoch = sharedSessionEpochValidator(pool)
   const verifyUpgradeSession = createCachedUpgradeSessionVerifier()
   const resolveUpgradeWorkspace = getSharedWorkspaceRouteResolver(pool)
   const connectionRegistry = new ConnectionRegistry()
@@ -1571,6 +1572,8 @@ export async function startAutomergeSync(
   const epochRevocation = stage !== 'off'
     ? startEpochRevocation(pool, connectionRegistry, {
         onWorkspaceAccessChanged: () => invalidateAllowedWorkspaceKeysCache(),
+        onEpochBumped: (orgId, userId) => validateSessionEpoch.forget(orgId, userId),
+        onGlobalEpochBumped: (userId) => validateSessionEpoch.forgetGlobal(userId),
       })
     : null
 

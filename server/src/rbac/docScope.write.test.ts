@@ -438,8 +438,10 @@ describe.skipIf(!TEST_DATABASE_URL)('buildWriteCheck — write gate matrix (live
       // Epoch 1: no grant -> not writable (and now cached under epoch 1).
       expect((await writableWorkspaceKeys(pool, claimsFor(userId, orgId, 1))).has(key)).toBe(false)
 
-      // Grant arrives (in production this bumps the org epoch via triggers,
-      // which terminates sockets and reissues sessions with the new epoch).
+      // Grant arrives. In production a grant no longer bumps the org epoch
+      // (ensureEpochTriggers in auth/wsAuth.ts): it NOTIFYs
+      // workspace_access_changed, whose listener drops this cache outright.
+      // Without that listener, same-epoch staleness is bounded by the TTL.
       await grantOnScope(orgId, userId, await versionScopeId(orgId, ws), { canRead: true, canWrite: true })
 
       // Same epoch inside the TTL still answers from cache — bounded staleness…
@@ -448,6 +450,55 @@ describe.skipIf(!TEST_DATABASE_URL)('buildWriteCheck — write gate matrix (live
       expect((await writableWorkspaceKeys(pool, claimsFor(userId, orgId, 2))).has(key)).toBe(true)
       // The read set shares the same entry/semantics.
       expect((await allowedWorkspaceKeys(pool, claimsFor(userId, orgId, 2))).has(key)).toBe(true)
+      await dropLandscape(ws.landscapeId)
+    } finally {
+      await dropOrg(orgId)
+      _clearAllowedWorkspaceKeysCacheForTests()
+    }
+  })
+
+  it('an invite-intent session (org-less, epoch 1) does not answer for the session accept re-pins to the org (epoch 1 too)', async () => {
+    // Regression: the cache was keyed per (user, epoch). An addition no longer
+    // bumps the org epoch, so the joined org can still be at epoch 1 — the same
+    // key as the org-less session that cached an EMPTY set before accepting.
+    _clearAllowedWorkspaceKeysCacheForTests()
+    const orgId = await makeOrg()
+    try {
+      const userId = await makeUser()
+      const ws = await makeWorkspace(orgId)
+      const key = `${ws.landscapeId}/${ws.versionId}`
+
+      expect((await allowedWorkspaceKeys(pool, claimsFor(userId, null, 1))).has(key)).toBe(false)
+
+      await memberOf(orgId, userId, 'admin') // the accept's insert
+      // No NOTIFY listener runs here: only the key can tell the two sessions apart.
+      expect((await allowedWorkspaceKeys(pool, claimsFor(userId, orgId, 1))).has(key)).toBe(true)
+      expect((await writableWorkspaceKeys(pool, claimsFor(userId, orgId, 1))).has(key)).toBe(true)
+      await dropLandscape(ws.landscapeId)
+    } finally {
+      await dropOrg(orgId)
+      _clearAllowedWorkspaceKeysCacheForTests()
+    }
+  })
+
+  it('a demoted user\'s new session (next uepoch) does not reuse the cached set of their old one', async () => {
+    // Per-user revocation moves only `uepoch`; keyed without it, the demoted
+    // user's re-minted session would be served their admin-era set for the
+    // TTL by any process that missed the NOTIFY (QA lens, 2026-10-16).
+    _clearAllowedWorkspaceKeysCacheForTests()
+    const orgId = await makeOrg()
+    try {
+      const userId = await makeUser()
+      await memberOf(orgId, userId, 'admin')
+      const ws = await makeWorkspace(orgId)
+      const key = `${ws.landscapeId}/${ws.versionId}`
+      const before: SessionClaims = { ...claimsFor(userId, orgId, 1), uepoch: 1 }
+      expect((await writableWorkspaceKeys(pool, before)).has(key)).toBe(true)
+
+      await pool.query("UPDATE org_members SET role = 'member' WHERE org_id = $1 AND user_id = $2", [orgId, userId])
+      const after: SessionClaims = { ...before, uepoch: 2 }
+      expect((await writableWorkspaceKeys(pool, after)).has(key)).toBe(false)
+      expect((await allowedWorkspaceKeys(pool, after)).has(key)).toBe(false)
       await dropLandscape(ws.landscapeId)
     } finally {
       await dropOrg(orgId)

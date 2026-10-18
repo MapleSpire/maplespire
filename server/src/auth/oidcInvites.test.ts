@@ -650,7 +650,11 @@ describe('POST /api/auth/invite/:token/accept', () => {
       if (s.includes('INSERT INTO team_members')) return { rows: [], rowCount: 1 }
       if (s.includes('UPDATE org_invites SET accepted_at')) return { rows: [] }
       if (s.includes('UPDATE users SET last_org_id')) return { rows: [] }
-      if (s.includes('FROM auth_epochs')) return { rows: [{ epoch: '4' }] } // BIGINT → string
+      // signCurrentSession's two reads (BIGINT → string).
+      if (s.includes('LEFT JOIN auth_global_epochs')) {
+        return { rows: [{ id: 'session-user-1', is_platform_admin: false, status: 'active', gepoch: '1' }] }
+      }
+      if (s.includes('FROM orgs o')) return { rows: [{ status: 'active', epoch: '4', uepoch: '1', member: true }] }
       return { rows: [] }
     })
   }

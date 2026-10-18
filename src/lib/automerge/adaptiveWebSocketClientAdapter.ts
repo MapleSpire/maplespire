@@ -86,6 +86,24 @@ function peerWireMessage(value: unknown): PeerWireMessage | null {
     : null
 }
 
+/** One unintended close of a sync socket. `opened` is false when the socket
+ * never reached `open` — which is how a browser reports an upgrade the server
+ * REFUSED (401 for a stale session): a bare 1006, details hidden on purpose. */
+export interface TransportClose {
+  code: number
+  opened: boolean
+}
+export type TransportCloseObserver = (close: TransportClose) => void
+
+let transportCloseObserver: TransportCloseObserver | null = null
+
+/** Install the page's one listener for unintended transport closes (the session
+ * watcher, lib/auth/sessionWatch.ts). The transport only reports; whatever the
+ * listener decides, reconnecting carries on unchanged. */
+export function setTransportCloseObserver(observer: TransportCloseObserver | null): void {
+  transportCloseObserver = observer
+}
+
 /**
  * DEV/E2E: the adapters alive in this page, so a test can drop the CURRENT
  * socket the way an outage would. A Playwright WebSocket route only intercepts
@@ -121,6 +139,8 @@ export class AdaptiveWebSocketClientAdapter extends NetworkAdapter {
   /** The code of the last close seen on this transport, or `null` before the
    * first one. Instrument only: nothing decides on it. */
   private closeCode: number | null = null
+  /** Did the CURRENT socket reach `open`? Reset per socket in `openSocket`. */
+  private socketOpened = false
   /** Bytes this transport has received, monotone for the life of the adapter
    * and ACROSS reconnects. It is the witness a boot document consults
    * to tell "the server is busy with someone else's turn" from "the server has
@@ -256,6 +276,7 @@ export class AdaptiveWebSocketClientAdapter extends NetworkAdapter {
     }
     const socket = new WebSocket(this.url)
     this.socket = socket
+    this.socketOpened = false
     socket.binaryType = 'arraybuffer'
     socket.addEventListener('open', this.onOpen)
     socket.addEventListener('close', this.onClose)
@@ -264,6 +285,7 @@ export class AdaptiveWebSocketClientAdapter extends NetworkAdapter {
   }
 
   private readonly onOpen = (): void => {
+    this.socketOpened = true
     clearTimeout(this.reconnectTimer)
     this.reconnectTimer = undefined
     this.reconnectAttempt = 0
@@ -278,6 +300,13 @@ export class AdaptiveWebSocketClientAdapter extends NetworkAdapter {
     // `Repo` reads it once at construction.
     this.ready = false
     this.emitRemoteDisconnected()
+    if (!this.intentionalClose && transportCloseObserver) {
+      try {
+        transportCloseObserver({ code: event.code, opened: this.socketOpened })
+      } catch (error) {
+        console.warn('[automerge] transport close observer failed', error)
+      }
+    }
     if (this.intentionalClose || this.reconnectTimer || !this.peerId) return
     if (SERVICE_RESTART_CODES.has(event.code)) this.handoffRetry = true
     // A first handoff retry can race the replacement owner's readiness and be

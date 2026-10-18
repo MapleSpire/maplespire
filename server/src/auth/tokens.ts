@@ -66,7 +66,8 @@ export function adminStashCookieName(): string {
 const DEFAULT_SESSION_MAX_AGE_S = 30 * 24 * 60 * 60 // 30 days
 
 /** Claims carried in the session JWT. `epoch` pins the org's auth_epochs
- * value at issuance — a bump invalidates every session minted before it.
+ * value at issuance — a bump invalidates every session in the org minted
+ * before it (org-wide events only); `uepoch` does the same for one user.
  * `imp` is set ONLY on an impersonation session — its absence means "a normal
  * session", so every cookie minted before impersonation existed still
  * verifies unchanged (backward compatible by construction: an old payload
@@ -76,9 +77,22 @@ export type SessionClaims = {
   orgId: string | null
   isPlatformAdmin: boolean
   epoch: number
+  /** Pins `auth_user_epochs` for (orgId, userId) at issuance: a reduction of
+   * THIS user's access in this org bumps it and revokes only their sessions
+   * (`epoch` stays for org-wide events — a suspension). OPTIONAL: a cookie
+   * minted before it existed has none, which reads as 1 — the value of an
+   * absent row — so no session is revoked by the deploy. */
+  uepoch?: number
+  /** Pins `auth_global_epochs` for userId at issuance: bumped when the user
+   * loses platform admin or is deactivated, which ends their sessions in
+   * EVERY org and the org-less ones (`uepoch` cannot reach those: it is keyed
+   * by org). OPTIONAL, absent = 1, like `uepoch`. */
+  gepoch?: number
   /** Set iff this session was minted by POST /api/platform/impersonate.
-   * `by` is the impersonating (platform admin) user's id. */
-  imp?: { by: string }
+   * `by` is the impersonating (platform admin) user's id; `gepoch` pins BY's
+   * global epoch, so revoking the impersonator ends the impersonation too
+   * (absent = 1). */
+  imp?: { by: string; gepoch?: number }
 }
 
 function getSecret(): Uint8Array {
@@ -116,7 +130,9 @@ export async function signSession(c: SessionClaims, maxAgeS?: number): Promise<s
     isPlatformAdmin: c.isPlatformAdmin,
     epoch: c.epoch,
   }
-  if (c.imp) payload.imp = c.imp
+  if (c.uepoch !== undefined) payload.uepoch = c.uepoch
+  if (c.gepoch !== undefined) payload.gepoch = c.gepoch
+  if (c.imp) payload.imp = c.imp.gepoch === undefined ? { by: c.imp.by } : { by: c.imp.by, gepoch: c.imp.gepoch }
   return new SignJWT(payload)
     .setProtectedHeader({ alg: 'HS256' })
     .setIssuedAt()
@@ -142,7 +158,9 @@ export async function verifySession(token: string): Promise<SessionClaims | null
       typeof payload.userId !== 'string' ||
       typeof payload.isPlatformAdmin !== 'boolean' ||
       typeof payload.epoch !== 'number' ||
-      (payload.orgId !== null && typeof payload.orgId !== 'string')
+      (payload.orgId !== null && typeof payload.orgId !== 'string') ||
+      (payload.uepoch !== undefined && typeof payload.uepoch !== 'number') ||
+      (payload.gepoch !== undefined && typeof payload.gepoch !== 'number')
     ) {
       return null
     }
@@ -151,17 +169,20 @@ export async function verifySession(token: string): Promise<SessionClaims | null
     // verifying unchanged. When present it must have the expected shape;
     // anything else (tampered/malformed) rejects the whole token rather than
     // silently dropping just the impersonation marker.
-    let imp: { by: string } | undefined
+    let imp: { by: string; gepoch?: number } | undefined
     if (payload.imp !== undefined) {
       const rawImp = payload.imp as Record<string, unknown> | null
       if (!rawImp || typeof rawImp.by !== 'string') return null
-      imp = { by: rawImp.by }
+      if (rawImp.gepoch !== undefined && typeof rawImp.gepoch !== 'number') return null
+      imp = typeof rawImp.gepoch === 'number' ? { by: rawImp.by, gepoch: rawImp.gepoch } : { by: rawImp.by }
     }
     return {
       userId: payload.userId,
       orgId: (payload.orgId as string | null) ?? null,
       isPlatformAdmin: payload.isPlatformAdmin,
       epoch: payload.epoch,
+      ...(typeof payload.uepoch === 'number' ? { uepoch: payload.uepoch } : {}),
+      ...(typeof payload.gepoch === 'number' ? { gepoch: payload.gepoch } : {}),
       ...(imp ? { imp } : {}),
     }
   } catch (err) {

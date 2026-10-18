@@ -13,7 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import type { NextFunction, Request, RequestHandler, Response } from 'express'
-import { readSessionCookie, verifySession, type SessionClaims } from './tokens.js'
+import { clearSessionCookie, readSessionCookie, verifySession, type SessionClaims } from './tokens.js'
 import { AsyncSingleFlight } from '../performance/asyncSingleFlight.js'
 
 /**
@@ -84,6 +84,26 @@ function isImpersonationWriteExempt(req: Request): boolean {
   return req.path === '/auth/impersonate/exit'
 }
 
+/** Probes never act on `req.auth`: a cookie riding along must not put a
+ * database read in front of a liveness or readiness answer. */
+function isSessionCheckExempt(req: Request): boolean {
+  return req.path === '/health' || req.path.startsWith('/health/') || req.path === '/ready'
+}
+
+/** Routes that read the session cookie themselves, so a failed epoch check
+ * may proceed unauthenticated there instead of answering 503. */
+function isSessionCheckFailurePassthrough(req: Request): boolean {
+  return req.path === '/auth/logout' || req.path === '/auth/me'
+}
+
+let lastSessionCheckErrorAt = 0
+function logSessionCheckFailure(err: unknown): void {
+  const now = Date.now()
+  if (now - lastSessionCheckErrorAt < DUAL_WARN_THROTTLE_MS) return
+  lastSessionCheckErrorAt = now
+  console.error('requireAuth: session epoch check failed (throttled to one line a minute):', err)
+}
+
 function isAllowlisted(req: Request): boolean {
   const path = req.path
   if (ALLOWLISTED_PREFIXES.some((p) => path === p.replace(/\/$/, '') || path.startsWith(p))) return true
@@ -103,8 +123,25 @@ function isAllowlisted(req: Request): boolean {
  *   rollout.
  * - `on`   → same verification, but missing/invalid is a 401 UNLESS the
  *   path is allowlisted.
+ *
+ * `isSessionCurrent` (stage 'on' only, cookie sessions only — a bearer
+ * identity is read fresh by its bridge) refuses a session revoked since it
+ * was signed. HTTP routes trust signed claims — `isPlatformAdmin`
+ * (workspaceGate.ts, orgRoutes.ts, shares.ts…) and `orgId`
+ * (workspaceGate.ts requireLandscapeInOrg reads no membership) — so without
+ * it a revoked platform admin's cookie kept cross-org admin for its 30-day
+ * life, a deactivated user's kept working, and a removed member's kept
+ * reading the org's landscape snapshots. A stale session is a 401
+ * `session_stale` (an allowlisted path proceeds unauthenticated instead, so
+ * logout, /auth/me and the sign-in routes still answer). A failed check is a
+ * 503 — fail closed, never admitted — except on logout and /auth/me, which
+ * read the cookie themselves. /health and /ready skip the check.
  */
-export function requireAuth(): RequestHandler {
+export interface RequireAuthOptions {
+  isSessionCurrent?: (claims: SessionClaims) => Promise<boolean>
+}
+
+export function requireAuth(options: RequireAuthOptions = {}): RequestHandler {
   return (req: Request, res: Response, next: NextFunction) => {
     const stage = authStage()
     if (stage === 'off') {
@@ -133,7 +170,33 @@ export function requireAuth(): RequestHandler {
     }
 
     sessionVerificationFlights.run(token, () => verifySession(token))
-      .then((claims) => {
+      .then(async (claims) => {
+        if (claims && stage === 'on' && options.isSessionCurrent && !isSessionCheckExempt(req)) {
+          let current: boolean
+          try {
+            current = await options.isSessionCurrent(claims)
+          } catch (err) {
+            logSessionCheckFailure(err)
+            // Logout and /auth/me read the cookie themselves; every other
+            // route — allowlisted switch-org and invite accept included —
+            // would answer a database blip as "signed out".
+            if (isSessionCheckFailurePassthrough(req)) {
+              next()
+              return
+            }
+            res.status(503).json({ error: 'Session check unavailable' })
+            return
+          }
+          if (!current) {
+            if (allowlisted) {
+              next()
+              return
+            }
+            clearSessionCookie(res)
+            res.status(401).json({ error: 'Session permissions changed; sign in again', code: 'session_stale' })
+            return
+          }
+        }
         if (claims) {
           req.auth = claims
           if (claims.imp && !isImpersonationWriteExempt(req)) {

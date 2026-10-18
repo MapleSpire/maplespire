@@ -15,10 +15,10 @@
 import type { Express, Request, Response } from 'express'
 import { pool } from '../db.js'
 import { findOrCreateUser, bootstrapPlatformAdmin } from './users.js'
-import { signSession, verifySession, setSessionCookie, clearSessionCookie, readSessionCookie } from './tokens.js'
+import { verifySession, setSessionCookie, clearSessionCookie, readSessionCookie } from './tokens.js'
 import { appendAudit } from './audit.js'
 import { resolveLoginOrg } from './provisioning.js'
-import { isSessionEpochCurrent } from './sessionEpoch.js'
+import { isSessionEpochCurrent, mintRefusalBody, signCurrentSession } from './sessionEpoch.js'
 import { authStage } from './middleware.js'
 
 // RFC 5322 is a whole universe; this is the same pragmatic "looks like an
@@ -30,13 +30,6 @@ function isValidEmail(v: unknown): v is string {
   return typeof v === 'string' && v.length <= 320 && EMAIL_RE.test(v)
 }
 
-async function currentOrgEpoch(orgId: string): Promise<number> {
-  // auth_epochs.epoch is BIGINT — node-pg returns it as a STRING. A string epoch
-  // inside the JWT fails verifySession's claim-shape check, so every session
-  // would be rejected the moment the epoch triggers create a real row. Coerce.
-  const { rows } = await pool.query<{ epoch: number | string }>('SELECT epoch FROM auth_epochs WHERE org_id = $1', [orgId])
-  return rows[0] ? Number(rows[0].epoch) : 1
-}
 
 /**
  * DEV-ONLY email/password-less login + the shared logout/me endpoints.
@@ -90,11 +83,15 @@ export function registerAuthRoutes(app: Express): void {
       )
       const isPlatformAdmin = freshRows[0]?.is_platform_admin ?? user.isPlatformAdmin
 
-      const epoch = orgId ? await currentOrgEpoch(orgId) : 1
-      const token = await signSession({ userId: user.id, orgId, isPlatformAdmin, epoch })
+      const token = await signCurrentSession(pool, { userId: user.id, orgId, isPlatformAdmin })
       setSessionCookie(res, token)
       res.json({ user: { id: user.id, email: user.email, isPlatformAdmin }, orgId })
     } catch (err) {
+      const refused = mintRefusalBody(err)
+      if (refused) {
+        res.status(403).json(refused)
+        return
+      }
       console.error('POST /api/auth/dev-login error:', err)
       res.status(500).json({ error: 'Failed to sign in' })
     }

@@ -15,7 +15,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { WORKSPACE_BINDING_TYPE, installWorkspaceBindingHandler } from './workspaceBinding'
 import { cbor, type PeerId } from '@automerge/automerge-repo/slim'
-import { reconnectDelayMs } from './adaptiveWebSocketClientAdapter'
+import { reconnectDelayMs, setTransportCloseObserver } from './adaptiveWebSocketClientAdapter'
 import { AdaptiveWebSocketClientAdapter } from './adaptiveWebSocketClientAdapter'
 
 class DelayedHandshakeWebSocket {
@@ -98,6 +98,36 @@ describe('adaptive Automerge reconnect delay', () => {
     expect(reconnectDelayMs(1006, 0, { random: () => 0.5 })).toBe(500)
     expect(reconnectDelayMs(1006, 2, { random: () => 0.5 })).toBe(2_000)
     expect(reconnectDelayMs(1006, 20, { random: () => 0.5 })).toBe(5_000)
+  })
+
+  it('reports every unintended close to the observer — refused upgrades as never-opened — and keeps reconnecting', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('WebSocket', DelayedHandshakeWebSocket)
+    const closes: Array<{ code: number; opened: boolean }> = []
+    setTransportCloseObserver((close) => {
+      closes.push(close)
+      throw new Error('a failing observer must not stop the transport')
+    })
+    try {
+      const adapter = new AdaptiveWebSocketClientAdapter('ws://observed.test/automerge')
+      adapter.connect('browser-peer' as PeerId)
+      const first = DelayedHandshakeWebSocket.instances[0]
+      first.open()
+      first.closeWith(4001) // the server's "Session revoked"
+      await vi.advanceTimersByTimeAsync(10_000)
+      const second = DelayedHandshakeWebSocket.instances[1]
+      expect(second).toBeDefined()
+      second.closeWith(1006) // the upgrade refused: never opened
+      expect(closes).toEqual([{ code: 4001, opened: true }, { code: 1006, opened: false }])
+
+      // Intentional: disconnect() detaches the socket's listeners BEFORE closing
+      // it, so its close can never reach onClose. Nothing more is asserted
+      // here — the fake's close() dispatches no event, so a stronger claim
+      // would pass vacuously (QA lens, 2026-10-16).
+      adapter.disconnect()
+    } finally {
+      setTransportCloseObserver(null)
+    }
   })
 
   it('does not report network readiness before the server peer handshake', async () => {

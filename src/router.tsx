@@ -66,6 +66,11 @@ import { PlatformTechnologies } from './components/platform/PlatformTechnologies
 import { PlatformSettings } from './components/platform/PlatformSettings'
 import { PlatformReferenceIntegrity } from './components/platform/PlatformReferenceIntegrity'
 import { ImpersonationBanner } from './components/platform/ImpersonationBanner'
+import { SessionEndedBanner } from './components/auth/SessionEndedBanner'
+import { createSessionWatch, sessionWatchApplies } from './lib/auth/sessionWatch'
+import { meWithReason } from './lib/auth/api'
+import { stashPostLoginPath } from './lib/auth/postLoginPath'
+import { setTransportCloseObserver } from './lib/automerge/adaptiveWebSocketClientAdapter'
 import { WorkspaceContractBanner } from './components/layout/WorkspaceContractBanner'
 import { WorkspaceRepointBanner } from './components/layout/WorkspaceRepointBanner'
 import { useUIStore, type AppView } from './stores/uiStore'
@@ -298,9 +303,23 @@ function AuthBoot() {
     load()
   }, [load])
 
+  // A live page whose session the server has ended (a demotion, a removal) must
+  // say so rather than let sync stall in silence — see lib/auth/sessionWatch.ts.
+  useEffect(() => {
+    setTransportCloseObserver(createSessionWatch({
+      probe: meWithReason,
+      shouldWatch: () => sessionWatchApplies(useAuthStore.getState()),
+      onEnded: (reason) => useAuthStore.getState().markSessionEnded(reason),
+    }))
+    return () => setTransportCloseObserver(null)
+  }, [])
+
   useEffect(() => {
     if (loading || !config || config.stage !== 'on' || user) return
     if (isAuthExempt(pathname)) return
+    // A page that booted on a cookie the server refused as stale: come back here
+    // after signing in again (LoginPage says why the session ended).
+    if (useAuthStore.getState().sessionEnded) stashPostLoginPath(pathname)
     navigate({ to: '/login', replace: true })
   }, [loading, config, user, pathname, navigate])
 
@@ -313,6 +332,7 @@ const rootRoute = createRootRoute({
   component: () => (
     <>
       <AuthBoot />
+      <SessionEndedBanner />
       <ImpersonationBanner />
       <WorkspaceContractBanner />
       <WorkspaceRepointBanner />

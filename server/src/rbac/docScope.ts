@@ -2436,12 +2436,20 @@ const allowedKeysCache = new Map<string, CacheEntry>()
 const allowedKeysInFlight = new Map<string, { generation: number; promise: Promise<WorkspaceKeySets> }>()
 let allowedKeysGeneration = 0
 
-function cacheKey(userId: string, epoch: number): string {
-  return `${userId}#${epoch}`
+/** An epoch means nothing without its org: an org-less session and a fresh
+ * org both sit at epoch 1. Keyed on the user alone, an invite-intent session's
+ * empty set (org-less, epoch 1) answered for the session accept re-pins to the
+ * joined org (epoch 1 again, now that an addition no longer bumps it) — and a
+ * refusal recorded from it is permanent for the socket. `isPlatformAdmin`
+ * selects a different query in computeWorkspaceKeySets, so it is keyed too,
+ * and so is the per-user epoch: a reduction of THIS user's access moves only it. */
+function cacheKey(claims: SessionClaims): string {
+  return `${claims.userId}#${claims.orgId ?? ''}#${claims.epoch}#${claims.uepoch ?? 1}#${claims.isPlatformAdmin ? 'pa' : ''}`
 }
 
-/** Clear the cache — exported for tests only (no production caller needs this;
- * grant changes bump the epoch, which naturally changes the cache key). */
+/** Clear the cache — exported for tests only (production clears it through
+ * `invalidateAllowedWorkspaceKeysCache`, on a workspace create or a grant's
+ * NOTIFY; a revocation changes the epoch and with it the cache key). */
 export function _clearAllowedWorkspaceKeysCacheForTests(): void {
   allowedKeysGeneration += 1
   allowedKeysCache.clear()
@@ -2451,8 +2459,8 @@ export function _clearAllowedWorkspaceKeysCacheForTests(): void {
 /**
  * Drop every cached per-user allowed-keys entry. Called when a WORKSPACE IS
  * CREATED (landscape / version / draft): the creator's cached set predates the
- * new scope row, and the epoch-bump invalidation only helps on reconnect — the
- * live session's next HTTP call still carries the old epoch, so without this
+ * new scope row, and nothing about a create changes the session's epoch — the
+ * live session's next HTTP call still carries the same one, so without this
  * the creator 403s out of their own brand-new workspace for up to the TTL
  * (e.g. `GET /api/automerge/root` right after creating a landscape). Cheap: creates are rare and the cache rebuilds in one query per user.
  */
@@ -2463,7 +2471,7 @@ export function invalidateAllowedWorkspaceKeysCache(): void {
 }
 
 async function workspaceKeySets(pool: Pool, claims: SessionClaims): Promise<WorkspaceKeySets> {
-  const ck = cacheKey(claims.userId, claims.epoch)
+  const ck = cacheKey(claims)
   for (;;) {
     const cached = allowedKeysCache.get(ck)
     const now = Date.now()
@@ -2496,11 +2504,12 @@ async function workspaceKeySets(pool: Pool, claims: SessionClaims): Promise<Work
  * for each version's scope, `rbac_effective_access` decides (org-admin of that
  * version's org, or a team grant with can_read anywhere on the ancestor chain).
  *
- * Cached per (userId, epoch) for ALLOWED_KEYS_TTL_MS — short enough that a
- * revoked grant is reflected quickly, and grant changes bump the org's
- * auth_epoch anyway (which changes the session's epoch on reconnect, which
- * changes the cache key), so staleness is bounded by the smaller of the TTL
- * or the epoch-revocation path in wsAuth.ts.
+ * Cached per (userId, orgId, epoch) for ALLOWED_KEYS_TTL_MS. A REVOCATION bumps
+ * the org's auth_epoch (which changes the session's epoch on reconnect, which
+ * changes the cache key). A GRANT does not bump: it NOTIFYs
+ * workspace_access_changed, whose listener (startEpochRevocation) drops this
+ * whole cache — best effort, so a missed notify leaves a new grant invisible
+ * for at most the TTL.
  *
  * Bounded by a deadline, as a gate-liveness requirement: this is the LAST
  * await on both RBAC gate chains, and brand-new documents (a bulk import's

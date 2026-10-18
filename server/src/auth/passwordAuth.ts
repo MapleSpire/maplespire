@@ -22,7 +22,8 @@ import { RedisUnavailableError } from '../runtime/redis.js'
 import { bootstrapPlatformAdmin, findOrCreateUser, type UserRecord } from './users.js'
 import { hashPassword, verificationTokenHash, verifyPassword } from './passwordCrypto.js'
 import { resolveLoginOrg } from './provisioning.js'
-import { setSessionCookie, signSession } from './tokens.js'
+import { setSessionCookie } from './tokens.js'
+import { mintRefusalBody, signCurrentSession } from './sessionEpoch.js'
 import { legalRequestAccepted, recordLegalAcceptance } from './legal.js'
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
@@ -116,12 +117,7 @@ async function sessionFor(user: UserRecord, inviteIntent: boolean, res: Response
   await bootstrapPlatformAdmin(pool, user.id, user.email)
   const { rows: fresh } = await pool.query<{ is_platform_admin: boolean }>('SELECT is_platform_admin FROM users WHERE id = $1', [user.id])
   const isPlatformAdmin = fresh[0]?.is_platform_admin ?? user.isPlatformAdmin
-  let epoch = 1
-  if (orgId) {
-    const { rows } = await pool.query<{ epoch: number | string }>('SELECT epoch FROM auth_epochs WHERE org_id = $1', [orgId])
-    epoch = rows[0] ? Number(rows[0].epoch) : 1
-  }
-  setSessionCookie(res, await signSession({ userId: user.id, orgId, isPlatformAdmin, epoch }))
+  setSessionCookie(res, await signCurrentSession(pool, { userId: user.id, orgId, isPlatformAdmin }))
   return { orgId, isPlatformAdmin }
 }
 
@@ -235,6 +231,8 @@ export function registerPasswordAuthRoutes(app: Express): void {
       if (session === 'suspended') return void res.status(403).json({ error: 'org_suspended' })
       res.json({ user: { id: user.id, email: user.email, isPlatformAdmin: session.isPlatformAdmin }, orgId: session.orgId })
     } catch (err) {
+      const refused = mintRefusalBody(err)
+      if (refused) return void res.status(403).json(refused)
       console.error('POST /api/auth/password-login error:', err)
       res.status(500).json({ error: 'Failed to sign in.' })
     }

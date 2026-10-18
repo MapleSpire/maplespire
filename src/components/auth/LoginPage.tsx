@@ -34,11 +34,19 @@ const ERROR_KEYS: Record<string, string> = {
   verification_failed: 'auth.login.error.verificationFailed',
   legal_required: 'auth.login.error.legalRequired',
   legal_acceptance_required: 'auth.login.error.legalRequired',
+  account_inactive: 'auth.login.error.accountInactive',
+  org_suspended: 'auth.login.error.orgSuspended',
 }
 
 function errorCodeFromQuery(): string | null {
   if (typeof window === 'undefined') return null
   return new URLSearchParams(window.location.search).get('error')
+}
+
+/** `?session=ended`: the live-page banner's "Sign in again" (SessionEndedBanner). */
+function sessionEndedFromQuery(): boolean {
+  if (typeof window === 'undefined') return false
+  return new URLSearchParams(window.location.search).get('session') === 'ended'
 }
 
 function verifiedFromQuery(): boolean {
@@ -79,6 +87,7 @@ function copyFor(surface: 'public' | 'sso', t: TFunction) {
 export function LoginPage({ surface = 'public' }: LoginPageProps) {
   const config = useAuthStore((s) => s.config)
   const user = useAuthStore((s) => s.user)
+  const sessionEnded = useAuthStore((s) => s.sessionEnded)
   const runDevLogin = useAuthStore((s) => s.devLogin)
   const runPasswordLogin = useAuthStore((s) => s.passwordLogin)
   const { t, i18n } = useTranslation()
@@ -215,6 +224,11 @@ export function LoginPage({ surface = 'public' }: LoginPageProps) {
             className="mb-4 rounded-lg border border-line bg-error-bg px-3 py-2 text-[12.5px] text-error-text"
           >
             {queryError}
+          </div>
+        )}
+        {(sessionEnded || sessionEndedFromQuery()) && (
+          <div data-testid="session-ended-notice" className="mb-4 rounded-lg border border-line bg-surface-200 px-3 py-2 text-[12.5px] text-fg">
+            {t('auth.sessionEnded.loginNotice')}
           </div>
         )}
         {verifiedFromQuery() && (

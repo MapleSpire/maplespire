@@ -182,12 +182,45 @@ export async function ensureAuthSchema(pool: Pool): Promise<void> {
     `)
 
     // One row per org; bumping `epoch` invalidates every session minted
-    // before the bump (checked on each request/WS message — see
-    // middleware.ts / SessionClaims.epoch). No row yet = epoch 1 implicitly.
+    // before the bump. Checked at the sync upgrade (sessionEpoch.ts), on live
+    // sockets (wsAuth.ts startEpochRevocation) and by GET /api/auth/me — NOT by
+    // the HTTP middleware. No row yet = epoch 1 implicitly. Reserved for
+    // org-wide events (a suspension); a change to one user's access bumps
+    // `auth_user_epochs` below instead.
     await client.query(`
       CREATE TABLE IF NOT EXISTS auth_epochs (
         org_id  TEXT PRIMARY KEY,
         epoch   BIGINT NOT NULL DEFAULT 1
+      )
+    `)
+
+    // One row per (org, user) whose access in that org was ever REDUCED;
+    // pinned in the session as `uepoch` and checked wherever `epoch` is.
+    // Without it, demoting one member revoked every session in the org — the
+    // admin who did it included (measured 2026-10-16). No row = epoch 1. No
+    // foreign keys, like auth_epochs: a row outliving its member is harmless,
+    // and it must outlive a DELETE of the membership it revokes.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS auth_user_epochs (
+        org_id   TEXT NOT NULL,
+        user_id  TEXT NOT NULL,
+        epoch    BIGINT NOT NULL DEFAULT 1,
+        PRIMARY KEY (org_id, user_id)
+      )
+    `)
+
+    // One row per user who ever lost platform admin or was deactivated
+    // (trg_epoch_users, wsAuth.ts ensureEpochTriggers); pinned in the session
+    // as `gepoch` and checked wherever `epoch` is, plus on cookie-authenticated
+    // HTTP. It reaches what the two tables above cannot: an org-less session,
+    // one pinned to an org the user has left, and the signed `isPlatformAdmin`
+    // claim the sync gate trusts across every org. A table, not a column on
+    // `users`: no ALTER of `users` at boot. No row = epoch 1, no foreign key —
+    // it must outlive a deleted user.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS auth_global_epochs (
+        user_id  TEXT PRIMARY KEY,
+        epoch    BIGINT NOT NULL DEFAULT 1
       )
     `)
 

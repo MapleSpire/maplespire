@@ -18,6 +18,7 @@ import type WebSocket from 'ws'
 import { decodeJwt } from 'jose'
 import { sessionCookieName, verifySession, type SessionClaims } from './tokens.js'
 import { authStage } from './middleware.js'
+import { sessionGlobalPins, sessionUserEpoch } from './sessionEpoch.js'
 import type { WorkspaceKey } from '../rbac/docScope.js'
 
 /**
@@ -303,6 +304,45 @@ export class ConnectionRegistry {
     return out
   }
 
+  /** The distinct (org, user) pairs holding a peer-bound socket here — what the
+   * per-user epoch poll needs to look at, and nothing more. */
+  liveOrgUsers(): { orgId: string; userId: string }[] {
+    const seen = new Map<string, { orgId: string; userId: string }>()
+    for (const ws of this.peerToSocket.values()) {
+      const claims = this.claimsBySocket.get(ws)
+      if (!claims?.orgId) continue
+      const key = JSON.stringify([claims.orgId, claims.userId])
+      if (!seen.has(key)) seen.set(key, { orgId: claims.orgId, userId: claims.userId })
+    }
+    return [...seen.values()]
+  }
+
+  /** Every peer-bound socket whose session depends on `userId`'s global epoch
+   * — its own user's, in any org or none, and impersonation sessions BY that
+   * user — with the global epoch that session pinned for them. */
+  socketsForGlobalUser(userId: string): { ws: WebSocket; claims: SessionClaims; gepoch: number }[] {
+    const out: { ws: WebSocket; claims: SessionClaims; gepoch: number }[] = []
+    for (const ws of this.peerToSocket.values()) {
+      const claims = this.claimsBySocket.get(ws)
+      if (!claims) continue
+      const pin = sessionGlobalPins(claims).find((p) => p.userId === userId)
+      if (pin) out.push({ ws, claims, gepoch: pin.gepoch })
+    }
+    return out
+  }
+
+  /** The distinct users whose global epoch a peer-bound socket here depends
+   * on — what the global epoch poll needs to look at. */
+  liveGlobalUsers(): string[] {
+    const seen = new Set<string>()
+    for (const ws of this.peerToSocket.values()) {
+      const claims = this.claimsBySocket.get(ws)
+      if (!claims) continue
+      for (const pin of sessionGlobalPins(claims)) seen.add(pin.userId)
+    }
+    return [...seen]
+  }
+
   /** Number of live (authenticated) peer connections — the platform overview's
    * `liveConnections` counter. Counts every bound peer regardless of auth
    * stage/claims shape (a null-claims entry under stage off/dual is still a
@@ -432,6 +472,13 @@ export interface EpochRevocationOptions {
   /** Clear process-local workspace authorization caches when another server
    * process commits a scope change. */
   onWorkspaceAccessChanged?: (orgId: string) => void
+  /** An epoch moved — the org's (no user) or one user's in the org. Lets the
+   * upgrade validator drop its burst-cached value at once instead of admitting
+   * a reconnect on the pre-bump epoch for up to its TTL. */
+  onEpochBumped?: (orgId: string, userId?: string) => void
+  /** A user's GLOBAL epoch moved (lost platform admin, deactivated) — same
+   * purpose as `onEpochBumped`, for the validator's global burst cache. */
+  onGlobalEpochBumped?: (userId: string) => void
 }
 
 interface OrgEpochRow {
@@ -441,8 +488,10 @@ interface OrgEpochRow {
 
 /**
  * Ensure the AFTER INSERT/UPDATE/DELETE triggers on `org_members`,
- * `team_members`, and `team_scope_permissions` that bump `auth_epochs` for the
- * affected org and `pg_notify('auth_epoch', org_id)`. Idempotent (CREATE OR
+ * `team_members`, and `team_scope_permissions` that bump `auth_user_epochs` for
+ * each affected (org, user) and `pg_notify('auth_user_epoch', …)` — on a change
+ * that can REDUCE that user's access only; a pure grant notifies
+ * `workspace_access_changed` instead (see `note_auth_grant`). Idempotent (CREATE OR
  * REPLACE / DROP+CREATE TRIGGER), safe to call on every boot alongside
  * `ensureRbacSchema`.
  *
@@ -455,6 +504,65 @@ export async function ensureEpochTriggers(pool: Pool): Promise<void> {
   const client = await pool.connect()
   try {
     await client.query('BEGIN')
+
+    // Global per-user bump: UPSERT-increment auth_global_epochs + notify. Ends
+    // the user's sessions in every org AND the org-less ones, which no
+    // (org, user) epoch can reach — and with them the signed `isPlatformAdmin`
+    // claim the sync gate trusts for the whole fleet (docScope.ts). It used to
+    // be that revoking platform admin bumped nothing: the old cookie kept
+    // cross-org sync for its 30-day life (architect lens, 2026-10-16).
+    await client.query(`
+      CREATE OR REPLACE FUNCTION bump_auth_global_epoch(p_user_id TEXT) RETURNS void AS $$
+      BEGIN
+        IF p_user_id IS NULL THEN
+          RETURN;
+        END IF;
+        INSERT INTO auth_global_epochs (user_id, epoch) VALUES (p_user_id, 2)
+        ON CONFLICT (user_id) DO UPDATE SET epoch = auth_global_epochs.epoch + 1;
+        PERFORM pg_notify('auth_global_epoch', p_user_id);
+      END;
+      $$ LANGUAGE plpgsql
+    `)
+
+    // users: a trigger, not the route, so every writer is covered (the
+    // platform console, a future route, an operator's SQL) and the bump
+    // commits with the change. Only REDUCTIONS bump — losing platform admin,
+    // leaving 'active', a deletion; a grant or a reactivation revokes nothing,
+    // the same rule as the membership triggers above.
+    await client.query(`
+      CREATE OR REPLACE FUNCTION trg_bump_epoch_users() RETURNS trigger AS $$
+      BEGIN
+        IF TG_OP = 'DELETE'
+           OR NEW.id IS DISTINCT FROM OLD.id
+           OR (OLD.is_platform_admin AND NOT NEW.is_platform_admin)
+           OR (NEW.status IS DISTINCT FROM OLD.status AND NEW.status IS DISTINCT FROM 'active') THEN
+          PERFORM bump_auth_global_epoch(OLD.id);
+        END IF;
+        RETURN NULL;
+      END;
+      $$ LANGUAGE plpgsql
+    `)
+    // Created only when MISSING, and FIRST in this transaction, so a boot
+    // takes no lock on `users` (read by every login and /auth/me) once the
+    // trigger exists, and a first boot takes it before the membership tables
+    // — the order a `DELETE FROM users` cascade takes them in. Reasoned by the
+    // reviewer lens (2026-10-16): DROP+CREATE every boot, last in this
+    // transaction, could deadlock against a concurrent user delete; not
+    // measured. The function above is CREATE OR REPLACE and locks no table; a
+    // change to the trigger's EVENTS needs a migration, not this boot path.
+    await client.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_trigger WHERE tgname = 'trg_epoch_users' AND tgrelid = 'users'::regclass
+        ) THEN
+          CREATE TRIGGER trg_epoch_users
+          AFTER UPDATE OR DELETE ON users
+          FOR EACH ROW EXECUTE FUNCTION trg_bump_epoch_users();
+        END IF;
+      END
+      $$
+    `)
 
     // Shared bump function: UPSERT-increment auth_epochs for one org + notify.
     await client.query(`
@@ -470,11 +578,72 @@ export async function ensureEpochTriggers(pool: Pool): Promise<void> {
       $$ LANGUAGE plpgsql
     `)
 
-    // org_members: org_id is a direct column.
+    // Per-user bump: UPSERT-increment auth_user_epochs for one (org, user) +
+    // notify. A REDUCTION of one user's access revokes that user's sessions in
+    // the org and nobody else's. It used to bump the org epoch, which signed out
+    // every colleague — the admin who made the change included (measured
+    // 2026-10-16: the demoting admin's socket was closed as revoked, their page's
+    // /api/auth/me check answered session_stale and cleared the cookie, and
+    // their next request got a 401). The org
+    // epoch above is now reserved for org-wide events (a suspension).
+    await client.query(`
+      CREATE OR REPLACE FUNCTION bump_auth_user_epoch(p_org_id TEXT, p_user_id TEXT) RETURNS void AS $$
+      BEGIN
+        IF p_org_id IS NULL OR p_user_id IS NULL THEN
+          RETURN;
+        END IF;
+        INSERT INTO auth_user_epochs (org_id, user_id, epoch) VALUES (p_org_id, p_user_id, 2)
+        ON CONFLICT (org_id, user_id) DO UPDATE SET epoch = auth_user_epochs.epoch + 1;
+        PERFORM pg_notify('auth_user_epoch', json_build_object('org', p_org_id, 'user', p_user_id)::text);
+      END;
+      $$ LANGUAGE plpgsql
+    `)
+
+    // A reduction bumps the per-user epoch of each user it reduced; that moves
+    // their allowed-workspace cache key (docScope.ts, user+org+epochs), and the
+    // listener drops the cache on the notify too — only a row re-keyed INTO
+    // another org announces a grant there.
+    //
+    // A change that only GRANTS bumps nothing. Accepting an invite used to sign
+    // out the inviter and every colleague (2026-10-16) to protect nobody: a
+    // session minted before a grant holds no right the grant takes away. The
+    // grant still has to reach this process's cached allowed-workspace sets
+    // (docScope.ts caches them per user+epoch, and the epoch no longer moves),
+    // so it NOTIFYs the channel whose listener drops them (startEpochRevocation
+    // → invalidateAllowedWorkspaceKeysCache). What a grant does NOT reach is a
+    // document the grantee's live socket was already refused: that refusal is
+    // permanent for the socket (denyLedger.ts 'rbac'), so the new access shows
+    // after a reload — it used to show after signing in again.
+    await client.query(`
+      CREATE OR REPLACE FUNCTION note_auth_grant(p_org_id TEXT) RETURNS void AS $$
+      BEGIN
+        IF p_org_id IS NULL THEN
+          RETURN;
+        END IF;
+        PERFORM pg_notify('workspace_access_changed', p_org_id);
+      END;
+      $$ LANGUAGE plpgsql
+    `)
+
+    // org_members: org_id is a direct column. Roles are 'admin' | 'member'
+    // (orgRoutes.ts); a change TO admin is the only role change that cannot
+    // reduce access, and a re-keyed row is a removal from the OLD org.
     await client.query(`
       CREATE OR REPLACE FUNCTION trg_bump_epoch_org_members() RETURNS trigger AS $$
       BEGIN
-        PERFORM bump_auth_epoch(COALESCE(NEW.org_id, OLD.org_id));
+        IF TG_OP = 'INSERT' THEN
+          PERFORM note_auth_grant(NEW.org_id);
+        ELSIF TG_OP = 'DELETE'
+           OR NEW.org_id IS DISTINCT FROM OLD.org_id
+           OR NEW.user_id IS DISTINCT FROM OLD.user_id
+           OR (NEW.role IS DISTINCT FROM OLD.role AND NEW.role IS DISTINCT FROM 'admin') THEN
+          PERFORM bump_auth_user_epoch(OLD.org_id, OLD.user_id);
+          IF TG_OP = 'UPDATE' AND NEW.org_id IS DISTINCT FROM OLD.org_id THEN
+            PERFORM note_auth_grant(NEW.org_id);
+          END IF;
+        ELSIF NEW.role IS DISTINCT FROM OLD.role THEN
+          PERFORM note_auth_grant(NEW.org_id);
+        END IF;
         RETURN NULL;
       END;
       $$ LANGUAGE plpgsql
@@ -486,15 +655,31 @@ export async function ensureEpochTriggers(pool: Pool): Promise<void> {
       FOR EACH ROW EXECUTE FUNCTION trg_bump_epoch_org_members()
     `)
 
-    // team_members: org_id via teams.org_id.
+    // team_members: org_id via teams.org_id. Team grants are a union
+    // (rbac_effective_access: bool_or over every team), so joining a team only
+    // adds; leaving one — or a row re-keyed away from it — may take away.
     await client.query(`
       CREATE OR REPLACE FUNCTION trg_bump_epoch_team_members() RETURNS trigger AS $$
       DECLARE
-        v_team_id TEXT := COALESCE(NEW.team_id, OLD.team_id);
-        v_org_id TEXT;
+        v_old_org_id TEXT;
+        v_new_org_id TEXT;
       BEGIN
-        SELECT org_id INTO v_org_id FROM teams WHERE id = v_team_id;
-        PERFORM bump_auth_epoch(v_org_id);
+        IF TG_OP <> 'INSERT' THEN
+          SELECT org_id INTO v_old_org_id FROM teams WHERE id = OLD.team_id;
+        END IF;
+        IF TG_OP <> 'DELETE' THEN
+          SELECT org_id INTO v_new_org_id FROM teams WHERE id = NEW.team_id;
+        END IF;
+        IF TG_OP = 'INSERT' THEN
+          PERFORM note_auth_grant(v_new_org_id);
+        ELSIF TG_OP = 'DELETE'
+           OR NEW.team_id IS DISTINCT FROM OLD.team_id
+           OR NEW.user_id IS DISTINCT FROM OLD.user_id THEN
+          PERFORM bump_auth_user_epoch(v_old_org_id, OLD.user_id);
+          IF TG_OP = 'UPDATE' AND v_new_org_id IS DISTINCT FROM v_old_org_id THEN
+            PERFORM note_auth_grant(v_new_org_id);
+          END IF;
+        END IF;
         RETURN NULL;
       END;
       $$ LANGUAGE plpgsql
@@ -506,15 +691,38 @@ export async function ensureEpochTriggers(pool: Pool): Promise<void> {
       FOR EACH ROW EXECUTE FUNCTION trg_bump_epoch_team_members()
     `)
 
-    // team_scope_permissions: org_id via teams.org_id.
+    // team_scope_permissions: org_id via teams.org_id. A new grant, or an
+    // update that only turns flags ON, adds; clearing can_read or can_write,
+    // deleting the row, or re-keying it may take away.
     await client.query(`
       CREATE OR REPLACE FUNCTION trg_bump_epoch_tsp() RETURNS trigger AS $$
       DECLARE
-        v_team_id TEXT := COALESCE(NEW.team_id, OLD.team_id);
-        v_org_id TEXT;
+        v_old_org_id TEXT;
+        v_new_org_id TEXT;
       BEGIN
-        SELECT org_id INTO v_org_id FROM teams WHERE id = v_team_id;
-        PERFORM bump_auth_epoch(v_org_id);
+        IF TG_OP <> 'INSERT' THEN
+          SELECT org_id INTO v_old_org_id FROM teams WHERE id = OLD.team_id;
+        END IF;
+        IF TG_OP <> 'DELETE' THEN
+          SELECT org_id INTO v_new_org_id FROM teams WHERE id = NEW.team_id;
+        END IF;
+        IF TG_OP = 'INSERT' THEN
+          PERFORM note_auth_grant(v_new_org_id);
+        ELSIF TG_OP = 'DELETE'
+           OR NEW.team_id IS DISTINCT FROM OLD.team_id
+           OR NEW.scope_id IS DISTINCT FROM OLD.scope_id
+           OR NEW.resource_type IS DISTINCT FROM OLD.resource_type
+           OR (OLD.can_read AND NOT NEW.can_read)
+           OR (OLD.can_write AND NOT NEW.can_write) THEN
+          -- Everyone the team's grant reached: its members at this moment.
+          PERFORM bump_auth_user_epoch(v_old_org_id, tm.user_id)
+          FROM team_members tm WHERE tm.team_id = OLD.team_id;
+          IF TG_OP = 'UPDATE' AND v_new_org_id IS DISTINCT FROM v_old_org_id THEN
+            PERFORM note_auth_grant(v_new_org_id);
+          END IF;
+        ELSIF NEW.can_read IS DISTINCT FROM OLD.can_read OR NEW.can_write IS DISTINCT FROM OLD.can_write THEN
+          PERFORM note_auth_grant(v_new_org_id);
+        END IF;
         RETURN NULL;
       END;
       $$ LANGUAGE plpgsql
@@ -525,6 +733,7 @@ export async function ensureEpochTriggers(pool: Pool): Promise<void> {
       AFTER INSERT OR UPDATE OR DELETE ON team_scope_permissions
       FOR EACH ROW EXECUTE FUNCTION trg_bump_epoch_tsp()
     `)
+
 
     await client.query('COMMIT')
   } catch (err) {
@@ -586,6 +795,102 @@ export function startEpochRevocation(
     if (epoch > prev) terminateStale(orgId, epoch)
   }
 
+  // Per-user revocation (auth_user_epochs): only THIS user's sockets in the
+  // org, and only those minted before the bump. Idempotent — a socket already
+  // closed has left the registry, so a repeat (notify + poll) finds nothing.
+  const terminateStaleUser = (orgId: string, userId: string, newEpoch: number) => {
+    const enforce = authStage() === 'on'
+    const sockets = registry.socketsForOrg(orgId).filter(({ claims }) => claims.userId === userId)
+    let terminated = 0
+    for (const { ws, claims } of sockets) {
+      if (sessionUserEpoch(claims) >= newEpoch) continue
+      if (enforce) {
+        try {
+          ws.close(4001, 'Session revoked — please reconnect')
+        } catch {
+          try {
+            ws.terminate()
+          } catch {
+            /* already gone */
+          }
+        }
+        terminated++
+      }
+    }
+    if (terminated > 0) {
+      console.log(
+        `[ws-auth] org ${orgId} user ${userId} epoch -> ${newEpoch}: ${terminated}/${sockets.length} stale connection(s) ${
+          enforce ? 'terminated' : 'observed (stage != on, not enforced)'
+        }`
+      )
+    }
+  }
+
+  // Global revocation (auth_global_epochs): every socket whose session pinned
+  // this user's global epoch below the new one — their own in any org or
+  // none, and impersonation sessions they started. Idempotent like the above.
+  const terminateStaleGlobal = (userId: string, newEpoch: number) => {
+    const enforce = authStage() === 'on'
+    const sockets = registry.socketsForGlobalUser(userId)
+    let terminated = 0
+    for (const { ws, gepoch } of sockets) {
+      if (gepoch >= newEpoch) continue
+      if (enforce) {
+        try {
+          ws.close(4001, 'Session revoked — please reconnect')
+        } catch {
+          try {
+            ws.terminate()
+          } catch {
+            /* already gone */
+          }
+        }
+        terminated++
+      }
+    }
+    if (sockets.some(({ gepoch }) => gepoch < newEpoch)) {
+      console.log(
+        `[ws-auth] user ${userId} global epoch -> ${newEpoch}: ${terminated}/${sockets.length} stale connection(s) ${
+          enforce ? 'terminated' : 'observed (stage != on, not enforced)'
+        }`
+      )
+    }
+  }
+
+  const readGlobalBump = (userId: string) => {
+    pool
+      .query<{ epoch: number | string }>('SELECT epoch FROM auth_global_epochs WHERE user_id = $1', [userId])
+      .then(({ rows }) => {
+        if (rows[0]) terminateStaleGlobal(userId, Number(rows[0].epoch))
+      })
+      .catch((err) => console.warn('[ws-auth] failed to read bumped global epoch:', err))
+  }
+
+  const pendingAccessChanged = new Set<string>()
+  const scheduleAccessChanged = (orgId: string) => {
+    if (!options.onWorkspaceAccessChanged) return
+    if (pendingAccessChanged.size === 0) {
+      setTimeout(() => {
+        const orgs = [...pendingAccessChanged]
+        pendingAccessChanged.clear()
+        for (const org of orgs) options.onWorkspaceAccessChanged?.(org)
+      }, 0)
+    }
+    pendingAccessChanged.add(orgId)
+  }
+
+  const readUserBump = (orgId: string, userId: string) => {
+    pool
+      .query<{ epoch: number | string }>(
+        'SELECT epoch FROM auth_user_epochs WHERE org_id = $1 AND user_id = $2',
+        [orgId, userId],
+      )
+      .then(({ rows }) => {
+        if (rows[0]) terminateStaleUser(orgId, userId, Number(rows[0].epoch))
+      })
+      .catch((err) => console.warn('[ws-auth] failed to read bumped user epoch:', err))
+  }
+
   let listenClient: PoolClient | null = null
   let stopped = false
   // Single-flight for the (re)connect: the poll fires on wall time, not on the
@@ -612,7 +917,37 @@ export function startEpochRevocation(
           options.onWorkspaceAccessChanged?.(msg.payload)
           return
         }
+        if (msg.channel === 'auth_user_epoch' && msg.payload) {
+          let target: { org?: unknown; user?: unknown } | null = null
+          try {
+            target = JSON.parse(msg.payload) as { org?: unknown; user?: unknown }
+          } catch {
+            console.warn('[ws-auth] unreadable auth_user_epoch payload:', msg.payload)
+          }
+          if (target && typeof target.org === 'string' && typeof target.user === 'string') {
+            const orgId = target.org
+            const userId = target.user
+            options.onEpochBumped?.(orgId, userId)
+            // The reduced user's cached allowed set (keyed on their OLD epochs)
+            // still answers HTTP calls made with the old cookie: drop it. A team
+            // grant narrowed for N members arrives as N notifies in one commit:
+            // coalesced to one drop per org per turn of the event loop.
+            scheduleAccessChanged(orgId)
+            // And read the epoch only if this process holds a socket to close.
+            if (registry.socketsForOrg(orgId).some(({ claims }) => claims.userId === userId)) {
+              readUserBump(orgId, userId)
+            }
+          }
+          return
+        }
+        if (msg.channel === 'auth_global_epoch' && msg.payload) {
+          const userId = msg.payload
+          options.onGlobalEpochBumped?.(userId)
+          if (registry.socketsForGlobalUser(userId).length > 0) readGlobalBump(userId)
+          return
+        }
         if (msg.channel !== 'auth_epoch' || !msg.payload) return
+        options.onEpochBumped?.(msg.payload)
         // Payload is just the org id; re-read its epoch (cheap, avoids trusting
         // an out-of-band epoch value in the notify payload itself).
         pool
@@ -641,6 +976,8 @@ export function startEpochRevocation(
         if (listenClient === deadClient) listenClient = null
       })
       await client.query('LISTEN auth_epoch')
+      await client.query('LISTEN auth_user_epoch')
+      await client.query('LISTEN auth_global_epoch')
       await client.query('LISTEN workspace_access_changed')
     } catch (err) {
       console.warn('[ws-auth] failed to establish LISTEN client (poll fallback still active):', err)
@@ -670,6 +1007,35 @@ export function startEpochRevocation(
         for (const r of rows) handleBump(r.org_id, Number(r.epoch))
       })
       .catch((err) => console.warn('[ws-auth] epoch poll failed:', err))
+    // Per-user epochs, for the (org, user) pairs that hold a live socket here
+    // only — the table grows with every reduction ever made, the live set does not.
+    const live = registry.liveOrgUsers()
+    if (live.length > 0) {
+      pool
+        .query<{ org_id: string; user_id: string; epoch: number | string }>(
+          `SELECT e.org_id, e.user_id, e.epoch FROM auth_user_epochs e
+           JOIN unnest($1::text[], $2::text[]) AS l(org_id, user_id)
+             ON l.org_id = e.org_id AND l.user_id = e.user_id`,
+          [live.map((p) => p.orgId), live.map((p) => p.userId)],
+        )
+        .then(({ rows }) => {
+          for (const r of rows) terminateStaleUser(r.org_id, r.user_id, Number(r.epoch))
+        })
+        .catch((err) => console.warn('[ws-auth] user epoch poll failed:', err))
+    }
+    // Global epochs, likewise only for the users a live socket here depends on.
+    const liveGlobal = registry.liveGlobalUsers()
+    if (liveGlobal.length > 0) {
+      pool
+        .query<{ user_id: string; epoch: number | string }>(
+          'SELECT user_id, epoch FROM auth_global_epochs WHERE user_id = ANY($1::text[])',
+          [liveGlobal],
+        )
+        .then(({ rows }) => {
+          for (const r of rows) terminateStaleGlobal(r.user_id, Number(r.epoch))
+        })
+        .catch((err) => console.warn('[ws-auth] global epoch poll failed:', err))
+    }
     // Also opportunistically retry the LISTEN client if it dropped.
     if (!listenClient) void connectListener()
   }, pollMs)
@@ -685,6 +1051,8 @@ export function startEpochRevocation(
       if (client) {
         try {
           await client.query('UNLISTEN auth_epoch')
+          await client.query('UNLISTEN auth_user_epoch')
+          await client.query('UNLISTEN auth_global_epoch')
           await client.query('UNLISTEN workspace_access_changed')
         } catch {
           /* connection may already be dead */

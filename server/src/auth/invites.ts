@@ -16,7 +16,8 @@ import { randomBytes, createHash } from 'node:crypto'
 import type { Pool } from 'pg'
 import { pool } from '../db.js'
 import { appendAudit } from './audit.js'
-import { signSession, setSessionCookie } from './tokens.js'
+import { setSessionCookie } from './tokens.js'
+import { signCurrentSession } from './sessionEpoch.js'
 import { getEmailProvider } from '../email/index.js'
 import { inviteEmail } from '../email/templates.js'
 
@@ -385,21 +386,17 @@ export function registerInviteRoutes(app: import('express').Express): void {
 
       // Re-pin the session to the org just joined (and remember it for the
       // next login): an invite-intent login arrives here with an ORG-LESS
-      // session that would otherwise have no working workspace at all. Epoch
-      // is read POST-commit — the membership insert's trigger just bumped it,
-      // and a pre-bump epoch would mint an already-revoked session. The client
-      // hard-navigates after accepting, so the new cookie takes effect
-      // immediately (fresh WS auth included).
-      const { rows: epochRows } = await pool.query<{ epoch: number | string }>(
-        'SELECT epoch FROM auth_epochs WHERE org_id = $1',
-        [invite.org_id]
-      )
-      const epoch = epochRows[0] ? Number(epochRows[0].epoch) : 1
-      const token2 = await signSession({
+      // session that would otherwise have no working workspace at all. The
+      // epochs are read POST-commit. The membership insert bumps neither (an
+      // addition grants, so it revokes nobody — ensureEpochTriggers in
+      // wsAuth.ts), but this user's own epoch in the org moved if they were
+      // removed from it before, and a stale one would mint an already-revoked
+      // session. The client hard-navigates after accepting, so the new cookie
+      // takes effect immediately (fresh WS auth included).
+      const token2 = await signCurrentSession(pool, {
         userId: auth.userId,
         orgId: invite.org_id,
         isPlatformAdmin: auth.isPlatformAdmin,
-        epoch,
       })
       setSessionCookie(res, token2)
 

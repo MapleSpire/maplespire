@@ -48,6 +48,13 @@ interface AuthStoreState {
   logout: () => Promise<void>
   /** Patch the in-memory user after a successful profile edit (PATCH /api/me). */
   setUser: (user: api.AuthUser) => void
+  /** Non-null once the server has said this page's session is over — found by
+   * `load()` (a stale cookie on boot) or by the live-page watcher
+   * (lib/auth/sessionWatch.ts). `user` is deliberately left as it was on a live
+   * page: clearing it would redirect away from whatever the user is looking at;
+   * the banner offers the way back instead. */
+  sessionEnded: api.SessionEndReason | null
+  markSessionEnded: (reason: api.SessionEndReason) => void
 }
 
 /** Pending for ever: the page is reloading, and a caller that continued —
@@ -66,6 +73,7 @@ export const useAuthStore = create<AuthStoreState>((set) => ({
   orgId: null,
   loading: true,
   impersonation: null,
+  sessionEnded: null,
 
   load: async () => {
     set({ loading: true })
@@ -83,7 +91,12 @@ export const useAuthStore = create<AuthStoreState>((set) => ({
       return
     }
     try {
-      const result = await api.me()
+      const session = await api.meWithReason()
+      const result = session.kind === 'signed-in' ? session.result : null
+      // A cookie the server just refused as stale: the login page says why.
+      if (session.kind === 'signed-out' && session.reason === 'permissions-changed') {
+        set({ sessionEnded: 'permissions-changed' })
+      }
       // This page opened ANOTHER user's local storage (or nobody's) — however
       // the previous session ended. Reload into this user's own
       // (accountNamespace.ts); `loading` stays true, so the bridge never boots
@@ -153,4 +166,6 @@ export const useAuthStore = create<AuthStoreState>((set) => ({
   },
 
   setUser: (user) => set({ user }),
+
+  markSessionEnded: (reason) => set({ sessionEnded: reason }),
 }))

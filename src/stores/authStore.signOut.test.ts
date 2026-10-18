@@ -22,7 +22,10 @@ const calls: string[] = []
 const api = {
   logout: vi.fn(async () => { calls.push('api.logout') }),
   getConfig: vi.fn(async () => ({ stage: 'on', devLogin: false, passwordLogin: true })),
-  me: vi.fn(async () => ({ user: { id: 'user-b', email: 'b@x.test', isPlatformAdmin: false }, claims: { orgId: 'org-b' } })),
+  meWithReason: vi.fn(async (): Promise<unknown> => ({
+    kind: 'signed-in',
+    result: { user: { id: 'user-b', email: 'b@x.test', isPlatformAdmin: false }, claims: { orgId: 'org-b' } },
+  })),
 }
 vi.mock('../lib/auth/api', () => api)
 vi.mock('../lib/i18n', () => ({ applyServerLocale: () => {} }))
@@ -98,6 +101,22 @@ describe('authStore.load — the account\'s storage', () => {
     expect(useAuthStore.getState()).toMatchObject({ loading: false, user: null })
     expect(reload).not.toHaveBeenCalled()
     error.mockRestore()
+  })
+
+  it('a cookie the server refuses as stale boots signed out AND remembers why (the login page says so)', async () => {
+    const { useAuthStore } = await import('./authStore')
+    useAuthStore.setState({ sessionEnded: null })
+    api.meWithReason.mockResolvedValueOnce({ kind: 'signed-out', reason: 'permissions-changed' })
+    await useAuthStore.getState().load()
+    expect(useAuthStore.getState()).toMatchObject({ loading: false, user: null, sessionEnded: 'permissions-changed' })
+  })
+
+  it('a plain signed-out boot carries no "session ended" reason', async () => {
+    const { useAuthStore } = await import('./authStore')
+    useAuthStore.setState({ sessionEnded: null })
+    api.meWithReason.mockResolvedValueOnce({ kind: 'signed-out', reason: 'signed-out' })
+    await useAuthStore.getState().load()
+    expect(useAuthStore.getState()).toMatchObject({ loading: false, user: null, sessionEnded: null })
   })
 
   it('AUTH=off never selects a namespace: the install opens what it always opened', async () => {
