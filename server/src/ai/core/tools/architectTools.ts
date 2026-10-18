@@ -23,7 +23,7 @@ import {
   objects, domains,
   type ObjView, type ConnView, type DomainView,
 } from './shapes.js'
-import { resolveIconOrWarn } from './icons.js'
+import { resolveIconOrWarn, type ResolvedIcon } from './icons.js'
 
 /**
  * create_architecture — atomic from-scratch generation. The NESTED schema is
@@ -42,6 +42,7 @@ const min1 = z.string().min(1)
 const componentSpec = z.object({
   name: min1,
   description: min1,
+  icon: z.string().optional().describe('Icon catalog name'),
 })
 const containerSpec = z.object({
   kind: z.enum(['app', 'store']).describe('app = service/API/UI; store = database/cache/queue/bucket'),
@@ -181,18 +182,18 @@ export const architectTools: AiToolDef[] = [
         const sysId = claim(sys.name, 'system')
         systemIds.push(sysId)
         const sysDomainId = resolveDomain(sys.domain)
-        let sysIcon: string | undefined
+        let sysIcon: Partial<ResolvedIcon> = {}
         if (sys.icon) {
-          const r = resolveIconOrWarn(sys.icon, 'system')
-          sysIcon = r.icon
-          if (r.warning) warnings.push(`${sys.name}: ${r.warning}`)
+          const { warning, ...resolved } = resolveIconOrWarn(sys.icon, 'system')
+          sysIcon = resolved
+          if (warning) warnings.push(`${sys.name}: ${warning}`)
         }
         planned.push({
           entity: {
             ...baseEntity(sysId, 'system', sys.name, sys.description),
             ...(sys.external ? { scope: 'external' } : {}),
             ...(sysDomainId ? { domainId: sysDomainId } : {}),
-            ...(sysIcon ? { icon: sysIcon } : {}),
+            ...sysIcon,
           },
         })
 
@@ -204,28 +205,35 @@ export const architectTools: AiToolDef[] = [
           noteCollision(c.name)
           const cId = claim(c.name, c.kind)
           containerIds.push(cId)
-          let cIcon: string | undefined
+          let cIcon: Partial<ResolvedIcon> = {}
           if (c.icon) {
-            const r = resolveIconOrWarn(c.icon, c.kind)
-            cIcon = r.icon
-            if (r.warning) warnings.push(`${c.name}: ${r.warning}`)
+            const { warning, ...resolved } = resolveIconOrWarn(c.icon, c.kind)
+            cIcon = resolved
+            if (warning) warnings.push(`${c.name}: ${warning}`)
           }
           planned.push({
             entity: {
               ...baseEntity(cId, c.kind, c.name, c.description),
               parentId: sysId,
               ...(sysDomainId ? { domainId: sysDomainId } : {}),
-              ...(cIcon ? { icon: cIcon } : {}),
+              ...cIcon,
             },
           })
           for (const comp of c.components ?? []) {
             noteCollision(comp.name)
             const compId = claim(comp.name, 'component')
+            let compIcon: Partial<ResolvedIcon> = {}
+            if (comp.icon) {
+              const { warning, ...resolved } = resolveIconOrWarn(comp.icon, 'component')
+              compIcon = resolved
+              if (warning) warnings.push(`${comp.name}: ${warning}`)
+            }
             planned.push({
               entity: {
                 ...baseEntity(compId, 'component', comp.name, comp.description),
                 parentId: cId,
                 ...(sysDomainId ? { domainId: sysDomainId } : {}),
+                ...compIcon,
               },
             })
           }

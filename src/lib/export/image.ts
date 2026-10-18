@@ -233,6 +233,7 @@ export async function renderDiagramPdfImage(bundle: ExportBundle, diagramId: str
     engine.focusOnBounds(bounds, pad)
     if (typeof document !== 'undefined' && document.fonts?.ready) await document.fonts.ready
     await nextFrame()
+    await engine.whenIconsSettled()
     await nextFrame()
 
     if (typeof CompressionStream !== 'undefined') {
@@ -296,6 +297,7 @@ export async function renderDiagramPngBlob(
       await document.fonts.ready
     }
     await nextFrame()
+    await engine.whenIconsSettled()
     await nextFrame()
 
     let out: HTMLCanvasElement = canvas

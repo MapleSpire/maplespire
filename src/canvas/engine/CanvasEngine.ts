@@ -14,6 +14,7 @@
 
 import type { C4Object, Connection, Group, Flow, Tag, SelectedItem, ConnectionHighlightStyle, ConnectionShape, Position, Comment, ShapeIconAssignment } from '../../types'
 import { resolveTechnologyIconPath } from '../../lib/technologies/iconPath'
+import { cancelIconCatalogWait, isIconCatalogLoading, shapeIconArtwork } from '../../lib/technologies/shapeIconArtwork'
 import { objectShortDescription } from '../../lib/objectDescription'
 import { objectTypeBadgeLabel } from '../../lib/objectTypeBadge'
 import { safeExternalHref } from '../../lib/objectLinks'
@@ -1752,6 +1753,7 @@ export class CanvasEngine {
     this.animEffects = []
     this.animLayersValid = false
     cancelAnimationFrame(this.rafId)
+    cancelIconCatalogWait(this.onIconCatalogReady)
     if (this.interactionTimeoutId) clearTimeout(this.interactionTimeoutId)
     if (this.wheelTimeoutId) clearTimeout(this.wheelTimeoutId)
     this.canvas.removeEventListener('mousedown', this.onMouseDown)
@@ -5177,6 +5179,21 @@ export class CanvasEngine {
     )
   }
 
+  private readonly onIconCatalogReady = () => this.scheduleRender()
+
+  /** Exports: resolve once the icon artwork the rendered shapes asked for has
+   * loaded or failed, bounded by `timeoutMs`, so a raster taken right after
+   * does not capture the letter badge that stands in while a logo loads. */
+  async whenIconsSettled(timeoutMs = 4000): Promise<void> {
+    const deadline = Date.now() + timeoutMs
+    for (;;) {
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+      if (!isIconCatalogLoading() && this.iconImageLoading.size === 0) return
+      if (Date.now() >= deadline) return
+      await new Promise<void>((resolve) => setTimeout(resolve, 25))
+    }
+  }
+
   private loadIconImage(url: string): HTMLImageElement | null {
     const cached = this.iconImageCache.get(url)
     if (cached) return cached
@@ -5214,11 +5231,14 @@ export class CanvasEngine {
     const size = 20
     const half = size / 2
 
-    // Try to render actual icon image
+    // Try to render actual icon image: the assignment's artwork, else the
+    // catalog entry a bare `icon` name points at (AI tools / imports wrote
+    // names alone before they wrote assignments).
+    const artwork = shapeIconArtwork(obj, this.onIconCatalogReady)
     const iconUrl = resolveTechnologyIconPath(
       this.resolvedTheme,
-      obj.iconAssignment?.iconLightPath,
-      obj.iconAssignment?.iconDarkPath,
+      artwork?.iconLightPath,
+      artwork?.iconDarkPath,
     )
     if (iconUrl) {
       const img = this.loadIconImage(iconUrl)

@@ -192,9 +192,9 @@ export const writeTools: AiToolDef[] = [
       // Lenient on create: a hallucinated icon must not sink object creation.
       // Technology assignment is intentionally absent here: only the catalog
       // endpoint may validate availability and construct an immutable snapshot.
-      const { icon, warning: iconWarning } = input.icon
+      const { warning: iconWarning, ...iconFields } = input.icon
         ? resolveIconOrWarn(input.icon, input.type)
-        : { icon: undefined, warning: undefined }
+        : { warning: undefined }
       const structureWarning =
         (input.type === 'app' || input.type === 'store') &&
         !input.parentId &&
@@ -209,7 +209,7 @@ export const writeTools: AiToolDef[] = [
         name: input.name,
         shortDescription: input.shortDescription ?? '',
         ...(input.description ? { description: input.description } : {}),
-        ...(icon ? { icon } : {}),
+        ...iconFields,
         position: input.position ?? { x: 0, y: 0 },
         size: DEFAULT_SIZE,
         ...(input.parentId ? { parentId: input.parentId } : {}),
@@ -298,8 +298,12 @@ export const writeTools: AiToolDef[] = [
       if (input.scope !== undefined) next.scope = input.scope
       if (input.status !== undefined) next.status = input.status
       if (input.icon !== undefined) {
-        if (input.icon === null) delete next.icon
-        else next.icon = requireIcon(input.icon, next.type ?? current.type ?? 'app')
+        // Same as the editor's icon picker: choosing replaces any assignment
+        // (a technology-supplied one included), clearing removes both.
+        if (input.icon === null) {
+          delete next.icon
+          delete next.iconAssignment
+        } else Object.assign(next, requireIcon(input.icon, next.type ?? current.type ?? 'app'))
       }
       if (input.properties) next.properties = { ...(current.properties ?? {}), ...input.properties }
 
@@ -503,9 +507,9 @@ export const writeTools: AiToolDef[] = [
         throw new AiToolError(`no diagram with id "${input.addToDiagramId}" — see list_diagrams`, 404)
       }
       // Lenient on create (see create_model_object): drop a bad icon, warn.
-      const { icon, warning: iconWarning } = input.icon
+      const { warning: iconWarning, ...iconFields } = input.icon
         ? resolveIconOrWarn(input.icon, 'group')
-        : { icon: undefined, warning: undefined }
+        : { warning: undefined }
       const id = newEntityId()
       const entity: GroupView = {
         id,
@@ -515,7 +519,7 @@ export const writeTools: AiToolDef[] = [
         tagAssignments: {},
         tagOrder: [],
         autoSize: true,
-        ...(icon ? { icon } : {}),
+        ...iconFields,
         ...(input.domainId ? { domainId: input.domainId } : {}),
         ...(input.description ? { description: input.description } : {}),
       }
@@ -596,8 +600,10 @@ export const writeTools: AiToolDef[] = [
       }
       if (input.color !== undefined) next.color = input.color
       if (input.icon !== undefined) {
-        if (input.icon === null) delete next.icon
-        else next.icon = requireIcon(input.icon, 'group')
+        if (input.icon === null) {
+          delete next.icon
+          delete next.iconAssignment
+        } else Object.assign(next, requireIcon(input.icon, 'group'))
       }
       if (input.domainId !== undefined) {
         if (input.domainId === null) delete next.domainId

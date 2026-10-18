@@ -17,9 +17,9 @@ import { ICON_CATALOG, type IconCatalogEntry } from './iconCatalog.gen.js'
 
 /**
  * Icon-catalog lookups for the AI tools. `object.icon` / `group.icon` store an
- * icon's exact catalog NAME (the client renders by name lookup), so writes
- * must canonicalize + validate against the catalog or the badge silently
- * renders nothing.
+ * icon's exact catalog NAME, and `iconAssignment` carries the artwork paths
+ * the canvas actually draws — a name alone rendered a letter badge (defect
+ * 2026-10-17), so every write sets both, canonicalized against the catalog.
  */
 
 const byLowerName = new Map<string, IconCatalogEntry>()
@@ -105,16 +105,46 @@ function iconProblem(name: string, shapeType: string): { message: string; status
   return null
 }
 
+/** The provenance a shape carries for catalog artwork — the exact shape the
+ * editor's icon picker writes (src/lib/technologyUsage.ts
+ * genericIconAssignment): the renderers draw a logo only from these paths. */
+export interface GenericIconAssignmentView {
+  source: 'generic'
+  mode: 'explicit'
+  displayName: string
+  iconLightPath?: string
+  iconDarkPath?: string
+}
+
+export interface ResolvedIcon {
+  icon: string
+  iconAssignment: GenericIconAssignmentView
+}
+
+export function genericIconAssignment(entry: IconCatalogEntry): GenericIconAssignmentView {
+  return {
+    source: 'generic',
+    mode: 'explicit',
+    displayName: entry.name,
+    ...(entry.iconLight ? { iconLightPath: entry.iconLight } : {}),
+    ...(entry.iconDark ? { iconDarkPath: entry.iconDark } : {}),
+  }
+}
+
+function resolvedIcon(entry: IconCatalogEntry): ResolvedIcon {
+  return { icon: entry.name, iconAssignment: genericIconAssignment(entry) }
+}
+
 /**
  * Validate `name` against the catalog for the given shape type and return the
  * CANONICAL catalog name to store (fixes case drift — the client lookup is
- * exact). Throws AiToolError with close-match suggestions on a miss.
+ * exact) with its artwork assignment; both fields are written together. Throws AiToolError with close-match suggestions on a miss.
  * Use on UPDATE paths, where setting the icon is the caller's explicit intent.
  */
-export function requireIcon(name: string, shapeType: string): string {
+export function requireIcon(name: string, shapeType: string): ResolvedIcon {
   const problem = iconProblem(name, shapeType)
   if (problem) throw new AiToolError(problem.message, problem.status)
-  return findIcon(name)!.name
+  return resolvedIcon(findIcon(name)!)
 }
 
 /**
@@ -125,10 +155,10 @@ export function requireIcon(name: string, shapeType: string): string {
 export function resolveIconOrWarn(
   name: string,
   shapeType: string
-): { icon?: string; warning?: string } {
+): Partial<ResolvedIcon> & { warning?: string } {
   const problem = iconProblem(name, shapeType)
   if (problem) return { warning: `icon ignored: ${problem.message}` }
-  return { icon: findIcon(name)!.name }
+  return resolvedIcon(findIcon(name)!)
 }
 
 export const ICON_COUNT = ICON_CATALOG.length

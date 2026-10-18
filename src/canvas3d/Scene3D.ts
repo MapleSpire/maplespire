@@ -3547,13 +3547,7 @@ export class Scene3D {
     // mono uppercase label riding the board just above the plate (kit style),
     // with the group's technology icon on its left when one is set (2D header)
     const groupIconTex = g.icon
-      ? techIconTexture(
-        g.icon,
-        () => this.requestRender(),
-        this.resolvedTheme,
-        g.iconAssignment?.iconLightPath,
-        g.iconAssignment?.iconDarkPath,
-      )
+      ? techIconTexture(g, () => this.requestRender(), this.resolvedTheme)
       : null
     if (groupIconTex) {
       const iconMesh = new THREE.Mesh(
@@ -3822,13 +3816,7 @@ export class Scene3D {
     const content = objectContentLayout({ x: 0, y: 0, width: w, height: h, contentTop })
     const typeColor = external ? objSkin.iconExternal : objSkin.icon
     const techTex = o.icon
-      ? techIconTexture(
-        o.icon,
-        () => this.requestRender(),
-        this.resolvedTheme,
-        o.iconAssignment?.iconLightPath,
-        o.iconAssignment?.iconDarkPath,
-      )
+      ? techIconTexture(o, () => this.requestRender(), this.resolvedTheme)
       : null
     if (techTex) {
       const glyph = new THREE.Mesh(
@@ -4269,13 +4257,7 @@ export class Scene3D {
     // obj.icon → the technology icon (image or generated badge); otherwise
     // the tinted first-letter plate.
     const drumIconTex = o.icon
-      ? techIconTexture(
-        o.icon,
-        () => this.requestRender(),
-        this.resolvedTheme,
-        o.iconAssignment?.iconLightPath,
-        o.iconAssignment?.iconDarkPath,
-      )
+      ? techIconTexture(o, () => this.requestRender(), this.resolvedTheme)
       : null
     if (drumIconTex) {
       // the raw logo, no plate — exactly how the 2D engine decals the store

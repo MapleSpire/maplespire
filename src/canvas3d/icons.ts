@@ -26,8 +26,9 @@
  */
 
 import * as THREE from 'three'
-import type { C4Type } from '../types'
+import type { C4Type, ShapeIconAssignment } from '../types'
 import { resolveTechnologyIconPath } from '../lib/technologies/iconPath'
+import { catalogIconArtwork, loadIconCatalog, shapeIconArtwork } from '../lib/technologies/shapeIconArtwork'
 
 type IconElement =
   | { k: 'path'; d: string }
@@ -162,14 +163,18 @@ const techTextureCache = new Map<string, THREE.CanvasTexture>()
  * abbr, the offline/broken-image look), then repaints itself with the actual
  * logo (rounded-clipped, like the 2D 4px-radius clip) when the image loads.
  * `onReady` fires after the swap so the scene can request a render.
+ * Artwork follows the 2D rule (shapeIconArtwork): the iconAssignment, else
+ * the catalog entry named by a bare `icon`.
  */
 export function techIconTexture(
-  iconName: string,
+  shape: { icon?: string; iconAssignment?: ShapeIconAssignment },
   onReady?: () => void,
   resolvedTheme: 'light' | 'dark' = 'light',
-  iconLightPath?: string,
-  iconDarkPath?: string,
 ): THREE.CanvasTexture | null {
+  const iconName = shape.iconAssignment?.displayName ?? shape.icon ?? ''
+  const artwork = shapeIconArtwork(shape)
+  const iconLightPath = artwork?.iconLightPath
+  const iconDarkPath = artwork?.iconDarkPath
   const config = {
     bg: '#6B665E',
     text: '#FFFFFF',
@@ -205,8 +210,7 @@ export function techIconTexture(
   tex.minFilter = THREE.LinearMipmapLinearFilter
   techTextureCache.set(cacheKey, tex)
 
-  const url = resolveTechnologyIconPath(resolvedTheme, iconLightPath, iconDarkPath)
-  if (url) {
+  const paint = (url: string) => {
     const img = new Image()
     img.crossOrigin = 'anonymous'
     img.onload = () => {
@@ -221,6 +225,18 @@ export function techIconTexture(
       onReady?.()
     }
     img.src = url // onerror: the badge stays — 2D behaves the same
+  }
+  const url = resolveTechnologyIconPath(resolvedTheme, artwork?.iconLightPath, artwork?.iconDarkPath)
+  if (url) {
+    paint(url)
+  } else if (!shape.iconAssignment) {
+    // A bare catalog name whose catalog chunk has not loaded yet: repaint this
+    // same texture once it has (a name truly absent keeps its letter badge).
+    void loadIconCatalog().then(() => {
+      const resolved = catalogIconArtwork(iconName)
+      const late = resolveTechnologyIconPath(resolvedTheme, resolved?.iconLightPath, resolved?.iconDarkPath)
+      if (late) paint(late)
+    }, () => {})
   }
   return tex
 }
