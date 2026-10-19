@@ -556,6 +556,10 @@ test.describe('3D board', () => {
     )
     const preLabel = await readConn(connId)
     expect(preLabel.waypoints).toEqual(base.waypoints)
+    // the rebuilt layer's label placement runs in slices after the frame
+    // (Scene3D.runLabelJob, 2026-10-11): the plates move when it commits,
+    // and the probe reports the scene busy until then
+    await page.waitForFunction(() => !window.__scene3d!.isCameraAnimating(), undefined, { timeout: 10000 })
 
     // 3) sliding the label writes labelPosition3d/labelOffset3d, 2D untouched.
     // Compare against the POST-FORK snapshot — the fork already stamped the
@@ -579,6 +583,7 @@ test.describe('3D board', () => {
     expect(afterLabel.labelOffset3d).toBeLessThanOrEqual(40)
     expect(afterLabel.labelPosition).toEqual(base.labelPosition)
     expect(afterLabel.labelOffset).toEqual(base.labelOffset)
+    await page.waitForFunction(() => !window.__scene3d!.isCameraAnimating(), undefined, { timeout: 10000 })
 
     // 4) dragging an endpoint dot re-anchors the 3D twin only. Aim the drop at
     // a KNOWN anchor — the geometric opposite of the current one — pulled 22%
@@ -709,6 +714,9 @@ test.describe('3D board', () => {
     const box = (await page.locator('[data-testid="canvas-3d"]').boundingBox())!
     await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2)
     await page.mouse.wheel(0, -300)
+    // the wheel GLIDES to its target (CameraRig.dollySmooth) — read the pose
+    // the exit will hand off only once it has landed
+    await page.waitForFunction(() => !window.__scene3d!.isCameraAnimating(), undefined, { timeout: 5000 })
     const pre = await page.evaluate(() => window.__scene3d!.getPose())
     // the exit handoff the 2D canvas must receive (mirror of viewportForPose)
     const scaleRaw = box.height / (2 * pre.distance * Math.tan((pre.fov / 2) * D))
@@ -739,7 +747,14 @@ test.describe('3D board', () => {
     // ── prefers-reduced-motion: jump cut both ways ────────────────────────────
     await page.emulateMedia({ reducedMotion: 'reduce' })
     await page.locator('[data-testid="view-3d"]').click()
-    await page.waitForFunction(() => !!window.__scene3d && window.__scene3d.nodeCount() > 0, undefined, { timeout: 30000 })
+    // the enter now starts once the shaders have linked (enterPending): read
+    // the state at the FIRST moment it has started — a tweened enter would
+    // still be at its flat start pose here, a jump cut is already landed
+    await page.waitForFunction(
+      () => !!window.__scene3d && window.__scene3d.nodeCount() > 0 && !window.__scene3d.enterPending(),
+      undefined,
+      { timeout: 30000, polling: 16 },
+    )
     const cut = await page.evaluate(() => ({
       animating: window.__scene3d!.isCameraAnimating(),
       floor: window.__scene3d!.floorAlpha(),
@@ -797,6 +812,9 @@ test.describe('3D board', () => {
         const a = window.__scene3d!.assetInfo()
         return a.bgIsEquirect && a.floorTextured && a.voxels > 0
       }, undefined, { timeout: 10000 })
+      // the skin swap rebuilds the board and links its programs before the
+      // next frame (Scene3D.scheduleCompile) — aim only at a settled board
+      await page.waitForFunction(() => !window.__scene3d!.isCameraAnimating(), undefined, { timeout: 15000 })
 
       const voxelInfo = await page.evaluate(() => window.__scene3d!.voxelInfo())
       expect(voxelInfo.count).toBe(120)
@@ -823,13 +841,24 @@ test.describe('3D board', () => {
       const selectionBefore = await page.evaluate(() => window.__scene3d!.selectionIds())
       await page.mouse.move(target!.x, target!.y)
       await expect(page.locator('[data-testid="canvas-3d"] canvas')).toHaveCSS('cursor', 'grab')
+      // The fragment grabbed is whatever the pointer hits AT THE PRESS — in a
+      // full suite run fragments can still be settling between the scan above
+      // and here, so re-resolve the id at the exact press point instead of
+      // assuming the scanned one (the assertion stays: that fragment moves).
+      const before = await page.evaluate(([x, y]) => {
+        const hit = window.__scene3d!.pickAt(x, y)
+        const all = window.__scene3d!.voxelInfo().fragments
+        return { id: hit?.kind === 'voxel' ? hit.id : null, all }
+      }, [target!.x, target!.y] as [number, number])
+      expect(before.id, 'the press lands on a loose fragment').not.toBeNull()
+      const start = before.all.find((f) => f.id === before.id)!
       await page.mouse.down()
       await page.mouse.move(target!.x + 42, target!.y + 18, { steps: 8 })
       await page.mouse.up()
 
       await expect.poll(() => page.evaluate(() => window.__scene3d!.voxelInfo().displaced)).toBeGreaterThan(0)
-      const moved = await page.evaluate((id) => window.__scene3d!.voxelInfo().fragments.find((f) => f.id === id)!, target!.id)
-      expect(Math.hypot(moved.x - target!.world.x, moved.z - target!.world.z)).toBeGreaterThan(1)
+      const moved = await page.evaluate((id) => window.__scene3d!.voxelInfo().fragments.find((f) => f.id === id)!, before.id!)
+      expect(Math.hypot(moved.x - start.x, moved.z - start.z), `${before.id} follows the drag`).toBeGreaterThan(1)
       expect(await page.evaluate(() => window.__scene3d!.selectionIds())).toEqual(selectionBefore)
 
       // Scene interaction is deliberately ephemeral: a new Scene3D instance
@@ -1070,6 +1099,44 @@ test.describe('3D board', () => {
     await page.mouse.click(target!.pt.x, target!.pt.y)
     await page.waitForFunction((id) => window.__scene3d!.selectionIds().includes(id), target!.id, { timeout: 5000 })
     expect(await page.evaluate(() => window.__scene3d!.flowInfo().units)).toBe(0)
+  })
+
+  // USER REGRESSION 2026-10-10: "sur les shapes je vois des régressions sur la
+  // police et la taille de la police et l'icône par rapport à avant". At the
+  // default (fit-to-screen) framing every card had swapped its face for a
+  // big Inter 700 title with no tech badge, subtitle or pill, and the drum
+  // names were printed on the drums in bold with the badge moved onto the
+  // lid. The base face (edfc9c6f7) is the contract at every framing.
+  test('shape faces keep the base fonts, sizes and tech badges at the default framing (USER REGRESSION)', async ({ page }) => {
+    await loginIfNeeded(page)
+    await importStorefront(page)
+    await enter3d(page)
+    await page.waitForFunction(() => window.__scene3d!.techIcons().length >= 2, undefined, { timeout: 10000 })
+    await page.waitForTimeout(300) // the settle-edge LOD pass
+    // the faces are only read at their design size from the design pose: a
+    // branch landed the enter morph on the fit pose, ~2x farther, and the
+    // user saw every title at half size (2026-10-10)
+    const pose = await page.evaluate(() => ({ at: window.__scene3d!.getPose(), base: window.__scene3d!.presetPose() }))
+    expect(pose.at.distance / pose.base.distance, 'enter lands on the base design pose').toBeCloseTo(1, 1)
+    const faces = await page.evaluate(() => window.__scene3d!.nodeFaces())
+    expect(faces.length).toBe(await page.evaluate(() => window.__scene3d!.nodeCount()))
+    const cards = faces.filter((f) => f.kind === 'card')
+    const drums = faces.filter((f) => f.kind === 'store')
+    expect(cards.length, 'the storefront board has cards').toBeGreaterThanOrEqual(3)
+    expect(drums.length, 'the storefront board has the Orders database drum').toBe(1)
+    for (const f of cards) {
+      expect(f.title, `card ${f.id}: title`).toEqual({ font: 'inter600', size: 13, visible: true })
+      expect(f.badge, `card ${f.id}: icon tile shown at its built size`).toEqual({ visible: true, scale: 1 })
+      expect(f.foreignFonts, `card ${f.id}: no font the base face never used`).toEqual([])
+    }
+    // the React web app's tech tile is one of them
+    expect(cards.some((f) => f.hasTech)).toBe(true)
+    for (const f of drums) {
+      expect(f.hasTech, 'the PostgreSQL drum has a technology').toBe(true)
+      expect(f.title, `drum ${f.id}: name tag`).toEqual({ font: 'inter600', size: 10.5, visible: true })
+      expect(f.badge, `drum ${f.id}: side badge shown at its built size`).toEqual({ visible: true, scale: 1 })
+      expect(f.foreignFonts).toEqual([])
+    }
   })
 
   test('grid toggle hides the floor dots; technology icons render on cards and drums (USER BUGS)', async ({ page }) => {

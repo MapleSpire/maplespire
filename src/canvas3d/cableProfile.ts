@@ -13,7 +13,13 @@
 // GNU Affero General Public License for more details.
 
 /**
- * Vertical profile of a LIT-profile connection cable (pure math — no three).
+ * Vertical profile of a connection under its label (pure math — no three).
+ *
+ * The lit board draws its connections as flat ink lines since 2026-10-12
+ * (inkLine.ts): Scene3D now hands connLabelPlacement a LEVEL profile
+ * (`cableProfileFor(0, 0, 0, total)`). The shaped profile below is what the
+ * retired cable tubes followed; connLabelPlacement still reads any profile
+ * (its tests exercise the shaped one), so the math stays with it.
  *
  * The reference maquette's cables PLUG into the slab walls and LIE on
  * whatever the shapes stand on: they leave the wall horizontally at plug
@@ -21,9 +27,6 @@
  * group platform — NOT the world floor), hold, and rise into the far plug.
  * Heights here are layer-local (the conn layer rides at plat+CONNECTION_LIFT),
  * so values are routinely negative.
- *
- * Every consumer of the cable's shape (tube geometry, traveling spark,
- * label lift) must sample THIS function so they agree exactly.
  */
 export interface CableProfile {
   /** Plug height at t=0 (source wall), layer-local. */

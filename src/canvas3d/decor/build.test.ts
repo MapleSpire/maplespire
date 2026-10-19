@@ -16,6 +16,11 @@ import { describe, expect, it } from 'vitest'
 import * as THREE from 'three'
 import {
   buildDecorMeshes,
+  CONTACT_BLOB_ALPHA,
+  CONTACT_BLOB_GROW,
+  contactBlobAlpha,
+  contactBlobTexture,
+  contactFootprint,
   disposeDecorBuild,
   disposeDecorGeometries,
   FLAG,
@@ -276,9 +281,13 @@ describe('decor pack budgets (draw calls, triangles, tinting)', () => {
     }))
     const build = buildDecorMeshes(deskPack, placed, { lit: true, deskLift: -30 })
     const meshes = meshesOf(build)
-    // pencil + coil + note + the Canadiana signature (leaf clump, the big
-    // single blade beside it, and the beaver)
-    expect(meshes.length).toBe(6)
+    // pencil + coil + note + the camp mug (loop 4's hero desk object) + the
+    // Canadiana signature (leaf clump, the big single blade round 8 added
+    // beside it, and the beaver) + loop 4 r2's near-field anchors (the
+    // notebooks and the plant) + loop 4 r3's far-band anchors (the pencil
+    // cup and the books) + loop 4 r4's gap fillers (the sketchbook and the
+    // blueprint)
+    expect(meshes.length).toBe(13)
     let tris = 0
     const m = new THREE.Matrix4()
     for (const mesh of meshes) {
@@ -286,8 +295,59 @@ describe('decor pack budgets (draw calls, triangles, tinting)', () => {
       mesh.getMatrixAt(0, m)
       expect(m.elements[13], `${mesh.userData.decorArchetype} sits at bench level`).toBeLessThan(-20)
     }
-    expect(tris, 'desk set triangle budget').toBeLessThan(4000)
+    // 4 000 → 4 300 (loop 4 r2): the notebooks' and the plant's procedural
+    // fallbacks brought this fallback set to exactly 4 000 (measured
+    // 2026-10-09); the shipped GLBs are gated in glbAssets.test.ts. Loop 4
+    // r3's far-band anchors (pencil cup, books) bring the fallback set to
+    // 4 196 (measured) — inside the same budget. 4 300 → 4 500 (loop 4 r4):
+    // the gap fillers' fallbacks (sketchbook, blueprint) measure 4 336 —
+    // the same ~4 % headroom over the measurement
+    expect(tris, 'desk set triangle budget').toBeLessThan(4500)
     disposeDecorBuild(build)
+    disposeDecorGeometries()
+  })
+
+  it('the grown desk props read at the fit framing AND stay inside their footprints (view3d quality loop 4)', () => {
+    // workbench-wide.png: "the cable coil is a grey ring … each prop should
+    // span at least 35 px at the fit framing". Grown ×DESK_PROP_GROWTH; the
+    // strict desk spacing rule bounds the MESH only if the registry footprint
+    // covers the rotation-safe plan radius of what is built.
+    const canadiana = DECOR_PACKS.find((p) => p.id === 'canadiana')!
+    const lineup = [...canadiana.archetypes, ...DESK_ARCHETYPES]
+    const report: string[] = []
+    for (const [id, minSpan] of [['desk-cable-coil', 34], ['ranger-hat', 52], ['desk-mug', 38]] as const) {
+      const a = lineup.find((x) => x.id === id)!
+      const build = buildDecorMeshes({ id: 'x', nameKey: 'x', archetypes: [a] }, fakePlacement([id]), { lit: true })
+      const geo = meshesOf(build)[0].geometry
+      const pos = geo.getAttribute('position')
+      let r = 0
+      let x0 = Infinity
+      let x1 = -Infinity
+      for (let i = 0; i < pos.count; i++) {
+        r = Math.max(r, Math.hypot(pos.getX(i), pos.getZ(i)))
+        x0 = Math.min(x0, pos.getX(i))
+        x1 = Math.max(x1, pos.getX(i))
+      }
+      report.push(`${id} r ${r.toFixed(1)} / footprint ${a.footprint}, span ${(x1 - x0).toFixed(1)}`)
+      expect(r, `${id}: rotation-safe radius within its footprint`).toBeLessThanOrEqual(a.footprint)
+      expect(r, `${id}: the footprint is honest (not padded)`).toBeGreaterThan(a.footprint * 0.8)
+      expect(x1 - x0, `${id}: grown, not the old speck`).toBeGreaterThan(minSpan)
+      disposeDecorBuild(build)
+    }
+    // the flag keeps the LARGEST desk footprint (the showcase pick) among the
+    // pieces the pick can take. Loop 4 r4's gap fillers (the open sketchbook,
+    // the blueprint) are broader at real scale (footprints 55 / 54), so
+    // placement.ts excludes every WORK-ZONE piece from the pick (quality pass
+    // "layout": they are laid in their zones) — and only a FLAT zone piece
+    // may outsize the flag: a tall one would be exactly the landmark the
+    // showcase exists to frame.
+    const flag = lineup.find((x) => x.id === 'canada-flag')!
+    for (const a of lineup) {
+      if ((a.zone ?? 'board') !== 'desk' || a.id === flag.id) continue
+      if (a.workZone && a.footprint >= flag.footprint) expect(a.height ?? 2 * a.footprint, `${a.id}: a broad zone piece is flat`).toBeLessThanOrEqual(15)
+      else expect(a.footprint, `${a.id} < flag`).toBeLessThan(flag.footprint)
+    }
+    expect(report.length).toBe(3)
     disposeDecorGeometries()
   })
 
@@ -644,8 +704,10 @@ describe('decor pack budgets (draw calls, triangles, tinting)', () => {
     // lobe, and a five-lobe blade delivers nine fingers. Instead, a per-blade
     // VERTICAL ramp: a monotone function of ONE coordinate, so it has no spatial
     // frequency to alias with and cannot touch the outline.
-    const canadiana = DECOR_PACKS.find((p) => p.id === 'canadiana')!
-    const build = buildDecorMeshes(canadiana, fakePlacement(['maple-leaf-mini']), { lit: true })
+    // (the hero blade left the canadiana board in loop 2 round 2 — it is
+    // built here from the greenery pack, which still carries it)
+    const greenery = DECOR_PACKS.find((p) => p.id === 'greenery')!
+    const build = buildDecorMeshes(greenery, fakePlacement(['maple-leaf-mini']), { lit: true })
     const geo = meshesOf(build)[0].geometry
     const pos = geo.getAttribute('position')
     const nrm = geo.getAttribute('normal')
@@ -767,7 +829,17 @@ describe('decor pack budgets (draw calls, triangles, tinting)', () => {
       // `placeDecor` multiplies the footprint by the instance scale itself, so
       // the registry number is the radius at scale 1, rounded up
       expect(a.footprint, `${a.id} footprint tracks its radius ${r.toFixed(2)}`).toBe(Math.ceil(r))
-      if ((a.zone ?? 'board') === 'board') {
+      if ((a.zone ?? 'board') === 'board' && a.clearance !== undefined) {
+        // VIEW3D QUALITY LOOP 3: a `clearance` leaf no longer leans on the
+        // 'open' cell rule for its rim proof — `keepsClear` (placement.ts)
+        // rejects any final pose whose scaled FOOTPRINT comes within 3 px of
+        // the slab edge, whatever the radius. That is what let the clumps
+        // spread past 25.81 (radius 26.4-27.6) to keep every blade's flag
+        // silhouette whole (glbAssets.test.ts overlap gate). The rim is then
+        // measured on the real placement (worstRim, 'the leaves POPULATE the
+        // board' below) instead of derived here.
+        expect(a.clearance, `${a.id} carries the footprint rim rule`).toBeGreaterThan(0)
+      } else if ((a.zone ?? 'board') === 'board') {
         expect(r, `${a.id} radius ${r.toFixed(2)} ≤ LEAF_BOARD_R_MAX`).toBeLessThanOrEqual(LEAF_BOARD_R_MAX)
         // the placement rule this is derived FROM, re-checked end to end
         expect(r * JITTER_TOP, `${a.id} clears the slab rim after jitter`).toBeLessThanOrEqual(
@@ -808,6 +880,18 @@ describe('decor pack budgets (draw calls, triangles, tinting)', () => {
         expect(Math.abs(b.roll), `${kind} clump roll`).toBeLessThanOrEqual(LEAF_ROLL_CLUMP_MAX + 1e-9)
       }
 
+      // …but they DO overlap: fallen leaves lie on one another. Since view3d
+      // quality loop 3 this is "every blade reaches at least one neighbour",
+      // not "every PAIR reaches": the loop-3 spread keeps each flag silhouette
+      // ≥85% whole (glbAssets.test.ts), and in the four-blade desk cluster the
+      // two blades at opposite corners then sit 36.9 apart for a 34.1 radius
+      // sum — still one pile, just no longer every leaf on every other.
+      for (let i = 0; i < blades.length; i++) {
+        const touches = blades.some(
+          (o, j) => j !== i && Math.hypot(o.cx - blades[i].cx, o.cz - blades[i].cz) < o.r + blades[i].r,
+        )
+        expect(touches, `${kind} blade ${i} lies on a neighbour (still a clump)`).toBe(true)
+      }
       for (let i = 0; i < blades.length; i++) {
         for (let j = i + 1; j < blades.length; j++) {
           const a = blades[i]
@@ -818,8 +902,6 @@ describe('decor pack budgets (draw calls, triangles, tinting)', () => {
           const meanDiameter = a.r + b.r
           expect(d, `${kind} ${i}×${j} centres ${d.toFixed(1)} vs ${(LEAF_CLUMP_SEP * meanDiameter).toFixed(1)}`)
             .toBeGreaterThanOrEqual(LEAF_CLUMP_SEP * meanDiameter)
-          // …but they DO overlap: fallen leaves lie on one another
-          expect(d, `${kind} ${i}×${j} still a clump`).toBeLessThan(a.r + b.r)
           // (b) YAW DELTA — an overlap must read as two leaves crossing, not as
           //     one thicker leaf.
           const raw = Math.abs(a.yaw - b.yaw) % (Math.PI * 2)
@@ -1103,8 +1185,12 @@ describe('decor pack budgets (draw calls, triangles, tinting)', () => {
     // So the shadow is DRAWN into the archetype geometry: still ONE InstancedMesh
     // per archetype, still deterministic, and it survives every LOD because it is
     // geometry rather than a shadow-map sample.
+    // a board blade and a desk clump: the hero blade left the canadiana board
+    // in loop 2 round 2, so it rides in from the greenery pack
     const canadiana = DECOR_PACKS.find((p) => p.id === 'canadiana')!
-    const build = buildDecorMeshes(canadiana, fakePlacement(['maple-leaf-mini', 'maple-leaf-cluster']), { lit: true })
+    const greenery = DECOR_PACKS.find((p) => p.id === 'greenery')!
+    const pack = { ...canadiana, archetypes: [...canadiana.archetypes, greenery.archetypes.find((a) => a.id === 'maple-leaf-mini')!] }
+    const build = buildDecorMeshes(pack, fakePlacement(['maple-leaf-mini', 'maple-leaf-cluster']), { lit: true })
     const meshes = meshesOf(build)
     expect(meshes.length, 'still one draw per archetype').toBe(2)
 
@@ -1308,8 +1394,10 @@ describe('decor pack budgets (draw calls, triangles, tinting)', () => {
     // and therefore the normal, is a function of RADIUS ONLY, so two fan
     // triangles at the same radius get the same normal by construction. This
     // gate measures exactly that, straight off the built blade.
-    const canadiana = DECOR_PACKS.find((p) => p.id === 'canadiana')!
-    const build = buildDecorMeshes(canadiana, fakePlacement(['maple-leaf-mini']), { lit: true })
+    // (built from the greenery pack: the hero blade left the canadiana board
+    // in loop 2 round 2)
+    const greenery = DECOR_PACKS.find((p) => p.id === 'greenery')!
+    const build = buildDecorMeshes(greenery, fakePlacement(['maple-leaf-mini']), { lit: true })
     const geo = meshesOf(build)[0].geometry
     const pos = geo.getAttribute('position')
     const nrm = geo.getAttribute('normal')
@@ -1835,14 +1923,36 @@ describe('decor pack budgets (draw calls, triangles, tinting)', () => {
       // full-size blade, and at least two leaves whose own radius is within
       // 20% of the rim budget (i.e. big, not confetti).
       if (c.some((p) => p.archetypeId === 'maple-leaf-mini')) heroSeeds++
-      if (boardLeaves.filter((p) => p.archetypeId === 'maple-leaf-mini' || p.archetypeId === 'maple-leaf-drift').length >= 2)
-        bigSeeds++
+      // LOOP 2 ROUND 2: the big leaves are the 3-blade clumps now (drift and
+      // bank) — the hero single left the canadiana paper
+      const big = ['maple-leaf-mini', 'maple-leaf-drift', 'maple-leaf-bank']
+      if (boardLeaves.filter((p) => big.includes(p.archetypeId)).length >= 2) bigSeeds++
     }
-    // as many leaf objects on the paper as the greenery pack lands trees…
+    // LOOP 2 ROUND 2 — the counts below were re-measured when every board
+    // leaf gained `clearance` (BOARD_LEAF_CLEARANCE = 60 px between its
+    // footprint and any card, cable or label: the critic's "saturated leaves
+    // between and against the cards", city-wide.png) and the lone hero blades
+    // left the canadiana paper. On this fixture the leaves now live in the
+    // open margins only: 5.00 leaves / 13.7 blades / 5.0 clumps per board
+    // against 8.08 trees (24 seeds, measured 2026-10-08). The INTENT holds —
+    // the paper is visibly dressed with fall, seed after seed, never a
+    // carpet — at the density the margins allow; what changed is WHERE.
+    //
+    // VIEW3D QUALITY LOOP 3 — FEWER, LARGER. The critic's verdict on the
+    // workbench-wide frame was "every leaf is an 8-15 px red splat … reads as
+    // spatter", and its fix was fewer, bigger leaves, each blade whole. The
+    // clumps spread (each flag silhouette ≥85% visible, glbAssets.test.ts) and
+    // the board blades grew ~13% (bases 22-24 → 25-27), so their footprints
+    // went 25-26 → 30-32 and the 60-px clearance fits fewer of them: re-measured
+    // on this fixture 4.38 leaves / 12.1 blades / 4.38 clumps per board against
+    // 8.08 trees, 18/24 seeds with ≥10 blades and with ≥4 drifts (24 seeds,
+    // 2026-10-09). The thresholds below track that; what does NOT move is the
+    // intent — every board dressed, drifts first, more blades than trees.
+    // A leaf object per ~2 trees on the paper…
     expect(
       leaves / SEEDS,
       `board leaves ${(leaves / SEEDS).toFixed(2)} vs trees ${(trees / SEEDS).toFixed(2)}`,
-    ).toBeGreaterThanOrEqual(0.8 * (trees / SEEDS))
+    ).toBeGreaterThanOrEqual(0.5 * (trees / SEEDS))
     // …but never a carpet (the cards still have to carry the story)
     expect(leaves / SEEDS, 'garnish, not a lawn').toBeLessThan(2 * (trees / SEEDS))
     // …and counted in BLADES (a clump is 2-4 leaves), the paper really is
@@ -1860,17 +1970,20 @@ describe('decor pack budgets (draw calls, triangles, tinting)', () => {
     //
     // The default framing shows most, not all, of the paper, so the board-wide
     // numbers are gated above the framing targets rather than at them.
-    expect(blades / SEEDS, `${(blades / SEEDS).toFixed(1)} blades/board vs the ≥10 in frame`).toBeGreaterThanOrEqual(14)
-    expect(clumps / SEEDS, `${(clumps / SEEDS).toFixed(1)} clumps/board vs the ≥4 in frame`).toBeGreaterThanOrEqual(5.5)
-    expect(tenBladeSeeds / SEEDS, 'every board carries ≥10 blades').toBeGreaterThanOrEqual(0.95)
-    expect(fourClumpSeeds / SEEDS, 'every board carries ≥4 drifts').toBeGreaterThanOrEqual(0.9)
+    // (loop 2 round 2 re-measure, see above: 13.7 blades, 5.0 clumps, 22/24
+    // seeds with ≥ 10 blades and with ≥ 4 drifts — was ≥ 14 / 5.5 / 0.95)
+    // (loop 3 re-measure, fewer + larger, see above: 12.1 blades, 4.38 clumps,
+    // 18/24 seeds with ≥ 10 blades and with ≥ 4 drifts — was ≥ 13 / 4.5 / 0.9)
+    expect(blades / SEEDS, `${(blades / SEEDS).toFixed(1)} blades/board vs the ≥10 in frame`).toBeGreaterThanOrEqual(12)
+    expect(clumps / SEEDS, `${(clumps / SEEDS).toFixed(1)} clumps/board vs the ≥4 in frame`).toBeGreaterThanOrEqual(4.25)
+    expect(tenBladeSeeds / SEEDS, 'most boards carry ≥10 blades').toBeGreaterThanOrEqual(0.7)
+    expect(fourClumpSeeds / SEEDS, 'most boards carry ≥4 drifts').toBeGreaterThanOrEqual(0.7)
     // …with the singles a genuine minority
     expect(clumps / Math.max(1, singles), `clump:single = ${(clumps / singles).toFixed(1)}:1`).toBeGreaterThan(2)
-    // …and the mid-board band gets its own archetype: the BANK collects in a
-    // cable's 10-34 px shoulder, which is exactly the mid-board band that
-    // otherwise stays bare, and it is the only leaf that banks against an
-    // obstacle at all
-    expect(bankSeeds / SEEDS, 'leaves bank against a cable run').toBeGreaterThanOrEqual(0.8)
+    // …and the BANK still collects against an obstacle — since loop 2 round
+    // 2 the board RIM, not a cable shoulder (the cable lane is exactly where
+    // the critic marked a leaf as a smudge; `clearance` forbids it)
+    expect(bankSeeds / SEEDS, 'leaves bank against the board rim').toBeGreaterThanOrEqual(0.8)
     // …without ever straddling the slab bevel (the affinity that buys the
     // banking is the one without the 'open' rim proof — so it is measured)
     expect(worstRim, `worst rim clearance ${worstRim.toFixed(1)} px`).toBeGreaterThan(0)
@@ -1882,10 +1995,12 @@ describe('decor pack budgets (draw calls, triangles, tinting)', () => {
     // …and a LEAFY scene carries them alongside the trees — singles AND drifts
     expect(greenLeafSeeds / SEEDS, 'greenery carries maples too').toBeGreaterThanOrEqual(0.9)
     expect(greenClumpSeeds / SEEDS, 'greenery carries leaf drifts too').toBeGreaterThanOrEqual(0.7)
-    // …and the READABLE ones are in the default framing, seed after seed: the
-    // hero blade is a board prop precisely so this is a claim
-    // about the paper the camera centres on, not about the desk annulus.
-    expect(heroSeeds / SEEDS, 'the hero blade lands every seed').toBeGreaterThanOrEqual(0.9)
+    // …and the READABLE ones are on the paper, seed after seed. Round 4 #5a
+    // made the hero SINGLE a board prop for this; loop 2 round 2 took it off
+    // the canadiana paper (a lone saturated blade between the cards read as
+    // litter — mini ×2, mini-b, mini-c counted on the run.mjs board), so the
+    // big leaves are the 3-blade clumps, and the single must stay off.
+    expect(heroSeeds, 'no lone hero blade on the canadiana paper').toBe(0)
     expect(bigSeeds / SEEDS, 'at least two BIG leaves per board').toBeGreaterThanOrEqual(0.8)
   })
 
@@ -2120,10 +2235,16 @@ describe('decor pack budgets (draw calls, triangles, tinting)', () => {
     disposeDecorGeometries()
   })
 
-  it('landmark caps: ONE cn-tower, at most a moose pair (critique #7)', () => {
+  it('landmark caps: ONE cn-tower, ONE moose, ONE beaver (critique #7, loop 4 r4)', () => {
+    // the moose cap was a pair (critique #7: "a herd does not read"); loop 4
+    // r4's workbench-wide.png showed the pair itself as scattered copies —
+    // one at (1240,355), its twin at (1160,690) — and three beavers. One
+    // each; placement.test.ts gates the placed count, this pins the source.
     const canadiana = DECOR_PACKS.find((p) => p.id === 'canadiana')!
     expect(canadiana.archetypes.find((a) => a.id === 'cn-tower')?.maxCount).toBe(1)
-    expect(canadiana.archetypes.find((a) => a.id === 'moose')?.maxCount).toBe(2)
+    expect(canadiana.archetypes.find((a) => a.id === 'moose')?.maxCount).toBe(1)
+    expect(canadiana.archetypes.find((a) => a.id === 'beaver')?.maxCount).toBe(1)
+    expect(DESK_ARCHETYPES.find((a) => a.id === 'beaver')?.maxCount).toBe(1)
   })
 
   it('unlit builds stay unlit + un-tone-mapped (decor works on every theme)', () => {
@@ -2136,6 +2257,259 @@ describe('decor pack budgets (draw calls, triangles, tinting)', () => {
       expect((mesh.material as THREE.Material).toneMapped).toBe(false)
       expect(mesh.castShadow).toBe(false)
     })
+    disposeDecorBuild(build)
+    disposeDecorGeometries()
+  })
+})
+
+// ── CONTACT SHADOWS (view3d quality, contact pass 2026-10-09) ───────────────
+// The critic: "props barely ground themselves: the flag base, moose hooves,
+// leaves and mug base lack visible contact shadows or AO". See the CONTACT
+// BLOBS block in build.ts for the measurements behind each number.
+describe('contact shadows: every prop grounded, one draw', () => {
+  const canadiana = DECOR_PACKS.find((p) => p.id === 'canadiana')!
+  const merged = [...canadiana.archetypes, ...DESK_ARCHETYPES]
+  const DESK_LIFT = -30
+  const placementInput: PlacementInput = {
+    archetypes: merged,
+    density: 'normal',
+    seed: 0xbeaf,
+    bounds: { x: 0, y: 0, w: 1100, h: 750 },
+    pad: { x: 88, y: 72 },
+    fractureBand: 0,
+    nodes: [
+      { id: 'a', type: 'app', rect: { x: 100, y: 100, w: 200, h: 120 } },
+      { id: 'b', type: 'store', rect: { x: 620, y: 420, w: 175, h: 100 } },
+    ],
+    groups: [],
+    connections: [{ points: [{ x: 300, y: 160 }, { x: 620, y: 470 }] }],
+    deskBand: 150,
+  }
+
+  const blobMeshesOf = (build: ReturnType<typeof buildDecorMeshes>): THREE.Mesh[] => {
+    const out: THREE.Mesh[] = []
+    build.group.traverse((o) => {
+      if ((o as THREE.Mesh).isMesh && !(o as THREE.InstancedMesh).isInstancedMesh && o.userData.decorContactBlobs) {
+        out.push(o as THREE.Mesh)
+      }
+    })
+    return out
+  }
+  const hasDrawnDecal = (g: THREE.BufferGeometry): boolean => {
+    const col = g.getAttribute('color')
+    if (!col || col.itemSize !== 4) return false
+    for (let i = 0; i < col.count; i++) if (col.getW(i) < 0.99) return true
+    return false
+  }
+
+  it('every placed prop gets EXACTLY ONE contact shadow — the shared blob layer or its own drawn decal — in ONE extra draw', () => {
+    const placed = placeDecor(placementInput)
+    expect(placed.length, 'a real desk + board placement').toBeGreaterThan(10)
+    const build = buildDecorMeshes({ ...canadiana, archetypes: merged }, placed, { lit: true, deskLift: DESK_LIFT })
+    const blobs = blobMeshesOf(build)
+    // ONE mesh for every blob of the build: one draw call, one material
+    expect(blobs.length, 'one merged blob mesh').toBe(1)
+    const blob = blobs[0]
+    const props = blob.userData.decorContactProps as string[]
+    const decalArch = new Set(meshesOf(build).filter((m) => hasDrawnDecal(m.geometry)).map((m) => String(m.userData.decorArchetype)))
+    expect(decalArch.size, 'the leaves carry their own drawn decal').toBeGreaterThan(0)
+    for (const id of decalArch) expect(id.startsWith('maple-leaf'), `${id}: only the leaf family draws its own`).toBe(true)
+    let decals = 0
+    for (const p of placed) {
+      const inBlobs = props.filter((id) => id === p.propId).length
+      if (decalArch.has(p.archetypeId)) {
+        decals++
+        expect(inBlobs, `${p.propId}: a drawn-decal prop is not doubled by a blob`).toBe(0)
+      } else {
+        expect(inBlobs, `${p.propId}: exactly one blob`).toBe(1)
+      }
+    }
+    expect(decals, 'the placement carries leaves').toBeGreaterThan(0)
+    expect(props.length + decals, 'one shadow per prop, no more').toBe(placed.length)
+    // the merged geometry is exactly one quad per blob
+    expect(blob.geometry.getAttribute('position').count).toBe(4 * props.length)
+    expect(blob.geometry.index!.count).toBe(6 * props.length)
+    // it never enters the shadow map, and it is a build-owned buffer
+    expect(blob.castShadow).toBe(false)
+    expect(blob.receiveShadow).toBe(false)
+    expect(build.geometries).toContain(blob.geometry)
+    expect(build.materials).toContain(blob.material)
+    disposeDecorBuild(build)
+    disposeDecorGeometries()
+  })
+
+  it('the blob material is the drum pad SDF blob\'s feature set — no new program — on ONE shared ≤128-px atlas', () => {
+    const build = buildDecorMeshes({ ...canadiana, archetypes: merged }, placeDecor(placementInput), { lit: true, deskLift: DESK_LIFT })
+    const blobMesh = blobMeshesOf(build)[0]
+    const mat = blobMesh.material as THREE.MeshBasicMaterial
+    // `!!geometry.attributes.normal` is a bit of three's program key: the
+    // first cut had no normals and linked its own program (live probe: the
+    // drum blob's cacheKey carried bit 23, the blob's did not — 52 programs
+    // after a decor pick instead of 51)
+    expect(blobMesh.geometry.getAttribute('normal'), 'normals for program-key parity').toBeTruthy()
+    // Scene3D buildStandee's lit drum shadow: MeshBasicMaterial { color,
+    // transparent, opacity, alphaMap, depthWrite: false, toneMapped: false }.
+    // Every program-key input below must match it (polygonOffset is GL state).
+    expect(mat.type).toBe('MeshBasicMaterial')
+    expect(mat.transparent).toBe(true)
+    expect(mat.depthWrite).toBe(false)
+    expect(mat.toneMapped).toBe(false)
+    expect(mat.alphaMap, 'alpha from the shared atlas').toBe(contactBlobTexture())
+    expect(mat.map, 'no colour map').toBeNull()
+    expect(mat.vertexColors, 'no vertex colours').toBe(false)
+    expect(mat.side).toBe(THREE.FrontSide)
+    expect(mat.polygonOffset, 'pulled over the desk / mat it lies on').toBe(true)
+    expect(mat.polygonOffsetFactor).toBeLessThan(0)
+    const tex = contactBlobTexture()
+    expect(tex.image.width).toBeLessThanOrEqual(128)
+    expect(tex.image.height).toBeLessThanOrEqual(128)
+    // a SECOND build shares the same texture object
+    const again = buildDecorMeshes({ ...canadiana, archetypes: merged }, placeDecor(placementInput), { lit: true, deskLift: DESK_LIFT })
+    expect((blobMeshesOf(again)[0].material as THREE.MeshBasicMaterial).alphaMap).toBe(tex)
+    // …and unlit builds have no blob layer at all
+    const unlit = buildDecorMeshes({ ...canadiana, archetypes: merged }, placeDecor(placementInput), { lit: false, deskLift: DESK_LIFT })
+    expect(blobMeshesOf(unlit).length).toBe(0)
+    for (const b of [build, again, unlit]) disposeDecorBuild(b)
+    disposeDecorGeometries()
+  })
+
+  it('the atlas: a dark plateau, a smooth ramp, ZERO on every cell border; the LOW row hugs, the TALL row spreads', () => {
+    const tex = contactBlobTexture()
+    const { data, width: W, height: H } = tex.image as { data: Uint8Array; width: number; height: number }
+    expect(H, 'square 2 × 2 atlas').toBe(W)
+    const g = (x: number, y: number) => data[(y * W + x) * 4 + 1] // alphaMap reads G
+    const C = W / 2
+    const peak = Math.round(255 * CONTACT_BLOB_ALPHA)
+    for (const [cx, cy] of [
+      [0, 0],
+      [C, 0],
+      [0, C],
+      [C, C],
+    ]) {
+      // centre at the plateau
+      expect(Math.abs(g(cx + C / 2, cy + C / 2) - peak), `cell ${cx},${cy} centre`).toBeLessThanOrEqual(1)
+      // the border ring stays (near) zero, so neither bilinear filtering nor
+      // the mip chain bleeds one cell into its neighbour
+      for (let i = 0; i < C; i++) {
+        for (const v of [g(cx + i, cy), g(cx + i, cy + C - 1), g(cx, cy + i), g(cx + C - 1, cy + i)]) {
+          expect(v, `cell ${cx},${cy} border`).toBeLessThanOrEqual(4)
+        }
+      }
+    }
+    // the profile is monotone in ρ and reaches 0 at the rim, for both rows
+    for (const row of ['tall', 'low'] as const) {
+      let prev = Infinity
+      for (let rho = 0; rho <= 1.0001; rho += 0.02) {
+        const a = contactBlobAlpha(rho, row)
+        expect(a, `${row} monotone at ρ ${rho.toFixed(2)}`).toBeLessThanOrEqual(prev + 1e-9)
+        prev = a
+      }
+      expect(contactBlobAlpha(1, row)).toBe(0)
+    }
+    // at the FOOTPRINT EDGE (ρ = 1/grow) both rows are still dark — the
+    // measured failure was a blob whose dark part hid under the prop
+    for (const row of ['tall', 'low'] as const) {
+      expect(contactBlobAlpha(1 / CONTACT_BLOB_GROW[row], row), `${row} α at the contact edge`).toBeGreaterThan(0.4)
+    }
+    // the low row's ramp is the tighter one
+    expect(CONTACT_BLOB_GROW.low).toBeLessThan(CONTACT_BLOB_GROW.tall)
+  })
+
+  it('each blob lies UNDER its prop, over the surface, covers the contact footprint, and leans away from the key light', () => {
+    const ids = DESK_ARCHETYPES.map((a) => a.id).filter((id) => !id.startsWith('maple-leaf'))
+    expect(ids, 'the flag, the mug and the animals are on the desk list').toEqual(expect.arrayContaining(['desk-mug']))
+    const all = [...new Map([...merged].map((a) => [a.id, a])).values()]
+    const deskIds = [...new Set([...ids, 'canada-flag', 'moose'])].filter((id) => all.some((a) => a.id === id))
+    const placed: PlacedProp[] = deskIds.map((id, i) => ({
+      propId: `${id}:0:${i}`,
+      archetypeId: id,
+      x: i * 120,
+      z: (i % 3) * 90,
+      rotY: i * 0.7, // a different yaw per prop: the quad must turn with it
+      scale: 1,
+      onPlatform: false,
+      onDesk: true,
+    }))
+    const pack = { id: 'x', nameKey: 'x', archetypes: all.filter((a) => deskIds.includes(a.id)) }
+    const build = buildDecorMeshes(pack, placed, { lit: true, deskLift: DESK_LIFT })
+    const blob = blobMeshesOf(build)[0]
+    const props = blob.userData.decorContactProps as string[]
+    expect(props.length).toBe(placed.length)
+    const pos = blob.geometry.getAttribute('position')
+    const m = new THREE.Matrix4()
+    const v = new THREE.Vector3()
+    const sun = new THREE.Vector2(LEAF_SHADOW_PER_HEIGHT[0], LEAF_SHADOW_PER_HEIGHT[1]).normalize()
+    const deskPlane = DESK_LIFT - 0.3
+    for (const mesh of meshesOf(build)) {
+      const id = String(mesh.userData.decorArchetype)
+      const fp = contactFootprint(mesh.geometry)
+      mesh.getMatrixAt(0, m)
+      const q = props.indexOf(placed.find((p) => p.archetypeId === id)!.propId)
+      expect(q, `${id} has a blob`).toBeGreaterThanOrEqual(0)
+      const quad = [0, 1, 2, 3].map((k) => new THREE.Vector3().fromBufferAttribute(pos, 4 * q + k))
+      // (a) FLAT, under the prop's lowest vertex, over the desk + cutting mat
+      let lowest = Infinity
+      const gp = mesh.geometry.getAttribute('position')
+      for (let i = 0; i < gp.count; i++) lowest = Math.min(lowest, v.fromBufferAttribute(gp, i).applyMatrix4(m).y)
+      for (const c of quad) {
+        expect(c.y, `${id} blob is flat`).toBeCloseTo(quad[0].y, 6)
+        expect(c.y, `${id} blob under the prop`).toBeLessThan(lowest)
+        expect(c.y - deskPlane, `${id} blob over the cutting mat (0.12)`).toBeGreaterThan(0.15)
+      }
+      // (b) it COVERS the contact footprint: every footprint corner, through
+      // the instance matrix, lies inside the quad (convex, same winding)
+      const inside = (px: number, pz: number) => {
+        let sign = 0
+        for (let k = 0; k < 4; k++) {
+          const a = quad[k]
+          const b = quad[(k + 1) % 4]
+          const cr = (b.x - a.x) * (pz - a.z) - (b.z - a.z) * (px - a.x)
+          if (Math.abs(cr) < 1e-9) continue
+          if (sign === 0) sign = Math.sign(cr)
+          else if (Math.sign(cr) !== sign) return false
+        }
+        return true
+      }
+      for (const [a, b] of [
+        [-1, -1],
+        [1, -1],
+        [1, 1],
+        [-1, 1],
+      ]) {
+        v.set(fp.cx + a * fp.hx, fp.minY, fp.cz + b * fp.hz).applyMatrix4(m)
+        expect(inside(v.x, v.z), `${id} footprint corner ${a},${b} inside its blob`).toBe(true)
+      }
+      // (c) it leans AWAY from the sun (azimuth −55°): the quad centre sits
+      // past the footprint centre along the key light's ground direction
+      const qc = quad.reduce((s, c) => s.add(c), new THREE.Vector3()).multiplyScalar(0.25)
+      v.set(fp.cx, fp.minY, fp.cz).applyMatrix4(m)
+      const lean = (qc.x - v.x) * sun.x + (qc.z - v.z) * sun.y
+      expect(lean, `${id} leans away from the key light`).toBeGreaterThan(0)
+      // …but never travels: under a fifth of the footprint radius
+      expect(lean, `${id} a contact shadow does not travel`).toBeLessThan(0.25 * Math.max(fp.hx, fp.hz))
+      // (d) faces UP (a culled quad is an invisible one)
+      const n = new THREE.Vector3().subVectors(quad[1], quad[0]).cross(new THREE.Vector3().subVectors(quad[2], quad[0]))
+      const idx = blob.geometry.index!
+      const [i0, i1, i2] = [idx.getX(6 * q), idx.getX(6 * q + 1), idx.getX(6 * q + 2)]
+      const tri = [i0, i1, i2].map((k) => new THREE.Vector3().fromBufferAttribute(pos, k))
+      const tn = new THREE.Vector3().subVectors(tri[1], tri[0]).cross(new THREE.Vector3().subVectors(tri[2], tri[0]))
+      expect(tn.y, `${id} blob wound to face +Y`).toBeGreaterThan(0)
+      expect(Math.abs(n.y), `${id} quad not degenerate`).toBeGreaterThan(1)
+    }
+    // (e) shapes: the mug's foot is ROUND, the book stack BOXY and LOW
+    const fpOf = (id: string) => contactFootprint(meshesOf(build).find((mm) => mm.userData.decorArchetype === id)!.geometry)
+    expect(fpOf('desk-mug').round, 'the mug stands on a disc').toBe(true)
+    expect(fpOf('desk-mug').low, 'the mug is tall').toBe(false)
+    if (deskIds.includes('desk-books')) {
+      expect(fpOf('desk-books').round, 'the book stack is boxy').toBe(false)
+      expect(fpOf('desk-books').low, 'the book stack is low').toBe(true)
+    }
+    if (deskIds.includes('canada-flag')) {
+      // the flag's contact is its FOOT, not its banner: the footprint stays
+      // inside the foot disc's reach, however wide the cloth flies
+      const f = fpOf('canada-flag')
+      expect(Math.max(f.hx, f.hz), 'the flag blob is the foot').toBeLessThanOrEqual(FLAG.BASE_R + 0.5)
+    }
     disposeDecorBuild(build)
     disposeDecorGeometries()
   })

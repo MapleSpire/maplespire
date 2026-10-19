@@ -17,6 +17,7 @@ import { mergeGeometries, mergeVertices } from 'three/examples/jsm/utils/BufferG
 import { CAMERA_PRESETS } from '../presets'
 import type { PlacedProp } from './placement'
 import type { DecorPackMeta } from './registry'
+import { decorAsset, decorAssetsVersion } from './glbAssets'
 
 /**
  * Decor mesh construction: ONE InstancedMesh per archetype (voxel-scatter
@@ -36,6 +37,9 @@ export interface DecorBuildResult {
   counts: Record<string, number>
   /** Every material in the group (morph-fade registration). */
   materials: THREE.Material[]
+  /** Geometry this build OWNS (the merged contact blobs) — everything else is
+   * the archetype cache's. Disposed with the build. */
+  geometries: THREE.BufferGeometry[]
 }
 
 interface ArchetypeGeom {
@@ -62,6 +66,20 @@ interface ArchetypeGeom {
    * silhouette of the decal DISC is the one thing the drawn shadow must not be
    * doubled by. */
   castsShadow?: boolean
+  /** Blender-authored archetypes (glbAssets.ts): the print / detail map,
+   * multiplied with the vertex colours, and the vein relief. */
+  map?: THREE.Texture | null
+  normalMap?: THREE.Texture | null
+  /** The normal map's scale AS LOADED: GLTFLoader flips y for meshes that
+   * shade with derivative tangents (glTF's +Y-up tangent space). */
+  normalScale?: THREE.Vector2 | null
+  /** glTF metallic-roughness map (G roughness, B metalness), with the
+   * material's own metalness factor: the flag's steel pole and brass foot
+   * share one mesh with the cloth, so the finish rides a map (glbAssets). */
+  metalRoughMap?: THREE.Texture | null
+  metalness?: number
+  /** Single-surface meshes (cloth, a blade): light both faces. */
+  doubleSided?: boolean
 }
 
 /** The camera's horizontal look direction at the default `iso` preset. Two
@@ -239,6 +257,16 @@ export const FLAG_YAW_BAND = {
   spread: 0.5,
 } as const
 
+/** The index cards' yaw band (desk-note.glb): their text-up axis is local −Z,
+ * which a yaw Y turns to (−sin Y, 0, −cos Y) — away from a camera at azimuth
+ * Y, i.e. "up" on screen. Same centre as the flag; the spread keeps a desk's
+ * cards from reading as one stamp while the writing stays within ±26° of
+ * upright. */
+export const NOTE_YAW_BAND = {
+  centres: [LEAF_READ_AXIS],
+  spread: 0.45,
+} as const
+
 function bandYaw(rotY: number, band: { centres: readonly number[]; spread: number }): number {
   const TAU = Math.PI * 2
   const u = (((rotY % TAU) + TAU) % TAU) / TAU
@@ -270,7 +298,27 @@ function tint(geo: THREE.BufferGeometry, hex: string): THREE.BufferGeometry {
   return geo
 }
 
+/** UV a part samples when it has no texture coordinates of its own (contact
+ * decals, primitives merged beside an asset blade): the maps' reserved corner,
+ * white in the detail map and flat in the normal map — see LEAF_UV in
+ * scripts/blender/canadiana_assets.py (the blade lives in [0.06, 0.94]²). */
+const NEUTRAL_UV: readonly [number, number] = [0.02, 0.02]
+
 function mergeParts(parts: THREE.BufferGeometry[]): THREE.BufferGeometry {
+  // mergeGeometries needs ONE attribute set: once any part carries UVs (an
+  // asset blade), the others get the neutral corner
+  if (parts.some((p) => p.getAttribute('uv'))) {
+    for (const p of parts) {
+      if (p.getAttribute('uv')) continue
+      const n = p.getAttribute('position').count
+      const uv = new Float32Array(n * 2)
+      for (let i = 0; i < n; i++) {
+        uv[i * 2] = NEUTRAL_UV[0]
+        uv[i * 2 + 1] = NEUTRAL_UV[1]
+      }
+      p.setAttribute('uv', new THREE.BufferAttribute(uv, 2))
+    }
+  }
   const merged = mergeGeometries(parts)
   for (const p of parts) p.dispose()
   return merged
@@ -496,6 +544,23 @@ function planterGeom(): THREE.BufferGeometry {
 
 // ── workbench props (desk zone) — REAL-scale objects beside the maquette ──
 
+/** View3d quality loop 4: "the desk props are 10-20 px specks" at the fit
+ * framing (workbench-wide.png: the cable coil a grey ring, the hats barely
+ * read). The coil (26 → 36 across) and the ranger hat (40 → 56 brim) grow by
+ * this factor; their registry footprints grow with them (registry.ts), so the
+ * desk spacing rule still bounds the meshes. The CN tower is not scaled (it
+ * is a 124-unit souvenir ornament since quality pass "cntower" — the 281-unit
+ * cone dominated the frame). */
+export const DESK_PROP_GROWTH = 1.4
+
+/** Move a prop so its plan-view bounding box is centred on the origin. */
+function centreXZ(geo: THREE.BufferGeometry): THREE.BufferGeometry {
+  geo.computeBoundingBox()
+  const b = geo.boundingBox!
+  geo.translate(-(b.min.x + b.max.x) / 2, 0, -(b.min.z + b.max.z) / 2)
+  return geo
+}
+
 function pencilGeom(): THREE.BufferGeometry {
   // lying flat along X: hex barrel, ferrule + eraser at −X, wood cone +
   // graphite tip at +X (a giant pencil next to the miniature buildings)
@@ -557,6 +622,37 @@ function cableCoilGeom(): THREE.BufferGeometry {
   return mergeParts(parts)
 }
 
+/** FALLBACK for desk-mug.glb (scripts/blender/desk_assets.py): the camp
+ * mug's silhouette — white enamel body, navy rim, coffee, a D handle at +X —
+ * on the asset's gabarit (r 19, 44 tall). No print: the official leaf is
+ * the GLB's texture, never redrawn as geometry here. */
+function mugGeom(): THREE.BufferGeometry {
+  const ENAMEL = '#F2EFE7'
+  const NAVY = '#1E2D4C'
+  const parts: THREE.BufferGeometry[] = []
+  const body = tint(new THREE.CylinderGeometry(19, 18.4, 41.4, 24, 1, true), ENAMEL)
+  body.translate(0, 0.6 + 20.7, 0)
+  parts.push(body)
+  const rim = tint(new THREE.TorusGeometry(18.6, 0.9, 6, 24), NAVY)
+  rim.rotateX(Math.PI / 2)
+  rim.translate(0, 43.2, 0)
+  parts.push(rim)
+  const foot = tint(new THREE.CylinderGeometry(18.4, 17, 1.2, 24), NAVY)
+  foot.translate(0, 0.6, 0)
+  parts.push(foot)
+  const coffee = tint(new THREE.CircleGeometry(17.6, 24), '#2B170C')
+  coffee.rotateX(-Math.PI / 2)
+  coffee.translate(0, 36.5, 0)
+  parts.push(coffee)
+  const handle = tint(new THREE.TorusGeometry(10.5, 2.3, 6, 12, Math.PI), ENAMEL)
+  handle.rotateZ(-Math.PI / 2)
+  handle.translate(18, 23, 0)
+  parts.push(handle)
+  // centred on the plan box like the GLB (the handle side is longer)
+  return centreXZ(mergeParts(parts))
+}
+
+/** FALLBACK for desk-note.glb (the two index cards with handwriting). */
 function deskNoteGeom(): THREE.BufferGeometry {
   const parts: THREE.BufferGeometry[] = [tint(new THREE.BoxGeometry(34, 0.9, 25), '#F2E7D2')]
   parts[0].translate(0, 0.45, 0)
@@ -568,9 +664,128 @@ function deskNoteGeom(): THREE.BufferGeometry {
   return mergeParts(parts)
 }
 
-// ── canadiana pack — desk-scale Canadiana miniatures (moose, beaver, loon,
-// ranger hats, red maple leaves, CN tower on the wood around the board;
-// compass + scalpel desk tools at the edges) ───────────────────────────────
+/** FALLBACK for desk-notebooks.glb (desk_assets.py, loop 4 r2): two pocket
+ * notebooks stacked askew with a pen across, on the asset's gabarit (54 x 34
+ * covers, 5 thick, plan radius 32.5). */
+function notebooksGeom(): THREE.BufferGeometry {
+  const parts: THREE.BufferGeometry[] = []
+  const lower = tint(new THREE.BoxGeometry(54, 5, 34), '#2F5A45')
+  lower.rotateY(0.12)
+  lower.translate(-1, 2.5, 0)
+  parts.push(lower)
+  const upper = tint(new THREE.BoxGeometry(54, 5, 34), '#7C2A23')
+  upper.rotateY(-0.16)
+  upper.translate(1, 7.5, -1)
+  parts.push(upper)
+  const pen = tint(new THREE.CylinderGeometry(1.55, 1.55, 50, 8), '#1F3766')
+  pen.rotateZ(Math.PI / 2)
+  pen.rotateY(0.42)
+  pen.translate(-1, 11.6, 1.5)
+  parts.push(pen)
+  return mergeParts(parts)
+}
+
+/** FALLBACK for desk-plant.glb: a terracotta pot with a sheaf of upright
+ * green blades (pot r 14.6, ~75 tall as the asset). */
+function plantGeom(): THREE.BufferGeometry {
+  const parts: THREE.BufferGeometry[] = []
+  const pot = tint(new THREE.CylinderGeometry(14.4, 10.6, 24, 16), '#B5623A')
+  pot.translate(0, 12, 0)
+  parts.push(pot)
+  for (let i = 0; i < 6; i++) {
+    const a = (i / 6) * Math.PI * 2
+    const blade = tint(new THREE.ConeGeometry(2.4, 34 + (i % 3) * 8, 4), '#2C5634')
+    blade.scale(1, 1, 0.35)
+    blade.rotateZ(0.16 * Math.cos(a))
+    blade.rotateX(0.16 * Math.sin(a))
+    blade.translate(3 * Math.cos(a), 24 + (34 + (i % 3) * 8) / 2, 3 * Math.sin(a))
+    parts.push(blade)
+  }
+  return mergeParts(parts)
+}
+
+/** FALLBACK for desk-pencil-cup.glb (desk_assets.py, loop 4 r3): a walnut
+ * cup (r 15, 40 tall) holding four splayed pencils, on the asset's gabarit
+ * (plan radius 18.4, 82.5 tall). */
+function pencilCupGeom(): THREE.BufferGeometry {
+  const parts: THREE.BufferGeometry[] = []
+  const cup = tint(new THREE.CylinderGeometry(15, 14.4, 40, 16), '#6A4329')
+  cup.translate(0, 20, 0)
+  parts.push(cup)
+  const tones = ['#E8B53A', '#C8402F', '#2F5A9A', '#3F7A4A']
+  for (let i = 0; i < tones.length; i++) {
+    const a = (i / tones.length) * Math.PI * 2 + 0.3
+    const pencil = tint(new THREE.CylinderGeometry(1.9, 1.9, 74, 6), tones[i])
+    pencil.translate(0, 37, 0)
+    pencil.rotateZ(0.18)
+    pencil.rotateY(a)
+    pencil.translate(3 * Math.cos(a), 6, 3 * Math.sin(a))
+    parts.push(pencil)
+  }
+  return centreXZ(mergeParts(parts))
+}
+
+/** FALLBACK for desk-books.glb (desk_assets.py, loop 4 r3): three small
+ * hardbacks stacked askew (58 x 38 at the bottom, 21 tall; plan radius 36). */
+function booksGeom(): THREE.BufferGeometry {
+  const parts: THREE.BufferGeometry[] = []
+  const books: [number, number, number, number, string][] = [
+    [58, 38, 8, 0, '#22385E'],
+    [54, 36, 7, 0.12, '#B07C2A'],
+    [50, 33, 6.2, -0.1, '#7A2A26'],
+  ]
+  let y = 0
+  for (const [w, d, t, yaw, tone] of books) {
+    const b = tint(new THREE.BoxGeometry(w, t, d), tone)
+    b.rotateY(yaw)
+    b.translate(0, y + t / 2, 0)
+    parts.push(b)
+    y += t
+  }
+  return centreXZ(mergeParts(parts))
+}
+
+/** FALLBACK for desk-sketchbook.glb (desk_assets.py, loop 4 r4): an A6
+ * spiral sketchbook lying open — two cream page blocks on black boards and a
+ * green pencil across, on the asset's gabarit (88.8 x 62, plan radius 54.2,
+ * 4.7 tall). */
+function sketchbookGeom(): THREE.BufferGeometry {
+  const parts: THREE.BufferGeometry[] = []
+  for (const side of [-1, 1]) {
+    const cover = tint(new THREE.BoxGeometry(44.4, 0.6, 62), '#2A2B2F')
+    cover.translate(side * 22.2, 0.3, 0)
+    parts.push(cover)
+    const t = side < 0 ? 1.3 : 2.1
+    const pages = tint(new THREE.BoxGeometry(42, t, 60), '#F4EFE3')
+    pages.translate(side * 22.4, 0.6 + t / 2, 0)
+    parts.push(pages)
+  }
+  const pencil = tint(new THREE.CylinderGeometry(1.15, 1.15, 50, 6), '#2F6B45')
+  pencil.rotateX(Math.PI / 2)
+  pencil.rotateY(0.59)
+  pencil.translate(25, 3.7, -4)
+  parts.push(pencil)
+  return centreXZ(mergeParts(parts))
+}
+
+/** FALLBACK for desk-blueprint.glb (desk_assets.py, loop 4 r4): a blueprint
+ * sheet half unrolled from its roll (92 across, plan radius 53, 12.4 tall). */
+function blueprintGeom(): THREE.BufferGeometry {
+  const parts: THREE.BufferGeometry[] = []
+  const sheet = tint(new THREE.BoxGeometry(46, 0.3, 92), '#1F4E8E')
+  sheet.translate(23, 0.15, 0)
+  parts.push(sheet)
+  const roll = tint(new THREE.CylinderGeometry(5.4, 5.4, 92, 14), '#E6E3D8')
+  roll.rotateX(Math.PI / 2)
+  roll.translate(0, 5.4, 0)
+  parts.push(roll)
+  return centreXZ(mergeParts(parts))
+}
+
+// ── canadiana pack — desk-scale Canadiana miniatures (ref1: moose, beaver,
+// loon, ranger hats, red maple leaves, CN tower on the wood around the
+// board; ref2: compass + scalpel desk tools at the edges) ──────────────────
+
 
 // ── THE MAPLE — LOBE HIERARCHY, not a starburst ────────────────────────────
 //
@@ -793,10 +1008,28 @@ export type LeafToneName = 'scarlet' | 'vermillion' | 'amber' | 'ochre'
  * #D80621 is NOT here — a pillar-box red is a heraldic red and a drift of them
  * on tan wood read as confetti. */
 export const LEAF_PALETTE: Record<LeafToneName, string> = {
-  scarlet: '#A9201F',
-  vermillion: '#CE5426',
-  amber: '#E6A64A',
-  ochre: '#6E4223',
+  // VIEW3D QUALITY LOOP 3 r2 — "the salmon leaf is washed-out pink, the brown
+  // leaf grey-brown and dull" (workbench-leaf.png): the critique's saturated
+  // autumn set is crimson #B3261E, orange #D9731A, gold #C9A227, rust #8A3B1C.
+  // Crimson, orange and rust are taken as given. Gold is not: at l 0.47 it is
+  // DARKER than walnut (0.455 + the 0.05 this palette's value gate requires),
+  // and a gold on walnut is the isoluminant blob the amber break exists to
+  // avoid — so amber keeps its value and only moves toward the critique's hue.
+  // (Most of the "washed-out" was not the palette: the blade's 0.55 roughness
+  // mirrored the key toward the iso camera — the asset is 0.72 now.)
+  scarlet: '#B3261E',
+  vermillion: '#D9731A',
+  amber: '#E3A93C',
+  // #6E4223 until 2026-10-08: under the city's low dusk key the delivered
+  // blade went near-black — a burnt leaf, not a brown one (loop1 city-leaf
+  // critique). Lifted to a russet brown, still the darkest break (l 0.357 vs
+  // walnut 0.455; the build.test palette gate wants < 0.405). Not the
+  // critique's #8A5A2B: at hue 30° its tip sat 5.8° / 0.028 luma from the
+  // DESK-darkened amber and the four desk breaks collapsed to three (the
+  // desk-distinctness gate caught it); hue 22° keeps them four.
+  // Loop 3 r2: the critique's RUST #8A3B1C (hue 17°, s 0.66 vs 0.54): the
+  // muted variant of #8C4E2A desaturated to the "grey-brown" it named.
+  ochre: '#8A3B1C',
 }
 
 /** Which surface a leaf archetype lands on. The tone mix follows from it. */
@@ -1020,10 +1253,28 @@ export const LEAF_SHADOW_PER_HEIGHT: readonly [number, number] = [
   -Math.sin(SUN_AZ) / Math.tan(SUN_EL),
   -Math.cos(SUN_AZ) / Math.tan(SUN_EL),
 ]
-/** Decal radius, as a multiple of the blade's rotation-safe radius. */
-export const LEAF_SHADOW_R = 1.15
-/** Alpha at the decal's centre. */
-export const LEAF_SHADOW_ALPHA = 0.22
+/** Decal radius, as a multiple of the blade's rotation-safe radius. 1.15 →
+ * 1.2 in the contact pass, with the smaller LEAF_SHADOW_OFFSET: the pool's
+ * near rim has to reach PAST the near lobe tips again. */
+export const LEAF_SHADOW_R = 1.2
+/** Alpha at the decal's centre — and, from the contact pass (2026-10-09), on
+ * its whole plateau out to LEAF_SHADOW_KNEE.
+ *
+ * Round 4 shipped 0.22 with α = 0.22·(1 − f)^1.6: by f = 0.6 that is 0.05,
+ * and the blade's lobe tips sit at f ≈ 0.87 of the decal — so every visible
+ * bit of the pool (the sinuses, the rim past the tips) was under 4% and the
+ * close-up showed no shadow at all (final-assets/workbench-leaf.png, the
+ * critic: "leaves look like decals"). The plateau keeps the dark INSIDE the
+ * lobes' reach, where the sinuses show it, and the ramp spends itself in the
+ * outer half of the radius, past the tips.
+ *
+ * Measured in the app (.probes/contact/decal-diff.png: the frame with every
+ * decal α forced to 0, subtracted): at 0.38 the pool darkened the desk by at
+ * most 25 of 255 levels, mean 11 — the decal shares the blade's glossy lit
+ * material, so its black film still carries the sheen. Hence 0.5. */
+export const LEAF_SHADOW_ALPHA = 0.5
+/** Fraction of the decal radius that stays at LEAF_SHADOW_ALPHA. */
+export const LEAF_SHADOW_KNEE = 0.5
 
 /** THE OFFSET, as a multiple of the blade's own radius.
  *
@@ -1032,8 +1283,16 @@ export const LEAF_SHADOW_ALPHA = 0.22
  * hidden UNDER the opaque blade. 0.35 of the blade radius puts the pool's near rim 1.5 R out on the sun's far
  * side and tucks it 0.8 R under on the near side: at the 30-50 px a single is
  * delivered at that is 2-3 px of visible shadow — enough to read as contact,
- * far too little to become a second silhouette competing with the blade. */
-export const LEAF_SHADOW_OFFSET = 0.35
+ * far too little to become a second silhouette competing with the blade.
+ *
+ * CONTACT PASS (2026-10-09): 0.35 → 0.22. The round-5 pool fell off as
+ * (1 − f)^1.6, so it HAD to be pushed out to show at all — and the price was
+ * a near rim tucked 0.8 R under the blade: the decal-diff probe showed the
+ * darkening entirely behind the leaf, none at its near lobes, i.e. a cast
+ * shadow, not a contact one. With the plateau ramp (LEAF_SHADOW_KNEE) a
+ * nearly concentric pool shows in every sinus, so the slide only has to lean
+ * it: near rim (1.2 − 0.22) R ≈ the near tips, far rim 1.42 R out. */
+export const LEAF_SHADOW_OFFSET = 0.22
 /** …and the same, for how far the pool slides toward the blade's LOW edge when
  * the die-cut is rolled about its stem→crown axis (see LEAF_ROLL_MAX). A
  * rolled blade touches down on one edge; the shadow has to touch down there
@@ -1044,8 +1303,10 @@ const SUN_XZ: readonly [number, number] = (() => {
   const m = Math.hypot(LEAF_SHADOW_PER_HEIGHT[0], LEAF_SHADOW_PER_HEIGHT[1])
   return [LEAF_SHADOW_PER_HEIGHT[0] / m, LEAF_SHADOW_PER_HEIGHT[1] / m]
 })()
-/** Ring radii (fractions of the decal radius) and the falloff exponent. */
-const SHADOW_RINGS = [0.45, 0.78, 1] as const
+/** Ring radii (fractions of the decal radius): vertex colours interpolate
+ * linearly, so the smoothstep ramp past LEAF_SHADOW_KNEE needs a few rings to
+ * stay smooth. */
+const SHADOW_RINGS = [0.45, 0.68, 0.86, 1] as const
 const SHADOW_SEGS = 12
 
 /** One blade's grounding decal: a flat fan in the XZ plane at y = 0, black with
@@ -1060,7 +1321,8 @@ function contactShadowGeom(radius: number, h: number, roll = 0): THREE.BufferGeo
   for (const f of SHADOW_RINGS) {
     // α falls smoothly to exactly 0 at the rim — a hard-edged disc is the one
     // thing a soft contact shadow must never be
-    const a = LEAF_SHADOW_ALPHA * Math.pow(1 - f, 1.6)
+    const t = Math.max(0, (f - LEAF_SHADOW_KNEE) / (1 - LEAF_SHADOW_KNEE))
+    const a = LEAF_SHADOW_ALPHA * (1 - t * t * (3 - 2 * t))
     for (let s = 0; s < SHADOW_SEGS; s++) {
       const th = (s / SHADOW_SEGS) * Math.PI * 2
       pos.push(Math.cos(th) * R * f, 0, Math.sin(th) * R * f)
@@ -1202,9 +1464,115 @@ function flattenCapNormals(geo: THREE.BufferGeometry, axis: 'x' | 'y' | 'z'): TH
   return geo
 }
 
-/** One leaf lying in the XZ plane (thickness on Y): NEARLY flat — no cup (see
- * `flattenCapNormals`), only the radius-only tip curl, which cannot fan (see
- * `curlLeafTips`).
+// ── THE BLENDER BLADE (glbAssets 'maple-leaf') ─────────────────────────────
+//
+// USER ASK 2026-10-08: the die-cut leaves "lack realism and definition". The
+// blade is now a sugar-maple mesh authored in Blender — five unequal lobes with
+// teeth, cupped margins and down-curled tips on an interior lattice, a real
+// petiole — carrying a DETAIL map (veins light, margin dark; near-white, so it
+// MULTIPLIES each blade's tone) and a NORMAL map of the vein relief. Mipmapped
+// textures are what make veins affordable at the 45-75 px a blade is delivered
+// at: the round-4 "anti-noise law" banned vein GEOMETRY, whose edges alias into
+// stipple, and a filtered map has no edges to alias.
+//
+// The asset is normalised ONCE into the procedural blade's own frame — centre
+// at the origin, crown toward −Z, lowest point on y = 0 — and scaled so its
+// rotation-safe radius (petiole included) is exactly LEAF_RADIUS per unit of
+// `size`. Every footprint, clearance and scatter rule written against
+// LEAF_RADIUS therefore holds unchanged for the new blade.
+
+let unitBladeCache: { version: number; geometry: THREE.BufferGeometry; zMin: number; zMax: number } | null = null
+
+function unitAssetBlade(): { geometry: THREE.BufferGeometry; zMin: number; zMax: number } | null {
+  const asset = decorAsset('maple-leaf')
+  if (!asset) return null
+  const v = decorAssetsVersion()
+  if (unitBladeCache && unitBladeCache.version === v) return unitBladeCache
+  const g = asset.geometry.clone()
+  g.computeBoundingBox()
+  const bb = g.boundingBox!
+  const cx = (bb.min.x + bb.max.x) / 2
+  const cz = (bb.min.z + bb.max.z) / 2
+  g.translate(-cx, -bb.min.y, -cz)
+  const pos = g.getAttribute('position')
+  let r = 0
+  for (let i = 0; i < pos.count; i++) r = Math.max(r, Math.hypot(pos.getX(i), pos.getZ(i)))
+  const s = LEAF_RADIUS / r
+  g.scale(s, s, s)
+  g.computeBoundingBox()
+  unitBladeCache = { version: v, geometry: g, zMin: g.boundingBox!.min.z, zMax: g.boundingBox!.max.z }
+  return unitBladeCache
+}
+
+/** THE ASSET BLADE'S TIP LIFT (contact pass 2026-10-09: "leaves look like
+ * decals"). The Blender blade carries its own lift (TIP_LIFT 0.048 of a leaf
+ * height in canadiana_assets.py), but the die-cut's radius curl
+ * (`curlLeafTips`) was never applied to it — and the clump STACK step was
+ * budgeted for exactly that curl (LEAF_STACK_FRAC = thickness + ½ LEAF_CURL).
+ * So the clump blades get it back at LEAF_CURL_FRAC, inside the budget the
+ * stack already pays for; a SINGLE, which nothing lies on, takes
+ * LEAF_SINGLE_TIP_LIFT. Same radius-only profile as the die-cut (flat inside
+ * LEAF_CURL_FLAT, quadratic ramp outside), so it cannot fan, and the shading
+ * normal tilts with the slope so the raised points catch the key light. */
+export const LEAF_SINGLE_TIP_LIFT = 0.1
+
+function liftAssetTips(geo: THREE.BufferGeometry, size: number, frac: number): void {
+  if (frac <= 0) return
+  const pos = geo.getAttribute('position') as THREE.BufferAttribute
+  const nrm = geo.getAttribute('normal') as THREE.BufferAttribute | undefined
+  const R = LEAF_RADIUS * size
+  const A = frac * LEAF_RADIUS * size
+  const span = 1 - LEAF_CURL_FLAT
+  for (let i = 0; i < pos.count; i++) {
+    const x = pos.getX(i)
+    const z = pos.getZ(i)
+    const r = Math.hypot(x, z)
+    const t = Math.min(1, (r / R - LEAF_CURL_FLAT) / span)
+    if (t <= 0) continue
+    pos.setY(i, pos.getY(i) + A * t * t)
+    if (!nrm || r < 1e-6) continue
+    // height field y += f(r): the surface normal n becomes (n − ∇f · n.y),
+    // renormalised (exact for a horizontal lid, close for the cupped blade)
+    const slope = (2 * A * t) / (span * R)
+    const ny = nrm.getY(i)
+    const nx = nrm.getX(i) - ((slope * x) / r) * ny
+    const nz = nrm.getZ(i) - ((slope * z) / r) * ny
+    const inv = 1 / Math.hypot(nx, ny, nz)
+    nrm.setXYZ(i, nx * inv, ny * inv, nz * inv)
+  }
+  pos.needsUpdate = true
+  if (nrm) nrm.needsUpdate = true
+}
+
+/** One asset blade at `size`, toned like the die-cut: an RGBA ramp from
+ * `base` at the petiole end (+Z) to `tip` at the crown (−Z) — the same single
+ * monotone break `tintLeafGroups` draws — on top of the detail map. */
+function assetLeafGeom(size: number, tone: LeafTone, tipLift = LEAF_CURL_FRAC): THREE.BufferGeometry | null {
+  const unit = unitAssetBlade()
+  if (!unit) return null
+  const g = unit.geometry.clone()
+  g.scale(size, size, size)
+  liftAssetTips(g, size, tipLift)
+  const pos = g.getAttribute('position')
+  const colors = new Float32Array(pos.count * 4)
+  const tipC = new THREE.Color(tone.tip)
+  const baseC = new THREE.Color(tone.base)
+  const span = (unit.zMax - unit.zMin) * size
+  const z0 = unit.zMax * size
+  for (let i = 0; i < pos.count; i++) {
+    const u = Math.min(1, Math.max(0, (z0 - pos.getZ(i)) / span))
+    colors[i * 4] = baseC.r + (tipC.r - baseC.r) * u
+    colors[i * 4 + 1] = baseC.g + (tipC.g - baseC.g) * u
+    colors[i * 4 + 2] = baseC.b + (tipC.b - baseC.b) * u
+    colors[i * 4 + 3] = 1
+  }
+  g.setAttribute('color', new THREE.BufferAttribute(colors, 4))
+  return g
+}
+
+/** One leaf lying in the XZ plane (thickness on Y): NEARLY flat — the round-3
+ * cup is still gone (see `flattenCapNormals`), and what replaces it is the
+ * radius-only tip curl, which cannot fan (see `curlLeafTips`).
  *
  * `lie` lifts the crown (LEAF_LIE ± a per-blade delta) and `roll` rocks the
  * blade about its own stem→crown axis for variety. Both are applied AFTER the
@@ -1214,7 +1582,13 @@ function flattenCapNormals(geo: THREE.BufferGeometry, axis: 'x' | 'y' | 'z'): TH
  *
  * Extrude output is non-indexed; `mergeVertices` re-indexes it so the leaf can
  * merge with the indexed primitive parts. */
-function mapleLeafGeom(size: number, tone: LeafTone, lie = LEAF_LIE, roll = 0): THREE.BufferGeometry {
+function mapleLeafGeom(size: number, tone: LeafTone, lie = LEAF_LIE, roll = 0, tipLift = LEAF_CURL_FRAC): THREE.BufferGeometry {
+  const blade = assetLeafGeom(size, tone, tipLift)
+  if (blade) {
+    if (roll) blade.rotateZ(roll)
+    if (lie) blade.rotateX(lie)
+    return blade
+  }
   const geo = new THREE.ExtrudeGeometry(mapleLeafShape(size), leafExtrude(size))
   tintLeafGroups(geo, size, tone)
   geo.rotateX(-Math.PI / 2) // lie flat on the desk/board (crown → −Z)
@@ -1386,18 +1760,28 @@ function stepOf(size: number, roll: number): number {
  * any size, and every clump still overlaps itself — fallen leaves lie ON one
  * another, they just no longer fuse.
  *
- * TONES follow the archetype's SURFACE: the board clumps draw from
- * LEAF_TONE_MIX_BOARD, the desk cluster from LEAF_TONE_MIX_DESK (all four
- * breaks, amber darkened). The trailing boolean is the MUTED flag. */
+ * VIEW3D QUALITY LOOP 3 — EACH BLADE KEEPS ITS WHOLE FLAG SILHOUETTE. The
+ * 0.55-diameter rule still let a blade lose 19-25% of its plan area under its
+ * neighbours (drift 25.2%, cluster 24.9%, pair 18.7% — measured on the shipped
+ * Blender blade by glbAssets.test.ts), and workbench-leaf.png showed no single
+ * complete 11-point outline in the desk pile. The slots were pushed out along
+ * their own directions (pair ×1.2, pairB ×1.12, drift/bank/cluster ×1.25) so
+ * no blade loses more than 15% (the gate); the clumps grew ~2 units of radius
+ * (board) and ~4 (desk cluster), which the registry footprints track.
+ *
+ * TONES follow the archetype's SURFACE (round 4 #3): the three board clumps
+ * draw from LEAF_TONE_MIX_BOARD (crimson / burnt orange / pale amber / dark
+ * brown), the desk cluster from LEAF_TONE_MIX_DESK (crimson and dark brown
+ * only). The trailing boolean is the MUTED flag. */
 const LEAF_CLUMPS: Record<LeafClumpKind, { base: number; surface: LeafSurface; rows: readonly ClumpRow[] }> = {
   // BOARD pair A — the smallest drift, and the one that slots into cells the
   // 3-blade drift cannot reach.
   pair: {
-    base: 24,
+    base: 27,
     surface: 'board',
     rows: [
-      [1.0, 0.3, 0.03, -0.045, -0.38, 0.14, 'scarlet', false],
-      [0.8, Math.PI - 0.28, -0.028, 0.038, 0.55, -0.25, 'amber', false],
+      [1.0, 0.3, 0.03, -0.045, -0.456, 0.168, 'scarlet', false],
+      [0.8, Math.PI - 0.28, -0.028, 0.038, 0.66, -0.3, 'amber', false],
     ],
   },
   // BOARD pair B — avoids a cloned motif. One geometry can only carry
@@ -1405,21 +1789,21 @@ const LEAF_CLUMPS: Record<LeafClumpKind, { base: number; surface: LeafSurface; r
   // identical couples at the same relative offset, scale and yaw. B is an
   // independent couple: different partner scale, separation, yaws and tones.
   pairB: {
-    base: 23,
+    base: 26,
     surface: 'board',
     rows: [
-      [1.0, -0.26, -0.031, 0.05, -0.3, -0.2, 'vermillion', false],
-      [0.6, Math.PI + 0.22, 0.026, -0.041, 0.78, 0.4, 'ochre', true],
+      [1.0, -0.26, -0.031, 0.05, -0.336, -0.224, 'vermillion', false],
+      [0.6, Math.PI + 0.22, 0.026, -0.041, 0.874, 0.448, 'ochre', true],
     ],
   },
   // BOARD drift — the three.
   drift: {
-    base: 22,
+    base: 25,
     surface: 'board',
     rows: [
-      [1.0, 0.18, 0.022, -0.048, -0.46, -0.34, 'scarlet', false],
-      [0.88, Math.PI + 0.3, -0.032, 0.044, 0.58, -0.32, 'vermillion', true],
-      [0.78, -0.31, 0.015, 0.036, -0.05, 0.72, 'amber', false],
+      [1.0, Math.PI - 0.2, 0.022, -0.048, -0.575, -0.425, 'scarlet', false],
+      [0.88, Math.PI + 0.3, -0.032, 0.044, 0.725, -0.4, 'vermillion', true],
+      [0.78, -0.31, 0.015, 0.036, -0.0625, 0.9, 'amber', false],
     ],
   },
   // BOARD bank — the one clump that does not live on open paper: its registry
@@ -1427,12 +1811,12 @@ const LEAF_CLUMPS: Record<LeafClumpKind, { base: number; surface: LeafSurface; r
   // shoulder of a cable run (leaves accumulating against an obstacle, which the
   // scatter alone cannot produce). Sized against LEAF_BOARD_R_MAX like the rest.
   bank: {
-    base: 22,
+    base: 25,
     surface: 'board',
     rows: [
-      [1.0, -0.2, 0.026, 0.047, -0.5, -0.3, 'scarlet', false],
-      [0.85, Math.PI + 0.19, -0.03, -0.043, 0.6, -0.36, 'scarlet', true],
-      [0.72, 0.28, 0.018, 0.039, -0.1, 0.74, 'vermillion', false],
+      [1.0, -0.2, 0.026, 0.047, -0.625, -0.375, 'scarlet', false],
+      [0.85, Math.PI + 0.19, -0.03, -0.043, 0.75, -0.45, 'scarlet', true],
+      [0.72, 0.28, 0.018, 0.039, -0.125, 0.925, 'vermillion', false],
     ],
   },
   // DESK cluster — the four, on beige: all FOUR breaks, with the amber
@@ -1441,10 +1825,10 @@ const LEAF_CLUMPS: Record<LeafClumpKind, { base: number; surface: LeafSurface; r
     base: 28,
     surface: 'desk',
     rows: [
-      [1.0, 0.16, 0.02, -0.046, -0.52, -0.3, 'scarlet', false],
-      [0.88, Math.PI - 0.24, -0.03, 0.05, 0.56, -0.42, 'vermillion', false],
-      [0.78, -0.32, 0.032, 0.042, -0.2, 0.78, 'amber', false],
-      [0.68, Math.PI + 0.33, -0.022, -0.037, 0.72, 0.46, 'ochre', true],
+      [1.0, Math.PI + 0.22, 0.02, -0.046, -0.65, -0.375, 'scarlet', false],
+      [0.88, Math.PI - 0.24, -0.03, 0.05, 0.7, -0.525, 'vermillion', false],
+      [0.78, -0.32, 0.032, 0.042, -0.25, 0.975, 'amber', false],
+      [0.68, 0.3, -0.022, -0.037, 0.9, 0.575, 'ochre', true],
     ],
   },
 }
@@ -1617,28 +2001,34 @@ function bladeShadowHeight(size: number, seat: number): number {
   return BLADE_OVER_DECAL + seat + leafThickness(size) / 2 + (LEAF_CURL * size) / 3
 }
 
+/** A clump's blades, each posed in the clump's own frame exactly as the
+ * clump mesh carries them (before the clump is seated). Exported so the
+ * overlap gate measures the shipped blades — the Blender asset when it is
+ * registered — rather than a copy of this transform. */
+export function mapleClumpBladeGeoms(kind: LeafClumpKind): THREE.BufferGeometry[] {
+  return mapleClumpLayout(kind).blades.map((b) => {
+    const geo = mapleLeafGeom(b.size, b.tone, b.lie, b.roll)
+    geo.rotateY(b.yaw)
+    geo.computeBoundingBox()
+    const bb = geo.boundingBox!
+    return geo.translate(
+      b.cx - (bb.min.x + bb.max.x) / 2,
+      BLADE_OVER_DECAL + b.seat - bb.min.y,
+      b.cz - (bb.min.z + bb.max.z) / 2,
+    )
+  })
+}
+
 /** Build a clump: PER-BLADE contact decals first (so they paint before the
  * blades in the merged index buffer — see the `contactShadowGeom` block on why
  * `depthWrite` is off), then the blades themselves, then the whole thing seated
  * so its LOWEST vertex sits exactly `DECAL_CLEAR` above `surfaceY`. */
 function mapleClumpGeom(kind: LeafClumpKind, surfaceY: number): THREE.BufferGeometry {
   const { blades } = mapleClumpLayout(kind)
-  const decals: THREE.BufferGeometry[] = []
-  const parts: THREE.BufferGeometry[] = []
-  for (const b of blades) {
-    const geo = mapleLeafGeom(b.size, b.tone, b.lie, b.roll)
-    geo.rotateY(b.yaw)
-    geo.computeBoundingBox()
-    const bb = geo.boundingBox!
-    geo.translate(
-      b.cx - (bb.min.x + bb.max.x) / 2,
-      BLADE_OVER_DECAL + b.seat - bb.min.y,
-      b.cz - (bb.min.z + bb.max.z) / 2,
-    )
-    parts.push(geo)
-    decals.push(contactShadowGeom(b.r, bladeShadowHeight(b.size, b.seat), b.roll).translate(b.cx, 0, b.cz))
-  }
-  const merged = mergeParts([...decals, ...parts])
+  const decals = blades.map((b) =>
+    contactShadowGeom(b.r, bladeShadowHeight(b.size, b.seat), b.roll).translate(b.cx, 0, b.cz),
+  )
+  const merged = mergeParts([...decals, ...mapleClumpBladeGeoms(kind)])
   merged.computeBoundingBox()
   return merged.translate(0, surfaceY + DECAL_CLEAR - merged.boundingBox!.min.y, 0)
 }
@@ -1648,7 +2038,7 @@ function mapleClumpGeom(kind: LeafClumpKind, surfaceY: number): THREE.BufferGeom
 function mapleLeafSingleGeom(kind: keyof typeof LEAF_SINGLES, surfaceY: number): THREE.BufferGeometry {
   const s = LEAF_SINGLES[kind]
   const tone = leafTone(s.tone, `single:${kind}`, s.muted, s.surface)
-  const geo = mapleLeafGeom(s.size, tone, LEAF_LIE + s.dLie, s.roll)
+  const geo = mapleLeafGeom(s.size, tone, LEAF_LIE + s.dLie, s.roll, LEAF_SINGLE_TIP_LIFT)
   geo.computeBoundingBox()
   geo.translate(0, BLADE_OVER_DECAL - geo.boundingBox!.min.y, 0)
   const decal = contactShadowGeom(LEAF_RADIUS * s.size, bladeShadowHeight(s.size, 0), s.roll)
@@ -1810,6 +2200,9 @@ function canadaFlagGeom(): THREE.BufferGeometry {
   return mergeParts(parts)
 }
 
+/** FALLBACK only — the shipped moose is the Blender sculpt (moose.glb, see the
+ * 'moose' silhouette). Kept so a failed fetch degrades to a moose-shaped toy
+ * instead of an empty desk. */
 function mooseGeom(): THREE.BufferGeometry {
   const B = '#6B4A33' // dark chocolate
   // deep tan — a paler antler melts into the desk wood at wide framing
@@ -1883,6 +2276,9 @@ function mooseGeom(): THREE.BufferGeometry {
   return mergeParts(parts)
 }
 
+/** FALLBACK only — the shipped beaver is the Blender sculpt (beaver.glb, see
+ * the 'beaver' silhouette). Kept so a failed fetch degrades to a critter
+ * instead of an empty desk. */
 function beaverGeom(): THREE.BufferGeometry {
   const B = '#8B5E3C' // warm brown
   const DARK = '#6B4530'
@@ -1976,24 +2372,42 @@ function rangerHatGeom(): THREE.BufferGeometry {
   return mergeParts(parts)
 }
 
+/** FALLBACK for cn-tower.glb (scripts/blender/desk_tools_assets.py): the
+ * souvenir's silhouette on the asset's gabarit — a granite plinth (r 13.6,
+ * 3.4 tall), a tapering shaft, the main pod with its dark glass band at
+ * ~0.6 H, the SkyPod at 0.8 H and the mast, 123.4 tall in all. Quality pass
+ * "cntower": the old 281-unit cone was "the tallest object on the set". */
+export const CN_TOWER_HEIGHT = 123.4
 function cnTowerGeom(): THREE.BufferGeometry {
-  const CREAM = '#E8E0D0'
+  const CONCRETE = '#D3CCBF'
+  const WHITE = '#EEECE6'
+  const GLASS = '#3A4654'
   const parts: THREE.BufferGeometry[] = []
-  const shaft = tint(new THREE.CylinderGeometry(5.5, 13, 185, 12), CREAM)
-  shaft.translate(0, 92.5, 0)
+  const plinth = tint(new THREE.CylinderGeometry(11.2, 13.6, 3.4, 20), '#2E2D30')
+  plinth.translate(0, 1.7, 0)
+  parts.push(plinth)
+  // three-sided (the Y base's footprint) tapering to the pod
+  const shaft = tint(new THREE.CylinderGeometry(2, 10.5, 70, 3), CONCRETE)
+  shaft.translate(0, 3.4 + 35, 0)
   parts.push(shaft)
-  const podRing = tint(new THREE.CylinderGeometry(14.5, 11, 9, 14), '#D9CFBC')
-  podRing.translate(0, 196, 0)
-  parts.push(podRing)
-  const pod = tint(new THREE.CylinderGeometry(12.5, 14.5, 9, 14), CREAM)
-  pod.translate(0, 205, 0)
-  parts.push(pod)
-  const upper = tint(new THREE.CylinderGeometry(2.6, 4.2, 42, 10), CREAM)
-  upper.translate(0, 230, 0)
+  const skirt = tint(new THREE.CylinderGeometry(7.3, 1.9, 3.6, 16), WHITE)
+  skirt.translate(0, 75.2, 0)
+  parts.push(skirt)
+  const glass = tint(new THREE.CylinderGeometry(7.4, 7.3, 3.9, 16), GLASS)
+  glass.translate(0, 79, 0)
+  parts.push(glass)
+  const roof = tint(new THREE.CylinderGeometry(1.75, 7.4, 1.5, 16), WHITE)
+  roof.translate(0, 81.7, 0)
+  parts.push(roof)
+  const upper = tint(new THREE.CylinderGeometry(1.5, 1.75, 13.5, 8), CONCRETE)
+  upper.translate(0, 89.2, 0)
   parts.push(upper)
-  const spire = tint(new THREE.CylinderGeometry(0.5, 1.6, 30, 8), '#C9BFA9')
-  spire.translate(0, 266, 0)
-  parts.push(spire)
+  const sky = tint(new THREE.CylinderGeometry(2.4, 2.8, 3.6, 12), WHITE)
+  sky.translate(0, 97.8, 0)
+  parts.push(sky)
+  const mast = tint(new THREE.CylinderGeometry(0.12, 1.05, CN_TOWER_HEIGHT - 99.6, 8), '#C9C6BF')
+  mast.translate(0, 99.6 + (CN_TOWER_HEIGHT - 99.6) / 2, 0)
+  parts.push(mast)
   return mergeParts(parts)
 }
 
@@ -2053,14 +2467,21 @@ function scalpelGeom(): THREE.BufferGeometry {
  * {0, π}, so the depth-axis fence holds for every blade the clump carries and
  * not merely for the instance's own yaw (see `mapleClumpFence`). */
 function leafArchetype(geometry: THREE.BufferGeometry, forbid = LEAF_YAW_FORBID): ArchetypeGeom {
+  // the blades were built from the Blender asset iff it carries UVs — then the
+  // archetype wears the asset's detail + vein maps on a two-sided surface
+  const asset = geometry.getAttribute('uv') ? decorAsset('maple-leaf') : null
   return {
     geometry,
     color: '#FFFFFF',
     groundOffset: 0,
-    roughness: 0.6,
+    roughness: asset ? asset.roughness : 0.6,
     scatter: forbid === LEAF_YAW_FORBID ? LEAF_SCATTER : { ...LEAF_SCATTER, forbid },
     contactDecal: true,
     castsShadow: false,
+    map: asset?.map ?? null,
+    normalMap: asset?.normalMap ?? null,
+    normalScale: asset?.normalScale ?? null,
+    doubleSided: asset !== null,
   }
 }
 
@@ -2080,15 +2501,164 @@ const SILHOUETTES: Record<string, () => ArchetypeGeom> = {
   'tree-round': () => ({ geometry: treeGeom(false), color: '#FFFFFF', groundOffset: 0 }),
   'tree-tall': () => ({ geometry: treeGeom(true), color: '#FFFFFF', groundOffset: 0 }),
   'planter-shrub': () => ({ geometry: planterGeom(), color: '#FFFFFF', groundOffset: 0 }),
-  'desk-pencil': () => ({ geometry: pencilGeom(), color: '#FFFFFF', groundOffset: 3.4 }),
-  'desk-cable-coil': () => ({ geometry: cableCoilGeom(), color: '#FFFFFF', groundOffset: 2.4 }),
-  'desk-note': () => ({ geometry: deskNoteGeom(), color: '#FFFFFF', groundOffset: 0 }),
+  // quality pass "cntower" ("chunky faceted hex, flat untextured ferrule,
+  // plain eraser"): the Blender pencil (desk_tools_assets.py) — a bevelled
+  // hex with a stamped top flat, a crimped brass ferrule, a pink eraser and
+  // a sharpened cone cut exactly through the hex (the six lacquer scallops),
+  // cedar grain and a graphite point — on the fallback's 101-unit gabarit,
+  // seated on its bottom flat at y = 0. The mug's print × COLOR_0 contract:
+  // no new shader program.
+  'desk-pencil': () => {
+    const asset = decorAsset('desk-pencil')
+    if (asset) return { geometry: asset.geometry, color: '#FFFFFF', groundOffset: 0.05, roughness: asset.roughness, map: asset.map }
+    return { geometry: pencilGeom(), color: '#FFFFFF', groundOffset: 3.4 }
+  },
+  // ×DESK_PROP_GROWTH (loop 4: "the coil is a grey ring at (1210,355)")
+  // …and centred on its plan box, so the plug's reach stays inside the
+  // rotation-safe footprint (registry.ts) instead of hanging 34 units off a
+  // coil-centred origin. Quality pass "cntower" ("a placeholder donut: a
+  // single smooth torus, no wire turns, no plug"): the Blender coil — four
+  // braided turns wound in a 2 x 2 bundle, a red hook-and-loop tie, a tail
+  // out to a two-prong plug — authored at the grown size (plan radius 34.4,
+  // under the same 36 footprint) and centred the same way.
+  'desk-cable-coil': () => {
+    const asset = decorAsset('desk-cable-coil')
+    if (asset) return { geometry: asset.geometry, color: '#FFFFFF', groundOffset: 0.05, roughness: asset.roughness, map: asset.map }
+    return {
+      geometry: centreXZ(cableCoilGeom().scale(DESK_PROP_GROWTH, DESK_PROP_GROWTH, DESK_PROP_GROWTH)),
+      color: '#FFFFFF',
+      groundOffset: 2.4 * DESK_PROP_GROWTH,
+    }
+  },
+  'desk-note': () => {
+    // loop 4: "a 15 px white square with a placeholder '!!!'" — the Blender
+    // cards (desk_assets.py): blue ruling, a red margin, handwriting-like
+    // scribbles and a box-and-arrow sketch printed on a curled index card
+    const asset = decorAsset('desk-note')
+    if (asset) {
+      return {
+        geometry: asset.geometry,
+        color: '#FFFFFF',
+        // the lower card is a zero-thickness sheet at y = 0: lift it clear of
+        // the desk plane (no z-fight) — 0.25 is 0.06 mm at 4.1 units/cm
+        groundOffset: 0.25,
+        roughness: asset.roughness,
+        map: asset.map,
+        doubleSided: true, // the curled corner shows its back
+        // the writing faces the reader: the card's text-up axis (local −Z)
+        // turns to the camera's look direction, ±NOTE_YAW_SPREAD — a free
+        // yaw left the handwriting upside down in loop4-r1-assets4
+        // /workbench-desk-note.png
+        yawBand: NOTE_YAW_BAND,
+      }
+    }
+    return { geometry: deskNoteGeom(), color: '#FFFFFF', groundOffset: 0 }
+  },
+  'desk-mug': () => {
+    // loop 4 hero desk object: the enamel camp mug with the official leaf
+    const asset = decorAsset('desk-mug')
+    if (asset) {
+      return { geometry: asset.geometry, color: '#FFFFFF', groundOffset: 0.05, roughness: asset.roughness, map: asset.map }
+    }
+    return { geometry: mugGeom(), color: '#FFFFFF', groundOffset: 0.05, roughness: 0.32 }
+  },
+  // loop 4 r2 near-field anchors ("the desk around the board is mostly
+  // empty"): Blender props (desk_assets.py) on the mug's material contract —
+  // print × COLOR_0, single-sided — so they share its shader program
+  'desk-notebooks': () => {
+    const asset = decorAsset('desk-notebooks')
+    if (asset) return { geometry: asset.geometry, color: '#FFFFFF', groundOffset: 0.05, roughness: asset.roughness, map: asset.map }
+    return { geometry: notebooksGeom(), color: '#FFFFFF', groundOffset: 0.05, roughness: 0.7 }
+  },
+  'desk-plant': () => {
+    const asset = decorAsset('desk-plant')
+    if (asset) return { geometry: asset.geometry, color: '#FFFFFF', groundOffset: 0.05, roughness: asset.roughness, map: asset.map }
+    return { geometry: plantGeom(), color: '#FFFFFF', groundOffset: 0.05, roughness: 0.8 }
+  },
+  // loop 4 r3 far-band anchors ("the whole far desk band is bare streaked
+  // wood"): the same print × COLOR_0 contract, so no new shader program
+  'desk-pencil-cup': () => {
+    const asset = decorAsset('desk-pencil-cup')
+    if (asset) return { geometry: asset.geometry, color: '#FFFFFF', groundOffset: 0.05, roughness: asset.roughness, map: asset.map }
+    return { geometry: pencilCupGeom(), color: '#FFFFFF', groundOffset: 0.05, roughness: 0.55 }
+  },
+  'desk-books': () => {
+    const asset = decorAsset('desk-books')
+    if (asset) return { geometry: asset.geometry, color: '#FFFFFF', groundOffset: 0.05, roughness: asset.roughness, map: asset.map }
+    return { geometry: booksGeom(), color: '#FFFFFF', groundOffset: 0.05, roughness: 0.72 }
+  },
+  // loop 4 r4 mid-size gap fillers ("the scattered small objects read as
+  // debris rather than a lived-in desk"): the same print × COLOR_0 contract
+  'desk-sketchbook': () => {
+    const asset = decorAsset('desk-sketchbook')
+    // the drawing faces the reader like the index cards' writing (page top =
+    // local −Z, the cards' text-up axis)
+    if (asset) return { geometry: asset.geometry, color: '#FFFFFF', groundOffset: 0.05, roughness: asset.roughness, map: asset.map, yawBand: NOTE_YAW_BAND }
+    return { geometry: sketchbookGeom(), color: '#FFFFFF', groundOffset: 0.05, roughness: 0.8, yawBand: NOTE_YAW_BAND }
+  },
+  'desk-blueprint': () => {
+    const asset = decorAsset('desk-blueprint')
+    if (asset) return { geometry: asset.geometry, color: '#FFFFFF', groundOffset: 0.05, roughness: asset.roughness, map: asset.map }
+    return { geometry: blueprintGeom(), color: '#FFFFFF', groundOffset: 0.05, roughness: 0.75 }
+  },
   'person-walking': () => ({ geometry: personGeom('walking'), color: '#FFFFFF', groundOffset: 0 }),
   'person-carrying': () => ({ geometry: personGeom('carrying'), color: '#FFFFFF', groundOffset: 0 }),
-  'moose': () => ({ geometry: mooseGeom(), color: '#FFFFFF', groundOffset: 0 }),
-  'beaver': () => ({ geometry: beaverGeom(), color: '#FFFFFF', groundOffset: 0.5 }),
+  'moose': () => {
+    // view3d quality loop 4 r2 ("a blocky toy: box body, box head, four stick
+    // legs, flat plank antlers"): the Blender bull (wildlife_assets.py) — a
+    // metaball sculpt with the shoulder hump, deep chest, slim hindquarters,
+    // jointed legs (knee/hock, pale stockings, dark cloven hooves), the long
+    // drooping muzzle, the bell, ears, and tapered palmate antlers with six
+    // tines a side. The SAME material contract as the beaver (COLOR_0 ×
+    // detail map, normal map, MR map), so it links no new shader program.
+    // mooseGeom() below stays the fallback until the GLB arrives.
+    const asset = decorAsset('moose')
+    if (asset) {
+      return {
+        geometry: asset.geometry,
+        color: '#FFFFFF',
+        groundOffset: CITY_PAVING_CLEAR,
+        roughness: asset.roughness,
+        map: asset.map,
+        normalMap: asset.normalMap,
+        normalScale: asset.normalScale ?? null,
+        metalRoughMap: asset.metalRoughMap ?? null,
+        metalness: asset.metalness ?? 0,
+      }
+    }
+    return { geometry: mooseGeom(), color: '#FFFFFF', groundOffset: 0 }
+  },
+  'beaver': () => {
+    // view3d quality loop 4 ("a two-sphere blob with a paddle: no face, legs,
+    // incisors or fur"): the Blender beaver (scripts/blender/wildlife_assets.py)
+    // — a sitting, hunched sculpt gnawing a stick, with eyes, nose, orange
+    // incisors, forepaws, webbed hind feet and a scaled tail; the fur
+    // countershade rides COLOR_0, the clumps and scales the detail/normal
+    // maps, the glossy eyes and nose the MR map. The procedural blob below
+    // stays the fallback until the GLB arrives (glbAssets.ts contract).
+    const asset = decorAsset('beaver')
+    if (asset) {
+      return {
+        geometry: asset.geometry,
+        color: '#FFFFFF',
+        // seated like the flag: no city paving plane cuts across the feet
+        groundOffset: CITY_PAVING_CLEAR,
+        roughness: asset.roughness,
+        map: asset.map,
+        normalMap: asset.normalMap,
+        normalScale: asset.normalScale ?? null,
+        metalRoughMap: asset.metalRoughMap ?? null,
+        metalness: asset.metalness ?? 0,
+      }
+    }
+    return { geometry: beaverGeom(), color: '#FFFFFF', groundOffset: 0.5 }
+  },
   'loon': () => ({ geometry: loonGeom(), color: '#FFFFFF', groundOffset: 0.1 }),
-  'ranger-hat': () => ({ geometry: rangerHatGeom(), color: '#FFFFFF', groundOffset: 0 }),
+  'ranger-hat': () => ({
+    geometry: rangerHatGeom().scale(DESK_PROP_GROWTH, DESK_PROP_GROWTH, DESK_PROP_GROWTH),
+    color: '#FFFFFF',
+    groundOffset: 0,
+  }),
   // roughness 0.6 (vs the clay 0.85): a leaf is a waxy blade, not clay, and
   // the sheen is half of what separates a flat cutout from the surface it lies
   // on. Every leaf archetype carries `contactDecal` (drawn grounding shadow,
@@ -2112,16 +2682,48 @@ const SILHOUETTES: Record<string, () => ArchetypeGeom> = {
   'maple-leaf-mini': () => leafArchetype(mapleLeafSingleGeom('mini', 0)),
   'maple-leaf-mini-b': () => leafArchetype(mapleLeafSingleGeom('miniB', 0)),
   'maple-leaf-mini-c': () => leafArchetype(mapleLeafSingleGeom('miniC', 0)),
-  'canada-flag': () => ({
-    geometry: canadaFlagGeom(),
-    color: '#FFFFFF',
-    // the foot seats on the city paving clearance, so no paving
-    // plane can cut across the base plate or the bottom of the pole
-    groundOffset: CITY_PAVING_CLEAR,
-    roughness: 0.75,
-    yawBand: FLAG_YAW_BAND,
-  }),
-  'cn-tower': () => ({ geometry: cnTowerGeom(), color: '#FFFFFF', groundOffset: 0 }),
+  'canada-flag': () => {
+    // USER ASK 2026-10-08 ("the flag lacks realism, it does not look like
+    // it"): the Blender flag — the OFFICIAL 11-point leaf printed on a
+    // cloth-relaxed banner, steel pole, brass finial, bevelled foot — on the
+    // same FLAG gabarit as the procedural one below, which stays the fallback
+    // until the GLB arrives.
+    const asset = decorAsset('canada-flag')
+    if (asset) {
+      return {
+        geometry: asset.geometry,
+        color: '#FFFFFF',
+        groundOffset: CITY_PAVING_CLEAR,
+        roughness: asset.roughness,
+        yawBand: FLAG_YAW_BAND,
+        map: asset.map,
+        // brushed-steel pole, brass finial and foot (loop 3 r2: "a grey
+        // plastic toy") — the finish per part is the asset's MR map
+        metalRoughMap: asset.metalRoughMap ?? null,
+        metalness: asset.metalness ?? 0,
+        doubleSided: true,
+      }
+    }
+    return {
+      geometry: canadaFlagGeom(),
+      color: '#FFFFFF',
+      // round 8 #3: the foot seats on the city paving clearance, so no paving
+      // plane can cut across the base plate or the bottom of the pole
+      groundOffset: CITY_PAVING_CLEAR,
+      roughness: 0.75,
+      yawBand: FLAG_YAW_BAND,
+    }
+  },
+  // quality pass "cntower" ("an untextured featureless white cone that
+  // dominates the frame"): the Blender souvenir (desk_tools_assets.py) — the
+  // Y base's three legs round a slim core, the main pod's white skirt and two
+  // glass bands, the SkyPod, the mast, slip-form banding on light concrete,
+  // on a granite plinth; 123.4 tall (was 281). Same print × COLOR_0 contract.
+  'cn-tower': () => {
+    const asset = decorAsset('cn-tower')
+    if (asset) return { geometry: asset.geometry, color: '#FFFFFF', groundOffset: 0.05, roughness: asset.roughness, map: asset.map }
+    return { geometry: cnTowerGeom(), color: '#FFFFFF', groundOffset: 0.05, roughness: 0.6 }
+  },
   'compass': () => ({ geometry: compassGeom(), color: '#FFFFFF', groundOffset: 0 }),
   'scalpel': () => ({ geometry: scalpelGeom(), color: '#FFFFFF', groundOffset: 0 }),
 }
@@ -2129,7 +2731,18 @@ const SILHOUETTES: Record<string, () => ArchetypeGeom> = {
 /** Every buildable archetype id (test gate: registry ids ⊆ this catalog). */
 export const SILHOUETTE_IDS: readonly string[] = Object.keys(SILHOUETTES)
 
+let geomCacheAssetVersion = -1
+
 function archetypeGeom(id: string): ArchetypeGeom | null {
+  if (geomCacheAssetVersion !== decorAssetsVersion()) {
+    // a Blender asset arrived: every silhouette built from the fallback is
+    // stale. The previous build's meshes are torn down by the same rebuild
+    // that asks for the new silhouettes, so releasing their GPU buffers here
+    // is safe (a stray render would simply re-upload).
+    for (const [, g] of geomCache) g.geometry.dispose()
+    geomCache.clear()
+    geomCacheAssetVersion = decorAssetsVersion()
+  }
   const hit = geomCache.get(id)
   if (hit) return hit
   const make = SILHOUETTES[id]
@@ -2137,6 +2750,241 @@ function archetypeGeom(id: string): ArchetypeGeom | null {
   const made = make()
   geomCache.set(id, made)
   return made
+}
+
+// ── CONTACT BLOBS (view3d quality, contact pass 2026-10-09) ────────────────
+//
+// The critic: "props barely ground themselves: the flag base, moose hooves,
+// leaves and mug base lack visible contact shadows or AO; leaves look like
+// decals". Two causes, measured with a live shadow-map probe (never committed):
+//
+//  1. 8 of 23 workbench props stood OUTSIDE the sun's shadow camera, which was
+//     fitted to the content bounds only — fixed at the root in
+//     lit/lighting.ts (`fitShadowCamera`'s `cover`);
+//  2. the props INSIDE it do cast, but the key light is 38° up at −55°, so a
+//     mug's or a flag foot's shadow falls BEHIND the prop from the default
+//     iso camera — toggling the sun's castShadow changed 1.06% of the frame,
+//     nearly all of it on the board (cards, drums). Nothing darkens the
+//     ground at the base, all around, which is what reads as contact.
+//
+// So every placed prop gets ONE contact shadow. A leaf archetype's is its own
+// drawn decal (below); every other prop's is ONE soft blob: a quad under its
+// CONTACT footprint (the bounding rect of the vertices in its lowest band —
+// hooves, a mug's base ring, the flag's foot, a whole low book stack), grown
+// by CONTACT_BLOB_GROW, elongated and yawed with the prop, and pushed a little
+// along the key light's throw. All blobs of a build are ONE merged mesh, ONE
+// MeshBasicMaterial (black-ish colour × a shared alpha map, transparent,
+// depthWrite off, polygonOffset toward the camera): one draw call, and the
+// material set is the drum pad's existing SDF blob (Scene3D buildStandee:
+// color + alphaMap + transparent + depthWrite off + toneMapped off), so the
+// program is one the board already links. It never casts or receives.
+//
+// The alpha map is a 128 × 128 atlas of four 64-px cells generated once, in
+// plain math (no DOM, so the gates can read it). Columns: a DISC for round
+// feet (a mug, a pot, the flag's foot) and a SQUIRCLE for boxy footprints
+// (books, a note, a moose's four hooves). Rows: a TALL prop's wide soft pool
+// and a LOW prop's tight rim (a book stack is not a mug: its shadow hugs it).
+// Strength is baked into the texels because the host's morph fade drives
+// every decor material's `opacity` (regFloorFade).
+//
+// The LEAVES are not in it. Each blade already carries its own drawn decal
+// (`contactShadowGeom`), one per blade rather than one per clump — a single
+// pool under a whole pile darkened the gaps between the blades into one
+// stain (.probes/contact red-tint pass, maple-leaf-cluster). That decal is
+// their contact shadow; this pass made it visible (LEAF_SHADOW_ALPHA).
+
+/** Quad half-extent / contact half-extent, and the ρ where the falloff
+ * starts, per row. TALL: the footprint edge sits at ρ = 1/1.7 = 0.59 of the
+ * quad, where α is still 0.56 (contactBlobAlpha), and the pool fades to 0
+ * 0.7 footprints further out. Two cuts were too thin to read, measured on the
+ * probe close-ups: 1.35 / α 0.55 / knee 0.6 (α 0.34 at the edge, gone 0.35
+ * footprints out — a hairline at the fit framing, .probes/contact/
+ * crop-wide.png) and 1.5 / 0.6 / 0.5 (crop-flag.png: the flag foot's ring
+ * indistinguishable from its own dark rubber skirt). LOW: edge at ρ = 0.82,
+ * α 0.55, gone a fifth of a footprint out. */
+export const CONTACT_BLOB_GROW = { tall: 1.7, low: 1.22 } as const
+const CONTACT_BLOB_KNEE = { tall: 0.45, low: 0.8 } as const
+/** Alpha at the blob's plateau (under the prop, mostly hidden by it). */
+export const CONTACT_BLOB_ALPHA = 0.6
+/** A prop is LOW when its opaque height is at most its contact half-extent. */
+const LOW_HEIGHT_PER_R = 1
+/** The atlas: 2 × 2 square cells. */
+export const CONTACT_BLOB_TEX_W = 128
+export const CONTACT_BLOB_TEX_H = 128
+const CELL = 64
+/** A footprint is ROUND when max(|u| + |v|) over its contact vertices (u, v
+ * normalised to its half-extents) stays under this: a disc's is √2 = 1.41, a
+ * filled rectangle's 2. */
+const ROUND_L1_MAX = 1.7
+/** The contact band: vertices within this share of the opaque height above
+ * the lowest one. A FLAT prop (height ≤ CONTACT_FLAT × its plan extent: a
+ * leaf, a note, the sketchbook) uses all of its vertices. */
+const CONTACT_BAND = 0.2
+const CONTACT_FLAT = 0.3
+/** The throw along the key light, per unit of prop height, capped at a share
+ * of the footprint radius: a contact shadow leans, it does not travel. */
+const CONTACT_THROW_PER_H = 0.06
+const CONTACT_THROW_MAX = 0.22
+/** Warm near-black: the desk's shadow tone, not neutral grey. */
+const CONTACT_BLOB_COLOR = '#1E140C'
+
+let contactBlobTex: THREE.DataTexture | null = null
+
+/** α of the blob at normalised radius ρ (0 centre, 1 quad rim). */
+export function contactBlobAlpha(rho: number, row: 'tall' | 'low' = 'tall'): number {
+  if (rho >= 1) return 0
+  const knee = CONTACT_BLOB_KNEE[row]
+  const t = Math.min(1, Math.max(0, (rho - knee) / (1 - knee)))
+  return CONTACT_BLOB_ALPHA * (1 - t * t * (3 - 2 * t))
+}
+
+/** The shared alpha atlas (generated once per page; GPU copy released by
+ * `disposeDecorGeometries`). alphaMap reads the GREEN channel. Cell (col,
+ * row): col 0 disc / 1 squircle, row 0 tall / 1 low — UV origin bottom-left,
+ * DataTexture rows bottom-up (flipY false). */
+export function contactBlobTexture(): THREE.DataTexture {
+  if (contactBlobTex) return contactBlobTex
+  const W = CONTACT_BLOB_TEX_W
+  const H = CONTACT_BLOB_TEX_H
+  const data = new Uint8Array(W * H * 4)
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const col = x < CELL ? 0 : 1
+      const row = y < CELL ? 'tall' : 'low'
+      // texel centre in the cell's [-1, 1]²
+      const u = (((x % CELL) + 0.5) / CELL) * 2 - 1
+      const v = (((y % CELL) + 0.5) / CELL) * 2 - 1
+      const rho = col === 0 ? Math.hypot(u, v) : Math.pow(u ** 4 + v ** 4, 0.25)
+      const a = Math.round(255 * contactBlobAlpha(rho, row))
+      const o = (y * W + x) * 4
+      data[o] = a
+      data[o + 1] = a
+      data[o + 2] = a
+      data[o + 3] = 255
+    }
+  }
+  const tex = new THREE.DataTexture(data, W, H, THREE.RGBAFormat)
+  tex.magFilter = THREE.LinearFilter
+  tex.minFilter = THREE.LinearMipmapLinearFilter
+  tex.generateMipmaps = true
+  tex.needsUpdate = true
+  contactBlobTex = tex
+  return tex
+}
+
+/** An archetype's CONTACT footprint in its own frame. */
+export interface ContactFootprint {
+  cx: number
+  cz: number
+  hx: number
+  hz: number
+  /** Lowest opaque vertex, and the opaque height above it. */
+  minY: number
+  height: number
+  round: boolean
+  /** Height ≤ LOW_HEIGHT_PER_R × contact half-extent: the tight-rim row. */
+  low: boolean
+}
+
+const footprintCache = new WeakMap<THREE.BufferGeometry, ContactFootprint>()
+
+/** The footprint of what TOUCHES the surface. A drawn leaf decal (RGBA colour,
+ * α < 1) is a shadow, not the blade — it is skipped. */
+export function contactFootprint(geo: THREE.BufferGeometry): ContactFootprint {
+  const hit = footprintCache.get(geo)
+  if (hit) return hit
+  const pos = geo.getAttribute('position')
+  const col = geo.getAttribute('color')
+  const decal = col && col.itemSize === 4
+  const opaque = (i: number) => !decal || col.getW(i) >= 0.999
+  let minY = Infinity
+  let maxY = -Infinity
+  let x0 = Infinity
+  let x1 = -Infinity
+  let z0 = Infinity
+  let z1 = -Infinity
+  for (let i = 0; i < pos.count; i++) {
+    if (!opaque(i)) continue
+    const y = pos.getY(i)
+    minY = Math.min(minY, y)
+    maxY = Math.max(maxY, y)
+    x0 = Math.min(x0, pos.getX(i))
+    x1 = Math.max(x1, pos.getX(i))
+    z0 = Math.min(z0, pos.getZ(i))
+    z1 = Math.max(z1, pos.getZ(i))
+  }
+  const height = maxY - minY
+  const flat = height <= CONTACT_FLAT * Math.max(x1 - x0, z1 - z0)
+  const top = flat ? Infinity : minY + CONTACT_BAND * height
+  x0 = Infinity
+  x1 = -Infinity
+  z0 = Infinity
+  z1 = -Infinity
+  for (let i = 0; i < pos.count; i++) {
+    if (!opaque(i) || pos.getY(i) > top) continue
+    x0 = Math.min(x0, pos.getX(i))
+    x1 = Math.max(x1, pos.getX(i))
+    z0 = Math.min(z0, pos.getZ(i))
+    z1 = Math.max(z1, pos.getZ(i))
+  }
+  const cx = (x0 + x1) / 2
+  const cz = (z0 + z1) / 2
+  // a pencil's contact is a line: keep the blob at least an eighth as wide as
+  // it is long, or it renders as a hairline (a fifth read as a wide smear
+  // along the pencil in the red-tint probe)
+  const r = Math.max(x1 - x0, z1 - z0) / 2
+  const hx = Math.max((x1 - x0) / 2, 0.125 * r, 1e-3)
+  const hz = Math.max((z1 - z0) / 2, 0.125 * r, 1e-3)
+  let l1 = 0
+  for (let i = 0; i < pos.count; i++) {
+    if (!opaque(i) || pos.getY(i) > top) continue
+    l1 = Math.max(l1, Math.abs(pos.getX(i) - cx) / hx + Math.abs(pos.getZ(i) - cz) / hz)
+  }
+  const fp = { cx, cz, hx, hz, minY, height, round: l1 <= ROUND_L1_MAX, low: height <= LOW_HEIGHT_PER_R * Math.max(hx, hz) }
+  footprintCache.set(geo, fp)
+  return fp
+}
+
+/** One blob quad, appended to the merged arrays: the footprint rect's corners
+ * through the instance's own matrix (yaw, tilt, scale), grown about their
+ * centre, thrown along the key light, flattened onto `y`. */
+function pushContactBlob(
+  out: { pos: number[]; uv: number[]; idx: number[] },
+  fp: ContactFootprint,
+  m: THREE.Matrix4,
+  scale: number,
+  y: number,
+): void {
+  const c = new THREE.Vector3(fp.cx, fp.minY, fp.cz).applyMatrix4(m)
+  const r = Math.max(fp.hx, fp.hz) * scale
+  const throwLen = Math.min(CONTACT_THROW_MAX * r, CONTACT_THROW_PER_H * fp.height * scale)
+  const tx = SUN_XZ[0] * throwLen
+  const tz = SUN_XZ[1] * throwLen
+  const base = out.pos.length / 3
+  const u0 = fp.round ? 0 : 0.5
+  const v0 = fp.low ? 0.5 : 0
+  const grow = CONTACT_BLOB_GROW[fp.low ? 'low' : 'tall']
+  const corner = new THREE.Vector3()
+  for (const [a, b] of [
+    [-1, -1],
+    [1, -1],
+    [1, 1],
+    [-1, 1],
+  ] as const) {
+    corner.set(fp.cx + a * fp.hx, fp.minY, fp.cz + b * fp.hz).applyMatrix4(m)
+    out.pos.push(c.x + (corner.x - c.x) * grow + tx, y, c.z + (corner.z - c.z) * grow + tz)
+    out.uv.push(u0 + (a + 1) / 4, v0 + (b + 1) / 4)
+  }
+  // wound to face +Y whatever the instance's handedness (a mirrored corner
+  // order would cull the quad)
+  const p = out.pos
+  const e1x = p[(base + 1) * 3] - p[base * 3]
+  const e1z = p[(base + 1) * 3 + 2] - p[base * 3 + 2]
+  const e2x = p[(base + 2) * 3] - p[base * 3]
+  const e2z = p[(base + 2) * 3 + 2] - p[base * 3 + 2]
+  const upFacing = e1z * e2x - e1x * e2z > 0 // (e1 × e2).y
+  if (upFacing) out.idx.push(base, base + 1, base + 2, base, base + 2, base + 3)
+  else out.idx.push(base, base + 2, base + 1, base, base + 3, base + 2)
 }
 
 /**
@@ -2162,6 +3010,10 @@ export function buildDecorMeshes(
   const scl = new THREE.Vector3()
   const pos = new THREE.Vector3()
 
+  const geometries: THREE.BufferGeometry[] = []
+  // lit only: the unlit profile has no shadows for a blob to stand in for
+  const blobs = opts.lit ? { pos: [] as number[], uv: [] as number[], idx: [] as number[], props: [] as string[] } : null
+
   // the host merges pack + shared desk archetypes, and packs may carry their
   // own copy of a shared desk id (canadiana's beaver / maple-leaf-cluster) —
   // dedupe so an id never builds two overlapping meshes
@@ -2179,14 +3031,21 @@ export function buildDecorMeshes(
     // depthWrite has to go with it, or the decal's α = 0 rim would punch
     // invisible holes in whatever is drawn behind it (see `contactShadowGeom`).
     const alpha = src.contactDecal === true
+    const side = src.doubleSided ? THREE.DoubleSide : THREE.FrontSide
     const material = opts.lit
       ? new THREE.MeshStandardMaterial({
           color: src.color,
           roughness: src.roughness ?? 0.85,
-          metalness: 0,
+          metalness: src.metalRoughMap ? (src.metalness ?? 1) : 0,
+          roughnessMap: src.metalRoughMap ?? null,
+          metalnessMap: src.metalRoughMap ?? null,
           vertexColors: true,
           transparent: alpha,
           depthWrite: !alpha,
+          map: src.map ?? null,
+          normalMap: src.normalMap ?? null,
+          ...(src.normalMap && src.normalScale ? { normalScale: src.normalScale.clone() } : {}),
+          side,
         })
       : new THREE.MeshBasicMaterial({
           color: src.color,
@@ -2194,6 +3053,8 @@ export function buildDecorMeshes(
           vertexColors: true,
           transparent: alpha,
           depthWrite: !alpha,
+          map: src.map ?? null,
+          side,
         })
     materials.push(material)
     const mesh = new THREE.InstancedMesh(src.geometry, material, items.length)
@@ -2205,6 +3066,8 @@ export function buildDecorMeshes(
       src.geometry.computeBoundingBox()
       baseMinY = src.geometry.boundingBox!.min.y
     }
+    if (!src.geometry.boundingBox) src.geometry.computeBoundingBox()
+    const fullMinY = src.geometry.boundingBox!.min.y
     for (let i = 0; i < items.length; i++) {
       const p = items[i]
       let seat = 0
@@ -2251,6 +3114,21 @@ export function buildDecorMeshes(
       scl.setScalar(p.scale)
       m4.compose(pos, q, scl)
       mesh.setMatrixAt(i, m4)
+      // a drawn-decal archetype (the leaves) already carries its contact
+      // shadow, one per blade — see the CONTACT BLOBS block
+      if (blobs && !alpha) {
+        // just under the prop's lowest point, never into the surface it
+        // stands on: the desk's cutting mat lies 0.12 over the desk plane,
+        // which is deskLift − 0.3 (Scene3D)
+        const ref = p.onDesk ? opts.deskLift ?? 0 : p.onPlatform ? opts.platformLift ?? 0 : 0
+        const base = ref + src.groundOffset + fullMinY * p.scale
+        // (desk floor 0.18 over the plane: the pencil's barrel bottoms out at
+        // 0.2 — build.test's "under the prop" gate measured 0.02 above it at
+        // a 0.22 floor)
+        const y = Math.max(base - CONTACT_BLOB_UNDER, ref + (p.onDesk ? -0.12 : 0.1))
+        pushContactBlob(blobs, contactFootprint(src.geometry), m4, p.scale, y)
+        blobs.props.push(p.propId)
+      }
     }
     mesh.instanceMatrix.needsUpdate = true
     if (opts.lit) {
@@ -2267,16 +3145,59 @@ export function buildDecorMeshes(
     counts[a.id] = items.length
     group.add(mesh)
   }
-  return { group, counts, materials }
+  if (blobs && blobs.props.length > 0) {
+    const geo = new THREE.BufferGeometry()
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(blobs.pos, 3))
+    geo.setAttribute('uv', new THREE.Float32BufferAttribute(blobs.uv, 2))
+    // unused by an unlit material, but `!!geometry.attributes.normal` is a
+    // bit of three's program key (vertexNormals): without it the blob linked
+    // a program of its own beside the drum pad's identical SDF blob
+    // (.probes/contact probe, cacheKey bit 23: 52 programs vs 51)
+    const nrm = new Float32Array(blobs.pos.length)
+    for (let i = 1; i < nrm.length; i += 3) nrm[i] = 1
+    geo.setAttribute('normal', new THREE.BufferAttribute(nrm, 3))
+    geo.setIndex(blobs.idx)
+    const material = new THREE.MeshBasicMaterial({
+      color: CONTACT_BLOB_COLOR,
+      alphaMap: contactBlobTexture(),
+      transparent: true,
+      depthWrite: false,
+      toneMapped: false,
+      // pulled toward the camera: the blob lies a fraction of a unit over the
+      // desk / mat / board, which a far zoom cannot resolve on depth alone
+      polygonOffset: true,
+      polygonOffsetFactor: -1,
+      polygonOffsetUnits: -4,
+    })
+    const mesh = new THREE.Mesh(geo, material)
+    mesh.castShadow = false
+    mesh.receiveShadow = false
+    // after the desk vignette (−12) and the board's SDF shadows (−11), before
+    // every other transparent pass — the leaves' blades and decals (0) paint
+    // OVER their blob, never under it
+    mesh.renderOrder = -1
+    mesh.userData.decorContactBlobs = blobs.props.length
+    mesh.userData.decorContactProps = blobs.props
+    materials.push(material)
+    geometries.push(geo)
+    group.add(mesh)
+  }
+  return { group, counts, materials, geometries }
 }
 
-/** Dispose a build's materials (geometry stays in the archetype cache). */
+/** How far under a prop's lowest point its blob is drawn. */
+const CONTACT_BLOB_UNDER = 0.12
+
+/** Dispose a build's materials and its own (non-cached) geometry. */
 export function disposeDecorBuild(result: DecorBuildResult): void {
   for (const m of result.materials) m.dispose()
+  for (const g of result.geometries) g.dispose()
 }
 
 /** Drop the silhouette cache (scene dispose — leak accounting). */
 export function disposeDecorGeometries(): void {
   for (const [, g] of geomCache) g.geometry.dispose()
   geomCache.clear()
+  // the GPU copy only — the texture object stays valid and re-uploads
+  contactBlobTex?.dispose()
 }

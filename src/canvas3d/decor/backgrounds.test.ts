@@ -15,13 +15,30 @@
 import { describe, expect, it } from 'vitest'
 import * as THREE from 'three'
 import {
+  assembleCityBackground,
   buildCityBackground,
+  buildCityGeometry,
+  buildCityGeometrySliced,
+  disposeCityGeometry,
   buildDeskLamp,
   buildStudioBackground,
+  DESK_LAMP_SHADE_REACH,
+  DESK_LAMP_SHADE_Y,
   disposeBackground,
+  LAMP_CONE,
+  LAMP_POOL_E,
+  LAMP_RANGE_THROWS,
   type BackgroundBuild,
   type MakeMat,
+  buildCityPodium,
+  CITY_PODIUM_H,
+  CITY_SCALE,
+  CITY_STOREY,
+  CITY_STREET_MARGIN,
+  PODIUM_STAIR_REACH,
+  STUDIO_FLOOR_REACH,
 } from './backgrounds'
+import { cityFacadeTextures, FACADE_FLAG_UV, FACADE_WATER_UV, PAVE_U0, PAVE_U1, WATER_ROUGHNESS } from './cityFacade'
 
 interface MatCall {
   role: string
@@ -69,12 +86,46 @@ const RADIUS = 2300
 const BASE_Y = -30
 
 describe('city background (ring around the desk zone)', () => {
-  it('stays within the hard budgets: ≤8 draws, ≤60k tris, sits on baseY, no shadows', () => {
+  it('the TIME-SLICED build yields between steps and produces the synchronous city byte for byte', async () => {
+    // The engine builds the city in slices so picking the background never
+    // freezes the page (view3d-quality 2026-10-08: one 59-78 ms task). The
+    // slicing must be invisible in the output: same parts, same order,
+    // same vertices, same manifests.
+    const opts = { hole: HOLE, radius: RADIUS, baseY: BASE_Y, seed: 11 }
+    const sync = buildCityGeometry(opts)
+    let slices = 0
+    const sliced = await buildCityGeometrySliced(opts, () => (slices++, false), 0)
+    expect(sliced, 'a build nobody stopped resolves').not.toBeNull()
+    expect(slices, 'sliceMs 0 → one step per macrotask: the build really yields').toBeGreaterThan(10)
+    expect(sliced!.parts.map((p) => p.tag)).toEqual(sync.parts.map((p) => p.tag))
+    sliced!.parts.forEach((p, i) => expect(checksum(p.geometry), p.tag).toBe(checksum(sync.parts[i].geometry)))
+    expect(sliced!.fabric).toEqual(sync.fabric)
+    expect(sliced!.streetLife).toEqual(sync.streetLife)
+    // a newer rebuild asking for another city stops the job: null, no throw
+    let n = 0
+    expect(await buildCityGeometrySliced(opts, () => ++n > 3, 0)).toBeNull()
+    // …and the cached geometry dressed twice keeps ONE set of buffers
+    const a = assembleCityBackground(sync, recordingMakeMat([]), { sharedGeometry: true })
+    const b = assembleCityBackground(sync, recordingMakeMat([]), { sharedGeometry: true })
+    meshesOf(a).forEach((m, i) => {
+      expect(m.geometry).toBe(meshesOf(b)[i].geometry)
+      expect(m.material, 'materials are fresh per assembly (engine owns their fade)').not.toBe(meshesOf(b)[i].material)
+      expect(m.userData.sharedGeometry, 'teardown must not dispose cached buffers').toBe(true)
+    })
+    disposeCityGeometry(sync)
+    disposeCityGeometry(sliced!)
+  })
+
+  it('stays within the hard budgets: ≤6 draws, ≤60k tris, sits on baseY, no shadows', () => {
     const calls: MatCall[] = []
     const b = buildCityBackground({ hole: HOLE, radius: RADIUS, baseY: BASE_Y, seed: 7, makeMat: recordingMakeMat(calls) })
     const meshes = meshesOf(b)
     expect(meshes.length).toBeGreaterThan(0)
-    expect(meshes.length, 'city draw calls').toBeLessThanOrEqual(8)
+    // 6 = four bands + bridges + mount. The river used to be a 7th draw on
+    // a material of its own; it now rides the south band through the atlas's
+    // glossy water texel, and that draw pays for the civic podium Scene3D
+    // adds under the board (quality pass "city": 7 city draws before, 7 now)
+    expect(meshes.length, 'city draw calls').toBeLessThanOrEqual(6)
     expect(b.drawCalls).toBe(meshes.length)
     const tris = trisOf(meshes)
     expect(tris, 'city triangle budget').toBeLessThanOrEqual(60000)
@@ -87,14 +138,55 @@ describe('city background (ring around the desk zone)', () => {
         BASE_Y - 1e-3,
       )
     }
-    // landmark presence: the river ribbon is its own (glossier) mesh
-    expect(meshes.some((m) => m.userData.bgPart === 'city-river')).toBe(true)
-    // the water's baked tone drift only renders when its material opts into
-    // vertex colors — without the flag the run reads as one flat band
-    const waterCall = calls.find((c) => c.opts?.roughness === 0.3)
-    expect(waterCall?.opts?.vertexColors, 'water tone drift needs vertexColors').toBe(true)
+    // landmark presence: the river rides the south band, on the glossy
+    // water texel (its old roughness 0.3 = 0.88 × the texel's 0.34)
+    const river = b.group.userData.cityRiver as { in: string; z0: number; z1: number } | null
+    expect(river?.in, 'the river is merged into the south band').toBe('city-south')
+    const south = meshes.find((m) => m.userData.bgPart === 'city-south')!
+    const suv = south.geometry.getAttribute('uv')
+    let wet = 0
+    for (let i = 0; i < suv.count; i++) {
+      if (Math.abs(suv.getX(i) - FACADE_WATER_UV[0]) < 1e-6 && Math.abs(suv.getY(i) - FACADE_WATER_UV[1]) < 1e-6) wet++
+    }
+    expect(wet, 'river vertices on the water texel').toBeGreaterThan(400)
+    expect(0.88 * WATER_ROUGHNESS).toBeCloseTo(0.3, 1)
+    // ONE material for the whole city — and the water's baked tone drift
+    // only renders when it opts into vertex colors (the flag was silently
+    // missing in round 3 and the run read as one flat band, AAA round 4 sev5)
+    expect(calls.length, 'one shared material').toBe(1)
+    expect(calls[0].opts?.vertexColors, 'band tones + water drift need vertexColors').toBe(true)
     expect(b.lamp).toBeUndefined()
     expect(calls.every((c) => c.role === 'decor')).toBe(true)
+    disposeBackground(b)
+  })
+
+  it('wears the facade atlas in the DESK program: map + roughness + normal maps + vertex colours, nothing else', () => {
+    // The desk material (Scene3D) is MeshStandardMaterial with exactly these
+    // four features; three keys a program on them, so a city material with
+    // the same set links nothing new (no shader link after the first frame).
+    // Any extra map (emissive, ao, metalness…) would key a new program.
+    const b = buildCityBackground({ hole: HOLE, radius: RADIUS, baseY: BASE_Y, seed: 7, makeMat: recordingMakeMat([]) })
+    const mats = new Set(meshesOf(b).map((m) => m.material as THREE.MeshStandardMaterial))
+    expect(mats.size).toBe(1)
+    const mat = [...mats][0]
+    const t = cityFacadeTextures()
+    expect(mat.map).toBe(t.map)
+    expect(mat.roughnessMap).toBe(t.roughnessMap)
+    expect(mat.normalMap).toBe(t.normalMap)
+    expect(mat.vertexColors).toBe(true)
+    for (const k of ['emissiveMap', 'aoMap', 'metalnessMap', 'alphaMap', 'bumpMap', 'displacementMap', 'lightMap', 'envMap'] as const) {
+      expect(mat[k], k).toBeNull()
+    }
+    // one shared set of ≤ 512-px maps, whoever asks
+    for (const tex of [t.map, t.roughnessMap, t.normalMap]) {
+      expect(tex.image.width).toBeLessThanOrEqual(512)
+      expect(tex.image.height).toBeLessThanOrEqual(512)
+    }
+    expect(cityFacadeTextures().map).toBe(t.map)
+    // every part carries the layout the material reads
+    for (const m of meshesOf(b)) {
+      for (const a of ['position', 'normal', 'uv', 'color']) expect(m.geometry.getAttribute(a), `${String(m.userData.bgPart)}.${a}`).toBeTruthy()
+    }
     disposeBackground(b)
   })
 
@@ -133,7 +225,7 @@ describe('city background (ring around the desk zone)', () => {
 
 describe('city round-5 regressions (verdict #5 — hero-framing visibility)', () => {
   const SEEDS = [1, 7, 42, 99, 1234]
-  const MARGIN = 56 // builder's street margin (private const — mirrored here)
+  const MARGIN = CITY_STREET_MARGIN // builder's street margin, world units
 
   it('west band keeps BUILT fabric near the margin for every seed (board must not read as an island)', () => {
     // A global lattice origin can leave the west face's first cell column
@@ -218,13 +310,49 @@ describe('city round-5 regressions (verdict #5 — hero-framing visibility)', ()
     }
   })
 
+  it('Mont-Royal sits at city scale: 0.09 of the ring, across the river, inside the ring, clear of the hole', () => {
+    // Quality pass "montroyal": the mount was the one landmark left at its
+    // K = 1 world size (0.06 of the ring — a 176-unit radius, a summit ~80
+    // units over the street beside 53-65-unit plaza blocks:
+    // tp5-montroyal-m1/city-mont-royal.png). 0.09 is 1.5x; the fixture ring
+    // fits it for every seed, so the tight-ring fallbacks never fire here.
+    for (const seed of SEEDS) {
+      const g = buildCityGeometry({ hole: HOLE, radius: RADIUS, baseY: BASE_Y, seed })
+      expect(g.mount, `seed ${seed}: mount seated`).not.toBeNull()
+      expect(g.mount!.source, 'no GLB registered in this file: the procedural fallback').toBe('procedural')
+      expect(g.mount!.r / RADIUS).toBeCloseTo(0.09, 6)
+      const part = g.parts.find((p) => p.tag === 'city-mount')!
+      part.geometry.computeBoundingBox()
+      const bb = part.geometry.boundingBox!
+      // across the river from the board (the river's far bank is z0)
+      expect(bb.max.z, `seed ${seed}: beyond the river`).toBeLessThan(g.river!.z0)
+      // wholly inside the ring
+      for (const x of [bb.min.x, bb.max.x])
+        for (const z of [bb.min.z, bb.max.z]) expect(Math.hypot(x - HOLE.x, z - HOLE.z)).toBeLessThan(RADIUS)
+      disposeCityGeometry(g)
+    }
+  })
+
   it('natural generation keeps headroom under the 58k backstop cap (cap must never clip the fabric)', () => {
-    // Measured over a 12-seed sweep (3, 5, 7, 11, 13, 18, 21, 33, 55, 99,
-    // 123, 777); the natural worst case is SEED 18. Re-measure the sweep when
-    // geometry is added — removing geometry only releases triangles.
-    // The bar is 57,000, below the 58,000 backstop — the one that would
-    // actually clip fabric. `b.triangles` coming back under the bar is the
-    // proof it did not clip anything on the way.
+    // RE-MEASURED for round 3, honestly, over the same 12-seed sweep — 3, 5, 7,
+    // 11, 13, 18, 21, 33, 55, 99, 123, 777. The landmark went 3,222 → 3,392
+    // tris and the natural worst 56,655 → 56,825, still at SEED 18 (21 sits at
+    // 56,387, 13 at 55,486, 123 at 55,407, and nothing else clears 54k). The
+    // round's ledger, part by part: the drum's plain wall +80 (a sixth profile
+    // row for the reveal, against 44 bearings instead of 60 now that the lathe
+    // no longer carries a rib per fin), the spherical dome +56, the annex shell
+    // +28, the observatory −12, and the 24 straight stays +90 — against −72 for
+    // the fan apron, which is ONE prism where the plinth, its three deck ribs,
+    // two footing pads and the haunch used to be five.
+    // The bar stays at 57,000: that is 175 over the measured worst, and the
+    // 58,000 backstop — the one that would actually clip fabric — stays ~1.2k
+    // away. `b.triangles` coming back under the bar is the proof it did not
+    // clip anything on the way.
+    // City scale (CITY_SCALE 2.2, 2026-10-10): ~1/K² as many cells, plaza-
+    // ring back rows — this ring now measures 13.6-14.7k over seeds 1, 3, 7,
+    // 11, 13, 18, 21, 42, 99, 1234 (the 900 x 560 fixture 14.0-15.3k, an
+    // 1800-unit ring 15.0-16.1k), so the cap is far away; the bar stays
+    // as the guard against a regrowth.
     for (const seed of [3, 7, 11, 13, 18, 21, 99]) {
       const b = buildCityBackground({
         hole: { x: 0, z: 0, w: 1200, h: 800 },
@@ -250,7 +378,11 @@ describe('Montréal fabric (user ask: walk-ups)', () => {
   }
   it('walk-up stock: a cornice parapet on EVERY walk-up, all roof treatments present, staircase prisms on the near ring', () => {
     // measured over the 3 seeds: walkups 121–140, penthouses 39–53,
-    // roofUnits 27–53, stairs 13–22 — bars keep slack for other boards
+    // roofUnits 27–53, stairs 13–22 — bars keep slack for other boards.
+    // City scale (2026-10-10, ~1/K² as many cells, plaza-ring back rows):
+    // walkups 101–107, penthouses 23–36, roofUnits 21–29, stairs 8–11 on
+    // these seeds (stairs 4–17 over ten) — the bars still hold, stairs
+    // with no slack left (they ride the near ring, which is ~K x sparser)
     for (const seed of SEEDS3) {
       const b = buildCityBackground({ hole: HOLE, radius: RADIUS, baseY: BASE_Y, seed, makeMat: recordingMakeMat([]) })
       const f = b.group.userData.cityFabric as CityFabric
@@ -264,6 +396,175 @@ describe('Montréal fabric (user ask: walk-ups)', () => {
   })
 })
 
+describe('city quality pass "city" (facades, roofs, Canadiana, podium)', () => {
+  interface Fabric {
+    facades: number
+    waterTowers: number
+    pitched: number
+    mansards: number
+    churches: number
+    flags: number
+    autumnTrees: number
+  }
+
+  it('the FAR field wears windows too (the critic: "no windows … at mid range")', () => {
+    // The old punched cells were geometry on near/mid blocks only (t < 0.55,
+    // i.e. inside 0.41·radius of the hole centre); beyond, every block was a
+    // blank box. A facade vertex is one whose UV lies in a style column
+    // (u < PAVE_U0). Bands only — the river and the landmarks carry none.
+    for (const seed of [7, 42, 1234]) {
+      const b = buildCityBackground({ hole: HOLE, radius: RADIUS, baseY: BASE_Y, seed, makeMat: recordingMakeMat([]) })
+      let far = 0
+      for (const m of meshesOf(b)) {
+        if (!/^city-(north|south|east|west)$/.test(String(m.userData.bgPart))) continue
+        const pos = m.geometry.getAttribute('position')
+        const uv = m.geometry.getAttribute('uv')
+        for (let i = 0; i < pos.count; i++) {
+          if (uv.getX(i) >= PAVE_U0) continue
+          if (Math.hypot(pos.getX(i) - HOLE.x, pos.getZ(i) - HOLE.z) > 0.6 * RADIUS) far++
+        }
+      }
+      // each facade box contributes 16 wall vertices; hundreds of far blocks.
+      // City scale (2026-10-10): the far field holds ~1/K² as many, K-times
+      // larger blocks — measured 2,164–2,580 vertices (135–161 blocks) over
+      // seeds 1, 3, 7, 11, 13, 18, 21, 42, 99, 1234; 0 without the atlas
+      expect(far, `seed ${seed}: far facade vertices`).toBeGreaterThan(16 * 100)
+      disposeBackground(b)
+    }
+  })
+
+  it('Montréal roofs and Canadiana: water tanks, mansards, pitched roofs, parish churches, City Hall flying the flag, autumn maples', () => {
+    // measured over seeds 1, 3, 7, 11, 13, 18, 21, 42, 99, 1234 on this
+    // ring: waterTowers 84-117, mansards 12-25, pitched 3-15, churches
+    // 15-30, autumnTrees 121-171, flags exactly 1 — bars keep slack for
+    // other boards, the flag is the contract (one City Hall a city).
+    // City scale (CITY_SCALE 2.2, 2026-10-10) re-measured over the same ten
+    // seeds: facades 324–376, waterTowers 39–52, mansards 3–18, churches
+    // 3–9 (church odds 0.4 → 0.7 for the ~1/K² cells), autumnTrees 24–40,
+    // pitched 0–3. PITCHED roofs are no longer a presence bar: they lived on
+    // the 1-storey annexes and the low far stock (< 20 maquette units), and
+    // the plaza ring is mid-rise with back rows where the annexes stood —
+    // seeds 7, 42 and 1234 build none. The count stays in the manifest.
+    for (const seed of [7, 42, 1234]) {
+      const b = buildCityBackground({ hole: HOLE, radius: RADIUS, baseY: BASE_Y, seed, makeMat: recordingMakeMat([]) })
+      const f = b.group.userData.cityFabric as Fabric
+      expect(f.facades, `seed ${seed}: facades`).toBeGreaterThan(250)
+      expect(f.waterTowers, `seed ${seed}: water tanks`).toBeGreaterThanOrEqual(30)
+      expect(f.mansards, `seed ${seed}: mansards`).toBeGreaterThanOrEqual(3)
+      expect(f.churches, `seed ${seed}: parish churches`).toBeGreaterThanOrEqual(3)
+      expect(f.flags, `seed ${seed}: City Hall's flag`).toBe(1)
+      expect(f.autumnTrees, `seed ${seed}: autumn maples`).toBeGreaterThanOrEqual(20)
+      // the flag cloth's two broad faces sample the flag texels — in the
+      // WEST band (City Hall stands on the first west column)
+      let flagVerts = 0
+      let flagBand = ''
+      for (const m of meshesOf(b)) {
+        const uv = m.geometry.getAttribute('uv')
+        for (let i = 0; i < uv.count; i++) {
+          const u = uv.getX(i)
+          const v = uv.getY(i)
+          if (u >= FACADE_FLAG_UV.u0 - 1e-9 && v >= FACADE_FLAG_UV.v0 - 1e-9 && v <= FACADE_FLAG_UV.v1 + 1e-9) {
+            flagVerts++
+            flagBand = String(m.userData.bgPart)
+          }
+        }
+      }
+      expect(flagVerts, `seed ${seed}: two faces × 4 corners`).toBe(8)
+      expect(flagBand).toBe('city-west')
+      disposeBackground(b)
+    }
+  })
+
+  it('street life on the east and north streets starts past the podium steps', () => {
+    // Scene3D gives the podium flights on '+x' and '+z' reaching
+    // PODIUM_STAIR_REACH past the hole edge (minus the 1.5-unit reveal); the
+    // iter4 harness shot had a car parked on them. Extents mirror the
+    // street-life test: walker ±4, vehicle ±15.
+    for (const seed of [1, 7, 42, 99, 1234]) {
+      const b = buildCityBackground({ hole: HOLE, radius: RADIUS, baseY: BASE_Y, seed, makeMat: recordingMakeMat([]) })
+      const life = b.group.userData.streetLife as { people: Array<{ x: number; z: number }>; vehicles: Array<{ x: number; z: number }> }
+      const maxX = HOLE.x + HOLE.w / 2
+      const maxZ = HOLE.z + HOLE.h / 2
+      const minX = HOLE.x - HOLE.w / 2
+      const minZ = HOLE.z - HOLE.h / 2
+      const clear = (p: { x: number; z: number }, ext: number): boolean => {
+        const eastSide = p.x > maxX && p.z > minZ && p.z < maxZ
+        const northSide = p.z > maxZ && p.x > minX && p.x < maxX
+        if (eastSide) return p.x - ext > maxX + PODIUM_STAIR_REACH
+        if (northSide) return p.z - ext > maxZ + PODIUM_STAIR_REACH
+        return true
+      }
+      for (const p of life.people) expect(clear(p, 4), `seed ${seed}: walker (${p.x.toFixed(0)}, ${p.z.toFixed(0)})`).toBe(true)
+      for (const p of life.vehicles) expect(clear(p, 15), `seed ${seed}: vehicle (${p.x.toFixed(0)}, ${p.z.toFixed(0)})`).toBe(true)
+      disposeBackground(b)
+    }
+  })
+
+  describe('civic podium', () => {
+    const SLAB = { x: 100, z: 60, w: 804, h: 464 }
+    const REACH = 48 // Scene3D passes CITY_HOLE_APRON
+    const opts = { slab: SLAB, reach: REACH, baseY: BASE_Y, stairs: ['+x', '+z'] as Array<'+x' | '+z'> }
+
+    it('fills the desk-to-slab gap exactly: the board and the desk props stand on its top', () => {
+      const g = buildCityPodium(opts)
+      g.computeBoundingBox()
+      const bb = g.boundingBox!
+      expect(bb.min.y, 'rises from the street').toBeCloseTo(BASE_Y, 6)
+      // the coping stands 0.15 proud of the paving; nothing else is higher
+      expect(bb.max.y).toBeLessThanOrEqual(BASE_Y + CITY_PODIUM_H + 0.15 + 1e-6)
+      // the paving top (the setts' strip of the atlas) is AT the slab bottom
+      const pos = g.getAttribute('position')
+      const uv = g.getAttribute('uv')
+      const nrm = g.getAttribute('normal')
+      let pavers = 0
+      for (let i = 0; i < pos.count; i++) {
+        if (nrm.getY(i) > 0.99 && uv.getX(i) >= PAVE_U0 - 1e-9 && uv.getX(i) <= PAVE_U1 + 1e-9) {
+          expect(pos.getY(i)).toBeCloseTo(BASE_Y + CITY_PODIUM_H, 6)
+          pavers++
+        }
+      }
+      expect(pavers, 'the top is paved').toBeGreaterThanOrEqual(8)
+      // and it runs UNDER the slab's edge past its rounded corners (r 30)
+      let under = 0
+      for (let i = 0; i < pos.count; i++) if (pos.getX(i) >= SLAB.x + 30 && pos.getX(i) <= SLAB.x + SLAB.w - 30 && pos.getZ(i) >= SLAB.z + 30 && pos.getZ(i) <= SLAB.z + 34 + 1e-6) under++
+      expect(under, 'paving reaches 34 under the slab edge').toBeGreaterThan(0)
+      g.dispose()
+    })
+
+    it('stays inside the city hole (slab + apron) except its flights of steps, which stay in the street margin', () => {
+      const g = buildCityPodium(opts)
+      g.computeBoundingBox()
+      const bb = g.boundingBox!
+      const APRON = 48 // CITY_HOLE_APRON (placement.ts) — the hole the city leaves
+      // the camera-far sides: the base course is the outermost part (the
+      // first run stood 0.5 past the hole — the wall face sat AT the reach
+      // and the base course 1.5 beyond it; `reach` now bounds both)
+      expect(bb.min.x).toBeGreaterThanOrEqual(SLAB.x - APRON - 1e-6)
+      expect(bb.min.z).toBeGreaterThanOrEqual(SLAB.z - APRON - 1e-6)
+      // the stair sides: ≤ PODIUM_STAIR_REACH past the wall face — inside
+      // the builder's street margin, where no block is ever seated
+      expect(bb.max.x).toBeLessThanOrEqual(SLAB.x + SLAB.w + REACH - 1.5 + PODIUM_STAIR_REACH + 1e-6)
+      expect(bb.max.z).toBeLessThanOrEqual(SLAB.z + SLAB.h + REACH - 1.5 + PODIUM_STAIR_REACH + 1e-6)
+      expect(REACH + PODIUM_STAIR_REACH).toBeLessThan(APRON + CITY_STREET_MARGIN)
+      // without stairs it never leaves the hole at all
+      const bare = buildCityPodium({ ...opts, stairs: [] })
+      bare.computeBoundingBox()
+      expect(bare.boundingBox!.max.x).toBeLessThanOrEqual(SLAB.x + SLAB.w + APRON + 1e-6)
+      expect(bare.boundingBox!.max.z).toBeLessThanOrEqual(SLAB.z + SLAB.h + APRON + 1e-6)
+      g.dispose()
+      bare.dispose()
+    })
+
+    it('has the city material layout (one indexed draw in the shared program) and a few hundred triangles', () => {
+      const g = buildCityPodium(opts)
+      for (const a of ['position', 'normal', 'uv', 'color']) expect(g.getAttribute(a), a).toBeTruthy()
+      expect(g.index).toBeTruthy()
+      expect(g.index!.count / 3).toBeLessThan(600)
+      g.dispose()
+    })
+  })
+})
+
 describe('city critique #6 (dusk grading + street life)', () => {
   const SUN_X = Math.sin((-55 * Math.PI) / 180)
   const SUN_Z = Math.cos((-55 * Math.PI) / 180)
@@ -274,16 +575,28 @@ describe('city critique #6 (dusk grading + street life)', () => {
     // must BAKE the falloff. Pooled over the four band meshes because a
     // single band's composition noise reaches ±23% (measured with the
     // gradient stripped); the pool balances it — west is all up-sun, east
-    // all down-sun, north/south carry both. Measured discriminator: with the
-    // ±24%/×2.4 ramp the far-field ratio runs 1.58–1.86 over 9 seeds, with a
-    // weaker ±15% ramp 1.29–1.40, without any ramp 0.97–1.05 — the 1.45 bar
-    // rejects both weaker states cleanly.
+    // all down-sun, north/south carry both. Measured discriminator, retuned
+    // for critique #7 (the round-6 ±15%/×1.7 ramp never survived to the
+    // screen — a Playwright luma-band probe that was never committed
+    // measured a 5.3 luma split under
+    // its 6 bar): with the ±24%/×2.4 ramp the far-field ratio runs
+    // 1.58–1.86 over 9 seeds, with the old ±15% ramp 1.29–1.40, without any
+    // ramp 0.97–1.05 — the 1.45 bar rejects both weaker states cleanly.
+    // City scale (CITY_SCALE 2.2, 2026-10-10): ~1/K² as many cells, so ONE
+    // seed's composition noise outgrew the margin — per seed, ten seeds:
+    // ramp 1.30–1.82, old ±15% ramp 1.06–1.50, no ramp 0.81–1.20 (the
+    // classes overlap). POOLED over these three seeds (sums, then the ratio)
+    // they separate again: ramp 1.605, old ramp 1.318, no ramp 1.000 — so
+    // the same 1.45 bar now reads the pool. Each seed must still carry real
+    // fabric on both sides (≥ 1000 samples; measured 2,967–3,614).
+    let upSum = 0
+    let upN = 0
+    let downSum = 0
+    let downN = 0
     for (const seed of [7, 42, 1234]) {
       const b = buildCityBackground({ hole: HOLE, radius: RADIUS, baseY: BASE_Y, seed, makeMat: recordingMakeMat([]) })
-      let upSum = 0
-      let upN = 0
-      let downSum = 0
-      let downN = 0
+      const up0 = upN
+      const down0 = downN
       for (const m of meshesOf(b)) {
         if (!/^city-(north|south|east|west)$/.test(String(m.userData.bgPart))) continue
         const pos = m.geometry.getAttribute('position')
@@ -302,13 +615,11 @@ describe('city critique #6 (dusk grading + street life)', () => {
         }
       }
       // both sides must carry real fabric or the mean is meaningless
-      expect(upN, `seed ${seed}: up-sun sample size`).toBeGreaterThan(1000)
-      expect(downN, `seed ${seed}: down-sun sample size`).toBeGreaterThan(1000)
-      expect(upSum / upN, `seed ${seed}: up-sun mean tone exceeds down-sun`).toBeGreaterThan(
-        (downSum / downN) * 1.45,
-      )
+      expect(upN - up0, `seed ${seed}: up-sun sample size`).toBeGreaterThan(1000)
+      expect(downN - down0, `seed ${seed}: down-sun sample size`).toBeGreaterThan(1000)
       disposeBackground(b)
     }
+    expect(upSum / upN, 'pooled up-sun mean tone exceeds down-sun').toBeGreaterThan((downSum / downN) * 1.45)
   })
 
   it('scatters street life on the ribbons: walkers + 3–5 vehicles, never inside the hole', () => {
@@ -376,14 +687,101 @@ describe('city critique #6 (dusk grading + street life)', () => {
   })
 })
 
+describe('city scale (the board reads as a civic plaza, not a crate in a toy town)', () => {
+  // the board's top over the street: the iso slab (floorD 14) on the podium
+  const BOARD_OVER_STREET = 14 + CITY_PODIUM_H
+  /** World heights over the street of the facade WALL corners (atlas style
+   * columns, horizontal normals, off the ground) lying `lo`-`hi` units out
+   * from the hole rect — a block's top corners and, for a rooftop storey,
+   * its base on the roof. */
+  function wallTops(b: BackgroundBuild, lo: number, hi: number): number[] {
+    const out: number[] = []
+    for (const m of meshesOf(b)) {
+      if (!/^city-(north|south|east|west)$/.test(String(m.userData.bgPart))) continue
+      const p = m.geometry.getAttribute('position')
+      const uv = m.geometry.getAttribute('uv')
+      const n = m.geometry.getAttribute('normal')
+      for (let i = 0; i < p.count; i++) {
+        if (uv.getX(i) >= PAVE_U0 || Math.abs(n.getY(i)) > 0.01 || p.getY(i) < BASE_Y + 1) continue
+        const dx = Math.max(0, Math.abs(p.getX(i) - HOLE.x) - HOLE.w / 2)
+        const dz = Math.max(0, Math.abs(p.getZ(i) - HOLE.z) - HOLE.h / 2)
+        const d = Math.hypot(dx, dz)
+        if (d >= lo && d < hi) out.push(p.getY(i) - BASE_Y)
+      }
+    }
+    return out.sort((a, c) => a - c)
+  }
+  const pct = (a: number[], q: number): number => a[Math.floor(q * (a.length - 1))]
+
+  it('the blocks round the plaza stand the board\'s thickness plus three storeys over the street, and the far city recedes', () => {
+    // USER (2026-10-10, tp3-final-dpr1/city-wide.png, city-tag-1.png): the
+    // board read as a giant crate ~5x the city's scale — a walk-up about the
+    // height of the desk flag. Measured on this fixture, seeds 1, 3, 7, 11,
+    // 13, 18, 21, 42, 99, 1234, wall corners within 300 units of the hole:
+    // at K = 1 p20 13-14 and median 16-19 (every block LOWER than the board's
+    // own 30); at CITY_SCALE 2.2 p20 55-56, median 58-64. The bar is the
+    // board's thickness plus three CITY_STOREYs (54), less the plaza rows'
+    // ±0.8-maquette segment jitter (1.8 world); the 1-storey annexes some
+    // plaza cells keep stay under the 20 % the p20 allows.
+    // The far field (800-2300 out) keeps a median of 97-108 (K = 1: 85-89)
+    // because its t² rise is damped; undamped it would be ~K x (≈190) and
+    // wall the horizon — the 130 bar rejects that.
+    for (const seed of [1, 7, 42, 99, 1234]) {
+      const b = buildCityBackground({ hole: HOLE, radius: RADIUS, baseY: BASE_Y, seed, makeMat: recordingMakeMat([]) })
+      const near = wallTops(b, 0, 300)
+      expect(near.length, `seed ${seed}: a built plaza ring`).toBeGreaterThan(200)
+      expect(pct(near, 0.2), `seed ${seed}: plaza ring p20 wall top`).toBeGreaterThanOrEqual(BOARD_OVER_STREET + 3 * CITY_STOREY - 1.8)
+      const far = wallTops(b, 800, RADIUS)
+      expect(pct(far, 0.5), `seed ${seed}: far-field median wall top`).toBeLessThanOrEqual(130)
+      disposeBackground(b)
+    }
+  })
+
+  it('people-scale parts keep a world size coherent with the storey, not K times it', () => {
+    // walkers ~1 storey, vehicles van-sized, trees 3-5 storeys: the parts the
+    // uniform K magnification must NOT grow (LIFE_K / VEH_K / TREE_K)
+    expect(CITY_SCALE).toBeGreaterThanOrEqual(2)
+    expect(CITY_SCALE).toBeLessThanOrEqual(2.5)
+    const b = buildCityBackground({ hole: HOLE, radius: RADIUS, baseY: BASE_Y, seed: 7, makeMat: recordingMakeMat([]) })
+    const life = b.group.userData.streetLife as { people: Array<{ x: number; z: number }> }
+    // the tallest thing standing on a walker's spot (±3 world) is the walker
+    const tops: number[] = []
+    for (const person of life.people) {
+      let top = -Infinity
+      for (const m of meshesOf(b)) {
+        if (!/^city-(north|south|east|west)$/.test(String(m.userData.bgPart))) continue
+        const p = m.geometry.getAttribute('position')
+        for (let i = 0; i < p.count; i++) {
+          if (Math.abs(p.getX(i) - person.x) < 3 && Math.abs(p.getZ(i) - person.z) < 3) top = Math.max(top, p.getY(i) - BASE_Y)
+        }
+      }
+      // over the street ribbon (1.4 maquette units up)
+      tops.push(top - 1.4 * CITY_SCALE)
+    }
+    // measured 8.7-9.9 over this seed's 15 walkers; at K = 1 the same
+    // silhouettes stood 11-15 over the street (by construction), i.e. ~2
+    // storeys of the old ~7-unit walk-up floor
+    for (const t of tops) expect(t, 'a walker stands about one storey').toBeLessThanOrEqual(CITY_STOREY * 1.35)
+    for (const t of tops) expect(t, 'and is still there to see').toBeGreaterThanOrEqual(CITY_STOREY * 0.75)
+    disposeBackground(b)
+  })
+})
+
 describe('studio cyclorama', () => {
-  it('is one vertex-graded sweep: ≤2 draws, rises from baseY, no shadows', () => {
+  const part = (b: BackgroundBuild, name: string): THREE.Mesh => {
+    const m = meshesOf(b).find((x) => x.userData.bgPart === name)
+    expect(m, name).toBeTruthy()
+    return m!
+  }
+
+  it('is a vertex-graded sweep on its own paper floor: ≤2 draws, from baseY, only the floor receives', () => {
     const calls: MatCall[] = []
     const b = buildStudioBackground({ radius: 3000, baseY: BASE_Y, makeMat: recordingMakeMat(calls) })
     const meshes = meshesOf(b)
     expect(meshes.length, 'studio draw calls').toBeLessThanOrEqual(2)
     expect(b.drawCalls).toBe(meshes.length)
-    const geo = meshes[0].geometry
+    const sweep = part(b, 'studio-sweep')
+    const geo = sweep.geometry
     const colors = geo.getAttribute('color')
     expect(colors, 'gradient rides vertex colors').toBeTruthy()
     // the warm gradient actually varies bottom → top
@@ -395,13 +793,98 @@ describe('studio cyclorama', () => {
     }
     expect(max - min).toBeGreaterThan(0.05)
     geo.computeBoundingBox()
-    // grounded on the desk but proud by a hair — a coplanar floor lip
-    // would z-fight the wood plane
-    expect(geo.boundingBox!.min.y).toBeGreaterThanOrEqual(BASE_Y)
-    expect(geo.boundingBox!.min.y).toBeLessThanOrEqual(BASE_Y + 2)
-    expect(meshes[0].castShadow).toBe(false)
-    expect(meshes[0].receiveShadow).toBe(false)
+    expect(geo.boundingBox!.min.y).toBeCloseTo(BASE_Y, 6)
+    expect(sweep.castShadow).toBe(false)
+    expect(sweep.receiveShadow).toBe(false)
+    // the floor IS the desk of this world: props' and board's shadows land on it
+    const floor = part(b, 'studio-floor')
+    expect(floor.castShadow).toBe(false)
+    expect(floor.receiveShadow).toBe(true)
+    // …and it recedes, so the cove rising from it never z-fights it
+    expect((floor.material as THREE.Material).polygonOffset).toBe(true)
+    // both are the one paper: vertex-coloured, same roughness request
+    expect(calls.filter((c) => c.role === 'decor' && c.opts?.vertexColors === true && c.opts?.roughness === 0.95)).toHaveLength(2)
     expect(b.lamp).toBeUndefined()
+    disposeBackground(b)
+  })
+
+  it('floors the WHOLE world in flat paper at baseY — the camera quadrant the 270° sweep leaves open included', () => {
+    // user 2026-10-12: "l'arrière plan studio a un problème avec la texture
+    // qui reste avec du bois" — the walnut desk showed in the open quadrant
+    const radius = 3000
+    const b = buildStudioBackground({ radius, baseY: BASE_Y, makeMat: recordingMakeMat([]) })
+    const floor = part(b, 'studio-floor')
+    const geo = floor.geometry
+    const pos = geo.getAttribute('position')
+    const nor = geo.getAttribute('normal')
+    const r = radius / 2.5
+    let reach = 0
+    for (let i = 0; i < pos.count; i++) {
+      expect(pos.getY(i)).toBeCloseTo(BASE_Y, 6)
+      expect(nor.getY(i)).toBe(1)
+      reach = Math.max(reach, Math.hypot(pos.getX(i), pos.getZ(i)))
+    }
+    // out past the old desk's rim (deskSize / 2 = 1.5 sweep radii)
+    expect(reach).toBeCloseTo(r * STUDIO_FLOOR_REACH, 3)
+    expect(STUDIO_FLOOR_REACH).toBeGreaterThanOrEqual(1.5)
+    // every triangle faces UP (counter-clockwise from above), none degenerate
+    const idx = geo.getIndex()!
+    const a = new THREE.Vector3()
+    const bb = new THREE.Vector3()
+    const c = new THREE.Vector3()
+    const n = new THREE.Vector3()
+    for (let t = 0; t < idx.count; t += 3) {
+      a.fromBufferAttribute(pos, idx.getX(t))
+      bb.fromBufferAttribute(pos, idx.getX(t + 1))
+      c.fromBufferAttribute(pos, idx.getX(t + 2))
+      n.crossVectors(bb.sub(a), c.sub(a))
+      expect(n.y, `triangle ${t / 3} faces up`).toBeGreaterThan(0)
+    }
+    // the floor covers EVERY bearing (the camera's +X/+Z quadrant included)
+    // with no hole: a ray down at any bearing and radius hits it
+    const ray = new THREE.Raycaster()
+    b.group.updateMatrixWorld(true)
+    for (let deg = 0; deg < 360; deg += 15) {
+      for (const f of [0.05, 0.4, 0.9, 1.4]) {
+        const x = Math.cos((deg * Math.PI) / 180) * r * f
+        const z = Math.sin((deg * Math.PI) / 180) * r * f
+        ray.set(new THREE.Vector3(x, BASE_Y + 100, z), new THREE.Vector3(0, -1, 0))
+        expect(ray.intersectObject(floor).length, `floor under ${deg}° × ${f}r`).toBeGreaterThan(0)
+      }
+    }
+    // seamless: one smooth grade, no texture, no per-board tone — neighbouring
+    // rings differ by a small step, and the floor meets the cove foot in the
+    // SAME tone (the sweep's lowest ring)
+    expect((floor.material as THREE.MeshStandardMaterial).map).toBeNull()
+    const col = geo.getAttribute('color')
+    const toneAt = (attrPos: THREE.BufferAttribute | THREE.InterleavedBufferAttribute, attrCol: THREE.BufferAttribute | THREE.InterleavedBufferAttribute, rho: number): number[] => {
+      let best = -1
+      let bestD = Infinity
+      for (let i = 0; i < attrPos.count; i++) {
+        const d = Math.abs(Math.hypot(attrPos.getX(i), attrPos.getZ(i)) - rho) + Math.abs(attrPos.getY(i) - BASE_Y) * 10
+        if (d < bestD) {
+          bestD = d
+          best = i
+        }
+      }
+      return [attrCol.getX(best), attrCol.getY(best), attrCol.getZ(best)]
+    }
+    const coveFoot = r - r * 0.18
+    const sweep = part(b, 'studio-sweep')
+    const footSweep = toneAt(sweep.geometry.getAttribute('position'), sweep.geometry.getAttribute('color'), coveFoot)
+    const footFloor = toneAt(pos, col, coveFoot)
+    for (let k = 0; k < 3; k++) expect(footFloor[k]).toBeCloseTo(footSweep[k], 4)
+    // past the foot (the open quadrant's far floor) the tone holds
+    const far = toneAt(pos, col, r * STUDIO_FLOOR_REACH)
+    for (let k = 0; k < 3; k++) expect(far[k]).toBeCloseTo(footFloor[k], 4)
+    // and toward the board it brightens smoothly (the light pool): no ring
+    // jumps more than a few percent over the next
+    let prev: number[] | null = null
+    for (const f of [0, 0.25, 0.45, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 1]) {
+      const t = toneAt(pos, col, coveFoot * f)
+      if (prev) for (let k = 0; k < 3; k++) expect(Math.abs(t[k] - prev[k])).toBeLessThan(0.06)
+      prev = t
+    }
     disposeBackground(b)
   })
 })
@@ -424,9 +907,21 @@ describe('brass desk lamp', () => {
     const lamp = b.lamp!
     expect(lamp).toBeTruthy()
     expect(lamp.target).toEqual(boardCenter)
-    expect(lamp.angle).toBeCloseTo(0.5, 5)
-    expect(lamp.penumbra).toBeCloseTo(0.6, 5)
+    // a physical desk lamp (lamp pass 2026-10-10: the decay-0 spec lit every
+    // surface in its cone at full strength — the critic's disc on the cards):
+    // inverse-square decay, a penumbra from edge to axis, a range cut-off
+    // past the target, and the intensity that puts LAMP_POOL_E on the target
+    expect(lamp.angle).toBeCloseTo(LAMP_CONE, 5)
+    expect(lamp.penumbra).toBe(1)
+    expect(lamp.decay).toBe(2)
+    const throwLen = Math.hypot(lamp.target[0] - lamp.position[0], lamp.target[1] - lamp.position[1], lamp.target[2] - lamp.position[2])
+    expect(lamp.distance).toBeCloseTo(throwLen * LAMP_RANGE_THROWS, 6)
+    expect(lamp.distance).toBeGreaterThan(throwLen)
+    expect(lamp.intensity / (throwLen * throwLen)).toBeCloseTo(LAMP_POOL_E, 6)
     expect(lamp.color).toBe('#FFD9A0')
+    // the brass casts from both faces: the dome is one open sheet, and the
+    // default back-face shadow side left a hollow ring outline on the desk
+    expect((meshes.find((m) => m.userData.bgPart === 'lamp-brass')!.material as THREE.Material).shadowSide).toBe(THREE.DoubleSide)
     // the spec sits up in the shade, pouring toward the board: its horizontal
     // bearing matches the base → board bearing
     expect(lamp.position[1]).toBeGreaterThan(BASE_Y + 100)
@@ -437,6 +932,32 @@ describe('brass desk lamp', () => {
     ).normalize()
     expect(toBoard.dot(fromSpec)).toBeGreaterThan(0.9)
     disposeBackground(b)
+  })
+
+  it('at any scale the dome looks where the light goes (a near aim at scale 0.5, as the workbench builds it)', () => {
+    // The workbench lamp is built at scale 0.5 aiming 40 units from its
+    // foot. The dome's aim mixed the world offset with the unscaled local
+    // shade position, so at 0.5 it pointed at a target twice as near as the
+    // light's: shade and pool disagreed. Rebuild the shade centre from the
+    // spec — light origin minus 30 local units back along the LIGHT's own
+    // direction — and it must land where the builder hangs the shade.
+    const foot: [number, number, number] = [400, -30, 90]
+    const scale = 0.5
+    for (const target of [
+      [400 - 24, -30, 90 - 32],
+      [400 + 70, -30, 90 + 10],
+      [0, 0, 0],
+    ] as [number, number, number][]) {
+      const b = buildDeskLamp({ position: foot, boardCenter: target, scale, makeMat: recordingMakeMat([]) })
+      const lamp = b.lamp!
+      const pos = new THREE.Vector3(...lamp.position)
+      const dir = new THREE.Vector3(...lamp.target).sub(pos).normalize()
+      const shade = pos.clone().addScaledVector(dir, -30 * scale)
+      const label = `aim ${target.join(',')}`
+      expect(shade.y - foot[1], `${label}: shade height`).toBeCloseTo(DESK_LAMP_SHADE_Y * scale, 4)
+      expect(Math.hypot(shade.x - foot[0], shade.z - foot[2]), `${label}: shade reach`).toBeCloseTo(DESK_LAMP_SHADE_REACH * scale, 4)
+      disposeBackground(b)
+    }
   })
 })
 

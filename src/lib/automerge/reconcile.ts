@@ -214,6 +214,107 @@ function reconcileValue(container: Plain, key: string, next: unknown): void {
   if (current !== next) container[key] = next
 }
 
+/**
+ * True when `reconcileValue(container, key, next)` on a container holding
+ * `current` at `key` would write NOTHING — i.e. `current` already deep-equals
+ * `next` under reconcile's own rules: an `undefined` member of an object
+ * target means "absent", a key the target lacks would be deleted, arrays
+ * compare by index (an index-equal `related` array is also a no-op for the
+ * by-id merge: nothing to remove, update or append), primitives by `===`.
+ *
+ * For the write path's PRE-DIFF: read against the MATERIALIZED document
+ * (`handle.doc()`, a plain frozen object), outside any change, so that only the
+ * entries that differ go through a change draft. Measured 2026-10-11 with real
+ * Automerge 3.2.6 (vitest scratch, 740 registry metas of 17 + 10 ids): reading
+ * every meta out of the materialized doc 0.4 ms, reconciling the same metas
+ * inside one change 266-279 ms — the draft is what costs.
+ *
+ * Conservative by construction: anything it cannot prove equal (a special
+ * Automerge value, a kind mismatch) reads as "would write", which only costs
+ * the ordinary reconcile.
+ */
+export function reconcileIsNoop(current: unknown, next: unknown): boolean {
+  if (Array.isArray(next)) {
+    if (!Array.isArray(current) || current.length !== next.length) return false
+    for (let i = 0; i < next.length; i++) if (!reconcileIsNoop(current[i], next[i])) return false
+    return true
+  }
+  if (isPlainObject(next)) {
+    if (!isPlainObject(current)) return false
+    for (const key of Object.keys(next)) {
+      const value = next[key]
+      // `undefined` = absent: a current key it would delete is caught by the
+      // loop over `current` below (a separate check here was a mutant no
+      // test could kill — review 2026-10-11).
+      if (value === undefined) continue
+      if (!(key in current) || !reconcileIsNoop(current[key], value)) return false
+    }
+    for (const key of Object.keys(current)) {
+      if (!(key in next) || next[key] === undefined) return false
+    }
+    return true
+  }
+  return current === next
+}
+
+/** Which keys `reconcile(collection, target)` would touch, decided against
+ * the MATERIALIZED collection (`reconcileIsNoop` per entry, outside any
+ * change): `update` = target keys whose value differs, `remove` = keys the
+ * target lacks or holds as `undefined`. Null when the reconcile would write
+ * nothing at all. */
+export interface CollectionReconcilePlan {
+  update: string[]
+  remove: string[]
+}
+
+export function planCollectionReconcile(
+  materialized: Record<string, unknown>,
+  target: Record<string, unknown>,
+): CollectionReconcilePlan | null {
+  const update: string[] = []
+  const remove: string[] = []
+  for (const key of Object.keys(target)) {
+    const next = target[key]
+    if (next === undefined) {
+      if (key in materialized) remove.push(key)
+      continue
+    }
+    if (!(key in materialized) || !reconcileIsNoop(materialized[key], next)) update.push(key)
+  }
+  for (const key of Object.keys(materialized)) {
+    if (!(key in target)) remove.push(key)
+  }
+  return update.length === 0 && remove.length === 0 ? null : { update, remove }
+}
+
+/** Apply a `planCollectionReconcile` plan to the change draft of the same
+ * collection: exactly `reconcile(draft, target)` minus the keys it would have
+ * left untouched — per-key `reconcileKey` (recursing, minimal ops), then the
+ * deletions, in reconcile's own order. */
+export function applyCollectionReconcile(
+  draft: Record<string, unknown>,
+  target: Record<string, unknown>,
+  plan: CollectionReconcilePlan,
+): void {
+  for (const key of plan.update) reconcileKey(draft, key, target[key])
+  for (const key of plan.remove) {
+    if (key in draft) delete draft[key]
+  }
+}
+
+/** Reconcile ONE key of `container` toward `next`, with exactly the semantics
+ * `reconcile` applies to that key when it walks the whole object: `undefined`
+ * deletes the key, containers recurse, primitives write only on change. For
+ * targeted writers that own a few fields of a large document and must not walk
+ * the rest of it (see `diagramViewWrite.ts`). */
+export function reconcileKey(container: Record<string, unknown>, key: string, next: unknown): void {
+  if (next === undefined) {
+    if (key in container) delete container[key]
+    return
+  }
+  reconcileValue(container, key, next)
+}
+
 /** Structured clone of JSON-ish data so we never hand an Automerge draft a
  * reference it might alias. (Avoids `structuredClone` for broad runtime support.)
  * Also DROPS `undefined`-valued object keys, which Automerge rejects with a

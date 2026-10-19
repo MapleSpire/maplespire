@@ -17,6 +17,7 @@ import {
   CameraRig,
   applyPose,
   distanceForZoom,
+  fitPoseToPoints,
   fovForPersp,
   lerpPose,
   poseFor2dViewport,
@@ -61,6 +62,48 @@ describe('camera math (design-kit CSS → three conversion)', () => {
     const fov = fovForPersp(1700)
     const d = distanceForZoom(1.25, 950, fov)
     expect(zoomForDistance(d, 950, fov)).toBeCloseTo(1.25, 9)
+  })
+
+  it('fitPoseToPoints puts every projected corner inside the canvas minus the chrome', () => {
+    // the run.mjs board's shape: a wide row of cards at the iso yaw, in a
+    // 1600x1000 editor with both panels, the tool pill and the bottom bars
+    const viewport = { width: 1600, height: 1000 }
+    const insets = { left: 388, right: 326, top: 62, bottom: 102 }
+    const corners: { x: number; y: number; z: number }[] = []
+    for (const [x, z, w, h] of [
+      [0, 0, 220, 120],
+      [300, -200, 220, 120],
+      [900, 0, 220, 120],
+      [600, 400, 200, 200],
+    ]) {
+      for (const cx of [x, x + w]) for (const cy of [0, 18]) for (const cz of [z, z + h]) corners.push({ x: cx, y: cy, z: cz })
+    }
+    const bounds = { cx: 560, cz: 200, width: 1120, height: 800 }
+    const start = presetPose('iso', bounds, viewport)
+    const project = (pose: CameraPose) => {
+      const cam = new THREE.PerspectiveCamera(pose.fov, viewport.width / viewport.height, 1, 1e7)
+      applyPose(cam, pose)
+      cam.updateMatrixWorld()
+      return corners.map((c) => {
+        const v = new THREE.Vector3(c.x, c.y, c.z).project(cam)
+        return { x: ((v.x + 1) / 2) * viewport.width, y: ((1 - v.y) / 2) * viewport.height }
+      })
+    }
+    const inside = (p: { x: number; y: number }) =>
+      p.x >= insets.left && p.x <= viewport.width - insets.right && p.y >= insets.top && p.y <= viewport.height - insets.bottom
+    // control: the bounds-only preset framing DOES put corners under the chrome
+    expect(project(start).every(inside)).toBe(false)
+    const fit = fitPoseToPoints(start, corners, viewport, insets, 16)
+    expect(fit.polar).toBe(start.polar)
+    expect(fit.azimuth).toBe(start.azimuth)
+    const pts = project(fit)
+    expect(pts.every(inside)).toBe(true)
+    // and it is a FIT, not a retreat: the hull fills the safe width or height
+    const xs = pts.map((p) => p.x)
+    const ys = pts.map((p) => p.y)
+    const fillW = (Math.max(...xs) - Math.min(...xs)) / (1600 - 388 - 326 - 32)
+    const fillH = (Math.max(...ys) - Math.min(...ys)) / (1000 - 62 - 102 - 32)
+    expect(Math.max(fillW, fillH)).toBeGreaterThan(0.98)
   })
 
   it('preset pose carries the kit polar/azimuth angles', () => {
@@ -166,6 +209,56 @@ describe('2D↔3D framing identity (§5 morph)', () => {
     reduced.tweenTo(to, 10_000, () => cut++)
     expect(cut).toBe(1)
     expect(reduced.getPose().targetX).toBe(500)
+  })
+
+  it('wheel zoom glides to an accumulated target instead of jumping a notch per event', () => {
+    const rig = new CameraRig(() => {}, () => false)
+    const d0 = rig.getPose().distance
+    const t0 = 1000
+    rig.dollySmooth(1.2, t0)
+    rig.dollySmooth(1.2, t0) // two notches before any frame: targets compound
+    // nothing moved on the event itself — the motion is spread over frames
+    expect(rig.getPose().distance).toBe(d0)
+    expect(rig.isAnimating()).toBe(true)
+    rig.step(t0 + 16)
+    const mid = rig.getPose().distance
+    expect(mid).toBeGreaterThan(d0)
+    expect(mid).toBeLessThan(d0 * 1.44)
+    // monotone approach, and it LANDS exactly on the compounded target
+    let prev = mid
+    for (let t = t0 + 32; t < t0 + 2000; t += 16) {
+      rig.step(t)
+      const d = rig.getPose().distance
+      expect(d).toBeGreaterThanOrEqual(prev)
+      prev = d
+    }
+    expect(rig.getPose().distance).toBeCloseTo(d0 * 1.44, 6)
+    expect(rig.isAnimating()).toBe(false)
+  })
+
+  it('wheel glide: clamps, yields to a tween, and jumps under reduced motion', () => {
+    const rig = new CameraRig(() => {}, () => false)
+    rig.dollySmooth(1e9, 0)
+    for (let t = 16; t < 3000; t += 16) rig.step(t)
+    expect(rig.getPose().distance).toBe(80_000)
+    rig.dollySmooth(0.5, 3000)
+    rig.tweenTo({ ...rig.getPose(), targetX: 42 }, 100)
+    // the tween owns the camera now; the glide must not keep easing distance
+    const at = rig.getPose().distance
+    rig.step(performance.now() + 1000)
+    expect(rig.getPose().distance).toBeCloseTo(at, 6)
+    // an explicit pose (enter morph, preset jump-cut) cancels the glide
+    rig.dollySmooth(2, 5000)
+    const fixed = { ...rig.getPose(), distance: 1234 }
+    rig.setPose(fixed)
+    expect(rig.isAnimating()).toBe(false)
+    rig.step(5100)
+    expect(rig.getPose().distance).toBe(1234)
+    const reduced = new CameraRig(() => {}, () => true)
+    const r0 = reduced.getPose().distance
+    reduced.dollySmooth(2, 0)
+    expect(reduced.getPose().distance).toBe(r0 * 2)
+    expect(reduced.isAnimating()).toBe(false)
   })
 
   it('frames content inside the visible viewport between floating sidebars', () => {

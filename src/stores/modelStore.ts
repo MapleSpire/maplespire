@@ -14,6 +14,7 @@
 
 import { create } from 'zustand'
 import { immer } from 'zustand/middleware/immer'
+import { isDraft, original } from 'immer'
 import type { C4Object, Connection, Diagram, Flow, FlowStep, Group, Tag, SelectedItem, Domain, Comment, DecisionRecord, Position, Size, ConnectionShape } from '../types'
 import { generateId } from '../lib/utils'
 import { LEGACY_COMMENT_AUTHOR, type CommentAuthorship } from '../lib/comments/authorship'
@@ -30,7 +31,7 @@ import {
   type PlacementIntentBatch,
   type PlacementLayoutSpace,
 } from '../lib/automerge/placementIntents'
-import { currentWorkspaceRef, workspaceRefKey } from '../lib/automerge/workspace'
+import { currentWorkspaceRef, subscribeWorkspaceRef, workspaceRefKey } from '../lib/automerge/workspace'
 import { workspaceKvStore } from '../lib/modelQuery/kvStore'
 
 export interface ObjectPlacementUpdate {
@@ -208,22 +209,740 @@ export function getDiagramIndex(): DiagramIndex {
 // Debounced syncAllLowerConnections helper.
 // Cancels any pending timer and re-schedules; the actual work runs once the
 // burst of mutations settles (trailing edge, 100 ms).
+//
+// SCOPED by the connection delta when the caller knows it (connect, reconnect,
+// delete — `endpointIds`): only the diagrams on which one of those endpoints
+// has a visible representative are re-derived (`diagramsReachingEndpoints`).
+// Measured 2026-10-11 (a Playwright connect-freeze probe, never committed; dev landscape of 739
+// diagrams / 12 421 objects / 6 929 connections, real mouse on the 2D canvas
+// and the 3D board): the unscoped pass re-derived EVERY diagram — each one an
+// O(objects + connections + all memberships) rebuild plus its own store
+// commit and index rebuild — as ONE 4 030-4 280 ms task 100 ms after every
+// connect, with the save badge already showing. A call without endpoint ids
+// (any caller that cannot name its delta) keeps the full pass, and a full
+// request in the same burst wins over a scoped one.
+//
+// The diagrams a mutation reaches are resolved at SCHEDULE time against the
+// index as it stands then — the mutators pass the reach of the OLD endpoints
+// and of the touched connection ids, read before their own commit, and
+// scheduleSyncAll adds the reach of every endpoint it is given — and again at
+// fire time for the endpoint ids collected over the burst. Resolving only at
+// fire time missed a diagram reached through an endpoint deleted later in the
+// same burst (delete A→B, then delete A and B: neither id resolves any more,
+// so the parent diagram's roll-up stayed stale). The two schedule-time
+// resolutions overlap for the old endpoints: removing either one alone leaves
+// every test green, removing both turns the burst test red (mutation battery,
+// 2026-10-11). The connection-id holders are defence in depth: no input found
+// reaches a diagram through them that the endpoints do not also reach.
+//
+// The pass itself runs in slices of LOWER_SYNC_SLICE_MS (`runLowerSlice`), so a
+// hub object reaching hundreds of diagrams yields between slices instead of
+// holding the main thread. A SCOPED pass is followed by a low-priority idle
+// HEAL over every diagram (`scheduleLowerHeal`): the unscoped pass used to
+// repair, incidentally, roll-ups left stale by paths that never re-derive
+// (remote projection, deleteObject, deleteSelectedItems, importModel, group
+// membership edits), and the scoped pass alone no longer does.
 // ---------------------------------------------------------------------------
 let _syncAllTimer: ReturnType<typeof setTimeout> | null = null
+let _syncAllFull = false
+let _syncScopeEndpointIds: Set<string> | null = null
+let _syncScopeDiagramIds: Set<string> | null = null
+let _syncWorkspaceKey: string | null = null
 
-function scheduleSyncAll(get: () => ModelState): void {
+const LOWER_SYNC_DEBOUNCE_MS = 100
+/** Work per slice before yielding; the first diagram of a slice that did not
+ * have to rebuild its context always runs, so a pass makes progress whatever
+ * the clock says. The commit (and the store subscribers it wakes) comes on top. */
+const LOWER_SYNC_SLICE_MS = 8
+/** rIC `timeout`: a board that never goes idle (a 3D scene animating every
+ * frame) still gets its heal, as an ordinary task. */
+const LOWER_HEAL_IDLE_TIMEOUT_MS = 2_000
+
+type LowerPassKind = 'scoped' | 'full' | 'heal'
+
+interface LowerPass {
+  kind: LowerPassKind
+  /** Diagram ids in processing order; null = every diagram, read at the first slice. */
+  queue: string[] | null
+  pos: number
+  ctx: LowerSyncContext | null
+  workspaceKey: string
+  /** Cancels the slice this pass has scheduled, if any. */
+  cancelScheduled: (() => void) | null
+}
+
+let _priorityPass: LowerPass | null = null
+let _healPass: LowerPass | null = null
+let lowerHealEnabled = true
+let lowerSyncNow: () => number = () => performance.now()
+let lowerSyncTrace: ((diagramId: string, kind: LowerPassKind) => void) | null = null
+
+const currentWorkspaceKey = (): string => workspaceRefKey(currentWorkspaceRef())
+
+let lowerScopeFailureLogged = false
+
+/**
+ * Run a SCOPE computation (which diagrams a connection mutation reaches).
+ * These run synchronously inside the user's own action, before or after its
+ * commit, and read model data that may come from a foreign or corrupt shard
+ * (a group whose `objectIds` is not an array…). On ANY throw: null, which every
+ * caller turns into a full pass — the user's edit must land whatever the scope
+ * computation thinks of the model. Logged once per session.
+ */
+function tryLowerScope<T>(compute: () => T): T | null {
+  try {
+    return compute()
+  } catch (error) {
+    if (!lowerScopeFailureLogged) {
+      lowerScopeFailureLogged = true
+      console.warn('[lower-sync] scope computation failed; falling back to a full roll-up pass', error)
+    }
+    return null
+  }
+}
+
+function scheduleSyncAll(
+  get: () => ModelState,
+  endpointIds?: readonly string[],
+  reachedDiagramIds?: Iterable<string>,
+): void {
+  // A newer mutation supersedes the heal; the pass it schedules re-arms one.
+  cancelLowerHeal()
+  const workspaceKey = currentWorkspaceKey()
+  if (_syncWorkspaceKey !== null && _syncWorkspaceKey !== workspaceKey) resetLowerSync()
+  _syncWorkspaceKey = workspaceKey
+  // Eager reach of the endpoints too: an endpoint deleted later in this burst
+  // no longer resolves at fire time. A reach that cannot be computed falls
+  // back to the full pass.
+  const eager = endpointIds === undefined || _syncAllFull
+    ? null
+    : tryLowerScope(() => diagramsReachingEndpoints(get(), endpointIds))
+  if (endpointIds === undefined || eager === null) {
+    _syncAllFull = true
+    _syncScopeEndpointIds = null
+    _syncScopeDiagramIds = null
+  } else {
+    _syncScopeEndpointIds ??= new Set()
+    for (const id of endpointIds) _syncScopeEndpointIds.add(id)
+    _syncScopeDiagramIds ??= new Set()
+    for (const id of reachedDiagramIds ?? []) _syncScopeDiagramIds.add(id)
+    for (const id of eager) _syncScopeDiagramIds.add(id)
+  }
   if (_syncAllTimer !== null) {
     clearTimeout(_syncAllTimer)
   }
-  _syncAllTimer = setTimeout(() => {
-    _syncAllTimer = null
-    const state = get()
-    for (const diagram of state.diagrams) {
-      // Re-read get() each iteration: syncLowerConnections mutates via immer set()
-      // so the latest version of get() is needed after each diagram sync.
-      get().syncLowerConnections(diagram.id)
+  _syncAllTimer = setTimeout(fireLowerSync, LOWER_SYNC_DEBOUNCE_MS)
+}
+
+function fireLowerSync(): void {
+  _syncAllTimer = null
+  const full = _syncAllFull
+  const endpoints = _syncScopeEndpointIds
+  const reached = _syncScopeDiagramIds
+  const workspaceKey = _syncWorkspaceKey ?? currentWorkspaceKey()
+  _syncAllFull = false
+  _syncScopeEndpointIds = null
+  _syncScopeDiagramIds = null
+  _syncWorkspaceKey = null
+  if (workspaceKey !== currentWorkspaceKey()) return
+  // This pass re-arms the heal when it is done.
+  cancelLowerHeal()
+  const state = useModelStore.getState()
+  const fireReach = full || endpoints === null
+    ? []
+    : tryLowerScope(() => diagramsReachingEndpoints(state, endpoints))
+  const isFull = full || (endpoints === null && reached === null) || fireReach === null
+  let targets: string[]
+  if (isFull) {
+    targets = state.diagrams.map((diagram) => diagram.id)
+  } else {
+    const wanted = new Set(reached ?? [])
+    for (const id of fireReach ?? []) wanted.add(id)
+    // What an in-flight pass had not reached yet is still owed.
+    const inFlight = _priorityPass
+    if (inFlight?.queue) for (let i = inFlight.pos; i < inFlight.queue.length; i++) wanted.add(inFlight.queue[i])
+    targets = wanted.size === 0 ? [] : state.diagrams.filter((d) => wanted.has(d.id)).map((d) => d.id)
+  }
+  cancelPriorityPass()
+  _priorityPass = {
+    kind: isFull ? 'full' : 'scoped',
+    queue: targets,
+    pos: 0,
+    ctx: null,
+    workspaceKey,
+    cancelScheduled: null,
+  }
+  runPriorityPass()
+}
+
+function runPriorityPass(): void {
+  const pass = _priorityPass
+  if (!pass) return
+  pass.cancelScheduled = null
+  const outcome = runLowerSlice(pass, LOWER_SYNC_SLICE_MS)
+  if (_priorityPass !== pass) return
+  if (outcome === 'more') {
+    const timer = setTimeout(runPriorityPass, 0)
+    pass.cancelScheduled = () => clearTimeout(timer)
+    return
+  }
+  _priorityPass = null
+  // A request already debounced will schedule its own pass, and that pass
+  // the heal: arming one now would only be cancelled by it.
+  if (outcome === 'done' && pass.kind === 'scoped' && _syncAllTimer === null) scheduleLowerHeal(pass.workspaceKey)
+}
+
+function cancelPriorityPass(): void {
+  if (!_priorityPass) return
+  _priorityPass.cancelScheduled?.()
+  _priorityPass = null
+}
+
+function scheduleLowerHeal(workspaceKey: string): void {
+  cancelLowerHeal()
+  if (!lowerHealEnabled) return
+  const pass: LowerPass = { kind: 'heal', queue: null, pos: 0, ctx: null, workspaceKey, cancelScheduled: null }
+  _healPass = pass
+  armLowerHealSlice(pass)
+}
+
+function armLowerHealSlice(pass: LowerPass): void {
+  pass.cancelScheduled = whenLowerSyncIdle((budgetMs) => {
+    if (_healPass !== pass) return
+    pass.cancelScheduled = null
+    const outcome = runLowerSlice(pass, budgetMs)
+    // The slice's own commit may have woken code that superseded this heal.
+    if (_healPass !== pass) return
+    if (outcome === 'more') armLowerHealSlice(pass)
+    else _healPass = null
+  })
+}
+
+function cancelLowerHeal(): void {
+  if (!_healPass) return
+  _healPass.cancelScheduled?.()
+  _healPass = null
+}
+
+interface IdleDeadlineLike {
+  didTimeout: boolean
+  timeRemaining: () => number
+}
+
+/** requestIdleCallback with a setTimeout fallback (Safari, Node). The budget is
+ * the idle period left, capped at LOWER_SYNC_SLICE_MS. */
+function whenLowerSyncIdle(run: (budgetMs: number) => void): () => void {
+  const host = globalThis as typeof globalThis & {
+    requestIdleCallback?: (callback: (deadline: IdleDeadlineLike) => void, options?: { timeout: number }) => number
+    cancelIdleCallback?: (id: number) => void
+  }
+  if (typeof host.requestIdleCallback === 'function') {
+    const id = host.requestIdleCallback((deadline) => {
+      const remaining = deadline.didTimeout ? LOWER_SYNC_SLICE_MS : deadline.timeRemaining()
+      run(Math.max(1, Math.min(LOWER_SYNC_SLICE_MS, remaining)))
+    }, { timeout: LOWER_HEAL_IDLE_TIMEOUT_MS })
+    return () => host.cancelIdleCallback?.(id)
+  }
+  const timer = setTimeout(() => run(LOWER_SYNC_SLICE_MS), 0)
+  return () => clearTimeout(timer)
+}
+
+/** Drop everything pending: the debounced request, an in-flight pass, the heal. */
+function resetLowerSync(): void {
+  if (_syncAllTimer !== null) clearTimeout(_syncAllTimer)
+  _syncAllTimer = null
+  _syncAllFull = false
+  _syncScopeEndpointIds = null
+  _syncScopeDiagramIds = null
+  _syncWorkspaceKey = null
+  cancelPriorityPass()
+  cancelLowerHeal()
+}
+
+// A workspace switch replaces the whole model: nothing collected for, or
+// derived against, the previous one may run against the next. (A ref primed
+// without notification is still caught: every slice re-checks the key.)
+subscribeWorkspaceRef(() => resetLowerSync())
+
+/**
+ * One slice of a pass: (re)build the context if the store moved under it,
+ * derive diagrams until the budget is spent, commit once.
+ *
+ * A context gone stale (the store moved between two slices) is rebuilt and
+ * the pass KEEPS its position, heal included: restarting the heal from the
+ * first diagram on every foreign change starved it for as long as the changes
+ * kept coming (a remote peer dragging replaces `objects` many times a
+ * second). The price: a diagram derived before the change, and a diagram
+ * added during the heal, may lag until the next heal.
+ *
+ * A slice that throws drops its pass — no model-sized context retained, no
+ * pass left registered as running — and the error propagates to the task
+ * that ran it.
+ */
+function runLowerSlice(pass: LowerPass, budgetMs: number): 'more' | 'done' | 'cancelled' {
+  if (pass.workspaceKey !== currentWorkspaceKey()) return 'cancelled'
+  // Nothing (left) to derive: no context to build.
+  if (pass.queue !== null && pass.pos >= pass.queue.length) return 'done'
+  let completed = false
+  try {
+    const started = lowerSyncNow()
+    const state = useModelStore.getState()
+    let rebuilt = false
+    if (pass.ctx === null || !lowerSyncContextCurrent(pass.ctx, state)) {
+      pass.ctx = buildLowerSyncContext(state)
+      rebuilt = true
     }
-  }, 100)
+    if (pass.queue === null) {
+      pass.queue = state.diagrams.map((diagram) => diagram.id)
+      pass.pos = 0
+    }
+    let derived = 0
+    while (pass.pos < pass.queue.length) {
+      // A slice that spent its budget on the (re)build yields before deriving;
+      // the next one finds the context current and derives at least one.
+      if ((derived > 0 || rebuilt) && lowerSyncNow() - started >= budgetMs) break
+      const diagramId = pass.queue[pass.pos++]
+      lowerSyncTrace?.(diagramId, pass.kind)
+      deriveLowerConnections(pass.ctx, diagramId)
+      derived++
+    }
+    const committed = commitLowerSync(pass.ctx)
+    if (import.meta.env.DEV) {
+      // Dev-only measurement hook for the Playwright connect-freeze probe
+      // (never committed): a page that defines the array gets one entry per slice.
+      const probe = (globalThis as { __lowerSyncProbe?: unknown[] }).__lowerSyncProbe
+      if (Array.isArray(probe)) {
+        probe.push({ kind: pass.kind, at: started, ms: lowerSyncNow() - started, derived, committed, rebuilt, left: pass.queue.length - pass.pos })
+      }
+    }
+    completed = true
+    return pass.pos < pass.queue.length ? 'more' : 'done'
+  } finally {
+    if (!completed) {
+      pass.ctx = null
+      pass.queue = []
+      pass.pos = 0
+      pass.cancelScheduled?.()
+      pass.cancelScheduled = null
+      if (_priorityPass === pass) _priorityPass = null
+      if (_healPass === pass) _healPass = null
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Lower roll-up derivation. `syncLowerConnections(diagramId)` re-derives ONE
+// diagram's roll-up; everything it reads except that diagram's own membership
+// is the same for every diagram of a pass — the object, group and connection
+// id-maps, the lowers by endpoint pair, which connection ids the diagrams
+// reference — so a pass builds them ONCE and keeps them current across its own
+// derivations instead of rebuilding them per diagram (the per-diagram rebuild
+// is what made a pass O(diagrams × model)). Derivations are applied to the
+// context immediately and committed to the store once per slice.
+//
+// Measured 2026-10-11 (Playwright connect-freeze and 3D heal-commit probes, never committed;
+// dev landscape of 745 diagrams / 12 482 objects / ~7 020 connections, real
+// mouse, 3 runs each in 2D and 3D): a connect's scoped pass is one 2.8-4.9 ms
+// slice; the heal that follows covers every diagram in 84-123 slices of at
+// most 8.7-9.9 ms (5.6-15.1 ms for a slice that commits), 651-732 ms of CPU
+// in all when nothing is stale, spread over 1.4-4.4 s. With the original
+// upward ancestor walk per direct connection instead of the downward
+// `visible` map, the same heal took 1.47-2.37 s of CPU in 169-243 slices of
+// up to 13.7 ms.
+// ---------------------------------------------------------------------------
+
+interface LowerSyncContext {
+  /** The store arrays this context reflects (after its own commits). */
+  diagrams: Diagram[]
+  objects: C4Object[]
+  groups: Group[]
+  connections: Connection[]
+  /** parentId -> child object ids, in store order. */
+  childrenByParentId: Map<string, string[]>
+  groupMap: Map<string, Group>
+  connectionMap: Map<string, Connection>
+  /** Every non-lower connection, in store order. A lower pass never changes it. */
+  directConnections: Connection[]
+  /** Lowers by endpoint pair, in store order — the LAST one is the one reused. */
+  lowersByPair: Map<string, Connection[]>
+  /** connection id -> how many diagrams reference it (once per diagram). */
+  refCount: Map<string, number>
+  diagramIndexById: Map<string, number>
+  /** Derived, not yet committed. */
+  pendingConnectionIds: Map<string, string[]>
+  pruned: Set<string>
+  added: Connection[]
+}
+
+type LowerSyncSource = Pick<ModelState, 'diagrams' | 'objects' | 'groups' | 'connections'>
+
+const lowerPairKey = (fromId: string, toId: string): string => `${fromId}→${toId}`
+
+function lowerSyncContextCurrent(ctx: LowerSyncContext, state: LowerSyncSource): boolean {
+  return ctx.diagrams === state.diagrams
+    && ctx.objects === state.objects
+    && ctx.groups === state.groups
+    && ctx.connections === state.connections
+}
+
+function buildLowerSyncContext(source: LowerSyncSource): LowerSyncContext {
+  const { diagrams, objects, groups, connections } = source
+  const childrenByParentId = new Map<string, string[]>()
+  for (const obj of objects) {
+    if (!obj.parentId) continue
+    const siblings = childrenByParentId.get(obj.parentId)
+    if (siblings) siblings.push(obj.id)
+    else childrenByParentId.set(obj.parentId, [obj.id])
+  }
+  const groupMap = new Map<string, Group>()
+  for (const grp of groups) groupMap.set(grp.id, grp)
+  const connectionMap = new Map<string, Connection>()
+  const directConnections: Connection[] = []
+  const lowersByPair = new Map<string, Connection[]>()
+  for (const conn of connections) {
+    connectionMap.set(conn.id, conn)
+    if (conn.kind === 'lower') {
+      const key = lowerPairKey(conn.fromId, conn.toId)
+      const list = lowersByPair.get(key)
+      if (list) list.push(conn)
+      else lowersByPair.set(key, [conn])
+    } else {
+      directConnections.push(conn)
+    }
+  }
+  const refCount = new Map<string, number>()
+  const countedIn = new Map<string, number>()
+  const diagramIndexById = new Map<string, number>()
+  for (let i = 0; i < diagrams.length; i++) {
+    const diagram = diagrams[i]
+    if (!diagramIndexById.has(diagram.id)) diagramIndexById.set(diagram.id, i)
+    for (const cid of diagram.connectionIds) {
+      if (countedIn.get(cid) === i) continue
+      countedIn.set(cid, i)
+      refCount.set(cid, (refCount.get(cid) ?? 0) + 1)
+    }
+  }
+  return {
+    diagrams, objects, groups, connections,
+    childrenByParentId, groupMap, connectionMap, directConnections, lowersByPair, refCount, diagramIndexById,
+    pendingConnectionIds: new Map(), pruned: new Set(), added: [],
+  }
+}
+
+function adjustRefCount(ctx: LowerSyncContext, ids: readonly string[], delta: 1 | -1): void {
+  for (const cid of new Set(ids)) {
+    const next = (ctx.refCount.get(cid) ?? 0) + delta
+    if (next > 0) ctx.refCount.set(cid, next)
+    else ctx.refCount.delete(cid)
+  }
+}
+
+/**
+ * Re-derive one diagram's lower connections against `ctx` and apply the
+ * result to it. False when nothing changes (same membership in the same
+ * order, nothing added or pruned) — the diagram is then not committed at all.
+ */
+function deriveLowerConnections(ctx: LowerSyncContext, diagramId: string): boolean {
+  const index = ctx.diagramIndexById.get(diagramId)
+  if (index === undefined) return false
+  const diagram = ctx.diagrams[index]
+  const currentIds = ctx.pendingConnectionIds.get(diagramId) ?? diagram.connectionIds
+  const diagramObjectSet = new Set(diagram.objectIds)
+
+  // Membership map: objectId -> containing groupId (only for groups on this diagram)
+  const objectToGroup = new Map<string, string>()
+  for (const groupId of diagram.groupIds) {
+    const group = ctx.groupMap.get(groupId)
+    if (group) {
+      for (const oid of group.objectIds) objectToGroup.set(oid, groupId)
+    }
+  }
+
+  // Nearest visible ancestor-or-self on this diagram, for every object that
+  // has one: walk DOWN from each object on the diagram, stopping at a child
+  // that is itself on the diagram (it is its own nearest). Equivalent to
+  // walking up from each endpoint (the original `findVisibleEndpoint`), which
+  // ran once per direct connection per diagram. `visible.has` doubles as the
+  // visited set, so a parent cycle cannot loop here.
+  const visible = new Map<string, string>()
+  for (const id of diagramObjectSet) visible.set(id, id)
+  for (const root of diagramObjectSet) {
+    const children = ctx.childrenByParentId.get(root)
+    if (!children) continue
+    const stack = children.slice()
+    while (stack.length > 0) {
+      const id = stack.pop()!
+      if (visible.has(id)) continue
+      visible.set(id, root)
+      const grandchildren = ctx.childrenByParentId.get(id)
+      if (grandchildren) for (const child of grandchildren) stack.push(child)
+    }
+  }
+  const findVisibleEndpoint = (objectId: string): string | null =>
+    visible.get(objectId) ?? objectToGroup.get(objectId) ?? null
+
+  // Lower connections currently attached to this diagram, and the diagram's
+  // NON-lower connections (the needed lower ones are re-attached below,
+  // reusing the same objects, hence the same ids).
+  const existingLowerIds: string[] = []
+  const newConnectionIds: string[] = []
+  for (const cid of currentIds) {
+    if (ctx.connectionMap.get(cid)?.kind === 'lower') existingLowerIds.push(cid)
+    else newConnectionIds.push(cid)
+  }
+
+  // --- Re-derive the lower connections this diagram needs. An existing lower
+  // with the same endpoint pair is reused, so a still-needed one keeps its id
+  // across re-syncs (deleting + recreating it invalidated a live selection —
+  // the right sidebar flickered open/closed). ---
+  const newConnectionIdSet = new Set(newConnectionIds)
+  const seenPairs = new Set<string>()
+  const usedLowerIds = new Set<string>()
+  const additions: Connection[] = []
+
+  for (const directConn of ctx.directConnections) {
+    const visibleFrom = findVisibleEndpoint(directConn.fromId)
+    const visibleTo = findVisibleEndpoint(directConn.toId)
+
+    // Skip if either endpoint has no visible representative
+    if (!visibleFrom || !visibleTo) continue
+
+    // Skip if both endpoints are directly visible (direct connection already shown)
+    if (visibleFrom === directConn.fromId && visibleTo === directConn.toId) continue
+
+    // Skip if rolled-up endpoints are the same (self-loop)
+    if (visibleFrom === visibleTo) continue
+
+    const pairKey = lowerPairKey(visibleFrom, visibleTo)
+    if (seenPairs.has(pairKey)) continue
+    seenPairs.add(pairKey)
+
+    const sameLowers = ctx.lowersByPair.get(pairKey)
+    const existingLower = sameLowers?.[sameLowers.length - 1]
+    if (existingLower) {
+      if (!newConnectionIdSet.has(existingLower.id)) {
+        newConnectionIds.push(existingLower.id)
+        newConnectionIdSet.add(existingLower.id)
+      }
+      usedLowerIds.add(existingLower.id)
+    } else {
+      const newConn: Connection = {
+        id: generateId(),
+        fromId: visibleFrom,
+        toId: visibleTo,
+        kind: 'lower',
+        type: 'dashed',
+        label: '',
+      }
+      additions.push(newConn)
+      newConnectionIds.push(newConn.id)
+      newConnectionIdSet.add(newConn.id)
+      usedLowerIds.add(newConn.id)
+    }
+  }
+
+  // --- Prune lower connections this diagram no longer needs and that no
+  // other diagram references (this one accounts for exactly one reference).
+  // Reused ones are kept, so ids stay stable. ---
+  const toPrune = new Set(
+    existingLowerIds.filter((cid) => !usedLowerIds.has(cid) && (ctx.refCount.get(cid) ?? 0) <= 1)
+  )
+
+  // Nothing to commit: same membership in the same order, nothing added or
+  // pruned. Committing anyway hands every subscriber a new `diagrams` array
+  // (index rebuild, React selectors, the bridge's durable-write classifier)
+  // for an identical value — once per diagram re-derived.
+  if (
+    additions.length === 0
+    && toPrune.size === 0
+    && newConnectionIds.length === currentIds.length
+    && newConnectionIds.every((cid, i) => cid === currentIds[i])
+  ) return false
+
+  adjustRefCount(ctx, currentIds, -1)
+  adjustRefCount(ctx, newConnectionIds, 1)
+  for (const cid of toPrune) {
+    const pruned = ctx.connectionMap.get(cid)
+    ctx.connectionMap.delete(cid)
+    ctx.pruned.add(cid)
+    if (!pruned) continue
+    const key = lowerPairKey(pruned.fromId, pruned.toId)
+    const kept = (ctx.lowersByPair.get(key) ?? []).filter((conn) => conn.id !== cid)
+    if (kept.length > 0) ctx.lowersByPair.set(key, kept)
+    else ctx.lowersByPair.delete(key)
+  }
+  for (const addition of additions) {
+    ctx.connectionMap.set(addition.id, addition)
+    const key = lowerPairKey(addition.fromId, addition.toId)
+    const list = ctx.lowersByPair.get(key)
+    if (list) list.push(addition)
+    else ctx.lowersByPair.set(key, [addition])
+    ctx.added.push(addition)
+  }
+  ctx.pendingConnectionIds.set(diagramId, newConnectionIds)
+  return true
+}
+
+/**
+ * Commit what `ctx` derived since its last commit, in ONE store update.
+ * Plain arrays, swapped whole: immer never drafts the large element arrays.
+ * The result is the one the per-diagram commits produced in sequence — each
+ * pruned lower removed, each addition appended in derivation order. Returns
+ * the number of diagrams committed.
+ */
+function commitLowerSync(ctx: LowerSyncContext): number {
+  const changed = ctx.pendingConnectionIds.size
+  if (changed === 0 && ctx.pruned.size === 0 && ctx.added.length === 0) return 0
+  const diagrams = ctx.diagrams.slice()
+  for (const [diagramId, connectionIds] of ctx.pendingConnectionIds) {
+    const index = ctx.diagramIndexById.get(diagramId)
+    if (index !== undefined) diagrams[index] = { ...diagrams[index], connectionIds }
+  }
+  let connections: Connection[] | null = null
+  if (ctx.pruned.size > 0 || ctx.added.length > 0) {
+    connections = ctx.pruned.size > 0 ? ctx.connections.filter((c) => !ctx.pruned.has(c.id)) : ctx.connections.slice()
+    for (const addition of ctx.added) if (!ctx.pruned.has(addition.id)) connections.push(addition)
+  }
+  ctx.pendingConnectionIds.clear()
+  ctx.pruned.clear()
+  ctx.added = []
+  // Recorded BEFORE the update: a subscriber that writes the store from inside
+  // it must read as a foreign change to the next slice, not as this commit.
+  ctx.diagrams = diagrams
+  if (connections) ctx.connections = connections
+  useModelStore.setState(connections ? { diagrams, connections } : { diagrams })
+  return changed
+}
+
+function drainLowerHeal(): void {
+  while (_healPass) {
+    const pass = _healPass
+    pass.cancelScheduled?.()
+    pass.cancelScheduled = null
+    if (runLowerSlice(pass, LOWER_SYNC_SLICE_MS) !== 'more' && _healPass === pass) _healPass = null
+  }
+}
+
+/** Test seams: observe and drive the debounced pass and the idle heal. */
+export const __lowerSyncForTest = {
+  trace(fn: ((diagramId: string, kind: LowerPassKind) => void) | null): void {
+    lowerSyncTrace = fn
+  },
+  setHealEnabled(enabled: boolean): void {
+    lowerHealEnabled = enabled
+    if (!enabled) cancelLowerHeal()
+  },
+  setClock(now: (() => number) | null): void {
+    lowerSyncNow = now ?? (() => performance.now())
+  },
+  pending(): { debounce: boolean; priority: boolean; heal: boolean } {
+    return { debounce: _syncAllTimer !== null, priority: _priorityPass !== null, heal: _healPass !== null }
+  },
+  /** Run the debounced request, the pass and the heal to completion, now. */
+  drain(): void {
+    if (_syncAllTimer !== null) {
+      clearTimeout(_syncAllTimer)
+      fireLowerSync()
+    }
+    while (_priorityPass) {
+      _priorityPass.cancelScheduled?.()
+      runPriorityPass()
+    }
+    drainLowerHeal()
+  },
+  /** Run ONLY the idle heal (if one is armed) to completion. */
+  runHeal(): void {
+    drainLowerHeal()
+  },
+  scheduleHeal(): void {
+    scheduleLowerHeal(currentWorkspaceKey())
+  },
+  reset(): void {
+    resetLowerSync()
+  },
+}
+
+/**
+ * The diagrams whose lower roll-up a change to connections touching
+ * `endpointIds` can alter, in store order. A connection contributes to a
+ * diagram's roll-up only when BOTH its endpoints resolve through
+ * `syncLowerConnections`' `findVisibleEndpoint` — the endpoint itself or its
+ * nearest ancestor is on the diagram, or a group on the diagram holds it. This
+ * returns every diagram where ANY endpoint resolves, a superset: re-deriving an
+ * unaffected diagram is a no-op (no commit, see syncLowerConnections), missing
+ * an affected one would leave a stale roll-up. Pruning stays correct for the
+ * diagrams skipped: their own needed set did not change, so a lower they
+ * reference is still referenced.
+ *
+ * An endpoint may also be a GROUP id: a lower rolled up through
+ * `findVisibleEndpoint` onto a group runs G1→G2, so deleting it must reach the
+ * diagrams that show those groups.
+ *
+ * Reads the module DiagramIndex, which the subscriber at the bottom of this
+ * file rebuilds synchronously on every store change.
+ */
+export function diagramsReachingEndpoints(
+  state: Pick<ModelState, 'diagrams' | 'groups'>,
+  endpointIds: Iterable<string>,
+): string[] {
+  const index = getDiagramIndex()
+  const reached = new Set<string>()
+  const endpoints = new Set(endpointIds)
+  for (const endpointId of endpoints) {
+    for (const diagramId of index.groupToDiagramIds.get(endpointId) ?? []) reached.add(diagramId)
+    const seen = new Set<string>()
+    let current: string | undefined = endpointId
+    while (current && !seen.has(current)) {
+      seen.add(current)
+      for (const diagramId of index.objectToDiagramIds.get(current) ?? []) reached.add(diagramId)
+      current = index.objectById.get(current)?.parentId
+    }
+  }
+  for (const group of state.groups) {
+    if (!group.objectIds.some((id) => endpoints.has(id))) continue
+    for (const diagramId of index.groupToDiagramIds.get(group.id) ?? []) reached.add(diagramId)
+  }
+  if (reached.size === 0) return []
+  return state.diagrams.filter((diagram) => reached.has(diagram.id)).map((diagram) => diagram.id)
+}
+
+/** The diagrams a connection mutation can affect, resolved NOW — call it
+ * BEFORE the mutation's own commit: the endpoints' reach (see
+ * diagramsReachingEndpoints) plus every diagram that holds one of the
+ * connection ids (a deleted connection leaves every `connectionIds`). */
+function reachBeforeMutation(endpointIds: readonly string[], connectionIds: readonly string[]): string[] {
+  const reached = new Set(diagramsReachingEndpoints(useModelStore.getState(), endpointIds))
+  const holders = getDiagramIndex().connectionToDiagramIds
+  for (const cid of connectionIds) {
+    for (const diagramId of holders.get(cid) ?? []) reached.add(diagramId)
+  }
+  return [...reached]
+}
+
+/** Scope of a batch of connection updates, read from the index BEFORE the
+ * update is applied (call it before `set`): old AND new endpoints of every
+ * endpoint-changing update, and the diagrams the OLD side reaches now. */
+function connectionUpdateScope(updates: readonly ConnectionBatchUpdate[]): {
+  endpointIds: string[]
+  reachedDiagramIds: string[]
+} {
+  const byId = getDiagramIndex().connectionById
+  const endpointIds: string[] = []
+  const oldEndpointIds: string[] = []
+  const connectionIds: string[] = []
+  for (const { id, data } of updates) {
+    if (data.fromId === undefined && data.toId === undefined) continue
+    const before = byId.get(id)
+    if (before) {
+      endpointIds.push(before.fromId, before.toId)
+      oldEndpointIds.push(before.fromId, before.toId)
+      connectionIds.push(id)
+    }
+    if (data.fromId !== undefined) endpointIds.push(data.fromId)
+    if (data.toId !== undefined) endpointIds.push(data.toId)
+  }
+  const reachedDiagramIds = connectionIds.length > 0 ? reachBeforeMutation(oldEndpointIds, connectionIds) : []
+  return { endpointIds, reachedDiagramIds }
 }
 
 interface ModelState {
@@ -411,7 +1130,12 @@ interface ModelState {
   getDescendantObjects: (objectId: string) => string[]
   getGroupClosure: (groupId: string) => string[]
   syncLowerConnections: (diagramId: string) => void
-  syncAllLowerConnections: () => void
+  /** Debounced roll-up re-derivation. With `endpointIds` (the old and new
+   * endpoints of the connections a mutation touched) only the diagrams those
+   * endpoints reach are re-derived — plus `reachedDiagramIds`, the reach the
+   * caller resolved BEFORE its own commit — then an idle heal re-derives the
+   * rest; without, every diagram. */
+  syncAllLowerConnections: (endpointIds?: readonly string[], reachedDiagramIds?: readonly string[]) => void
 
   // Related diagrams for expand/zoom navigation
   getRelatedDiagrams: (objectId: string, options?: { includeCurrent?: boolean }) => {
@@ -525,6 +1249,32 @@ function has3dRouting(c: Connection): boolean {
 }
 
 /**
+ * `list.find((x) => x.id === id)` for many ids, without reading every
+ * element through an immer draft: ids are indexed once on the plain base
+ * array (the draft's `original`, or `list` itself when it is not a draft),
+ * and the element is read from `list` at that index. An index the draft no
+ * longer agrees with (an element inserted or removed earlier in the same
+ * recipe) falls back to the scan. (Not `find`'s answer in one case only: a
+ * duplicate id inserted ahead of the original in the same recipe.)
+ */
+function draftLookup<T extends { id: string }>(list: T[]): (id: string) => T | undefined {
+  let index: Map<string, number> | null = null
+  return (id) => {
+    if (!index) {
+      const base = ((isDraft(list) ? original(list as never) : list) as T[] | undefined) ?? list
+      index = new Map()
+      for (let i = 0; i < base.length; i++) if (!index.has(base[i].id)) index.set(base[i].id, i)
+    }
+    const i = index.get(id)
+    if (i !== undefined) {
+      const x = list[i]
+      if (x && x.id === id) return x
+    }
+    return list.find((x) => x.id === id)
+  }
+}
+
+/**
  * Fork-on-first-3D-edit: the first edit made on the 3D board snapshots the
  * diagram's CURRENTLY-RESOLVED placement (objects + groups + its connections'
  * routing) into the 3D layer, so later 2D edits can't tear the perfected 3D
@@ -538,24 +1288,34 @@ function ensureFork3d(
   diagram: Diagram,
 ): void {
   if (diagram.layouts3d) return
+  // CONNECT FREEZE (2026-10-11): `state.objects.find` per member walked the
+  // WHOLE landscape through the immer draft — every element read makes a
+  // proxy — on the first 3D edit of a diagram: ensureFork3d was 23-27 ms of
+  // a reconnect's pointerup on a 9-node diagram of the dev landscape
+  // (12 482 objects, 7 038 connections; reconnect-drop profile,
+  // tp5-connect3d). Each id is now located once through the plain base
+  // array, then read from the draft at that index.
+  const find = draftLookup(state.objects)
   const l3: Record<string, { position: Position; size: Size }> = {}
   for (const oid of diagram.objectIds) {
-    const o = state.objects.find((x) => x.id === oid)
+    const o = find(oid)
     const l = diagram.layouts?.[oid]
     const position = l?.position ?? o?.position
     const size = l?.size ?? o?.size
     if (position && size) l3[oid] = { position: { ...position }, size: { ...size } }
   }
+  const findGroup = draftLookup(state.groups)
   for (const gid of diagram.groupIds) {
-    const g = state.groups.find((x) => x.id === gid)
+    const g = findGroup(gid)
     const l = diagram.layouts?.[gid]
     const position = l?.position ?? g?.position
     const size = l?.size ?? g?.size
     if (position && size) l3[gid] = { position: { ...position }, size: { ...size } }
   }
   diagram.layouts3d = l3
+  const findConnection = draftLookup(state.connections)
   for (const cid of diagram.connectionIds) {
-    const c = state.connections.find((x) => x.id === cid)
+    const c = findConnection(cid)
     if (!c || has3dRouting(c)) continue
     if (c.waypoints) c.waypoints3d = c.waypoints.map((p) => ({ ...p }))
     if (c.fromAnchor !== undefined) c.fromAnchor3d = c.fromAnchor
@@ -930,6 +1690,9 @@ export const useModelStore = create<ModelState>()(
 
     updatePlacementsBatch: ({ objects = [], groups = [], connections = [] }) => {
       if (objects.length === 0 && groups.length === 0 && connections.length === 0) return
+      // Read before the commit: the scoped roll-up needs the OLD endpoints too.
+      // (null = could not be computed: the roll-up falls back to a full pass)
+      const lowerScope = tryLowerScope(() => connectionUpdateScope(connections))
       const before = get()
       const diagram = before.diagrams.find((candidate) => candidate.id === before.currentDiagramId)
       const space = activeLayoutSpace()
@@ -1019,7 +1782,7 @@ export const useModelStore = create<ModelState>()(
         if (placementRevision !== undefined) state.placementRevision = placementRevision
       })
       if (connections.some(({ data }) => data.fromId !== undefined || data.toId !== undefined)) {
-        get().syncAllLowerConnections()
+        get().syncAllLowerConnections(lowerScope?.endpointIds, lowerScope?.reachedDiagramIds)
       }
     },
 
@@ -1047,11 +1810,14 @@ export const useModelStore = create<ModelState>()(
           diagram.connectionIds.push(id)
         }
       })
-      get().syncAllLowerConnections()
+      get().syncAllLowerConnections([conn.fromId, conn.toId])
       return id
     },
 
     updateConnectionsBatch: (updates) => {
+      // Read before the commit: the scoped roll-up needs the OLD endpoints too.
+      // (null = could not be computed: the roll-up falls back to a full pass)
+      const lowerScope = tryLowerScope(() => connectionUpdateScope(updates))
       set((state) => {
         const byId = new Map(state.connections.map((connection, index) => [connection.id, index]))
         for (const { id, data } of updates) {
@@ -1075,7 +1841,7 @@ export const useModelStore = create<ModelState>()(
       // (a reconnect); a curved↔straight / solid↔dashed / label edit skips the whole
       // O(diagrams×connections) recompute it used to trigger on every keystroke.
       if (updates.some(({ data }) => data.fromId !== undefined || data.toId !== undefined)) {
-        get().syncAllLowerConnections()
+        get().syncAllLowerConnections(lowerScope?.endpointIds, lowerScope?.reachedDiagramIds)
       }
     },
 
@@ -1219,6 +1985,11 @@ export const useModelStore = create<ModelState>()(
     },
 
     deleteConnection: (id) => {
+      const deleted = getDiagramIndex().connectionById.get(id)
+      // Before the commit: the delete takes `id` out of every diagram, and the
+      // endpoints may be deleted later in the same burst.
+      // (null = could not be computed: the roll-up falls back to a full pass)
+      const reached = deleted ? tryLowerScope(() => reachBeforeMutation([deleted.fromId, deleted.toId], [id])) : null
       set((state) => {
         const connection = state.connections.find((candidate) => candidate.id === id)
         if (connection?.kind !== 'lower' && !state.pendingDeletedConnectionIds.includes(id)) {
@@ -1230,7 +2001,8 @@ export const useModelStore = create<ModelState>()(
         })
         state.selectedItems = state.selectedItems.filter((s) => s.id !== id)
       })
-      get().syncAllLowerConnections()
+      // An id the index does not know keeps the full pass (nothing to scope by).
+      get().syncAllLowerConnections(deleted && reached ? [deleted.fromId, deleted.toId] : undefined, reached ?? undefined)
     },
 
     selectObjects: (ids) => {
@@ -2147,11 +2919,12 @@ export const useModelStore = create<ModelState>()(
       get().syncLowerConnections(targetDiagramId)
     },
 
-    syncAllLowerConnections: () => {
+    syncAllLowerConnections: (endpointIds, reachedDiagramIds) => {
       // Debounced: rapid connection mutations (add/update/delete) batch into one
       // pass ~100 ms after the last call, avoiding O(D×C×O) per keystroke.
-      // The settled final state is identical to the synchronous behaviour.
-      scheduleSyncAll(get)
+      // Scoped to the diagrams the endpoints reach when the caller names them
+      // (see scheduleSyncAll for the measurement).
+      scheduleSyncAll(get, endpointIds, reachedDiagramIds)
     },
 
     addFlow: (flow) => {
@@ -2318,143 +3091,12 @@ export const useModelStore = create<ModelState>()(
       // ~25k proxies over the objects/connections arrays and froze diagram
       // switches for ~7.5s at 15k/10k. The algorithm is unchanged — only *where*
       // it runs: read plain here, then apply one minimal recipe that swaps whole
-      // array refs (immer never drafts the big element arrays).
-      const { diagrams, objects, groups, connections } = get()
-      const diagram = diagrams.find((d) => d.id === diagramId)
-      if (!diagram) return
-
-      // --- Build lookup structures for O(1) access ---
-      const objectMap = new Map<string, C4Object>()
-      for (const obj of objects) objectMap.set(obj.id, obj)
-
-      const groupMap = new Map<string, Group>()
-      for (const grp of groups) groupMap.set(grp.id, grp)
-
-      const diagramObjectSet = new Set(diagram.objectIds)
-
-      // Membership map: objectId -> containing groupId (only for groups on this diagram)
-      const objectToGroup = new Map<string, string>()
-      for (const groupId of diagram.groupIds) {
-        const group = groupMap.get(groupId)
-        if (group) {
-          for (const oid of group.objectIds) {
-            objectToGroup.set(oid, groupId)
-          }
-        }
-      }
-
-      const connectionMap = new Map<string, Connection>()
-      for (const conn of connections) connectionMap.set(conn.id, conn)
-
-      // Helper: find nearest visible ancestor on this diagram
-      const findVisibleEndpoint = (objectId: string): string | null => {
-        if (diagramObjectSet.has(objectId)) return objectId
-        let current = objectMap.get(objectId)?.parentId
-        while (current) {
-          if (diagramObjectSet.has(current)) return current
-          current = objectMap.get(current)?.parentId
-        }
-        return objectToGroup.get(objectId) ?? null
-      }
-
-      // Lower connections currently attached to this diagram.
-      const existingLowerIds = diagram.connectionIds.filter(
-        (cid) => connectionMap.get(cid)?.kind === 'lower'
-      )
-
-      // Reuse map: endpoint-pair → existing lower connection. Built from ALL
-      // lower connections BEFORE any pruning so a still-needed one keeps its id
-      // across re-syncs. Deleting + recreating it with a fresh id (the previous
-      // behaviour) invalidated a live selection — clicking a lower connection
-      // then made the right sidebar flicker open/closed because the next sync
-      // (now also run on every hydration) replaced the selected connection.
-      const lowerByPair = new Map<string, Connection>()
-      for (const conn of connections) {
-        if (conn.kind === 'lower') lowerByPair.set(`${conn.fromId}→${conn.toId}`, conn)
-      }
-
-      // Start from the diagram's NON-lower connections; the needed lower ones are
-      // re-attached below (reusing the same objects, hence the same ids).
-      const newConnectionIds = diagram.connectionIds.filter(
-        (cid) => connectionMap.get(cid)?.kind !== 'lower'
-      )
-
-      // --- Re-derive the lower connections this diagram needs ---
-      const newConnectionIdSet = new Set(newConnectionIds)
-      const seenPairs = new Set<string>()
-      const usedLowerIds = new Set<string>()
-      const additions: Connection[] = []
-
-      for (const directConn of connections) {
-        if (directConn.kind === 'lower') continue
-
-        const visibleFrom = findVisibleEndpoint(directConn.fromId)
-        const visibleTo = findVisibleEndpoint(directConn.toId)
-
-        // Skip if either endpoint has no visible representative
-        if (!visibleFrom || !visibleTo) continue
-
-        // Skip if both endpoints are directly visible (direct connection already shown)
-        if (visibleFrom === directConn.fromId && visibleTo === directConn.toId) continue
-
-        // Skip if rolled-up endpoints are the same (self-loop)
-        if (visibleFrom === visibleTo) continue
-
-        const pairKey = `${visibleFrom}→${visibleTo}`
-        if (seenPairs.has(pairKey)) continue
-        seenPairs.add(pairKey)
-
-        const existingLower = lowerByPair.get(pairKey)
-        if (existingLower) {
-          if (!newConnectionIdSet.has(existingLower.id)) {
-            newConnectionIds.push(existingLower.id)
-            newConnectionIdSet.add(existingLower.id)
-          }
-          usedLowerIds.add(existingLower.id)
-        } else {
-          const newConn: Connection = {
-            id: generateId(),
-            fromId: visibleFrom,
-            toId: visibleTo,
-            kind: 'lower',
-            type: 'dashed',
-            label: '',
-          }
-          additions.push(newConn)
-          newConnectionIds.push(newConn.id)
-          newConnectionIdSet.add(newConn.id)
-          lowerByPair.set(pairKey, newConn)
-          usedLowerIds.add(newConn.id)
-        }
-      }
-
-      // --- Prune lower connections this diagram no longer needs and that no
-      // other diagram references. Reused ones are kept, so ids stay stable. ---
-      const otherDiagramConnectionIds = new Set<string>()
-      for (const d of diagrams) {
-        if (d.id === diagram.id) continue
-        for (const cid of d.connectionIds) otherDiagramConnectionIds.add(cid)
-      }
-      const toPrune = new Set(
-        existingLowerIds.filter(
-          (cid) => !usedLowerIds.has(cid) && !otherDiagramConnectionIds.has(cid)
-        )
-      )
-
-      // Minimal recipe: assign the precomputed plain arrays. Swapping whole refs
-      // means immer never drafts the 15k/10k elements. Additions have fresh ids,
-      // so they survive the prune filter regardless of order.
-      set((state) => {
-        const d = state.diagrams.find((dd) => dd.id === diagramId)
-        if (!d) return
-        d.connectionIds = newConnectionIds
-        if (additions.length > 0 || toPrune.size > 0) {
-          const next =
-            toPrune.size > 0 ? connections.filter((c) => !toPrune.has(c.id)) : connections.slice()
-          for (const a of additions) next.push(a)
-          state.connections = next
-        }
-      })
+      // array refs (immer never drafts the big element arrays). The derivation
+      // and the commit live in deriveLowerConnections / commitLowerSync, shared
+      // with the debounced pass and the idle heal, which build the context
+      // once for many diagrams.
+      const ctx = buildLowerSyncContext(get())
+      if (deriveLowerConnections(ctx, diagramId)) commitLowerSync(ctx)
     },
 
     // Decision record actions

@@ -33,7 +33,9 @@ import type { Lighting3D } from '../specs'
  * Roles that must stay UNLIT even in the lit profile (focus/UI overlays and
  * emissive accents that tone mapping would dull): 'glow', 'selectionRing',
  * 'handle' — they return a MeshBasicMaterial with `toneMapped: false` so the
- * ACES pass leaves their colors alone.
+ * ACES pass leaves their colors alone. 'connInk' (the connection lines,
+ * inkLine.ts) too: their contrast was computed on the exact hex values, so
+ * neither the lamp nor ACES may move them.
  */
 
 /** Matte-ceramic surfaces: card slabs + walls, drums, floor walls, pads,
@@ -51,14 +53,11 @@ const CHROME_ROLES = new Set([
   'drumBand',
 ])
 /** Focus/UI overlays that stay unlit + un-tone-mapped in the lit profile. */
-const UNLIT_ROLES = new Set(['glow', 'selectionRing', 'handle'])
+const UNLIT_ROLES = new Set(['glow', 'selectionRing', 'handle', 'connInk'])
 
 export interface LitSurfaceOpts {
   side?: THREE.Side
   depthWrite?: boolean
-  /** Geometry carries baked per-vertex colors (cable tube + plug boots merge
-   * into ONE draw); pair with a WHITE css so the bake shows verbatim. */
-  vertexColors?: boolean
 }
 
 /** Build the lit material for a role (one fresh instance per call). */
@@ -91,20 +90,6 @@ export function litSurface(
       clearcoatRoughness: 0.55,
       specularIntensity: 0.5,
       envMapIntensity: 0.45,
-    })
-  }
-
-  if (role === 'ribbon') {
-    // Connections read as physical cables (tube geometry lands separately);
-    // a bit glossier than the ceramic so they catch the key light. Rubber
-    // sheath + molded plugs bake their tones as vertex colors (one draw).
-    return new THREE.MeshPhysicalMaterial({
-      color,
-      ...blend,
-      vertexColors: opts.vertexColors ?? false,
-      roughness: 0.42,
-      metalness: 0,
-      envMapIntensity: 0.65,
     })
   }
 

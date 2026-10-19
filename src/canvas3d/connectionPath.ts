@@ -205,7 +205,13 @@ export function connectionPath(conn: Connection, fromRect: Rect, toRect: Rect): 
       ? anchorPoint(toRect, conn.toAnchor)
       : edgePoint(toRect, fromRect.x + fromRect.w / 2, fromRect.y + fromRect.h / 2)
 
-  const segments = buildSegments(fromEdge, toEdge, conn.waypoints ?? [], conn.shape ?? 'curved')
+  return pathFromEdges(fromEdge, toEdge, conn.waypoints ?? [], conn.shape ?? 'curved')
+}
+
+/** The route between two edge points (the 2D engine's segments, its ends
+ * set back for the flat arrowhead). */
+function pathFromEdges(fromEdge: EdgePoint, toEdge: EdgePoint, waypoints: Position[], shape: ConnectionShape): PathGeometry {
+  const segments = buildSegments(fromEdge, toEdge, waypoints, shape)
   const first = segments[0]
   const last = segments[segments.length - 1]
   const arrowSize = 14

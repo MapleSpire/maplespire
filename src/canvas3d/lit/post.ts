@@ -41,7 +41,43 @@ export interface PostStack {
   render(): void
   /** Logical (CSS) size — the composer picks up renderer.getPixelRatio(). */
   setSize(width: number, height: number): void
+  /** The buffer the RenderPass draws the scene into. three keys a program on
+   * the target it renders to (tone mapping + output colour space differ
+   * between the canvas and a linear half-float buffer), so scene programs
+   * must be precompiled with THIS target bound or they compile again,
+   * synchronously, on the first composed frame. */
+  readonly sceneTarget: THREE.WebGLRenderTarget
+  /** Every material the passes themselves own (fullscreen quads, AO, bloom
+   * mips) — precompiled before the stack goes live. */
+  passMaterials(): THREE.Material[]
   dispose(): void
+}
+
+/** Materials reachable from a pass object — a bounded walk of own fields
+ * (postprocessing and n8ao keep their quads' materials one or two objects
+ * deep). Renderer/scene/camera/textures are not followed. */
+function collectMaterials(root: object, out: Set<THREE.Material>, depth: number, seen: Set<object>): void {
+  if (depth < 0 || seen.has(root)) return
+  seen.add(root)
+  for (const key of Object.keys(root)) {
+    const v = (root as Record<string, unknown>)[key]
+    if (!v || typeof v !== 'object') continue
+    if ((v as THREE.Material).isMaterial) {
+      out.add(v as THREE.Material)
+      continue
+    }
+    if (
+      v instanceof THREE.WebGLRenderer ||
+      (v as THREE.Scene).isScene ||
+      (v as THREE.Camera).isCamera ||
+      (v as THREE.Texture).isTexture ||
+      (v as THREE.WebGLRenderTarget).isRenderTarget ||
+      ArrayBuffer.isView(v)
+    ) {
+      continue
+    }
+    collectMaterials(v as object, out, depth - 1, seen)
+  }
 }
 
 /** AO radius in WORLD px (cards are ~200 wide — this hugs edges + feet). */
@@ -91,6 +127,15 @@ export function createPostStack(
     },
     setSize(width: number, height: number) {
       composer.setSize(width, height)
+    },
+    get sceneTarget() {
+      return composer.inputBuffer
+    },
+    passMaterials() {
+      const out = new Set<THREE.Material>()
+      const seen = new Set<object>()
+      for (const pass of composer.passes) collectMaterials(pass, out, 5, seen)
+      return [...out]
     },
     dispose() {
       // EffectComposer.dispose() drops every pass + its render targets; the

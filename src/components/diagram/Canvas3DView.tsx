@@ -26,6 +26,7 @@ import { resolveSceneDecor } from '../../canvas3d/decor/decorSpec'
 import { DecorPopover } from './DecorPopover'
 import { CameraControls } from './CameraControls'
 import { WebglFallback } from './WebglFallback'
+import { measureCanvasSafeInsets } from './canvasSafeArea'
 import type { Scene3D } from '../../canvas3d'
 import type { C4Object, Connection, Group } from '../../types'
 
@@ -221,27 +222,54 @@ export function Canvas3DView({
         })
         sceneRef.current = scene
         if (sharedSceneRef) sharedSceneRef.current = scene
-        scene.setResolvedTheme(useThemeStore.getState().resolved)
-        scene.setReadonly(isReadonly)
-        scene.setSize(wrap.clientWidth, wrap.clientHeight)
+        // fit-to-screen frames inside what the floating chrome leaves
+        // visible, measured from the DOM when the fit runs (canvasSafeArea.ts)
+        scene.setSafeAreaProvider(() => measureCanvasSafeInsets(canvas))
+        const mounted = scene
+        // the e2e/readiness probe reads "animating" from here until the enter
+        // tween starts — the build + compile wait below are part of the enter
+        mounted.holdForEnter()
+        // Two tasks, not one: the renderer/context creation above, then — after
+        // yielding to the event loop — the configuration and the ONE scene
+        // build it batches. Back to back they were a single 114-123 ms task
+        // (enter3d import.then, view3d quality loop 2026-10-08); split and
+        // batched, the longest enter task read 66-86 ms over eight runs — still
+        // above 50: the CDP profile puts slab geometry, paper-board textures
+        // and room-environment setup inside that one build.
+        return new Promise<void>((resolve) => setTimeout(resolve, 0)).then(() => {
+          if (disposed || sceneRef.current !== mounted) return
+          configure(mounted)
+          return afterBuild(mounted)
+        })
+      })
+      .catch((err) => {
+        console.error('3D view failed to load', err)
+        setFailed(true)
+      })
+
+    function configure(target: Scene3D): void {
+      target.batch(() => {
+        target.setResolvedTheme(useThemeStore.getState().resolved)
+        target.setReadonly(isReadonly)
+        target.setSize(wrap!.clientWidth, wrap!.clientHeight)
         const skin = useSkinStore.getState().getResolvedSkin(
           useModelStore.getState().getCurrentDiagram()?.skinId,
           useThemeStore.getState().resolved,
         )
-        scene.setSkin(skin)
-        scene.setTheme3d(themeFor3d(skin))
+        target.setSkin(skin)
+        target.setTheme3d(themeFor3d(skin))
         const diag = useModelStore.getState().getCurrentDiagram()
-        scene.setConnectionHighlightStyle(diag?.connectionHighlightStyle ?? 'traveling-dot')
-        scene.setConnectionAnimationsEnabled(diag?.connectionAnimationsEnabled ?? true)
-        scene.setSceneDecor(resolveSceneDecor(diag))
-        scene.setBottomTab(useUIStore.getState().bottomTab)
-        scene.setActiveTagGroup(useUIStore.getState().activeTagGroupId)
+        target.setConnectionHighlightStyle(diag?.connectionHighlightStyle ?? 'traveling-dot')
+        target.setConnectionAnimationsEnabled(diag?.connectionAnimationsEnabled ?? true)
+        target.setSceneDecor(resolveSceneDecor(diag))
+        target.setBottomTab(useUIStore.getState().bottomTab)
+        target.setActiveTagGroup(useUIStore.getState().activeTagGroupId)
         {
           const ui = useUIStore.getState()
-          scene.setTagInteractions(ui.hoveredTagId, ui.pinnedTagIds, ui.focusedTagId, ui.hiddenTagIds)
+          target.setTagInteractions(ui.hoveredTagId, ui.pinnedTagIds, ui.focusedTagId, ui.hiddenTagIds)
           for (const kind of ['technology', 'status', 'teams'] as const) {
             const interaction = ui.managedPerspectiveInteractions[kind]
-            scene.setManagedPerspectiveInteractions(
+            target.setManagedPerspectiveInteractions(
               kind,
               interaction.hoveredId,
               interaction.pinnedIds,
@@ -250,27 +278,41 @@ export function Canvas3DView({
             )
           }
         }
-        scene.setShowGrid(useUIStore.getState().showGrid)
-        scene.setCameraPreset(useUIStore.getState().cameraPreset)
+        target.setShowGrid(useUIStore.getState().showGrid)
+        target.setCameraPreset(useUIStore.getState().cameraPreset)
         syncData()
-        scene.setSelection(useModelStore.getState().selectedItems.map((s) => s.id))
-        // Enter morph: first frame = the flat canvas reading (framing
+        target.setSelection(useModelStore.getState().selectedItems.map((s) => s.id))
+      })
+    }
+
+    function afterBuild(mounted: Scene3D): Promise<void> {
+      // The scene's shaders link asynchronously (Scene3D.scheduleCompile):
+      // the 2D board stays on screen and the page stays responsive until
+      // they are ready, then the morph plays from its first frame instead
+      // of a tween that already ran while the main thread was frozen.
+      // the user may leave 3D while the programs link (seconds on a cold
+      // GPU): the exit choreography then owns the camera and the phase
+      const leaving = () => phaseRef.current === 'exit' || phaseRef.current === 'bye'
+      return mounted.whenCompiled().then(() => {
+        if (disposed || sceneRef.current !== mounted || leaving()) return
+        // §5 enter morph: first frame = the flat canvas reading (framing
         // identity with the 2D viewport, floor undressed), one design tween up.
-        scene.enterMorph(getViewportRef.current?.() ?? null, {
-          width: wrap.clientWidth,
-          height: wrap.clientHeight,
+        mounted.enterMorph(getViewportRef.current?.() ?? null, {
+          width: wrap!.clientWidth,
+          height: wrap!.clientHeight,
         })
-        setReady(true)
-        // Start the crossfade only once the scene has real pixels — its rAF
-        // (queued by enterMorph) renders before this one fires.
-        requestAnimationFrame(() => {
-          if (!disposed) setPhase('enter')
+        // …and the faded-floor variants enterMorph just asked for
+        return mounted.whenCompiled().then(() => {
+          if (disposed || sceneRef.current !== mounted || leaving()) return
+          setReady(true)
+          // Start the crossfade only once the scene has real pixels — its rAF
+          // (queued by enterMorph) renders before this one fires.
+          requestAnimationFrame(() => {
+            if (!disposed) setPhase('enter')
+          })
         })
       })
-      .catch((err) => {
-        console.error('3D view failed to load', err)
-        setFailed(true)
-      })
+    }
 
     const observer = new ResizeObserver(() => {
       if (wrapRef.current && sceneRef.current) {
@@ -458,8 +500,15 @@ export function Canvas3DView({
         )}
         style={{ touchAction: 'none' }}
       />
+      {/* pointer-events-none: the spinner is not chrome. The safe-area
+          measurement (canvasSafeArea.ts) hit-tests what floats over the
+          canvas, and the enter framing (Scene3D.enterTargetPose) is measured
+          while this is still up: a 40-px sample grid that lands on the 24-px
+          centred spinner would clear it from one side, as if a panel sat in
+          the middle of the board. Not observed at 1280x720 or 1600x1000 (no
+          sample point falls on it there) — a hazard at other sizes. */}
       {!ready && (
-        <div className="absolute inset-0 flex items-center justify-center">
+        <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
           <div className="h-6 w-6 animate-spin rounded-full border-2 border-fg-subtle border-t-transparent" />
         </div>
       )}

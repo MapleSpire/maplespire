@@ -940,6 +940,68 @@ describe('T6 — deleting a server-owned diagram under a summary registry', () =
     expect(fixture.meta.doc()?.deletedDiagramIds ?? []).toEqual([])
   })
 
+  it('QA 2026-10-11: the registry PRE-DIFF still strips a connection deleted this session out of a NON-active meta', async () => {
+    // The write path pre-diffs every existing registry meta against the
+    // materialized shard and skips the equal ones (connect-freeze fix). A
+    // non-active meta's desired composition is its EXISTING composition MINUS
+    // the ids tombstoned this session, so a pre-diff that compares against the
+    // unstripped composition calls it "equal" and the deleted connection stays
+    // in that diagram's registry entry for ever. Mutant (QA lens): the pre-diff
+    // skips `stripDeletedFromComposition` — every arm in src/lib/automerge and
+    // src/stores stayed GREEN. The strip is only live under `bfsActive` (the
+    // only mode that records tombstones), hence this suite's fixture.
+    //
+    // Three phases, because the FIRST flushes of this fixture rewrite every
+    // meta for other reasons (the docUrl is re-minted), which would carry the
+    // strip along incidentally and let the mutant pass:
+    //  1. settle until the registry is quiescent;
+    //  2. delete a connection that only the NON-active meta lists;
+    //  3. the meta must lose exactly that id.
+    localStorage.setItem('maplespire:bootFromServer', 'true')
+    const fixture = summaryFixture({ summaryOnly: false })
+    const classicShard = fixture.registryBase
+    classicShard.change((shard: any) => {
+      shard.diagrams['dg-other'] = {
+        id: 'dg-other', name: 'Other', type: 'container', docUrl: '',
+        objectIds: ['o-a', 'o-b'], connectionIds: ['c-x', 'c-keep'], groupIds: [],
+      }
+      shard.diagrams['dg-trigger'] = {
+        id: 'dg-trigger', name: 'Trigger', type: 'container', docUrl: '',
+        objectIds: [], connectionIds: [], groupIds: [],
+      }
+    })
+    wire(fixture)
+    const { startBridge, isRegistrySummaryOnlyActive, isBootFromServerActive } = await import('./bridge')
+    await startBridge({ landscapeId: 'ordinary-bfs-strip', versionId: 'current' })
+    expect(isBootFromServerActive()).toBe(true)
+    expect(isRegistrySummaryOnlyActive()).toBe(false)
+
+    // Phase 1: quiescence.
+    useModelStore.setState({
+      diagrams: [
+        { id: 'dg-other', name: 'Other', type: 'container', objectIds: ['o-a', 'o-b'], connectionIds: ['c-x', 'c-keep'], groupIds: [], layouts: {} } as any,
+        { id: 'dg-trigger', name: 'Trigger', type: 'container', objectIds: [], connectionIds: [], groupIds: [], layouts: {} } as any,
+      ],
+      connections: [{ id: 'c-x', fromId: 'o-a', toId: 'o-b', type: 'solid' } as any],
+    })
+    await settleWrites()
+    useModelStore.getState().updateDiagram('dg-trigger', { name: 'Trigger renamed' })
+    await settleWrites()
+    expect((classicShard.doc()?.diagrams['dg-trigger'] as any).name).toBe('Trigger renamed')
+    // Anti-void: the id is still there before the delete.
+    expect([...(classicShard.doc()?.diagrams['dg-other'] as any).connectionIds]).toEqual(['c-x', 'c-keep'])
+
+    // Phase 2: an explicit delete — the only change this flush carries.
+    useModelStore.getState().deleteConnection('c-x')
+    await settleWrites()
+
+    // Phase 3.
+    const other = classicShard.doc()?.diagrams['dg-other'] as any
+    expect([...other.connectionIds]).toEqual(['c-keep'])
+    expect([...other.objectIds]).toEqual(['o-a', 'o-b'])
+    expect(other.name).toBe('Other')
+  })
+
   it('en mode CLASSIQUE le balayage ignore les tombstones — mais balaye quand même', async () => {
     // `observeRegistryForAbsence` passes `tombstonedIds` only under a
     // summary registry, and `observeRegistryAbsence` strips them from

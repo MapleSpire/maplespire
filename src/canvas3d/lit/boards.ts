@@ -36,12 +36,27 @@ export type TrayBoardTextures = PaperBoardTextures
 
 export type TrayVariant = 'wood' | 'museum' | 'clay'
 export const TRAY_VARIANTS: readonly TrayVariant[] = ['wood', 'museum', 'clay']
+/** Each tray's base paint (the tile's fill before grain, speckle or
+ * mottling) — also what the lit ink lines pick their ink set against
+ * (inkLine.inkSetFor). */
+export const TRAY_BASE_CSS: Record<TrayVariant, string> = {
+  wood: '#CB9C5C',
+  museum: '#F0F2F2',
+  clay: '#9A4E2E',
+}
 
 export interface TraySpec {
   /** Grid line color (css) — ignored when showGrid is false. */
   grid: string
   /** Draw the pitch grid? (the board's grid toggle swaps color maps). */
   showGrid: boolean
+  /** Draw the 20-unit MINOR lines too (default true)? Scene3D's board at
+   * rest wears the majors only and swaps to the full pitch while a card is
+   * dragged — view3d quality loop 4 r3 (workbench-wide / city-wide /
+   * workbench-labels.png): "an even 20-unit cross-hatch is clearly visible
+   * over the whole board wood, behind every card and label", at the 0.14 /
+   * 0.08 minor alphas loop 4 had already halved twice. */
+  minors?: boolean
 }
 
 /** px per grid cell in the tile bitmap — must equal paper.ts's private
@@ -69,17 +84,24 @@ function lcg(seed: number): () => number {
   }
 }
 
-function tile(): { canvas: HTMLCanvasElement; ctx: CanvasRenderingContext2D } {
+function tile(px: number = TILE_PX): { canvas: HTMLCanvasElement; ctx: CanvasRenderingContext2D } {
   const canvas = document.createElement('canvas')
-  canvas.width = TILE_PX
-  canvas.height = TILE_PX
+  canvas.width = px
+  canvas.height = px
   return { canvas, ctx: canvas.getContext('2d')! }
 }
 
 /** Texture params copied verbatim from paper.ts — same cap mesh, same raw
  * world-px extrude UVs, so the FIXED repeat keeps the pitch exact and the
- * cached textures are safely shared across scenes. */
-function mkTexture(c: HTMLCanvasElement, srgb: boolean): THREE.CanvasTexture {
+ * cached textures are safely shared across scenes. `span` (world units the
+ * tile covers along u, v) defaults to the grid tile; a map carrying no grid
+ * may span more — three gives every map its own uv transform (a uniform,
+ * the same program). */
+function mkTexture(
+  c: HTMLCanvasElement,
+  srgb: boolean,
+  span: { x: number; z: number } = { x: PAPER_PITCH * PAPER_TILE_CELLS, z: PAPER_PITCH * PAPER_TILE_CELLS },
+): THREE.CanvasTexture {
   const tex = new THREE.CanvasTexture(c)
   tex.wrapS = THREE.RepeatWrapping
   tex.wrapT = THREE.RepeatWrapping
@@ -87,7 +109,7 @@ function mkTexture(c: HTMLCanvasElement, srgb: boolean): THREE.CanvasTexture {
   tex.anisotropy = 16
   tex.generateMipmaps = true
   tex.minFilter = THREE.LinearMipmapLinearFilter
-  tex.repeat.setScalar(1 / (PAPER_PITCH * PAPER_TILE_CELLS))
+  tex.repeat.set(1 / span.x, 1 / span.z)
   return tex
 }
 
@@ -141,10 +163,12 @@ function gridLines(
   majorWidth: number,
   majorAlpha: number,
   shift = 0,
+  minors = true,
 ): void {
   ctx.globalAlpha = alpha
   ctx.lineWidth = width
-  for (let c = 0; c < PAPER_TILE_CELLS; c++) {
+  // c = 0 is the major's own line (drawn again, heavier, below)
+  for (let c = minors ? 0 : PAPER_TILE_CELLS; c < PAPER_TILE_CELLS; c++) {
     const p = c * CELL_PX + 0.5 + shift
     ctx.beginPath()
     ctx.moveTo(p, 0)
@@ -174,17 +198,38 @@ function engravedGrid(
   cutWidth: number,
   cutAlpha: number,
   catchAlpha: number,
+  minors = true,
 ): void {
   ctx.strokeStyle = cut
-  gridLines(ctx, cutWidth, cutAlpha, cutWidth + 0.8, Math.min(1, cutAlpha + 0.15))
+  gridLines(ctx, cutWidth, cutAlpha, cutWidth + 0.8, Math.min(1, cutAlpha + 0.15), 0, minors)
   ctx.strokeStyle = lightCatch
-  gridLines(ctx, 1, catchAlpha, 1.2, catchAlpha, 1.4)
+  gridLines(ctx, 1, catchAlpha, 1.2, catchAlpha, 1.4, minors)
 }
 
 // ── wood: honey veneer with visible grain figure, engraved desk ──────────────
 
+/** VIEW3D QUALITY LOOP 4 (critic, workbench-labels / workbench-cold /
+ * workbench-wide.png): the wood cap read as "dense short dash and stagger
+ * marks every 10-20 px — a brick or tile pattern behind the cards", and as a
+ * fine grid across the whole plateau at the overview distance. Its colour
+ * tile repeats every 100 world units (the grid pitch contract), so every
+ * feature in it — the grain wiggles, the two knots, the heavy latewood —
+ * repeated twice across each 200-wide card. The colour map now carries the
+ * grain at HALF its old albedo contrast and no knots (a knot every ~70 units
+ * was the strongest periodic mark); the PLANKS — long, few, staggered — live
+ * in the roughness map on its own large repeat (WOOD_ROUGH), where the key
+ * light picks them out as satin variation instead of printed stripes. */
+const WOOD_GRAIN_CONTRAST = 0.5
+
+/** The wood roughness tile: 512 px square stretched over 1600 x 640 world
+ * units — long along the grain (x, 0.32 px/unit: grain and plank ends are
+ * smooth along it) and finer across (z, 0.8 px/unit: the seams between
+ * planks). Planks are 80 units wide (8 rows a tile) and 800 long — four
+ * 200-wide cards — with each row's end seams staggered at random. */
+export const WOOD_ROUGH = { px: 512, spanX: 1600, spanZ: 640, plankW: 80, plankL: 800 } as const
+
 function paintWoodColor(ctx: CanvasRenderingContext2D, rnd: () => number, spec: TraySpec): void {
-  ctx.fillStyle = '#CB9C5C'
+  ctx.fillStyle = TRAY_BASE_CSS.wood
   ctx.fillRect(0, 0, TILE_PX, TILE_PX)
 
   // tight straight grain: many low-amplitude streaks along x — dark latewood
@@ -192,7 +237,14 @@ function paintWoodColor(ctx: CanvasRenderingContext2D, rnd: () => number, spec: 
   // mipmap averaging at default zoom (the tan-laminate fix)
   // ~a third of the streaks additionally WANDER on a low-frequency wave
   // (period ≈ a third of the tile, amplitude 2..4px) so the field clusters
-  // and crosses itself instead of reading as evenly-spaced printed stripes
+  // and crosses itself instead of reading as evenly-spaced printed stripes.
+  // VIEW3D QUALITY LOOP 3: at 0.09..0.20 alpha this family read as "dense
+  // vertical grain striations" at the same pitch as the connection tubes, and
+  // the pale 'evaluates'/'uses' line lost its contrast across it
+  // (workbench-labels.png). It now runs at 0.035..0.08 — a texture under the
+  // figure, not a stripe field — and the heavy latewood + sheen bands below
+  // carry the grain read at framing distance. Same rnd() draws, same count, so
+  // the rest of the tile keeps its exact layout.
   const streaks = 150
   for (let i = 0; i < streaks; i++) {
     const y0 = rnd() * TILE_PX
@@ -201,7 +253,7 @@ function paintWoodColor(ctx: CanvasRenderingContext2D, rnd: () => number, spec: 
     const phase = rnd() * Math.PI * 2
     const width = 0.8 + rnd() * 1.8
     const dark = rnd() < 0.62
-    const a = 0.09 + rnd() * 0.11
+    const a = (0.035 + rnd() * 0.045) * WOOD_GRAIN_CONTRAST
     const wave = rnd() < 0.34 ? 2 + rnd() * 2 : 0
     const wavePeriods = 2 + Math.floor(rnd() * 2)
     const wavePhase = rnd() * Math.PI * 2
@@ -218,7 +270,7 @@ function paintWoodColor(ctx: CanvasRenderingContext2D, rnd: () => number, spec: 
     const amp = 1 + rnd() * 2.6
     const periods = 1 + Math.floor(rnd() * 3)
     const phase = rnd() * Math.PI * 2
-    const a = 0.12 + rnd() * 0.1
+    const a = (0.12 + rnd() * 0.1) * WOOD_GRAIN_CONTRAST
     const wave = rnd() < 0.38 ? 2.2 + rnd() * 1.8 : 0
     const wavePeriods = 2 + Math.floor(rnd() * 2)
     const wavePhase = rnd() * Math.PI * 2
@@ -234,68 +286,89 @@ function paintWoodColor(ctx: CanvasRenderingContext2D, rnd: () => number, spec: 
     const amp = 2.5 + rnd() * 4.5
     const periods = 1 + Math.floor(rnd() * 2)
     const phase = rnd() * Math.PI * 2
-    const a = 0.05 + rnd() * 0.04
+    const a = (0.05 + rnd() * 0.04) * WOOD_GRAIN_CONTRAST
     ctx.strokeStyle = `rgba(140,88,42,${a})`
     ctx.lineWidth = 10 + rnd() * 12
     strokeGrainLine(ctx, y0, amp, periods, phase)
   }
 
-  // knot / cathedral figures: two nested-ellipse figures per tile, elongated
-  // along the grain — the local event that breaks the streak period (sawn
-  // figure clusters around knots); wrap-drawn so an edge-crossing knot
-  // continues on the opposite side
-  for (let k = 0; k < 2; k++) {
-    const kx = rnd() * TILE_PX
-    const ky = rnd() * TILE_PX
-    const rot = (rnd() - 0.5) * 0.35
-    const rings = 4 + Math.floor(rnd() * 3)
-    const rx0 = 6 + rnd() * 5
-    const grow = 5 + rnd() * 4
-    for (let ring = 0; ring < rings; ring++) {
-      const rx = rx0 + ring * grow
-      const ry = rx * (0.32 + rnd() * 0.1)
-      const a = (0.14 - ring * 0.018) * (0.85 + rnd() * 0.3)
-      ctx.strokeStyle = `rgba(96,54,26,${a})`
-      ctx.lineWidth = 1.4 + rnd() * 1.6
-      wrapped((dx, dy) => {
-        ctx.beginPath()
-        ctx.ellipse(kx + dx, ky + dy, rx, ry, rot, 0, Math.PI * 2)
-        ctx.stroke()
-      })
-    }
-    // dark heartwood core
-    ctx.fillStyle = 'rgba(70,38,18,0.28)'
-    wrapped((dx, dy) => {
-      ctx.beginPath()
-      ctx.ellipse(kx + dx, ky + dy, rx0 * 0.55, rx0 * 0.3, rot, 0, Math.PI * 2)
-      ctx.fill()
-    })
-  }
+  // no knots: two cathedral figures per 100-unit tile printed a knot every
+  // ~70 world units across the whole cap — the periodic mark the loop-4
+  // critic read as a tile pattern (see WOOD_GRAIN_CONTRAST)
 
-  if (spec.showGrid) engravedGrid(ctx, spec.grid, 'rgb(255,230,190)', 1.6, 0.85, 0.5)
+  // the engraved grid at about a THIRD of its old strength (cut 0.85 → 0.3,
+  // light catch 0.5 → 0.17): at full strength the cap read as "a parquet of
+  // square tiles, each carrying its own grain block" (view3d quality loop 3,
+  // workbench-flag.png / workbench-labels.png) and the cut lines competed with
+  // the connection tubes. It stays a carved pitch you can find, not a lattice
+  // you see first; the slab itself already gives the board its scale.
+  //
+  // VIEW3D QUALITY LOOP 4: with the grain halved, the 20-unit MINOR lines
+  // became the pattern itself — "a fine grid texture across the whole
+  // plateau" at the overview (seen by eye in loop4-scene-fix1/
+  // workbench-cold.png). Minors drop to half again (cut 0.3 → 0.14, catch 0.17 →
+  // 0.08); the 100-unit majors keep their weight (0.45 → 0.4), so the pitch
+  // still reads as five-cell squares up close and recedes in the overview.
+  //
+  // LOOP 4 r3: still read as "an even 20-unit cross-hatch over the whole
+  // board" — the minors are drawn only on the DRAG variant (spec.minors,
+  // Scene3D swaps maps while a card moves), so at rest the cap is plain
+  // wood under the 100-unit majors.
+  if (spec.showGrid) {
+    const minors = spec.minors !== false
+    ctx.strokeStyle = spec.grid
+    gridLines(ctx, 1.6, 0.14, 2.4, 0.4, 0, minors)
+    ctx.strokeStyle = 'rgb(255,230,190)'
+    gridLines(ctx, 1, 0.08, 1.2, 0.17, 1.4, minors)
+  }
 }
 
+/** The wood roughness tile (WOOD_ROUGH): satin planks, each its own sheen,
+ * long seams between the rows and staggered end seams — the plank layout,
+ * read by the key light rather than printed in the albedo. Drawn on its own
+ * 512 canvas; x runs along the grain. */
 function paintWoodRough(ctx: CanvasRenderingContext2D, rnd: () => number): void {
-  // satin base ~0.59 with 0.37..0.82 streaks along the grain — the key light
-  // picks up brushed-sheen bands, an anisotropic-look read
+  const { px, spanX, spanZ, plankW, plankL } = WOOD_ROUGH
+  const sx = px / spanX // canvas px per world unit along the grain
+  const sz = px / spanZ // …and across it
+  const rowH = plankW * sz
+  const plankPx = plankL * sx
+  // satin base ~0.59 (the old tile's), each plank 0.50..0.67 around it
   ctx.fillStyle = 'rgb(150,150,150)'
-  ctx.fillRect(0, 0, TILE_PX, TILE_PX)
-  // broad sheen bands first: wide smooth/rough alternation so the satin
-  // variation survives mipmapping where 1px streaks average away
-  for (let i = 0; i < 12; i++) {
-    const y0 = rnd() * TILE_PX
-    const v = 112 + Math.floor(rnd() * 76)
-    ctx.strokeStyle = `rgba(${v},${v},${v},0.3)`
-    ctx.lineWidth = 8 + rnd() * 14
-    strokeGrainLine(ctx, y0, 1.5 + rnd() * 3, 1 + Math.floor(rnd() * 2), rnd() * Math.PI * 2)
-  }
-  for (let i = 0; i < 150; i++) {
-    const y0 = rnd() * TILE_PX
-    const v = 95 + Math.floor(rnd() * 115)
-    const a = 0.4 + rnd() * 0.35
-    ctx.strokeStyle = `rgba(${v},${v},${v},${a})`
-    ctx.lineWidth = 1 + rnd() * 3.5
-    strokeGrainLine(ctx, y0, 0.4 + rnd() * 1.4, 1 + Math.floor(rnd() * 3), rnd() * Math.PI * 2)
+  ctx.fillRect(0, 0, px, px)
+  const rows = Math.round(spanZ / plankW)
+  for (let r = 0; r < rows; r++) {
+    const y = r * rowH
+    // where this row's end seams fall: a random stagger, one seam per plank
+    const offset = rnd() * plankPx
+    const ends: number[] = []
+    for (let x = offset; x < px; x += plankPx) ends.push(x)
+    // plank bodies, end to next end; the last one wraps across the tile's
+    // x edge, drawn again one tile to the left so RepeatWrapping closes it
+    for (let i = 0; i < ends.length; i++) {
+      const v = 128 + Math.floor(rnd() * 44)
+      ctx.fillStyle = `rgb(${v},${v},${v})`
+      const x0 = ends[i]
+      const x1 = i + 1 < ends.length ? ends[i + 1] : ends[0] + px
+      for (const dx of [0, -px]) ctx.fillRect(x0 + dx, y, x1 - x0, rowH)
+    }
+    // the long seam under the row: a rough (matte) 1.5-px groove
+    ctx.fillStyle = 'rgba(232,232,232,0.85)'
+    ctx.fillRect(0, y, px, 1.5)
+    // end seams: one matte line across the row at each plank end
+    for (const x of ends) ctx.fillRect(x, y, 1, rowH)
+    // a few sheen streaks along each row — glossier and rougher, low
+    // alpha: grain catching the key, never a printed stripe
+    for (let s = 0; s < 6; s++) {
+      const v = 105 + Math.floor(rnd() * 110)
+      ctx.strokeStyle = `rgba(${v},${v},${v},${0.12 + rnd() * 0.12})`
+      ctx.lineWidth = 1 + rnd() * 3
+      const yy = y + 3 + rnd() * (rowH - 6)
+      ctx.beginPath()
+      ctx.moveTo(0, yy)
+      ctx.lineTo(px, yy) // level: the x seam must close
+      ctx.stroke()
+    }
   }
 }
 
@@ -304,7 +377,7 @@ function paintWoodRough(ctx: CanvasRenderingContext2D, rnd: () => number): void 
 function paintMuseumColor(ctx: CanvasRenderingContext2D, rnd: () => number, spec: TraySpec): void {
   // cool porcelain white — a few points colder than the paper board's warm
   // cream so the two presets separate at a glance
-  ctx.fillStyle = '#F0F2F2'
+  ctx.fillStyle = TRAY_BASE_CSS.museum
   ctx.fillRect(0, 0, TILE_PX, TILE_PX)
 
   // micro speckle — denser and higher per-fleck contrast than paper tooth so
@@ -362,7 +435,7 @@ function paintMuseumColor(ctx: CanvasRenderingContext2D, rnd: () => number, spec
   // hairline grid: plain ink pass — lacquer is silkscreened, not carved
   if (spec.showGrid) {
     ctx.strokeStyle = spec.grid
-    gridLines(ctx, 1.4, 0.7, 2.2, 0.85)
+    gridLines(ctx, 1.4, 0.7, 2.2, 0.85, 0, spec.minors !== false)
   }
 }
 
@@ -403,7 +476,7 @@ function paintClayColor(ctx: CanvasRenderingContext2D, rnd: () => number, spec: 
   // screen, so the paint must sit well BELOW the apron target (#B0603D
   // still rendered pale salmon; this deeper, more saturated base lands
   // within reach of the apron after the lift)
-  ctx.fillStyle = '#9A4E2E'
+  ctx.fillStyle = TRAY_BASE_CSS.clay
   ctx.fillRect(0, 0, TILE_PX, TILE_PX)
 
   // kiln mottling: soft warm blobs both ways around the base — alphas ~1.5x
@@ -467,8 +540,8 @@ function paintClayColor(ctx: CanvasRenderingContext2D, rnd: () => number, spec: 
   ctx.fillRect(0, 0, TILE_PX, TILE_PX)
 
   // embossed grid: darker line + light catch, same engraving read as wood —
-  // higher cut alpha than on a pale base: the ink sits closer to fired terracotta
-  if (spec.showGrid) engravedGrid(ctx, spec.grid, 'rgb(240,198,162)', 1.7, 0.8, 0.45)
+  // cut alpha up vs the old pale base: the ink sits closer to fired terracotta
+  if (spec.showGrid) engravedGrid(ctx, spec.grid, 'rgb(240,198,162)', 1.7, 0.8, 0.45, spec.minors !== false)
 }
 
 function paintClayRough(ctx: CanvasRenderingContext2D, rnd: () => number): void {
@@ -509,7 +582,8 @@ const ROUGH_PAINTERS: Record<TrayVariant, RoughPainter> = {
 }
 
 function build(variant: TrayVariant, spec: TraySpec): TrayBoardTextures {
-  const key = `${variant}|${spec.grid}|${spec.showGrid}`
+  // minors only matter with the grid on: the off maps stay one instance
+  const key = `${variant}|${spec.grid}|${spec.showGrid}|${spec.showGrid && spec.minors !== false}`
   const hit = pairCache.get(key)
   if (hit) return hit
 
@@ -519,9 +593,13 @@ function build(variant: TrayVariant, spec: TraySpec): TrayBoardTextures {
   // grid-independent roughness, built once per variant (see module doc)
   let rough = roughCache.get(variant)
   if (!rough) {
-    const r = tile()
+    // the wood planks span far more than the 100-unit grid tile (WOOD_ROUGH)
+    const plank = variant === 'wood'
+    const r = tile(plank ? WOOD_ROUGH.px : TILE_PX)
     ROUGH_PAINTERS[variant](r.ctx, lcg(SEEDS[variant] ^ 0x9e3779b9))
-    rough = mkTexture(r.canvas, false)
+    rough = plank
+      ? mkTexture(r.canvas, false, { x: WOOD_ROUGH.spanX, z: WOOD_ROUGH.spanZ })
+      : mkTexture(r.canvas, false)
     roughCache.set(variant, rough)
   }
 

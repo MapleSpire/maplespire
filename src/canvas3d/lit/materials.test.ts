@@ -30,14 +30,14 @@ describe('litSurface (lit material family contracts)', () => {
   })
 
   it('REAL geometry keeps writing depth (bodies occlude, AO shades them)', () => {
-    for (const role of ['cardCap', 'cardFill', 'cardWall', 'floorWall', 'drum', 'drumLid', 'pad', 'platform', 'ribbon']) {
+    for (const role of ['cardCap', 'cardFill', 'cardWall', 'floorWall', 'drum', 'drumLid', 'pad', 'platform']) {
       const m = litSurface(role, '#FFFFFF', {}, L)
       expect(m.depthWrite, `${role} writes depth`).toBe(true)
     }
   })
 
-  it('focus/UI overlays stay unlit and un-tone-mapped (hex-stable under ACES)', () => {
-    for (const role of ['glow', 'selectionRing', 'handle']) {
+  it('focus/UI overlays and the connection ink stay unlit and un-tone-mapped (hex-stable under ACES)', () => {
+    for (const role of ['glow', 'selectionRing', 'handle', 'connInk']) {
       const m = litSurface(role, '#00F0FF', {}, L)
       expect(m).toBeInstanceOf(THREE.MeshBasicMaterial)
       expect(m.toneMapped).toBe(false)
@@ -49,12 +49,5 @@ describe('litSurface (lit material family contracts)', () => {
     expect(m).toBeInstanceOf(THREE.MeshPhysicalMaterial)
     expect(m.roughness).toBeCloseTo(0.4)
     expect(m.clearcoat).toBeCloseTo(0.5)
-  })
-
-  it('ribbon honours vertexColors (cable + molded plugs bake as one draw)', () => {
-    const on = litSurface('ribbon', '#FFFFFF', { vertexColors: true }, L)
-    const off = litSurface('ribbon', '#FFFFFF', {}, L)
-    expect(on.vertexColors).toBe(true)
-    expect(off.vertexColors).toBe(false)
   })
 })

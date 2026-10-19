@@ -67,6 +67,9 @@ export function makeText(spec: TextSpec, onSynced: () => void): Text {
   t.text = spec.text
   t.font = FONT_URLS[spec.font]
   t.fontSize = spec.size
+  // read back by the __scene3d.nodeFaces probe (the shape-typography
+  // regression gate, 2026-10-10)
+  t.userData.fontId = spec.font
   t.color = spec.color
   t.anchorX = spec.anchorX ?? 'left'
   t.anchorY = spec.anchorY ?? 'top'

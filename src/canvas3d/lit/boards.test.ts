@@ -24,6 +24,7 @@ import {
   museumTrayTextures,
   trayTexturesFor,
   woodTrayTextures,
+  WOOD_ROUGH,
   type TraySpec,
   type TrayVariant,
 } from './boards'
@@ -134,7 +135,13 @@ describe('tray board textures (lit board-surface contracts)', () => {
     const fixedRepeat = 1 / (PAPER_PITCH * PAPER_TILE_CELLS)
     for (const v of TRAY_VARIANTS) {
       const { map, roughnessMap } = FNS[v](SPEC)
-      for (const tex of [map, roughnessMap]) {
+      // every map carrying the GRID keeps the 100-unit tile (the pitch is
+      // exact). The wood roughness carries no grid: since view3d quality loop
+      // 4 it holds the plank layout on its own large repeat — see the next
+      // test — because a 100-unit tile repeated its features twice across
+      // every 200-wide card (critic: "a brick or tile pattern behind the
+      // cards", workbench-labels.png)
+      for (const tex of v === 'wood' ? [map] : [map, roughnessMap]) {
         expect(tex.repeat.x, `${v} fixed repeat x`).toBeCloseTo(fixedRepeat, 10)
         expect(tex.repeat.y, `${v} fixed repeat y`).toBeCloseTo(fixedRepeat, 10)
         expect(tex.wrapS).toBe(THREE.RepeatWrapping)
@@ -151,6 +158,41 @@ describe('tray board textures (lit board-surface contracts)', () => {
     }
   })
 
+  it('wood planks: the roughness spans long planks on its own repeat, every texture <= 512 px', () => {
+    const { map, roughnessMap } = woodTrayTextures(SPEC)
+    expect(WOOD_ROUGH.plankL, 'a plank is at least four 200-wide cards long').toBeGreaterThanOrEqual(800)
+    expect(roughnessMap.repeat.x).toBeCloseTo(1 / WOOD_ROUGH.spanX, 12)
+    expect(roughnessMap.repeat.y).toBeCloseTo(1 / WOOD_ROUGH.spanZ, 12)
+    // fewer repeats per board than the grid tile, along both axes
+    expect(roughnessMap.repeat.x).toBeLessThan(map.repeat.x / 4)
+    expect(roughnessMap.repeat.y).toBeLessThan(map.repeat.y)
+    // the tile holds whole plank rows and whole plank lengths, so the
+    // layout closes across RepeatWrapping
+    expect(WOOD_ROUGH.spanZ % WOOD_ROUGH.plankW).toBe(0)
+    expect(WOOD_ROUGH.spanX % WOOD_ROUGH.plankL).toBe(0)
+    expect(roughnessMap.wrapS).toBe(THREE.RepeatWrapping)
+    expect(roughnessMap.anisotropy).toBe(16)
+    for (const tex of [map, roughnessMap]) {
+      const img = tex.image as HTMLCanvasElement
+      expect(Math.max(img.width, img.height)).toBeLessThanOrEqual(512)
+    }
+  })
+
+  it('wood albedo: no knot figures — the periodic mark of the 100-unit tile', () => {
+    activeLog = []
+    woodTrayTextures({ ...SPEC, showGrid: false })
+    // the colour map's only ellipses were the knots; the roughness has none
+    expect(activeLog.filter(([m]) => m === 'ellipse')).toHaveLength(0)
+    // …and the grain at half its old albedo contrast: the heaviest latewood
+    // was 0.22 alpha, now 0.11 (greyscale strokes belong to the roughness)
+    const grain = activeLog
+      .filter(([m]) => m === 'set:strokeStyle')
+      .map(([, c]) => /^rgba\((\d+),(\d+),(\d+),([\d.]+)\)$/.exec(String(c)))
+      .filter((m): m is RegExpExecArray => !!m && !(m[1] === m[2] && m[2] === m[3]))
+    expect(grain.length).toBeGreaterThan(100)
+    for (const m of grain) expect(Number(m[4])).toBeLessThanOrEqual(0.11 + 1e-9)
+  })
+
   it('is deterministic: regeneration replays the exact draw-command stream', () => {
     for (const v of TRAY_VARIANTS) {
       activeLog = []
@@ -163,6 +205,35 @@ describe('tray board textures (lit board-surface contracts)', () => {
       FNS[v](SPEC)
       expect(activeLog, `${v} identical stream`).toEqual(first)
     }
+  })
+
+  it('minors:false keeps the 100-unit majors and drops every 20-unit minor (the board at rest, loop 4 r3)', () => {
+    // workbench-wide / city-wide / workbench-labels.png (loop 4 r3): "an even
+    // 20-unit cross-hatch is clearly visible over the whole board wood".
+    // Scene3D's cap wears minors:false at rest and the full pitch while a
+    // card is dragged. A vertical grid line starts at moveTo(p, 0); the
+    // minors sit at p = c·64 + 0.5 (+ the 1.4 engraving shift), c = 1..4,
+    // the major at 1.1 (+ shift).
+    const minorX = new Set<number>()
+    for (let c = 1; c < 5; c++) for (const s of [0, 1.4]) minorX.add(c * 64 + 0.5 + s)
+    const verticals = (log: Call[], xs: (x: number) => boolean) =>
+      log.filter(([m, x, y]) => m === 'moveTo' && y === 0 && xs(x as number)).length
+    for (const v of TRAY_VARIANTS) {
+      activeLog = []
+      const rest = FNS[v]({ ...SPEC, minors: false })
+      const restLog = activeLog
+      activeLog = []
+      const drag = FNS[v]({ ...SPEC, minors: true })
+      const dragLog = activeLog
+      expect(rest.map, `${v}: rest and drag maps differ`).not.toBe(drag.map)
+      expect(rest.roughnessMap, `${v}: one roughness for both`).toBe(drag.roughnessMap)
+      expect(verticals(restLog, (x) => minorX.has(x)), `${v}: no minor at rest`).toBe(0)
+      expect(verticals(dragLog, (x) => minorX.has(x)), `${v}: the minors while dragging`).toBeGreaterThan(0)
+      // the majors stay in both
+      expect(verticals(restLog, (x) => x === 1.1 || x === 2.5), `${v}: majors at rest`).toBeGreaterThan(0)
+    }
+    // the default is the full pitch (every pre-r3 caller keeps its map)
+    expect(woodTrayTextures(SPEC)).toBe(woodTrayTextures({ ...SPEC, minors: true }))
   })
 
   it('showGrid=false skips the grid pass entirely', () => {

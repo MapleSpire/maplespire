@@ -15,6 +15,7 @@
 import * as THREE from 'three'
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js'
 import type { Lighting3D } from '../specs'
+import { compileAndWait } from './compileSafe'
 
 /**
  * The LIT render profile's light rig (PBR theme-by-theme migration).
@@ -35,6 +36,15 @@ import type { Lighting3D } from '../specs'
 export interface LightRig {
   sun: THREE.DirectionalLight
   hemi: THREE.HemisphereLight
+  /** The sun's unit direction (toward the light) as the theme set it — the
+   * ONE source `fitShadowCamera` re-anchors from. Re-deriving it from
+   * `sun.position` (which already carries the last target offset) drifted
+   * the sun one step toward the board centre on every decor-only build: the
+   * studio key (az −55°, el 38°) read az −22.6°, el 33.9° after one extra
+   * fit on the quality board (.probes/lamp probe, 2026-10-10) — longer
+   * shadows thrown the wrong way, cast farther from their drums at every
+   * decor pick, converging on a horizontal sun. */
+  sunDir: THREE.Vector3
 }
 
 /** Studio-rig parameter defaults (matching the reference-image mood). */
@@ -55,17 +65,15 @@ export function mountLightRig(scene: THREE.Scene, rig: LightRig | null, lighting
   const next = rig ?? {
     sun: new THREE.DirectionalLight(),
     hemi: new THREE.HemisphereLight(),
+    sunDir: new THREE.Vector3(0, 1, 0),
   }
   const sun = lighting.sun ?? {}
   next.sun.color.set(sun.color ?? SUN_COLOR)
   next.sun.intensity = sun.intensity ?? SUN_INTENSITY
   const az = ((sun.azimuthDeg ?? SUN_AZIMUTH_DEG) * Math.PI) / 180
   const el = ((sun.elevationDeg ?? SUN_ELEVATION_DEG) * Math.PI) / 180
-  next.sun.position.set(
-    SUN_DISTANCE * Math.cos(el) * Math.sin(az),
-    SUN_DISTANCE * Math.sin(el),
-    SUN_DISTANCE * Math.cos(el) * Math.cos(az),
-  )
+  next.sunDir.set(Math.cos(el) * Math.sin(az), Math.sin(el), Math.cos(el) * Math.cos(az))
+  next.sun.position.copy(next.sunDir).multiplyScalar(SUN_DISTANCE)
   // Shadows stay OFF at mount time — the shadow camera must be fitted to the
   // content bounds first (fitShadowCamera, called from rebuild, enables them).
   const ambient = lighting.ambient ?? {}
@@ -86,15 +94,23 @@ export function mountLightRig(scene: THREE.Scene, rig: LightRig | null, lighting
 export function fitShadowCamera(
   rig: LightRig,
   bounds: { x: number; y: number; width: number; height: number },
-  opts: { mapSize?: 1024 | 2048; enabled?: boolean; intensity?: number } = {},
+  opts: {
+    mapSize?: 1024 | 2048
+    enabled?: boolean
+    intensity?: number
+    /** World box of casters OUTSIDE the content bounds that must still land in
+     * the map — the decor layer (props on the desk band around the slab). */
+    cover?: THREE.Box3 | null
+  } = {},
 ): void {
   const cx = bounds.x + bounds.width / 2
   const cz = bounds.y + bounds.height / 2
   rig.sun.target.position.set(cx, 0, cz)
   rig.sun.target.updateMatrixWorld()
-  // Keep the sun direction, re-anchor around the content centre.
-  const dir = rig.sun.position.clone().normalize()
-  rig.sun.position.copy(dir.multiplyScalar(SUN_DISTANCE)).add(rig.sun.target.position)
+  // Keep the sun direction, re-anchor around the content centre — from the
+  // rig's own direction, never from the (already re-anchored) position: see
+  // `LightRig.sunDir` for the drift that caused
+  rig.sun.position.copy(rig.sunDir).multiplyScalar(SUN_DISTANCE).add(rig.sun.target.position)
   if (!opts.enabled) {
     rig.sun.castShadow = false
     return
@@ -103,12 +119,47 @@ export function fitShadowCamera(
   const margin = 140
   const half = Math.max(bounds.width, bounds.height) / 2 + margin
   const cam = rig.sun.shadow.camera
-  cam.left = -half
-  cam.right = half
-  cam.top = half
-  cam.bottom = -half
-  cam.near = SUN_DISTANCE - half - 200
-  cam.far = SUN_DISTANCE + half + 200
+  let left = -half
+  let right = half
+  let bottom = -half
+  let top = half
+  let near = SUN_DISTANCE - half - 200
+  let far = SUN_DISTANCE + half + 200
+  if (opts.cover && !opts.cover.isEmpty()) {
+    // THE DESK PROPS (view3d quality, contact pass 2026-10-09). The square
+    // above is fitted to the CONTENT bounds; the decor layer stands on the
+    // desk band around the slab, past it. Measured on the quality harness's
+    // workbench board (a shadow-map probe, never committed; light-space NDC of
+    // every decor instance): 8 of 23 props were OUTSIDE the map — the flag
+    // (x 1.22), the beaver (1.32), the sketchbook (1.39), the blueprint, the
+    // notebooks, the pencil cup, a coil, a leaf clump — so they cast nothing
+    // at all. The box grows (never shrinks) to the light-space bounds of the
+    // cover box. Same light view three uses for the shadow pass: the camera
+    // at the light, looking at its target, default up.
+    cam.position.copy(rig.sun.position)
+    cam.lookAt(rig.sun.target.position)
+    cam.updateMatrixWorld()
+    const view = cam.matrixWorldInverse
+    const b = opts.cover
+    const p = new THREE.Vector3()
+    const pad = 24 // a prop's soft shadow edge + PCF kernel, world units
+    for (let i = 0; i < 8; i++) {
+      p.set(i & 1 ? b.max.x : b.min.x, i & 2 ? b.max.y : b.min.y, i & 4 ? b.max.z : b.min.z).applyMatrix4(view)
+      left = Math.min(left, p.x - pad)
+      right = Math.max(right, p.x + pad)
+      bottom = Math.min(bottom, p.y - pad)
+      top = Math.max(top, p.y + pad)
+      // view space looks down −z
+      near = Math.min(near, -p.z - 200)
+      far = Math.max(far, -p.z + 200)
+    }
+  }
+  cam.left = left
+  cam.right = right
+  cam.top = top
+  cam.bottom = bottom
+  cam.near = Math.max(1, near)
+  cam.far = far
   cam.updateProjectionMatrix()
   const size = opts.mapSize ?? 2048
   if (rig.sun.shadow.mapSize.x !== size) {
@@ -167,9 +218,100 @@ export function acquireRoomEnvironment(renderer: THREE.WebGLRenderer): THREE.Tex
   return texture
 }
 
+/** PMREM internals the warm-up reaches for. Private three API: every access
+ * is guarded, and any mismatch falls back to the synchronous build. */
+interface PmremInternals {
+  _setSize?(size: number): void
+  _allocateTargets?(): THREE.WebGLRenderTarget
+  _blurMaterial?: THREE.Material | null
+  _ggxMaterial?: THREE.Material | null
+  _lodMeshes?: THREE.Mesh[]
+}
+
+/** A build in flight: holders acquired before it lands are counted here and
+ * carried into the cache entry (or, if all released meanwhile, the texture is
+ * disposed on arrival — the dispose-residue gates count it). */
+interface PendingRoomEnv {
+  promise: Promise<THREE.Texture>
+  refs: number
+}
+const pendingRoomEnv = new WeakMap<THREE.WebGLRenderer, PendingRoomEnv>()
+
+/** Same texture and ref-count as `acquireRoomEnvironment`, without the
+ * main-thread stall.
+ *
+ * Measured (scripts/view3d-quality, RTX 4080, 2026-10-08): the synchronous
+ * build spent 387-399 ms on entering the lit profile, almost all of it the
+ * page WAITING for the GPU process to link the room's materials and the
+ * blur/GGX convolution shaders (three's first use queries each program's
+ * uniforms, which blocks until the link is done). Here those programs are
+ * started with `compileAsync` — bound to a half-float target, exactly as the
+ * cube render and the convolution passes will draw — and only once the
+ * driver reports them linked does `fromScene` run, now as plain draw calls. */
+export function acquireRoomEnvironmentAsync(renderer: THREE.WebGLRenderer): Promise<THREE.Texture> {
+  const cached = roomEnvCache.get(renderer)
+  if (cached) {
+    cached.refs++
+    return Promise.resolve(cached.texture)
+  }
+  const pending = pendingRoomEnv.get(renderer)
+  if (pending) {
+    pending.refs++
+    return pending.promise
+  }
+  const pmrem = new THREE.PMREMGenerator(renderer)
+  const room = new RoomEnvironment()
+  const warmTarget = new THREE.WebGLRenderTarget(4, 4, { type: THREE.HalfFloatType, depthBuffer: true })
+  const jobs: Promise<unknown>[] = []
+  const prev = renderer.getRenderTarget()
+  const internals = pmrem as unknown as PmremInternals
+  try {
+    renderer.setRenderTarget(warmTarget)
+    jobs.push(compileAndWait(renderer, room, new THREE.PerspectiveCamera(90, 1, 0.1, 100)))
+    if (internals._setSize && internals._allocateTargets) {
+      internals._setSize(256)
+      internals._allocateTargets().dispose()
+      const plane = internals._lodMeshes?.[0]?.geometry
+      const warm = new THREE.Scene()
+      for (const m of [internals._blurMaterial, internals._ggxMaterial]) {
+        if (m && plane) warm.add(new THREE.Mesh(plane, m))
+      }
+      if (warm.children.length) jobs.push(compileAndWait(renderer, warm, new THREE.OrthographicCamera()))
+    }
+  } catch {
+    /* internals moved — fromScene below links them itself */
+  } finally {
+    renderer.setRenderTarget(prev)
+  }
+  const entry: PendingRoomEnv = { promise: Promise.resolve(null as unknown as THREE.Texture), refs: 1 }
+  const ceiling = new Promise<void>((r) => setTimeout(r, 4000))
+  entry.promise = Promise.race([Promise.all(jobs), ceiling])
+    .catch(() => {})
+    .then(() => {
+      warmTarget.dispose()
+      let texture: THREE.Texture
+      try {
+        texture = pmrem.fromScene(room, 0.04).texture
+      } finally {
+        pmrem.dispose()
+        disposeSceneDeep(room)
+        pendingRoomEnv.delete(renderer)
+      }
+      if (entry.refs > 0) roomEnvCache.set(renderer, { texture, refs: entry.refs })
+      else texture.dispose() // every holder let go while it was building
+      return texture
+    })
+  pendingRoomEnv.set(renderer, entry)
+  return entry.promise
+}
+
 export function releaseRoomEnvironment(renderer: THREE.WebGLRenderer): void {
   const entry = roomEnvCache.get(renderer)
-  if (!entry) return
+  if (!entry) {
+    const pending = pendingRoomEnv.get(renderer)
+    if (pending) pending.refs--
+    return
+  }
   entry.refs--
   if (entry.refs <= 0) {
     entry.texture.dispose()

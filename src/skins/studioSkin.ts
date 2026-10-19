@@ -297,7 +297,15 @@ export const studioSkin: SkinConfig = {
         ibl: { intensity: 0.35 },
         shadows: { enabled: true, opacity: 0.63, mapSize: 2048 },
         material: { roughness: 0.62, metalness: 0, clearcoat: 0.22 },
-        bloom: { strength: 0.35, threshold: 0.9 },
+        // threshold 0.9 → 1 (the theme contract's ceiling, specs.ts): the
+        // composer's scene buffer is linear and untoned, and the white card
+        // faces sat just over 0.9 — every card bloomed, and the veil lifted
+        // the INK printed on it. Measured (view3d quality loop 4 r3, ink probe
+        // on the run.mjs board, DPR 1, labels close-up): the #1E1D1B title's
+        // darkest pixel read (106,101,94) under the high/medium post stacks
+        // and (30,29,27) composer-less; at 1 it reads (33,31,29). The lamp's
+        // specular glints still bloom.
+        bloom: { strength: 0.35, threshold: 1 },
       },
     },
   },

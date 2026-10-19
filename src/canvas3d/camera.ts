@@ -135,6 +135,84 @@ export function presetPose(
   }
 }
 
+/**
+ * Refine `start` so every world point projects inside the viewport minus
+ * `insets` (css px) with `marginPx` to spare — the EXACT fit, by projection.
+ *
+ * `presetPose` sizes the shot from the axis-aligned content bounds with a
+ * cos(rx) foreshortening guess, which ignores the azimuth: at the iso
+ * preset's 40° yaw a wide board's rotated corners overshoot it, and the
+ * fit-to-screen left the Ingest card under the right properties panel and a
+ * drum's name tag on the bottom toolbar (view3d quality loop 2, round 2,
+ * city-wide.png after canvas-zoom-fit). This keeps polar/azimuth/fov and
+ * iterates target + distance: each pass projects every point, re-centres
+ * the projected hull on the safe rectangle (screen-relative pan) and scales
+ * the distance by the hull/safe ratio. Perspective makes one pass inexact,
+ * so it repeats until both converge (a few passes on real boards).
+ */
+export function fitPoseToPoints(
+  start: CameraPose,
+  points: readonly { x: number; y: number; z: number }[],
+  viewport: { width: number; height: number },
+  insets: CameraViewportInsets = {},
+  marginPx = 16,
+): CameraPose {
+  if (points.length === 0) return { ...start }
+  const vw = Math.max(1, viewport.width)
+  const vh = Math.max(1, viewport.height)
+  const left = Math.max(0, insets.left ?? 0) + marginPx
+  const right = Math.max(0, insets.right ?? 0) + marginPx
+  const top = Math.max(0, insets.top ?? 0) + marginPx
+  const bottom = Math.max(0, insets.bottom ?? 0) + marginPx
+  const safeW = Math.max(40, vw - left - right)
+  const safeH = Math.max(40, vh - top - bottom)
+  const safeCx = left + safeW / 2
+  const safeCy = top + safeH / 2
+  const cam = new THREE.PerspectiveCamera(start.fov, vw / vh, 1, 1e7)
+  const v = new THREE.Vector3()
+  const pose = { ...start }
+  for (let iter = 0; iter < 24; iter++) {
+    applyPose(cam, pose)
+    cam.updateMatrixWorld()
+    let minX = Infinity
+    let minY = Infinity
+    let maxX = -Infinity
+    let maxY = -Infinity
+    let behind = false
+    for (const p of points) {
+      v.set(p.x, p.y, p.z).applyMatrix4(cam.matrixWorldInverse)
+      if (v.z > -1) {
+        behind = true
+        break
+      }
+      v.applyMatrix4(cam.projectionMatrix)
+      const sx = ((v.x + 1) / 2) * vw
+      const sy = ((1 - v.y) / 2) * vh
+      minX = Math.min(minX, sx)
+      maxX = Math.max(maxX, sx)
+      minY = Math.min(minY, sy)
+      maxY = Math.max(maxY, sy)
+    }
+    if (behind) {
+      pose.distance *= 2
+      continue
+    }
+    const scale = Math.max((maxX - minX) / safeW, (maxY - minY) / safeH, 1e-3)
+    const dx = (minX + maxX) / 2 - safeCx
+    const dy = (minY + maxY) / 2 - safeCy
+    if (Math.abs(scale - 1) < 0.002 && Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5) break
+    // pan so the hull centre lands on the safe centre (CameraRig.panBy's
+    // screen→floor mapping, sign flipped: move the CONTENT by −dx, −dy)
+    const worldPerPx = 1 / zoomForDistance(pose.distance, vh, pose.fov)
+    const az = pose.azimuth * DEG
+    const upScale = 1 / Math.max(0.2, Math.cos(pose.polar * DEG))
+    pose.targetX += (dx * Math.cos(az) + dy * Math.sin(az) * upScale) * worldPerPx
+    pose.targetZ += (dx * -Math.sin(az) + dy * Math.cos(az) * upScale) * worldPerPx
+    pose.distance = Math.min(80_000, Math.max(120, pose.distance * scale))
+  }
+  return pose
+}
+
 /** Cartesian camera position for a pose. */
 export function posePosition(pose: CameraPose): THREE.Vector3 {
   const polar = Math.max(0.5, pose.polar) * DEG // never exactly 0 (lookAt up degeneracy)
@@ -203,6 +281,12 @@ export function lerpPose(a: CameraPose, b: CameraPose, t: number): CameraPose {
 
 // ── the rig ──────────────────────────────────────────────────────────────────
 
+/** Dolly clamps (world units from the target). */
+const MIN_DISTANCE = 120
+const MAX_DISTANCE = 80_000
+/** Wheel-glide time constant: ~95 % of a notch lands within 3τ ≈ 250 ms. */
+export const GLIDE_TAU_MS = 85
+
 /**
  * Owns the PerspectiveCamera + pose state; free navigation mutates the pose
  * inside clamps, presets/reset tween to their pose with the design curve.
@@ -212,6 +296,8 @@ export class CameraRig {
   readonly camera: THREE.PerspectiveCamera
   private pose: CameraPose
   private viewport = { width: 1, height: 1 }
+  /** Wheel glide in flight: the distance it is easing to (see dollySmooth). */
+  private glide: { distance: number; last: number } | null = null
   private tween: {
     from: CameraPose
     to: CameraPose
@@ -254,14 +340,33 @@ export class CameraRig {
     return { ...this.pose }
   }
 
+  /** The viewport (css px) the rig frames against. */
+  getViewport(): { width: number; height: number } {
+    return { ...this.viewport }
+  }
+
+  /** The pose `goToPresetFitting` would land on (no side effects) — the
+   * board's DEFAULT framing, which decor placement aims its showcase at. */
+  fitPoseFor(
+    presetId: CameraPresetId,
+    bounds: { cx: number; cz: number; width: number; height: number },
+    points: readonly { x: number; y: number; z: number }[],
+    insets: CameraViewportInsets,
+  ): CameraPose {
+    return fitPoseToPoints(presetPose(presetId, bounds, this.viewport), points, this.viewport, insets)
+  }
+
   setPose(pose: CameraPose): void {
+    // an explicit pose wins over a wheel glide still easing toward a target
+    // the caller never saw (enter morph, showcase step, preset jump-cut)
+    this.glide = null
     this.pose = { ...pose }
     applyPose(this.camera, this.pose)
     this.onChange()
   }
 
   isAnimating(): boolean {
-    return this.tween !== null
+    return this.tween !== null || this.glide !== null
   }
 
   prefersReducedMotion(): boolean {
@@ -279,13 +384,15 @@ export class CameraRig {
       onComplete?.()
       return
     }
+    this.glide = null
     this.tween = { from: this.getPose(), to, start: performance.now(), duration, onComplete }
     this.onChange()
   }
 
-  /** Advance the running tween; returns true while animating. */
+  /** Advance the running tween and the wheel glide; true while either runs. */
   step(now: number): boolean {
-    if (!this.tween) return false
+    const gliding = this.stepGlide(now)
+    if (!this.tween) return gliding
     const { from, to, start, duration, onComplete } = this.tween
     const t = Math.min(1, (now - start) / duration)
     this.pose = lerpPose(from, to, designEase(t))
@@ -351,6 +458,22 @@ export class CameraRig {
     else this.tweenTo(to)
   }
 
+  /** Frame at `presetId` so every one of `points` (world space — the corners
+   * of each node's 3D box) projects inside the canvas minus `insets`: the
+   * exact fit (see fitPoseToPoints). No points → the bounds framing. */
+  goToPresetFitting(
+    presetId: CameraPresetId,
+    bounds: { cx: number; cz: number; width: number; height: number },
+    points: readonly { x: number; y: number; z: number }[],
+    insets: CameraViewportInsets,
+    immediate = false,
+  ): void {
+    const to = this.fitPoseFor(presetId, bounds, points, insets)
+    this.dirty = false
+    if (immediate) this.setPose(to)
+    else this.tweenTo(to)
+  }
+
   // ── free navigation (interrupts any tween) ─────────────────────────────────
 
   orbitBy(dxPx: number, dyPx: number): void {
@@ -380,10 +503,49 @@ export class CameraRig {
     this.onChange()
   }
 
-  dollyBy(factor: number): void {
+  /** Wheel zoom. Each notch moves a TARGET distance and the camera glides to
+   * it (exponential approach, GLIDE_TAU_MS time constant, in log-distance so
+   * a zoom feels the same at every scale). Applying a whole notch on the
+   * event — the old behaviour — is a 20 % jump per click, which reads as a
+   * stutter however fast the frames are. Reduced motion keeps the jump. */
+  dollySmooth(factor: number, now = performance.now()): void {
+    if (this.reducedMotion()) {
+      this.dollyBy(factor)
+      return
+    }
     this.tween = null
     this.dirty = true
-    this.pose.distance = Math.min(80_000, Math.max(120, this.pose.distance * factor))
+    const base = this.glide?.distance ?? this.pose.distance
+    this.glide = {
+      distance: Math.min(MAX_DISTANCE, Math.max(MIN_DISTANCE, base * factor)),
+      last: this.glide?.last ?? now,
+    }
+    this.onChange()
+  }
+
+  private stepGlide(now: number): boolean {
+    const g = this.glide
+    if (!g) return false
+    const dt = Math.min(64, Math.max(0, now - g.last))
+    g.last = now
+    const k = 1 - Math.exp(-dt / GLIDE_TAU_MS)
+    const from = Math.log(this.pose.distance)
+    const to = Math.log(g.distance)
+    if (Math.abs(to - from) < 0.002) {
+      this.pose.distance = g.distance
+      this.glide = null
+    } else {
+      this.pose.distance = Math.exp(from + (to - from) * k)
+    }
+    applyPose(this.camera, this.pose)
+    return this.glide !== null
+  }
+
+  dollyBy(factor: number): void {
+    this.tween = null
+    this.glide = null
+    this.dirty = true
+    this.pose.distance = Math.min(MAX_DISTANCE, Math.max(MIN_DISTANCE, this.pose.distance * factor))
     applyPose(this.camera, this.pose)
     this.onChange()
   }

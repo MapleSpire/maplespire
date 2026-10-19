@@ -67,9 +67,71 @@ import {
   SELECTED_LIFT,
   type CameraPresetId,
 } from './presets'
-import { cableProfileFor, cableYAt, type CableProfile } from './cableProfile'
-import type { Scene3dDecorInfo, Scene3dDisposeResidue, Scene3dProbe, Scene3dSceneStats } from './scene3dProbe'
+import { cableProfileFor, type CableProfile } from './cableProfile'
 import {
+  buildInkGeometry,
+  createInkUniforms,
+  headFit,
+  inkCapGrowth,
+  headShear,
+  inkHeadOnDisc,
+  inkHeadTriangle,
+  inkRouteToHead,
+  inkStartOnDisc,
+  inkSetFor,
+  inkStyle,
+  INK_CORE_MAX_CSS,
+  INK_CORE_MIN_CSS,
+  INK_CORE_W,
+  INK_DASH_MIN_CSS,
+  INK_DASHED,
+  INK_DOTTED,
+  INK_HEAD_HALF_W,
+  INK_HEAD_LEN,
+  INK_PACKET,
+  INK_SETS,
+  inkBeadUniform,
+  inkPacketFade,
+  patchInkMaterial,
+  screenDir,
+  stripCasingWidthPx,
+  stripCoreWidthPx,
+  stripFacing,
+  type InkDisc,
+  type InkHead,
+  type InkSetId,
+  type InkStyle,
+} from './inkLine'
+import {
+  buildHandleGeometry,
+  createHandleMaterial,
+  createHandleUniforms,
+  discTriangleGap,
+  easeOut,
+  editHandleVisibility,
+  handleHitRadius,
+  handleStyle,
+  HANDLE_D_HOT,
+  HANDLE_HOVER_MS,
+  setHandleAnchor,
+  setHandleAppearance,
+  type EditHandleKind,
+} from './editHandle'
+import { createGradientBackdrop, disposeGradientBackdrop, setBackdropTexture, type GradientBackdrop } from './backdrop'
+import { ShadowDepthWarmer } from './lit/shadowWarm'
+import type {
+  Scene3dArrowhead,
+  Scene3dCityMount,
+  Scene3dConnLayer,
+  Scene3dDecorInfo,
+  Scene3dDisposeResidue,
+  Scene3dPose,
+  Scene3dProbe,
+  Scene3dSceneStats,
+  Scene3dSlowFrame,
+} from './scene3dProbe'
+import {
+  applyPose,
   CameraRig,
   designEase,
   poseFor2dViewport,
@@ -78,8 +140,24 @@ import {
   type CameraViewportInsets,
 } from './camera'
 import {
+  cameraSide,
+  labelAbbreviations,
+  litLabelPlacement,
+  onWireMaxDistance,
+  onWireSpots,
+  resolveScreenLabels,
+  wireAnchor,
+  type Box,
+  type LabelShow,
+  type Occluder,
+  type ScreenLabel,
+} from './connLabelPlacement'
+import {
   colorAlpha,
+  contrastRatio,
   drumFaceColor,
+  ensureContrast,
+  LIT_SMALL_INK_CONTRAST,
   mixColors,
   nodeWallColors,
   readableOn,
@@ -106,10 +184,23 @@ import {
 } from '../lib/layout/alignmentGuides'
 import { makeText, preloadFonts } from './text'
 import {
+  BoxGrid,
+  exceptSource,
+  freeScale,
+  INTER_CAP_EM,
+  legibleScale,
+  type ObstacleSource,
+  overlapsAny,
+  roomiestSpot,
+  scaleAbout,
+  settleScales,
+  unionSource,
+} from './labelLegibility'
+import { convexGap, convexHull, convexOverlap, plaqueInFront, screenShadowOnFloor, slideClear } from './screenClearance'
+import {
   ANCHOR_COUNT,
   anchorPoint,
   connectionPath,
-  edgePoint,
   endpointDragPreview,
   nearestAnchorIndex,
   nearestSegmentIndex,
@@ -117,18 +208,17 @@ import {
   pathPoint,
   pathTangent,
   samplePath,
-  type EdgePoint,
-  type Face,
   type PathGeometry,
   type Rect,
 } from './connectionPath'
 import type { Environment3D, FloorSpec3D, NodeSpec3D, Theme3dSource } from './specs'
 import type { SceneDecor3D } from './decor/decorSpec'
-import { placeDecor } from './decor/placement'
+import { CITY_HOLE_APRON, placeDecor, type PlacementInput, type ShowcaseView } from './decor/placement'
 import { DESK_ARCHETYPES, getDecorPack } from './decor/registry'
-import { buildDecorMeshes, disposeDecorBuild, disposeDecorGeometries, type DecorBuildResult } from './decor/build'
+import { buildDecorMeshes, disposeDecorGeometries, type DecorBuildResult } from './decor/build'
+import { decorAsset, loadDecorAssets, releaseDecorAssetGpu } from './decor/glbAssets'
 import {
-  acquireRoomEnvironment,
+  acquireRoomEnvironmentAsync,
   disposeLightRig,
   fitShadowCamera,
   mountLightRig,
@@ -137,11 +227,38 @@ import {
 } from './lit/lighting'
 import { litSurface } from './lit/materials'
 import type { PostStack, QualityTier } from './lit/post'
+import { compileAndWait } from './lit/compileSafe'
 import { paperBoardTextures } from './lit/paper'
-import { trayTexturesFor, type TrayVariant } from './lit/boards'
-import { workbenchTextures } from './lit/wood'
-import { buildCityBackground, buildDeskLamp, buildStudioBackground, type MakeMat } from './decor/backgrounds'
-import { mergeGeometries, toCreasedNormals } from 'three/examples/jsm/utils/BufferGeometryUtils.js'
+import { TRAY_BASE_CSS, trayTexturesFor, type TrayVariant } from './lit/boards'
+import {
+  CITY_DESK_BASE,
+  CITY_DESK_CONTRAST,
+  CITY_DESK_RELIEF,
+  WOOD_DESK_RELIEF,
+  deskBoardsGeometry,
+  deskVignetteTexture,
+  disposeWorkbenchTextures,
+  workbenchTextures,
+} from './lit/wood'
+import { CUT_MAT_LIFT, cuttingMatGeometry, cuttingMatTextures, disposeCuttingMatTextures } from './lit/cuttingMat'
+import {
+  assembleCityBackground,
+  buildCityGeometrySliced,
+  buildCityPodium,
+  buildDeskLamp,
+  buildStudioBackground,
+  cityMaterial,
+  CITY_PODIUM_H,
+  DESK_LAMP_FOOT_R,
+  DESK_LAMP_SHADE_R,
+  DESK_LAMP_SHADE_REACH,
+  disposeCityGeometry,
+  type CityGeometry,
+  type CityGeometryOpts,
+  type MakeMat,
+} from './decor/backgrounds'
+import { disposeCityFacadeTextures } from './decor/cityFacade'
+import { toCreasedNormals } from 'three/examples/jsm/utils/BufferGeometryUtils.js'
 import { disposeThemeAssets, getLoadedAsset, loadThemeAsset } from './assets'
 import { getActiveScene3D, setActiveScene3D } from './activeScene'
 
@@ -151,24 +268,130 @@ const CARD_PAD_X = 15
 const CARD_PAD_Y = 13
 const NAME_SIZE = 13
 const SUB_SIZE = 10.5
+/** Lit-profile connection label (text px / plate height) — see buildConnections. */
+const CONN_LABEL_SIZE_LIT = 13
+const CONN_LABEL_PLATE_H_LIT = 21
 const PILL_SIZE = 10
 const PILL_H = 16
 const PILL_RADIUS = 6
 // standee drum (kit CylStandee)
 const DRUM_R = 46
 const DRUM_H = 64
+/** Lit connection label plates draw in the transparent pass after every card
+ * and tag decal/text (renderOrder 0), and under the flow packets (40+); their
+ * text is +1. */
+const CONN_LABEL_PLATE_ORDER = 30
+/** Lit ink lines (inkLine.ts) draw in the transparent pass between the card
+ * decals (0) and the label plates: each connection's casing, then its core,
+ * in [INK_ORDER_BASE, INK_ORDER_BASE + INK_ORDER_SPAN) — a later line's halo
+ * cuts a clean gap through an earlier line's ink where they cross. What the
+ * connection layer draws OVER the lines (flow effects, edit chrome) is lifted
+ * to INK_ORDER_OVER. */
+const INK_ORDER_BASE = 1
+const INK_ORDER_SPAN = 20
+const INK_ORDER_OVER = 22
+/** A lit ink line picks within this many css px of its projected centreline
+ * (inkLineAt) — the design spec's "a click within 4 css px of a line's
+ * centre selects it", with a pixel of rounding. */
+const INK_PICK_PX = 5
 const PAD_R = 59
 
 /** Kit text-width heuristic (Editor3DApp uses `len * 6.2 + 14` at 10.5px). */
 const approxTextWidth = (text: string, fontSize: number) => text.length * fontSize * 0.59
 
-// ── Projected-size LOD (the draw-call/text mitigation at scale) ─────────────
+/** The floor tag in front of a drum (buildStandee, kit ed3c3__tag): the
+ * datastore NAME, Inter 600 at SUB_SIZE — the base design (edfc9c6f7).
+ * Quality loop 4 moved the name onto the drum's face in big bold text and
+ * left the tag the technology; the user rejected that on 2026-10-10 ("sur
+ * les shapes je vois des régressions sur la police et la taille de la police
+ * et l'icône par rapport à avant") and the base typography is restored. */
+function storeTagText(o: C4Object): string {
+  return o.name
+}
+
+/** The floor tag's width (text + 18, kit — drawn even for an empty name,
+ * as the base did). */
+function storeTagW(o: C4Object): number {
+  return approxTextWidth(storeTagText(o), SUB_SIZE) + 18
+}
+
+/** The floor tag's height (kit). */
+const STORE_TAG_H = 18
+
+/**
+ * The floor tag's board rect (top-left + size), or null without a tag.
+ *
+ * Quality pass "labels" round 2 (tp2-final-dpr1/workbench-labels.png x
+ * 415-500 y 700-760 and x 690-760 y 880-940): the tag sat at a fixed +z
+ * (cz + 49 .. 67) whatever the camera azimuth — at the iso preset (rz 45)
+ * that is BESIDE the drum, its inner end on the pad ring under the drum's
+ * foot ('PostgreSQL') and its outer end run off under the bottom chrome
+ * ('Elasticsearch'). It now stands on the CAMERA side — its centre on the
+ * board ray from the drum centre toward the preset camera — with every
+ * corner past the drum's front tangent line by STORE_TAG_GAP: a plaque in
+ * front of the exhibit, no part of it beside or behind the drum (a flat point
+ * in front of a standing cylinder is never hidden by it). Every consumer
+ * (the standee, the fit box, the label occluders and obstacles, the decor
+ * footprint, the probe's solids) reads this one rect.
+ */
+const STORE_TAG_GAP = 6
+function storeTagRect(o: C4Object, r: Rect, azimuthDeg: number, drumR: number): Box | null {
+  const w = storeTagW(o)
+  if (!(w > 0)) return null
+  return plaqueInFront(r.x + r.w / 2, r.y + r.h / 2, w, STORE_TAG_H, azimuthDeg, drumR, STORE_TAG_GAP)
+}
+
+// ── Projected-size LOD (plan §0/§3 — the draw-call/text mitigation at scale) ──
 // A node's readable decorations hide once its on-screen width shrinks past
 // readability, so a fit-all of hundreds of nodes doesn't pay for sub-pixel text
 // and tiles nobody can read. Decorations tag themselves via `userData.lod`; the
 // pickable fill plate, slab and shadow are NEVER tagged (they define the card).
 const LOD_SECONDARY = 1 // subtitle, tech pills, accent bar — first to hide
 const LOD_PRIMARY = 2 // name, type tile, glyph, icon — kept until very small
+// (No far-title tier and no badge growth/hiding: view3d quality loop 3 r2
+// swapped every card's face for a big Inter 700 title at wide framings and
+// hid the tech badges under a readable size; the user rejected both on
+// 2026-10-10 — the card and drum faces are the base design at every
+// framing, and only this projected-size LOD hides them, as in edfc9c6f7.)
+/** The desk lamp's bearing on the workbench (plan unit vector from its foot,
+ * world x/z) and how far along it the light lands (world px): the shade
+ * hangs BEHIND the foot, away from the slab, and pours back down onto the
+ * desk around the lamp's own base — toward the camera, so the pool and the
+ * lit inside of the dome both face the default iso view.
+ *
+ * Measured with .probes/lamp (each aim a live probe, 2026-10-10): any shade
+ * hung over the slab lit the board (the critic's disc and hot spot); a shade
+ * over the desk looking straight down hid its own pool from the iso camera
+ * (the dome covers ~80 units of desk behind it, the raised board ~36 in
+ * front of its edge) — at −x 85 / −z 20 the visible pool was a 35 × 16 px
+ * sliver, Δ ≤ 11 luminance; at −x 140 / −z 50 the back of the dome faced
+ * the camera like a dish. Up-screen is about (−0.58, −0.81) here. */
+const LAMP_BEARING: readonly [number, number] = [-0.6, -0.8]
+const LAMP_AIM_DIST = 40
+/** A lit connection label grows at most this much (labelLegibility.ts). */
+const CONN_LABEL_MAX_GROW = 2.2
+/** A sliced label placement pass runs at most about this long per task
+ * (runLabelJob) — far under the 50-ms long-task line, so input and frames
+ * run between slices. */
+const LABEL_SLICE_MS = 8
+/** …and the first slice of a FULL rebuild's pass (runLabelJob `inline`):
+ * room for a small board's whole pass (25-29 ms on the 9-node test board,
+ * me-tp4 labelPerf) so its decor is built around the placed plates. */
+const LABEL_INLINE_MS = 60
+/** Screen gap (css px) a lit label plate keeps from every card and drum at
+ * the default framing (quality pass "labels": 'evaluates' read as tucked
+ * under Alert manager at a 0.4 px overlap). The margin absorbs the build's
+ * fit pose against the live one: they agreed within 0.2 px on one probe,
+ * but a harness run (tp2-labels, first pass, margin 1.5) built 'queries'
+ * >= 1.5 px clear and measured it 0.8 px live, edge to edge with
+ * 'searches'. At 2.5, 'reads' and 'consumes' (1.9-2.3 px) shrink in place
+ * to x1.94 / x1.89 (11.9 / 8.7 px caps). */
+const LABEL_SCREEN_GAP_PX = 2.5
+/** A label slid off a card on screen must still read: its projected cap
+ * height at the default framing (the harness gate holds 8 px; the estimate
+ * is the view-centre scale, measured 2 % over the true cap on the harness
+ * board — 'evaluates' 9.2 estimated, 9.0 measured — so 0.5 px of margin). */
+const LABEL_SCREEN_MIN_CAP_PX = 8.5
 const LOD_SECONDARY_PX = 140 // card projected width (css px) below which tier-1 hides
 const LOD_PRIMARY_PX = 84 // …below which tier-2 hides too (a bare colored slab)
 
@@ -176,6 +399,14 @@ const LOD_PRIMARY_PX = 84 // …below which tier-2 hides too (a bare colored sla
 // turn every 60s — pausing on any interaction and resuming after a beat.
 const SHOWCASE_DEG_PER_S = 6
 const SHOWCASE_RESUME_MS = 2500
+/** Longest the render loop waits on an async shader compile (scheduleCompile). */
+const COMPILE_GATE_MAX_MS = 4000
+/** Longest the decor layer waits for its Blender GLBs before building the procedural fallback. */
+const DECOR_ASSET_WAIT_MS = 1500
+/** Governor: frame-pacing EMA above this (ms) counts as a slow frame (~38 fps)… */
+const GOVERNOR_SLOW_MS = 26
+/** …and this many consecutive slow frames steps quality down once. */
+const GOVERNOR_SLOW_FRAMES = 60
 
 export interface Scene3DCallbacks {
   onObjectSelect: (id: string | null, multi: boolean) => void
@@ -248,6 +479,12 @@ interface FlowUnit {
   tick: (now: number) => void
   /** traveling-dot / energy-beam: the traveling packet (probe handle). */
   dot?: THREE.Object3D
+  /** A lit ink line's bead (painted in its core, no mesh of its own): where
+   * its centre is (layer-local plan), for the probe. */
+  pos?: { x: number; z: number }
+  /** …its line, the fade uniforms of the meshes that paint it, and the fade
+   * and on-screen clearance (css px) it was last drawn with. */
+  bead?: { connId: string; ks: THREE.IUniform<number>[]; fade: number; clearPx: number }
   /** Normalized animation phase last rendered (dev probe: e2e asserts
    * PROGRESS on the phase — world distance depends on path length/pacing). */
   lastT?: number
@@ -292,6 +529,7 @@ type SurfaceRole =
   | 'drumLid'
   | 'tagPlate'
   | 'ribbon'
+  | 'connInk'
   | 'connLabel'
   | 'handle'
   | 'selectionRing'
@@ -352,7 +590,12 @@ export class Scene3D {
   private floorGridToggle: { uniform: THREE.IUniform<THREE.Color>; on: THREE.Color; off: THREE.Color } | null = null
   /** Lit-profile grid toggle: the paper board swaps textures instead of a
    * shader uniform (on/off variants share the palette-keyed cache). */
-  private litFloorGrid: { mat: THREE.MeshPhysicalMaterial; on: THREE.Texture; off: THREE.Texture } | null = null
+  /** The lit cap's map-only grid toggle: `on` at rest, `drag` (the full
+   * pitch, minors included — trays only; paper has one look) while a card
+   * or a group is dragged, `off` when the grid is hidden. */
+  private litFloorGrid: { mat: THREE.MeshPhysicalMaterial; on: THREE.Texture; off: THREE.Texture; drag: THREE.Texture } | null = null
+  /** A card or a group is being dragged (litFloorGrid shows the minors). */
+  private gridDragging = false
   /** Live focus animations, one per highlighted connection (rebuilt with the
    * connections; empty whenever nothing is selected → idle rAF stays 0). */
   private flowUnits: FlowUnit[] = []
@@ -376,11 +619,183 @@ export class Scene3D {
   private lastDropGuideSnap = { x: false, y: false }
   /** Routing geometry from the last buildConnections — edit-gesture math reads it. */
   private connGeoms = new Map<string, PathGeometry>()
-  /** Per-build cable anatomy facts (lit profile) — read by the cableInfo()
-   * dev probe so e2e can assert every plug lands INSIDE its node's wall and
-   * the run rests ABOVE its support (no cable ends floating beside the shapes,
-   * no mid-span sinking into group platforms). */
-  private cableDebug: CableDebugEntry[] = []
+  /** Arc position + normal offset each lit label was actually drawn at (it
+   * may have slid along its wire, or nudged across it) — the label-slide
+   * gesture starts from it, so grabbing a label does not snap it back to its
+   * stored spot. */
+  private connLabelOffsets = new Map<string, { t: number; offset: number }>()
+  /** Board boxes of the lit label plates from the last buildConnections —
+   * decor placement keeps its props off them. */
+  private connLabelBoxes: Box[] = []
+  /** Debug/perf: how the last buildConnections grew its labels (probe). */
+  private connLabelGrowth: { kWant: number; labels: { connId: string; kFree: number; moved: boolean }[] } = { kWant: 1, labels: [] }
+  /** The desk lamp's plan footprint on the workbench (world x/z + radius):
+   * one circle over its foot, the desk under its shade and its pool — desk
+   * props keep off it and the greenery zone gathers beside it (placement.ts
+   * `lamp`). Null without a lamp. */
+  private lampFoot: { x: number; z: number; r: number } | null = null
+  /** The last built slab (world x/z of its top-left corner, size, top and
+   * desk heights) — dev probe only (boardInfo). */
+  private boardBox: { x: number; z: number; w: number; h: number; topY: number; deskY: number } | null = null
+  /** The last `placeDecor` input, archetypes as ids — dev probe only
+   * (decorPlacementInput): the quality harness replays the live desk layout
+   * through the pure function offline. */
+  private lastDecorInput: (Omit<PlacementInput, 'archetypes'> & { archetypes: string[] }) | null = null
+  /** The label boxes the current decor was placed around (labelBoxesSig). */
+  private decorAvoidSig = ''
+  /** Lit connection labels that grow at far framings (labelLegibility.ts):
+   * the plate + text, the label's box at its own size (centre + extent), the
+   * point it grows away from, the room it has (kFree) and its current k. */
+  private connLabelScalers: {
+    plate: THREE.Mesh
+    text: Text
+    cx: number
+    cz: number
+    w: number
+    h: number
+    anchor: { x: number; y: number }
+    kFree: number
+    k: number
+    /** The connection it labels (connLabelOffsets key). */
+    connId: string
+    /** Its entry in connLabelBoxes (the decor keeps off it). */
+    boxIndex: number
+    /** Arc position + signed normal offset it sits at. */
+    t: number
+    offset: number
+    /** The arc position it prefers (stored, else the midpoint) and the side
+     * a cross-wire nudge tries first — onWireSpots' ordering. */
+    tPref: number
+    side: number
+    /** Path point + unit tangent at an arc position (its own wire). */
+    sample: (t: number) => { pt: { x: number; y: number }; tan: { x: number; y: number } }
+    /** Where the plate lands (centre + lift) at (t, offset), wire clearance
+     * enforced — litLabelPlacement in its follow-the-pointer mode. */
+    placeAt: (t: number, offset: number) => { x: number; y: number; lift: number; t: number; offset: number }
+    cableR: number
+    /** The connection's whole label, and what it shows at the current
+     * framing (resolveConnLabelVisibility: whole, abbreviated or hidden). */
+    fullText: string
+    shown: LabelShow
+    /** The plate geometry of the whole label (w wide); an abbreviated plate
+     * wears a narrower one centred in it until the label shows whole again. */
+    fullGeo: THREE.BufferGeometry
+    plateR: number
+    /** Where it may be drawn at any framing: spot 0 is where buildConnections
+     * placed it, the rest are the spots ON its wire (onWireSpots, preference
+     * order) clear of the other wires on the board — the settle pass takes
+     * the first one with room on screen. Empty until the build fills it. */
+    spots: { x: number; z: number; lift: number; t: number; offset: number; anchor: { x: number; y: number } }[]
+    /** The lift its home spot (cx, cz) floats at — the placement pass's
+     * state; the plate mesh shows it only once the pass commits. */
+    lift: number
+    /** Its own placement inputs (text, preferred spot, wire, cable radius):
+     * a rebuild that leaves them alone keeps showing what the label showed
+     * until the new placement pass commits (runLabelJob). */
+    sig: string
+  }[] = []
+  /** The running lit-label placement pass (connLabelLayout), sliced off the
+   * build that started it; null when none is pending. */
+  private labelJob: {
+    gen: Generator<void, void, void>
+    t0: number
+    cpuMs: number
+    slices: number
+    maxSliceMs: number
+  } | null = null
+  /** True from the start of a placement pass until it commits: the label
+   * meshes show the previous framing's result (or where the build put them)
+   * and the settle-time scale / resolve leave them alone. */
+  private labelHold = false
+  /** The slice scheduler of the placement pass (a MessageChannel task: no
+   * 4-ms timer clamp between slices, and input still runs between them). */
+  private labelChannel: MessageChannel | null = null
+  private labelSliceFn: (() => void) | null = null
+  /** The uniforms every lit ink material shares (inkLine.ts): the canvas
+   * height in css px and the world px per css px at the orbit target —
+   * refreshed before each frame (updateInkUniforms). */
+  private inkUniforms = createInkUniforms()
+  /** The lit edit handles of the single selected connection (editHandle.ts):
+   * one billboard geometry (front + x-ray meshes share it), the handles in
+   * its vertex order — the target knob is re-placed every frame
+   * (updateEditHandles), since its world spot depends on the camera. */
+  private editChrome: {
+    connId: string
+    geo: THREE.BufferGeometry
+    items: {
+      role: 'source' | 'knob' | 'bend' | 'drag' | 'anchor'
+      kind: EditHandleKind
+      id: number
+      x: number
+      y: number
+      z: number
+      visible: boolean
+      pick: PickTarget | null
+    }[]
+    /** The knob's spot is behind its own target shape (it hides). */
+    knobOccluded?: boolean
+  } | null = null
+  private handleUniforms = createHandleUniforms()
+  /** The selected line's halo material and its resting opacity (a hovered
+   * head / knob brightens it). */
+  private selectHalo: { mat: THREE.Material; base: number } | null = null
+  /** The hovered handle (its glow + growth run HANDLE_HOVER_MS from `start`). */
+  private handleHover: { id: number; start: number } | null = null
+  /** Cost of the lit label passes (probe connLabelPerf, TASK 2): the last
+   * build's placement pass (growth, screen pass, spot lists) and the
+   * settle-time resolve (last, worst, count). */
+  private connLabelPerf = {
+    buildMs: 0,
+    resolveMs: 0,
+    resolveMaxMs: 0,
+    resolves: 0,
+    connBuildMs: 0,
+    connBuildMaxMs: 0,
+    connBuilds: 0,
+    jobSlices: 0,
+    jobMaxSliceMs: 0,
+    jobWallMs: 0,
+    jobsCancelled: 0,
+  }
+  /** The connection the pointer rests on (its label shows whole). */
+  private connLabelHoverId: string | null = null
+  /** Text-bearing features on each card's top face (the type chip, the
+   * title), CARD-LOCAL — recorded by buildCard, translated by the card's
+   * position in buildConnections, where lit label plates keep off them. */
+  private cardTextRects = new Map<string, Box[]>()
+  /** Host-measured overlay insets (css px) for fit-to-screen — see
+   * setSafeAreaProvider. */
+  private safeAreaProvider: (() => CameraViewportInsets) | null = null
+  /** The insets the last fit-to-screen framed inside (see frame()). */
+  private lastFitInsets: { left: number; right: number; top: number; bottom: number } | null = null
+  /** batch(): nesting depth, and whether a rebuild was requested inside it. */
+  private batchDepth = 0
+  private batchDirty = false
+  /** Each connection's centreline as built (the ribbon's samples,
+   * layer-local x / height / z) — the connLabelWireInfo probe measures every
+   * label plate against its OWN wire with it, the arrow probe samples the
+   * line's contrast along it. */
+  private connLines = new Map<string, { x: number; y: number; z: number }[]>()
+  /** Every connection's flat arrowhead as the last connection build drew it
+   * (arrowheadInfo probe; the label passes keep off the lit ones): its tip
+   * and axis (layer-local), the target's rect, the 2D stroke and — lit — the
+   * ink style it wears (inkLine.ts). Unlit ribbons keep Clean's 14 × ±5
+   * triangle (`ink` null). */
+  private arrowDebug: {
+    connId: string
+    toId: string
+    kind: 'flat'
+    head: InkHead
+    length: number
+    halfW: number
+    target: Rect
+    /** The lit line's dash pattern (world px), null when solid. */
+    dash: readonly [number, number] | null
+    highlighted: boolean
+    alpha: number
+    strokeCss: string
+    ink: InkStyle | null
+  }[] = []
 
   /** The floor dressing (slab, grid, border, ground shadow) fades with the
    * 2D↔3D morph: 0 = the flat 2D reading, 1 = the dressed board. The
@@ -447,6 +862,8 @@ export class Scene3D {
 
   private raf = 0
   private needsRender = false
+  /** A shadow caster may have changed since the shadow map was last drawn. */
+  private shadowsDirty = true
   private disposed = false
   private devProbeIdentity: unknown = null
   /** GL context resilience: render loop pauses while the context is
@@ -506,19 +923,100 @@ export class Scene3D {
   private litRig: LightRig | null = null
   /** Whether this scene holds a ref on the shared PMREM room environment. */
   private litEnvHeld = false
+  /** The IBL build in flight, if any — the compile gate waits on it. */
+  private envPending: Promise<void> | null = null
+  /** Bumped on every release, so a build that lands late is dropped. */
+  private envSeq = 0
   /** The lit post stack (own lazy chunk; null = composer-less render). */
   private post: PostStack | null = null
   private postLoading = false
   /** Auto-degrade bookkeeping (lit frames only): EMA of renderFrame cost. */
   private frameCostEma = 0
   private slowFrames = 0
+  /** rAF timestamp of the last rendered frame (0 = the loop went idle). */
+  private lastRenderAt = 0
+  /** performance.now() when the last rendered tick finished its work… */
+  private lastTickEnd = 0
+  /** …and when the rAF that runs the NEXT tick was requested (governor). */
+  private rafRequestedAt = 0
 
   // ── scene decoration (per-diagram shared setting — decor track) ────────────
   private sceneDecor: SceneDecor3D | null = null
   /** Background world actually built by the last buildFloor (probe/e2e). */
   private bgWorldBuilt: 'workbench' | 'city' | 'studio' | 'void' | null = null
   private decorBuild: DecorBuildResult | null = null
+  /** Blender decor meshes in flight / arrived (see buildDecor). */
+  private decorAssetsPending: Promise<void> | null = null
+  private decorAssetsSettled = false
+  /** City background geometry, cached per (board footprint, seed): every
+   * full rebuild re-dresses it with fresh materials instead of re-running
+   * the 59-78 ms builder (view3d-quality 2026-10-08, `floorMs` on city). */
+  private cityGeom: { key: string; geom: CityGeometry } | null = null
+  /** The in-flight time-sliced city build (null once settled or cancelled). */
+  private cityJob: { key: string; promise: Promise<CityGeometry | null> } | null = null
+  /** Resolves once the current floor's city is attached — the compile gate
+   * waits on it, so the previous frame stays on screen meanwhile. */
+  private cityPending: Promise<void> | null = null
+  /** The current floor's city mount point (cleared by clearRoot). */
+  private cityHolder: THREE.Group | null = null
+  /** Lit slab geometries (bevel + creased normals) by dimensions. The cards,
+   * plinths and board slab of a rebuild mostly repeat the same few sizes,
+   * and `toCreasedNormals` was ~24 ms of every full rebuild (profile of the
+   * city decor pick, 2026-10-08). Entries no rebuild used are released at
+   * the end of the next full rebuild. */
+  private slabGeoCache = new Map<string, THREE.BufferGeometry>()
+  private slabGeoUsed = new Set<string>()
+  /** Debug/perf: wall-clock cost of the last FULL rebuild (perfInfo probe). */
+  private buildTimings = {
+    totalMs: 0,
+    floorMs: 0,
+    decorMs: 0,
+    builds: 0,
+    firstFrameMs: 0,
+    compileMs: 0,
+    postFirstMs: 0,
+    postFirstShadowMs: 0,
+    /** `builds` when the first-frame probe last fired (-1: not yet this build). */
+    postFirstBuild: -1,
+    postFirstComposed: false,
+  }
+  /** First-frame probe, armed by every full rebuild AND by the post-stack
+   * mount: the next presented frame (plus the shadow pass split ahead of it,
+   * see `primeShadowPass`) reports its own wall time and the programs it
+   * still had to link. Re-armed per build so a rebuild never reports the
+   * previous build's frame (loop1-r2 carried enter-3D's 170.300000011 ms
+   * into the city pick, bit-identical). */
+  private postFirstRenderPending = false
+  /** Programs live before the probed frame's shadow pass (null: not started). */
+  private postFirstBefore: Set<unknown> | null = null
+  private postFirstNewPrograms: string[] = []
+  private postFirstPriorPrograms: string[] = []
+  private firstFramePending = false
+  /** Scene-owned gradient backdrop (see backdrop.ts) — replaces a texture
+   * `scene.background`, which the async compile gate cannot reach. */
+  private backdrop: GradientBackdrop | null = null
+  /** Shadow-depth programs warmed by the compile gate (see lit/shadowWarm.ts). */
+  private readonly depthWarmer = new ShadowDepthWarmer()
+  /** 1×1 target bound while the depth variants compile: three keys a program
+   * on whether a target is bound (linear output, no tone mapping), and the
+   * shadow pass always draws into one. */
+  private depthWarmTarget: THREE.WebGLRenderTarget | null = null
+  /** Camera that sees nothing — renders the shadow map alone (primeShadowPass). */
+  private shadowPrimeCamera: THREE.PerspectiveCamera | null = null
+  /** Async shader compile gate — see `scheduleCompile`. */
+  private compiling = false
+  private compileSeq = 0
+  private compileWaiters: (() => void)[] = []
+  /** When the gate first closed (0 = open): the ceiling is anchored HERE, so a
+   * stream of superseding rebuilds cannot hold the loop indefinitely. */
+  private compileGateSince = 0
+  /** An enter morph is committed but its tween has not started (holdForEnter). */
+  private enterPending = false
+  /** Bumped by every enter/exit: a deferred enter checks it is still current. */
+  private enterGen = 0
   private decorRefreshTimer: ReturnType<typeof setTimeout> | null = null
+  /** The idle callback a fired decorRefreshTimer handed the rebuild to. */
+  private decorRefreshIdle: number | null = null
   /** Floor pad/fracture actually used by the last buildFloor (decor inputs). */
   private lastFloorPad = { x: 88, y: 72 }
   private lastFractureBand = 0
@@ -533,7 +1031,14 @@ export class Scene3D {
     this.renderer.outputColorSpace = THREE.SRGBColorSpace
     this.renderer.toneMapping = THREE.NoToneMapping
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2))
-    this.rig = new CameraRig(() => this.requestRender())
+    // three's shader-error check reads each program's link status and info
+    // log on first use — a SYNCHRONOUS round trip that makes the page wait for
+    // the GPU process to finish compiling. Without it a pending compile delays
+    // the frame on the GPU side only; the main thread (UI, input) stays free.
+    // Kept in development, where a broken shader must fail loudly.
+    this.renderer.debug.checkShaderErrors = import.meta.env.DEV
+    this.measureVsync()
+    this.rig = new CameraRig(() => this.requestCameraRender())
     this.scene.add(this.root)
     this.scene.add(this.smartGuideLayer)
     this.smartGuideLayer.name = 'smart-guides'
@@ -551,12 +1056,28 @@ export class Scene3D {
 
     // Dev-only introspection for honest e2e assertions (never used by app code).
     // Assigned to a TYPED target (`scene3dProbe.ts` augments Window), so the
-    // compiler checks the key as well as the shape (through a
-    // `Record<string, unknown>` cast, any key at all would typecheck).
-    if (import.meta.env.DEV) {
+    // compiler checks the key as well as the shape — through the old
+    // `Record<string, unknown>` cast, any key at all typechecked.
+    // VITE_SCENE3D_PROBE=on keeps it in a production build, so the quality loop
+    // (scripts/view3d-quality) can measure load time on bundled code.
+    if (import.meta.env.DEV || import.meta.env.VITE_SCENE3D_PROBE === 'on') {
       window.__scene3d = {
         getPose: () => this.rig.getPose(),
-        isCameraAnimating: () => this.rig.isAnimating(),
+        // the base design pose the enter morph lands on (enterTargetPose)
+        presetPose: () => this.rig.presetPoseFor(this.preset, this.contentBounds()),
+        // honest readiness: a committed-but-unstarted enter and a pending
+        // shader link are part of "the camera is still moving into place"
+        // …and while a sliced label placement pass is pending (the plates
+        // still show the previous pass): a probe reading labels before it
+        // commits would grade a state nobody settles on
+        isCameraAnimating: () =>
+          this.rig.isAnimating() ||
+          this.enterPending ||
+          this.compiling ||
+          this.connCompiling ||
+          this.decorRebuildRaf !== null ||
+          this.labelJob !== null,
+        enterPending: () => this.enterPending,
         /** Morph floor fade (0 = flat 2D reading, 1 = dressed board). */
         floorAlpha: () => this.floorAlpha,
         /** The pose the last enter morph STARTED from (framing identity). */
@@ -591,7 +1112,8 @@ export class Scene3D {
             glowCount,
             motionCount: this.motionUnits.length,
             fog: !!this.scene.fog,
-            bgIsGradient: this.scene.background instanceof THREE.Texture,
+            // the gradient is a scene-owned backdrop mesh now (backdrop.ts)
+            bgIsGradient: this.backdrop?.visible === true && this.backdrop.parent === this.scene,
           }
         },
         nodeCount: () => this.nodeGroups.size,
@@ -626,7 +1148,8 @@ export class Scene3D {
           let lightsCount = 0
           let shadowCasters = 0
           this.scene.traverse((o) => {
-            if ((o as THREE.Light).isLight) lightsCount++
+            // a parked practical (intensity 0, kept so programs never recompile) contributes nothing
+            if ((o as THREE.Light).isLight && (o as THREE.Light).intensity > 0) lightsCount++
             if ((o as THREE.Mesh).isMesh && o.castShadow) shadowCasters++
           })
           return {
@@ -673,10 +1196,166 @@ export class Scene3D {
             ? Object.entries(this.decorBuild.counts).map(([id, count]) => ({ id, count }))
             : [],
         }),
-        /** Debug/e2e: lit cable anatomy — every plug must land INSIDE its
-         * node's wall span and the run must rest ABOVE the higher support.
-         * Empty under the unlit profile. */
-        cableInfo: () => this.cableDebug.map((c) => ({ ...c, from: { ...c.from }, to: { ...c.to } })),
+        perfInfo: () => ({
+          ...this.buildTimings,
+          programs: this.renderer.info.programs?.length ?? 0,
+          programNames: (this.renderer.info.programs ?? []).map((p) => p.name),
+          // every live program's cache key (names are the material's, ''
+          // for nearly all): what a gesture added is a diff of these
+          programKeys: (this.renderer.info.programs ?? []).map((p) => String((p as unknown as { cacheKey?: string }).cacheKey ?? '')),
+          postFirstNewPrograms: [...this.postFirstNewPrograms],
+          postFirstPriorPrograms: [...this.postFirstPriorPrograms],
+          postFirstPending: this.postFirstRenderPending,
+          postLive: this.post !== null,
+          depthWarmVariants: this.depthWarmer.variantCount,
+          slowFrames: this.slowFrameLog.map((f) => ({ ...f })),
+          warmDraws: this.warmDraws,
+          warmDrawMs: this.warmDrawMs,
+        }),
+        setSlowFrameMs: (ms: number) => {
+          this.slowFrameMs = Math.max(1, ms)
+        },
+        benchFrames: (frames: number) => {
+          // Synchronous GPU-honest frame timing: each frame orbits the camera,
+          // advances the flow animations, renders through the real pipeline
+          // and is FORCED to completion by a 1-px readback, so the interval is
+          // the whole CPU+GPU cost — independent of vsync and of rAF pacing.
+          const gl = this.renderer.getContext()
+          const px = new Uint8Array(4)
+          const start = this.rig.getPose()
+          const times: number[] = []
+          for (let i = 0; i < frames; i++) {
+            const t0 = performance.now()
+            this.rig.setPose({ ...start, azimuth: (start.azimuth + (i * 90) / frames) % 360 })
+            this.stepFlow(t0)
+            this.renderFrameInner()
+            gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px)
+            times.push(performance.now() - t0)
+          }
+          this.rig.setPose(start)
+          this.updateNodeLod()
+          // only the camera and the flow dots moved: the cached shadow map
+          // is still exact (requestCameraRender) — a bench must not leave the
+          // next measured window a shadow re-render it did not cause
+          this.requestCameraRender()
+          return times
+        },
+        decorProps: (archetypeId: string) => {
+          const out: { x: number; y: number; z: number; scale: number; h: number; r: number; corners: [number, number, number][] }[] = []
+          const m = new THREE.Matrix4()
+          const v = new THREE.Vector3()
+          const s = new THREE.Vector3()
+          this.decorBuild?.group.updateMatrixWorld(true)
+          this.decorBuild?.group.traverse((o) => {
+            const im = o as THREE.InstancedMesh
+            if (!im.isInstancedMesh || o.userData.decorArchetype !== archetypeId) return
+            // the silhouette's own height (a moose's antler crown included):
+            // the quality harness frames its close-ups on it
+            if (!im.geometry.boundingBox) im.geometry.computeBoundingBox()
+            const bb = im.geometry.boundingBox!
+            // …and a rotation-safe plan radius about the origin (the box's
+            // farthest corner), so a close-up can frame a FLAT prop too
+            const r0 = Math.hypot(Math.max(-bb.min.x, bb.max.x), Math.max(-bb.min.z, bb.max.z))
+            for (let i = 0; i < im.count; i++) {
+              im.getMatrixAt(i, m)
+              m.premultiply(im.matrixWorld)
+              v.setFromMatrixPosition(m)
+              s.setFromMatrixScale(m)
+              // the geometry box's 8 corners in world space (posed, scaled):
+              // what the harness projects to frame a close-up exactly
+              const corners: [number, number, number][] = []
+              for (const cx of [bb.min.x, bb.max.x]) {
+                for (const cy of [bb.min.y, bb.max.y]) {
+                  for (const cz of [bb.min.z, bb.max.z]) {
+                    const w = new THREE.Vector3(cx, cy, cz).applyMatrix4(m)
+                    corners.push([w.x, w.y, w.z])
+                  }
+                }
+              }
+              out.push({ x: v.x, y: v.y, z: v.z, scale: s.y, h: (bb.max.y - Math.min(0, bb.min.y)) * s.y, r: r0 * Math.max(s.x, s.z), corners })
+            }
+          })
+          return out
+        },
+        boardInfo: () => (this.boardBox ? { ...this.boardBox } : null),
+        decorPlacementInput: () => (this.lastDecorInput ? JSON.parse(JSON.stringify(this.lastDecorInput)) : null),
+        decorSilhouettes: (archetypeId: string) => {
+          // every instance's projected SILHOUETTE box (its posed vertices
+          // through the live camera, ≤ ~4 000 sampled a mesh) — a geometry
+          // box's corners overshoot a round or long prop by up to √2
+          const rect = this.canvas.getBoundingClientRect()
+          const cam = this.rig.camera
+          cam.updateMatrixWorld()
+          this.decorBuild?.group.updateMatrixWorld(true)
+          const out: { x0: number; y0: number; x1: number; y1: number }[] = []
+          const m = new THREE.Matrix4()
+          const v = new THREE.Vector3()
+          this.decorBuild?.group.traverse((o) => {
+            const im = o as THREE.InstancedMesh
+            if (!im.isInstancedMesh || o.userData.decorArchetype !== archetypeId) return
+            const pos = im.geometry.getAttribute('position')
+            const step = Math.max(1, Math.floor(pos.count / 4000))
+            for (let i = 0; i < im.count; i++) {
+              im.getMatrixAt(i, m)
+              m.premultiply(im.matrixWorld)
+              const b = { x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity }
+              for (let k = 0; k < pos.count; k += step) {
+                v.fromBufferAttribute(pos, k).applyMatrix4(m).project(cam)
+                const sx = rect.left + ((v.x + 1) / 2) * rect.width
+                const sy = rect.top + ((1 - v.y) / 2) * rect.height
+                b.x0 = Math.min(b.x0, sx)
+                b.x1 = Math.max(b.x1, sx)
+                b.y0 = Math.min(b.y0, sy)
+                b.y1 = Math.max(b.y1, sy)
+              }
+              out.push(b)
+            }
+          })
+          return out
+        },
+        projectWorld: (points: { x: number; y: number; z: number }[]) => {
+          const rect = this.canvas.getBoundingClientRect()
+          const cam = this.rig.camera
+          cam.updateMatrixWorld()
+          const v = new THREE.Vector3()
+          return points.map((p) => {
+            v.set(p.x, p.y, p.z).project(cam)
+            return { x: rect.left + ((v.x + 1) / 2) * rect.width, y: rect.top + ((1 - v.y) / 2) * rect.height }
+          })
+        },
+        arrowheadInfo: (): Scene3dArrowhead[] => this.arrowheadProbe(),
+        connLayerInfo: (): Scene3dConnLayer => {
+          // what the connection layer is made of: geometry types by count,
+          // the ink meshes (casings + cores), and whether anything casts a
+          // shadow (the lit cables did; the ink lines must not)
+          const geometryTypes: Record<string, number> = {}
+          let inkMeshes = 0
+          let inkCores = 0
+          let shadowCasters = 0
+          this.connLayer.traverse((o) => {
+            const mesh = o as THREE.Mesh
+            if (!mesh.isMesh || this.connTexts.includes(o as Text)) return
+            geometryTypes[mesh.geometry.type] = (geometryTypes[mesh.geometry.type] ?? 0) + 1
+            if (o.userData.ink) inkMeshes++
+            if (o.userData.ink === 'core') inkCores++
+            if (mesh.castShadow) shadowCasters++
+          })
+          return {
+            geometryTypes,
+            inkMeshes,
+            inkCores,
+            shadowCasters,
+            inkSet: this.renderProfile === 'lit' ? this.inkSet() : null,
+          }
+        },
+        setPose: (pose: Partial<Scene3dPose>) => {
+          this.rig.setPose({ ...this.rig.getPose(), ...pose })
+          // a jump-cut lands at once: what a settled camera re-evaluates
+          // (LOD, the labels it shows, the chevrons it sees) follows, as it
+          // would after an orbit that ended here
+          this.updateNodeLod()
+          this.requestRender()
+        },
         forceContextRestore: () => this.renderer.forceContextRestore(),
         /** Debug/e2e: showcase auto-orbit state (on + currently held?). */
         showcaseInfo: () => ({
@@ -688,6 +1367,219 @@ export class Scene3D {
           return g ? { x: g.position.x, y: g.position.z } : null
         },
         nodeIds: () => [...this.nodeGroups.keys()],
+        textLegibility: () => {
+          // the projected CAP HEIGHT (css px) of every node title on screen
+          // and every connection label: the glyph's up axis (local +y) taken
+          // through the text's own world matrix and projected at its anchor
+          // (world −Z: the card title and the drum's floor-tag name lie flat)
+          const cam = this.rig.camera
+          cam.updateMatrixWorld()
+          this.scene.updateMatrixWorld()
+          const rect = this.canvas.getBoundingClientRect()
+          const a = new THREE.Vector3()
+          const b = new THREE.Vector3()
+          const capPx = (t: Text): number => {
+            a.set(0, 0, 0).applyMatrix4(t.matrixWorld)
+            b.set(0, (t.fontSize as number) * INTER_CAP_EM, 0).applyMatrix4(t.matrixWorld)
+            a.project(cam)
+            b.project(cam)
+            return Math.hypot(((b.x - a.x) / 2) * rect.width, ((b.y - a.y) / 2) * rect.height)
+          }
+          const titles: { id: string; kind: 'card' | 'store'; capPx: number }[] = []
+          for (const [id, unit] of this.nodeGroups) {
+            for (const child of unit.children) {
+              const store = child.userData.storeTag === 'text'
+              if (!child.visible || !(store || child.userData.cardContentRole === 'title')) continue
+              titles.push({ id, kind: store ? 'store' : 'card', capPx: capPx(child as Text) })
+            }
+          }
+          const labels = this.connTexts.filter((t) => t.visible).map((t) => ({ text: String(t.text), capPx: capPx(t), k: t.scale.x }))
+          return { titles, labels, growth: { ...this.connLabelGrowth, labels: this.connLabelGrowth.labels.map((l) => ({ ...l })) } }
+        },
+        nodeScreenBoxes: () => {
+          const rect = this.canvas.getBoundingClientRect()
+          const cam = this.rig.camera
+          cam.updateMatrixWorld()
+          const v = new THREE.Vector3()
+          return this.nodeFitBoxes().map(({ id, corners }) => {
+            let x0 = Infinity
+            let y0 = Infinity
+            let x1 = -Infinity
+            let y1 = -Infinity
+            for (const c of corners) {
+              v.set(c.x, c.y, c.z).project(cam)
+              const sx = rect.left + ((v.x + 1) / 2) * rect.width
+              const sy = rect.top + ((1 - v.y) / 2) * rect.height
+              x0 = Math.min(x0, sx)
+              y0 = Math.min(y0, sy)
+              x1 = Math.max(x1, sx)
+              y1 = Math.max(y1, sy)
+            }
+            return { id, x: x0, y: y0, w: x1 - x0, h: y1 - y0 }
+          })
+        },
+        nodeFaces: () => {
+          // what each node's face shows right now (USER REGRESSION
+          // 2026-10-10: the far-title mode had replaced every card's face at
+          // the wide framing — Inter 700 at up to 34, no badge, no subtitle —
+          // and the drums' names had moved onto the drum in bold). Per node:
+          // its title text block (the card name, or the drum's floor-tag
+          // name) with font / size / visibility, its technology / type badge
+          // (shown? scale?), and any text block in a font the base design
+          // never used for a node face.
+          const BASE_FONTS = new Set(['inter400', 'inter600'])
+          const out: {
+            id: string
+            kind: 'card' | 'store'
+            hasTech: boolean
+            title: { font: string; size: number; visible: boolean } | null
+            badge: { visible: boolean; scale: number } | null
+            foreignFonts: string[]
+          }[] = []
+          for (const [id, unit] of this.nodeGroups) {
+            let title: { font: string; size: number; visible: boolean } | null = null
+            let badge: { visible: boolean; scale: number } | null = null
+            const foreignFonts: string[] = []
+            for (const child of unit.children) {
+              const font = child.userData.fontId as string | undefined // text.makeText
+              if (font !== undefined && !BASE_FONTS.has(font)) foreignFonts.push(font)
+              if (child.userData.cardContentRole === 'title' || child.userData.storeTag === 'text') {
+                title = { font: font ?? '?', size: (child as Text).fontSize as number, visible: child.visible }
+              }
+              if (child.userData.cardContentRole === 'icon' || child.userData.drumBadge === true) {
+                badge = { visible: child.visible, scale: child.scale.x }
+              }
+            }
+            out.push({
+              id,
+              kind: unit.userData.nodeKind === 'store' ? 'store' : 'card',
+              hasTech: unit.userData.hasTech === true,
+              title,
+              badge,
+              foreignFonts,
+            })
+          }
+          return out
+        },
+        labelScreenInfo: () => {
+          // every lit connection label plate's four corners as DRAWN (its
+          // geometry box through its own world matrix — scale and lift
+          // included), and every node solid's points, through the LIVE
+          // camera in client css px (quality pass "labels")
+          const rect = this.canvas.getBoundingClientRect()
+          const cam = this.rig.camera
+          cam.updateMatrixWorld()
+          this.scene.updateMatrixWorld()
+          const v = new THREE.Vector3()
+          const proj = (x: number, y: number, z: number) => {
+            v.set(x, y, z).project(cam)
+            return { x: rect.left + ((v.x + 1) / 2) * rect.width, y: rect.top + ((1 - v.y) / 2) * rect.height }
+          }
+          const labels = this.connLabelScalers
+            .filter((s) => s.plate.visible && s.text.visible)
+            .map((s) => {
+              const g = s.plate.geometry
+              if (!g.boundingBox) g.computeBoundingBox()
+              const bb = g.boundingBox!
+              const pts = [
+                [bb.min.x, bb.min.z],
+                [bb.max.x, bb.min.z],
+                [bb.max.x, bb.max.z],
+                [bb.min.x, bb.max.z],
+              ].map(([x, z]) => {
+                const w = new THREE.Vector3(x, bb.max.y, z).applyMatrix4(s.plate.matrixWorld)
+                return proj(w.x, w.y, w.z)
+              })
+              return { connId: s.connId, text: String(s.text.text), k: s.text.scale.x, pts }
+            })
+          const nodes = this.nodeSolids().map((n) => ({ id: n.id, kind: n.kind, pts: n.pts.map((p) => proj(p.x, p.y, p.z)) }))
+          return { labels, nodes }
+        },
+        storeTagInfo: () => {
+          // each drum's floor tag (storeTagRect): its plate's four top
+          // corners in WORLD space as drawn, its text and whether both show
+          // (LOD) — the harness frames each one and gates it whole on the
+          // canvas and clear of every node on screen (quality pass "labels"
+          // round 2: 'PostgreSQL' / 'Elasticsearch' tucked under the drums)
+          this.scene.updateMatrixWorld()
+          const out: { id: string; text: string; visible: boolean; corners: { x: number; y: number; z: number }[] }[] = []
+          for (const [id, unit] of this.nodeGroups) {
+            const plate = unit.children.find((c) => c.userData.storeTag === 'plate') as THREE.Mesh | undefined
+            const text = unit.children.find((c) => c.userData.storeTag === 'text') as Text | undefined
+            if (!plate || !text) continue
+            const g = plate.geometry
+            if (!g.boundingBox) g.computeBoundingBox()
+            const bb = g.boundingBox!
+            const corners = [
+              [bb.min.x, bb.min.z],
+              [bb.max.x, bb.min.z],
+              [bb.max.x, bb.max.z],
+              [bb.min.x, bb.max.z],
+            ].map(([x, z]) => {
+              const w = new THREE.Vector3(x, bb.max.y, z).applyMatrix4(plate.matrixWorld)
+              return { x: w.x, y: w.y, z: w.z }
+            })
+            out.push({ id, text: String(text.text), visible: plate.visible && text.visible, corners })
+          }
+          return out
+        },
+        connLabelPerf: () => ({ ...this.connLabelPerf }),
+        connLabelStates: () => {
+          // TASK 2: what each lit label shows at the current framing (whole,
+          // abbreviated, hidden), whether hover / selection forces it whole,
+          // and its own cable's centreline in WORLD space — the harness
+          // hovers a hidden label's wire with the real pointer
+          this.scene.updateMatrixWorld()
+          const layerM = this.connLayer.matrixWorld
+          return this.connLabelScalers.map((s) => ({
+            connId: s.connId,
+            text: s.fullText,
+            state: s.shown.state,
+            shown: s.shown.text,
+            drawn: s.plate.visible && s.text.visible,
+            textNow: String(s.text.text),
+            hovered: this.connLabelHoverId === s.connId,
+            selected: this.selectedIds.has(s.connId),
+            k: s.k,
+            spots: s.spots.length,
+            wire: (this.connLines.get(s.connId) ?? []).map((p) => {
+              const w = new THREE.Vector3(p.x, p.y, p.z).applyMatrix4(layerM)
+              return { x: w.x, y: w.y, z: w.z }
+            }),
+          }))
+        },
+        connLabelWireInfo: () => {
+          // each visible lit label plate's WORLD centre as drawn (its geometry
+          // box through its own world matrix — scale and lift included), its
+          // drawn half extents, and its own line's centreline as built (the
+          // ribbon's samples, layer-local -> world). Quality pass
+          // "labels" round 2: the harness gates plate-to-own-wire distance.
+          this.scene.updateMatrixWorld()
+          const layerM = this.connLayer.matrixWorld
+          return this.connLabelScalers
+            .filter((s) => s.plate.visible && s.text.visible)
+            .map((s) => {
+              const g = s.plate.geometry
+              if (!g.boundingBox) g.computeBoundingBox()
+              const bb = g.boundingBox!
+              const c = new THREE.Vector3((bb.min.x + bb.max.x) / 2, bb.max.y, (bb.min.z + bb.max.z) / 2).applyMatrix4(s.plate.matrixWorld)
+              const sx = new THREE.Vector3()
+              s.plate.matrixWorld.decompose(new THREE.Vector3(), new THREE.Quaternion(), sx)
+              const wire = (this.connLines.get(s.connId) ?? []).map((p) => {
+                const w = new THREE.Vector3(p.x, p.y, p.z).applyMatrix4(layerM)
+                return { x: w.x, y: w.y, z: w.z }
+              })
+              return {
+                connId: s.connId,
+                text: String(s.text.text),
+                k: s.text.scale.x,
+                centre: { x: c.x, y: c.y, z: c.z },
+                halfW: ((bb.max.x - bb.min.x) * sx.x) / 2,
+                halfH: ((bb.max.z - bb.min.z) * sx.z) / 2,
+                wire,
+              }
+            })
+        },
         /** Debug/probe: the background world's fabric manifest (walk-up /
          * cornice / roof-treatment counts for the Montréal city ring). */
         cityFabricInfo: () => {
@@ -696,6 +1588,31 @@ export class Scene3D {
             if (o.userData.cityFabric) found = o.userData.cityFabric
           })
           return found
+        },
+        /** Debug/probe: the city's Mont-Royal — which mesh it wears and its
+         * WORLD box (the drawn `city-mount` part), for the harness close-up. */
+        cityMountInfo: () => {
+          let out: Scene3dCityMount | null = null
+          this.root.updateMatrixWorld()
+          this.root.traverse((o) => {
+            const seat = o.userData.cityMount as { r: number; source: 'glb' | 'procedural' } | null | undefined
+            if (out || !seat) return
+            let mesh: THREE.Mesh | null = null
+            o.traverse((c) => {
+              if (!mesh && c.userData.bgPart === 'city-mount') mesh = c as THREE.Mesh
+            })
+            if (!mesh) return
+            const box = new THREE.Box3().setFromObject(mesh)
+            const tris = (g: THREE.BufferGeometry) => (g.index ? g.index.count : g.getAttribute('position').count) / 3
+            out = {
+              source: seat.source,
+              min: [box.min.x, box.min.y, box.min.z],
+              max: [box.max.x, box.max.y, box.max.z],
+              radius: seat.r,
+              triangles: tris((mesh as THREE.Mesh).geometry),
+            }
+          })
+          return out
         },
         smartGuideInfo: () => ({
           guides: this.smartGuides.map((guide) => ({ ...guide })),
@@ -736,7 +1653,7 @@ export class Scene3D {
           kinds: this.flowUnits.map((u) => u.kind),
           dotPos: this.flowUnits[0]?.dot
             ? { x: this.flowUnits[0].dot.position.x, z: this.flowUnits[0].dot.position.z }
-            : null,
+            : (this.flowUnits[0]?.pos ?? null),
           phase: this.flowUnits[0]?.lastT ?? null,
         }),
         /** Debug/e2e: the grid toggle + whether the floor dots currently show. */
@@ -745,7 +1662,7 @@ export class Scene3D {
           dotsVisible: this.floorGridToggle
             ? !this.floorGridToggle.uniform.value.equals(this.floorGridToggle.off)
             : this.litFloorGrid
-              ? this.litFloorGrid.mat.map === this.litFloorGrid.on
+              ? this.litFloorGrid.mat.map !== this.litFloorGrid.off
               : false,
         }),
         /** Debug/e2e: mounted theme assets — custom bodies by asset id, the
@@ -888,23 +1805,139 @@ export class Scene3D {
           const off = Math.max(-40, Math.min(40, conn.labelOffset ?? 0))
           const pt = pathPoint(geom, t)
           const tan = pathTangent(geom, t)
+          // the lit chrome's handles sit on the drawn line (the source on its
+          // first point, the target knob behind the head; the head itself
+          // when the knob is hidden)
+          const chrome = this.editChrome?.connId === id ? this.editChrome : null
+          const src = chrome?.items.find((h) => h.role === 'source')
+          const knob = chrome?.items.find((h) => h.role === 'knob')
+          const head = chrome ? this.arrowDebug.find((a) => a.connId === id)?.head : undefined
+          const to = knob?.visible ? { x: knob.x, y: knob.z } : head ? { x: head.x - Math.cos(head.angle) * 5, y: head.z - Math.sin(head.angle) * 5 } : null
           return {
-            from: { x: geom.fromEdge.x, y: geom.fromEdge.y },
-            to: { x: geom.toEdge.x, y: geom.toEdge.y },
+            from: src ? { x: src.x, y: src.z } : { x: geom.fromEdge.x, y: geom.fromEdge.y },
+            to: to ?? { x: geom.toEdge.x, y: geom.toEdge.y },
             mid: pathPoint(geom, 0.5),
             label: conn.label ? { x: pt.x - tan.y * off, y: pt.y + tan.x * off } : null,
             waypoints: (conn.waypoints ?? []).map((w) => ({ ...w })),
             planeY: this.connLayer.position.y,
           }
         },
-        // `satisfies`, not a cast (see `scene3dProbe.ts`): `npm run build` is
-        // the comparison — a member added here without being declared there is
-        // an excess-property error, a member declared there and not installed
-        // here is a missing-property error. It is not redundant with the typed
-        // target: it names the contract where the literal is edited, and it is
-        // what USES the `import type` above, which keeps `scene3dProbe.ts` (and
-        // its global augmentation) in this program. Drop the import and
-        // `window.__scene3d` stops existing here (TS2339).
+        editHandleInfo: () => {
+          const chrome = this.editChrome
+          if (!chrome) return null
+          this.updateEditHandles()
+          const cam = this.rig.camera
+          const rect = this.canvas.getBoundingClientRect()
+          cam.updateMatrixWorld()
+          this.connLayer.updateWorldMatrix(true, false)
+          const layerM = this.connLayer.matrixWorld
+          const scr = (x: number, y: number, z: number) => {
+            const p = new THREE.Vector3(x, y, z).applyMatrix4(layerM).project(cam)
+            return { x: rect.left + ((p.x + 1) / 2) * rect.width, y: rect.top + ((1 - p.y) / 2) * rect.height }
+          }
+          const dark = this.palette?.dark === true
+          const handles = chrome.items.map((h) => {
+            const s = scr(h.x, h.y, h.z)
+            const look = handleStyle(h.kind, dark)
+            const d = this.handleDrawnDiameter(h)
+            return {
+              role: h.role,
+              kind: h.kind,
+              id: h.id,
+              visible: h.visible,
+              x: +s.x.toFixed(2),
+              y: +s.y.toFixed(2),
+              diameterPx: +d.toFixed(2),
+              bodyPx: +(look.diameter - 2 * look.ringW).toFixed(2),
+              hitPx: handleHitRadius(look.diameter),
+              ly: h.y,
+            }
+          })
+          // the endpoint-drag preview as built (its ink attributes)
+          let preview: { name: string; minCss: number; maxCss: number; dash: number[]; opacity: number; css: string } | null = null
+          this.connLayer.traverse((o) => {
+            if (o.userData.ink !== 'preview') return
+            const g = (o as THREE.Mesh).geometry
+            const m = (o as THREE.Mesh).material as THREE.MeshBasicMaterial
+            const p = g.getAttribute('aParam')
+            const c = g.getAttribute('aCap')
+            const ds = g.getAttribute('aDash')
+            preview = {
+              name: o.name,
+              minCss: 2 * p.getY(0),
+              maxCss: 2 * c.getX(0),
+              // [on, period] in css px at the orbit target's scale
+              dash: [ds.getX(0), ds.getY(0)].map((x) => +(x / this.inkUniforms.uInkWppTarget.value).toFixed(2)),
+              opacity: m.opacity,
+              css: '#' + m.color.getHexString(THREE.SRGBColorSpace),
+            }
+          })
+          // the bead: centre on screen, its fade and clearance
+          const beadUnit = this.flowUnits.find((u) => u.bead?.connId === chrome.connId && u.pos)
+          const lineY = this.connLines.get(chrome.connId)?.[0]?.y ?? 0
+          const bead = beadUnit
+            ? { ...scr(beadUnit.pos!.x, lineY, beadUnit.pos!.z), fade: +beadUnit.bead!.fade.toFixed(4), clearPx: +beadUnit.bead!.clearPx.toFixed(2), phase: beadUnit.lastT ?? null }
+            : null
+          const arrow = this.arrowDebug.find((a) => a.connId === chrome.connId)
+          const head = arrow ? this.inkHeadAt(arrow, cam, rect.height).tri.map((q) => scr(q.x, q.y, q.z)) : null
+          const knob = handles.find((h) => h.role === 'knob' && h.visible)
+          let gap: number | null = null
+          let knobTip: number | null = null
+          // the knob's disc edge to the head triangle, as drawn, and its
+          // centre to the tip (it sits ON the tip: the 2D destination dot)
+          if (knob && head) {
+            gap = +discTriangleGap(knob, knob.diameterPx / 2, head).toFixed(2)
+            knobTip = +Math.hypot(knob.x - head[0].x, knob.y - head[0].y).toFixed(2)
+          }
+          const line = this.connLines.get(chrome.connId)
+          const src = handles.find((h) => h.role === 'source')
+          const first = line?.[0] ? scr(line[0].x, line[0].y, line[0].z) : null
+          return {
+            connId: chrome.connId,
+            handles,
+            head,
+            knobHeadGapPx: gap,
+            knobTipPx: knobTip,
+            sourceOffLinePx: src && first ? +Math.hypot(src.x - first.x, src.y - first.y).toFixed(2) : -1,
+            hover: { id: this.handleUniforms.uHoverId.value, t: this.handleUniforms.uHoverT.value },
+            pressId: this.handleUniforms.uPressId.value,
+            knobOccluded: chrome.knobOccluded === true,
+            preview,
+            bead,
+            haloOpacity: this.selectHalo ? +(this.selectHalo.mat as THREE.MeshBasicMaterial).opacity.toFixed(4) : null,
+            haloBase: this.selectHalo?.base ?? null,
+            handleOrder: (() => {
+              let o = -1
+              this.connLayer.traverse((x) => {
+                if (x.name === 'edit-handles' || x.name === 'edit-handles-xray') o = Math.max(o, x.renderOrder)
+              })
+              return o
+            })(),
+            // the label plates and their text, as drawn
+            labelOrderMax: Math.max(-1, ...this.connLabelScalers.map((s) => s.plate.renderOrder), ...this.connTexts.map((t) => t.renderOrder)),
+            minHandleOrder: (() => {
+              let o = Infinity
+              this.connLayer.traverse((x) => {
+                if (x.name === 'edit-handles' || x.name === 'edit-handles-xray') o = Math.min(o, x.renderOrder)
+              })
+              return o
+            })(),
+          }
+        },
+        // `satisfies`, not a cast, and it is the whole point of the type.
+        //
+        // Seven e2e spec files each described this object in their own
+        // `declare global`, and they disagreed — see `scene3dProbe.ts` for what
+        // the first merged program measured. This one line makes `npm run build`
+        // the comparison: a member added here without being declared there is an
+        // excess-property error, a member declared there and not installed here
+        // is a missing-property error.
+        // `satisfies` on top of the typed target, and it is not redundant for
+        // two reasons. It names the contract at the point a reader is editing
+        // the literal; and it is what USES the `import type` above, which is
+        // what keeps `scene3dProbe.ts` in this program — and a global
+        // augmentation only applies while its module is in the program. Drop
+        // the import and `window.__scene3d` stops existing here (TS2339).
       } satisfies Scene3dProbe
       this.devProbeIdentity = window.__scene3d
     }
@@ -912,7 +1945,22 @@ export class Scene3D {
 
   // ── host API ───────────────────────────────────────────────────────────────
 
+  /** Last css size `setSize` applied (null: never called). */
+  private hostSize: { w: number; h: number } | null = null
+
   setSize(width: number, height: number): void {
+    // A ResizeObserver callback with the size unchanged (layout settling
+    // while the enter crossfade runs) must not reallocate anything: at DPR 2
+    // post.setSize re-creates the composer's MSAA buffers, the AO targets and
+    // the bloom mip chain at 3200 x 2000, and the next composed frame pays
+    // their allocation (loop4-r1-dpr2: one 277 ms composed frame ~680 ms
+    // after the first one, DPR 2 only).
+    // (compared with the last size the HOST gave, not renderer.getSize: the
+    // renderer starts at the canvas default 300 x 150, which a first call of
+    // that exact size must still apply to the rig)
+    if (this.hostSize && this.hostSize.w === width && this.hostSize.h === height) return
+    this.hostSize = { w: width, h: height }
+    this.resizedSinceFrame = true
     this.renderer.setSize(width, height, false)
     this.post?.setSize(width, height)
     this.rig.setViewport(width, height)
@@ -947,6 +1995,7 @@ export class Scene3D {
     const dataUrl = this.canvas.toDataURL('image/png')
     this.renderer.setPixelRatio(prevRatio)
     this.post?.setSize(css.x, css.y)
+    this.resizedSinceFrame = true
     this.requestRender()
 
     const comma = dataUrl.indexOf(',')
@@ -996,26 +2045,193 @@ export class Scene3D {
    * through here (loop, probes, capture), so the lit post stack can slot a
    * composer in without touching call sites. */
   private renderFrame(): void {
-    if (this.post) {
+    if (this.firstFramePending) {
+      // perf probe: the first frame after a full build pays program compiles
+      // and texture uploads — measure it, it is the visible hitch
+      this.firstFramePending = false
       const t0 = performance.now()
+      this.renderFrameInner()
+      this.buildTimings.firstFrameMs = performance.now() - t0
+    } else {
+      this.renderFrameInner()
+    }
+    // the new build now holds every program it draws with (including the
+    // shadow-depth variants acquired by this frame) — the old build's
+    // materials can go without taking a shared program down with them
+    this.flushRetiredMaterials()
+  }
+
+  private renderFrameInner(): void {
+    if (this.shadowsDirty) {
+      // autoUpdate is off under the lit profile (see requestCameraRender);
+      // three clears needsUpdate itself after re-rendering the map
+      this.renderer.shadowMap.needsUpdate = true
+      this.shadowsDirty = false
+    }
+    if (this.postFirstRenderPending) {
+      // perf probe: which programs did the first frame of this build (or of
+      // the freshly mounted post stack) still have to link? Each one is a
+      // synchronous stall the warm-up missed. The shadow pass split ahead of
+      // it (primeShadowPass) already took the `before` snapshot, so its links
+      // are counted here too.
+      this.postFirstRenderPending = false
+      const before = this.postFirstBefore ?? new Set<unknown>(this.renderer.info.programs ?? [])
+      this.postFirstBefore = null
+      this.postFirstPriorPrograms = (this.renderer.info.programs ?? [])
+        .filter((p) => before.has(p))
+        .map((p) => `${p.name}|${p.cacheKey}`)
+      const t0 = performance.now()
+      this.renderComposed()
+      this.buildTimings.postFirstMs = performance.now() - t0
+      this.buildTimings.postFirstBuild = this.buildTimings.builds
+      this.buildTimings.postFirstComposed = this.post !== null
+      this.postFirstNewPrograms = (this.renderer.info.programs ?? [])
+        .filter((p) => !before.has(p))
+        .map((p) => `${p.name}|${p.cacheKey}`)
+      return
+    }
+    this.renderComposed()
+  }
+
+  private renderComposed(): void {
+    this.updateInkUniforms()
+    this.updateEditHandles()
+    this.updateInkBeads()
+    if (this.post) {
       this.post.render()
-      // Auto-degrade governor: sustained slow lit frames walk the tier down
-      // (high → medium → low), never back up — a stutter on entry is fine, a
-      // permanently sluggish board is not.
-      const cost = performance.now() - t0
-      this.frameCostEma = this.frameCostEma === 0 ? cost : this.frameCostEma * 0.9 + cost * 0.1
-      if (this.frameCostEma > 26) {
-        if (++this.slowFrames >= 60) {
-          this.slowFrames = 0
-          this.frameCostEma = 0
-          this.setQualityTier(this.qualityTier === 'high' ? 'medium' : 'low')
-        }
-      } else {
-        this.slowFrames = 0
-      }
       return
     }
     this.renderer.render(this.scene, this.rig.camera)
+  }
+
+  /** Arm the first-frame probe for a new program set (a full build or a post
+   * stack swap) — nothing of the previous measurement is carried over. */
+  private armFirstFrameProbe(): void {
+    this.postFirstRenderPending = true
+    this.postFirstBefore = null
+    this.postFirstNewPrograms = []
+    this.postFirstPriorPrograms = []
+    this.buildTimings.postFirstMs = 0
+    this.buildTimings.postFirstShadowMs = 0
+    this.buildTimings.postFirstBuild = -1
+    this.buildTimings.postFirstComposed = false
+  }
+
+  /** Render the shadow map ALONE, in its own task, ahead of the first
+   * composed frame of a build / post-stack swap.
+   *
+   * The shadow pass (every caster into a 2-4k depth map) and the composed
+   * pass (scene + AO + bloom at DPR 2) used to share one task: enter-3D at
+   * DPR 2 measured a 216 ms long task (loop1-r2-dpr2, gate 200). Split, each
+   * is its own task and the composed frame finds the map already current.
+   *
+   * How: three renders shadow maps only inside `renderer.render`, from each
+   * light's own shadow camera — the main camera only gates LAYERS. A camera
+   * with the main camera's layers but a frustum that contains nothing culls
+   * every frustum-culled object from the main pass (the clip-space backdrop
+   * still draws, one quad), while the shadow pass renders every caster. It
+   * draws into the composer's scene buffer, which the composed frame clears
+   * and redraws, so every program key matches the RenderPass's — nothing new
+   * is linked. Returns false when there is nothing to prime. */
+  private primeShadowPass(): boolean {
+    const sm = this.renderer.shadowMap
+    if (!this.post || !sm.enabled || !(this.shadowsDirty || sm.needsUpdate)) return false
+    sm.needsUpdate = true
+    this.shadowsDirty = false
+    const cam = (this.shadowPrimeCamera ??= new THREE.PerspectiveCamera(1, 1, 1, 2))
+    cam.layers.mask = this.rig.camera.layers.mask
+    // far below the floor, looking further down, a 1-unit-deep frustum
+    cam.position.set(0, -1e6, 0)
+    cam.lookAt(0, -2e6, 0)
+    cam.updateMatrixWorld()
+    if (this.postFirstRenderPending && !this.postFirstBefore) {
+      this.postFirstBefore = new Set<unknown>(this.renderer.info.programs ?? [])
+    }
+    const prev = this.renderer.getRenderTarget()
+    const t0 = performance.now()
+    try {
+      this.renderer.setRenderTarget(this.post.sceneTarget)
+      this.renderer.render(this.scene, cam)
+    } finally {
+      this.renderer.setRenderTarget(prev)
+    }
+    if (this.postFirstRenderPending) this.buildTimings.postFirstShadowMs = performance.now() - t0
+    return true
+  }
+
+  /** Auto-degrade governor, fed by FRAME PACING: the interval between two
+   * consecutively rendered rAF frames. Sustained slow pacing walks the lit
+   * tier down (high → medium → low), then the pixel ratio (→ 1.5 → 1), never
+   * back up — a stutter on entry is fine, a permanently sluggish board is not.
+   *
+   * It used to time `post.render()` on the CPU. That call returns once the
+   * commands are SUBMITTED; on a GPU-bound laptop it stays a few ms while
+   * the frames themselves take 40+, so the governor could never fire where
+   * it was needed. Pacing includes the GPU's back-pressure.
+   *
+   * …but NOT the wait for input. A drag renders on pointer moves, so the
+   * interval between two drag frames also contains however long the next
+   * pointer event took to arrive — time during which no frame was even
+   * requested. That gap is subtracted (`rafRequestedAt − lastTickEnd`): what
+   * remains is the previous frame's own work plus the wait from request to
+   * rAF, which is exactly where GPU back-pressure shows. Measured before the
+   * fix (scripts/view3d-quality + an orbit profile, 2026-10-08, RTX 4080 at
+   * 3 ms/frame): a scripted mouse orbit fed input-paced 21-31 ms intervals,
+   * the EMA crossed 26 ms on the city board, and the governor dropped the
+   * tier MID-ORBIT — a full rebuild (city, slabs, decor placement) plus a
+   * post-stack swap — which IS the 82-100 ms "orbit hitch". */
+  /** Display refresh interval, measured once on empty rAF ticks (no GPU work
+   * queued, so the interval is the panel's pacing, not ours). The MINIMUM
+   * over the window: a busy tick can only lengthen an interval. */
+  private vsyncMs = 1000 / 60
+
+  private measureVsync(): void {
+    let last = 0
+    let n = 0
+    let min = Infinity
+    const tick = (t: number) => {
+      if (this.disposed) return
+      if (last) min = Math.min(min, t - last)
+      last = t
+      if (++n < 12) requestAnimationFrame(tick)
+      else if (Number.isFinite(min) && min > 2) this.vsyncMs = min
+    }
+    requestAnimationFrame(tick)
+  }
+
+  private governFramePacing(now: number): void {
+    const last = this.lastRenderAt
+    this.lastRenderAt = now
+    // last === 0: the previous tick did not render or the loop went idle, so
+    // this interval is not a frame time. Capped so one hidden-tab gap cannot
+    // swing the average on its own.
+    if (this.renderProfile !== 'lit' || last === 0) return
+    const inputWait = Math.max(0, this.rafRequestedAt - this.lastTickEnd)
+    const dt = Math.min(250, Math.max(0, now - last - inputWait))
+    this.frameCostEma = this.frameCostEma === 0 ? dt : this.frameCostEma * 0.9 + dt * 0.1
+    // "slow" is relative to what the DISPLAY can deliver: a 30 Hz panel or
+    // Chrome's energy saver paces every frame at ~33 ms on an idle GPU, which
+    // an absolute 26 ms threshold read as overload and walked the quality
+    // down to nothing (review 2026-10-08)
+    if (this.frameCostEma <= Math.max(GOVERNOR_SLOW_MS, this.vsyncMs * 1.6)) {
+      this.slowFrames = 0
+      return
+    }
+    if (++this.slowFrames < GOVERNOR_SLOW_FRAMES) return
+    this.slowFrames = 0
+    this.frameCostEma = 0
+    if (this.qualityTier !== 'low') {
+      this.setQualityTier(this.qualityTier === 'high' ? 'medium' : 'low')
+      return
+    }
+    const pr = this.renderer.getPixelRatio()
+    if (pr > 1) {
+      this.renderer.setPixelRatio(Math.max(1, pr - 0.5))
+      const size = this.renderer.getSize(new THREE.Vector2())
+      this.post?.setSize(size.x, size.y)
+      this.resizedSinceFrame = true
+      this.requestRender()
+    }
   }
 
   /** Flip the renderer/scene between the unlit and lit profiles from the
@@ -1031,8 +2247,18 @@ export class Scene3D {
         lighting.toneMapping === 'neutral' ? THREE.NeutralToneMapping : THREE.ACESFilmicToneMapping
       this.renderer.toneMappingExposure = lighting.exposure ?? 1.1
       this.renderer.shadowMap.enabled = lighting.shadows?.enabled !== false
-      this.renderer.shadowMap.type = THREE.PCFSoftShadowMap
+      // PCFShadowMap, NOT PCFSoftShadowMap: three r185 deprecates the soft
+      // type and rewrites it to PCF inside the FIRST shadow render — after
+      // every precompile, so each lit program was keyed on the wrong shadow
+      // type and linked again, synchronously, on the first frame (26 programs,
+      // 1.1 s, perfInfo().postFirstNewPrograms 2026-10-08). r185's PCF is the
+      // soft variant the old type asked for.
+      this.renderer.shadowMap.type = THREE.PCFShadowMap
+      // re-rendered only when a caster may have changed (shadowsDirty)
+      this.renderer.shadowMap.autoUpdate = false
+      this.shadowsDirty = true
       this.litRig = mountLightRig(this.scene, this.litRig, lighting)
+      this.mountPracticalSpot()
       if (this.renderProfile !== 'lit') {
         // entering the lit profile: pick the starting tier once — software
         // rasterizers (SwiftShader CI, VMs) never get the AO pass by default
@@ -1047,11 +2273,28 @@ export class Scene3D {
       if (opts.forceEnvRefresh && this.litEnvHeld) {
         releaseRoomEnvironment(this.renderer)
         this.litEnvHeld = false
+        this.envSeq++
         this.scene.environment = null
       }
       if (!this.litEnvHeld) {
-        this.scene.environment = acquireRoomEnvironment(this.renderer)
+        // Built off the critical path (acquireRoomEnvironmentAsync). The
+        // environment is part of every lit program's key, so the compile gate
+        // waits for it (scheduleCompile) — nothing is linked twice and no frame
+        // is drawn without it.
         this.litEnvHeld = true
+        const seq = ++this.envSeq
+        this.envPending = acquireRoomEnvironmentAsync(this.renderer)
+          .then((texture) => {
+            if (seq !== this.envSeq || this.disposed) return
+            this.scene.environment = texture
+          })
+          .catch(() => {
+            /* no IBL: the rig's sun + hemisphere still light the board */
+          })
+          .finally(() => {
+            if (seq === this.envSeq) this.envPending = null
+          })
+        this.scheduleCompile()
       }
       this.scene.environmentIntensity = lighting.ibl?.intensity ?? 0.35
       this.renderProfile = 'lit'
@@ -1060,11 +2303,15 @@ export class Scene3D {
       this.renderer.toneMapping = THREE.NoToneMapping
       this.renderer.toneMappingExposure = 1
       this.renderer.shadowMap.enabled = false
+      this.renderer.shadowMap.autoUpdate = true
       disposeLightRig(this.scene, this.litRig)
       this.litRig = null
+      this.unmountPracticalSpot()
       if (this.litEnvHeld) {
         releaseRoomEnvironment(this.renderer)
         this.litEnvHeld = false
+        this.envSeq++
+        this.envPending = null
       }
       this.scene.environment = null
       this.scene.environmentIntensity = 1
@@ -1072,6 +2319,33 @@ export class Scene3D {
       this.disposePost()
       this.qualityTier = 'high'
     }
+  }
+
+  /** The lit profile's practical lamp light, mounted ONCE per activation and
+   * parked at intensity 0 when the background has no lamp.
+   *
+   * three keys every lit program on the scene's light counts, so a SpotLight
+   * that came and went with the workbench background recompiled EVERY lit
+   * material on each background switch (35 programs, 983 ms of main-thread
+   * link on an RTX 4080 — scripts/view3d-quality, 2026-10-08). A constant
+   * light set keeps the programs; only uniforms change. */
+  private practicalSpot: THREE.SpotLight | null = null
+
+  private mountPracticalSpot(): void {
+    if (this.practicalSpot) return
+    const spot = new THREE.SpotLight(0xffffff, 0, 0, 0.43, 0.5, 0)
+    spot.castShadow = false
+    spot.name = 'practical-spot'
+    this.scene.add(spot, spot.target)
+    this.practicalSpot = spot
+  }
+
+  private unmountPracticalSpot(): void {
+    const spot = this.practicalSpot
+    if (!spot) return
+    this.scene.remove(spot, spot.target)
+    spot.dispose()
+    this.practicalSpot = null
   }
 
   /** Software rasterizers start at 'medium' (no AO pass) — N8AO on a CPU
@@ -1104,11 +2378,40 @@ export class Scene3D {
         if (this.disposed || this.renderProfile !== 'lit' || this.qualityTier === 'low') return
         const lit = this.theme3d?.environment?.lighting
         if (!lit) return
+        // What this stack is FOR: a tier change, a lighting swap or a context
+        // restore while it warms (seconds on a cold GPU) makes it the wrong
+        // stack, and it must not be installed (review 2026-10-08)
+        const gen = this.postGen
+        const tier = this.qualityTier
         const size = this.renderer.getSize(new THREE.Vector2())
-        this.post = m.createPostStack(this.renderer, this.scene, this.rig.camera, lit, this.qualityTier as Exclude<QualityTier, 'low'>)
-        this.post.setSize(size.x, size.y)
-        this.composerPassCount = this.post.passCount
-        this.requestRender()
+        const stack = m.createPostStack(this.renderer, this.scene, this.rig.camera, lit, tier as Exclude<QualityTier, 'low'>)
+        stack.setSize(size.x, size.y)
+        // Keep rendering composer-less until every program the composed frame
+        // needs is linked — swapping the stack in cold froze the main thread
+        // for ~1 s on the first composed frame (see compileSceneFor).
+        this.postLoading = true
+        const ceiling = new Promise<void>((r) => setTimeout(r, COMPILE_GATE_MAX_MS))
+        const warmed = (this.envPending ?? Promise.resolve()).then(() => this.compileSceneFor(stack, true))
+        return Promise.race([warmed, ceiling]).then(() => {
+          this.postLoading = false
+          const stale = gen !== this.postGen || tier !== this.qualityTier || this.theme3d?.environment?.lighting !== lit
+          if (this.disposed || this.renderProfile !== 'lit' || this.qualityTier === 'low' || this.post || stale) {
+            stack.dispose()
+            // superseded, not cancelled: build the stack the scene wants NOW
+            if (stale && !this.disposed && !this.post) this.ensurePost()
+            return
+          }
+          this.post = stack
+          // the passes' programs are linked: introspect them between frames
+          this.settlePrograms()
+          this.armFirstFrameProbe()
+          this.composerPassCount = stack.passCount
+          // the scene may have changed key-relevant state while the stack
+          // warmed (the enter morph turns the floor transparent) — gate the
+          // first composed frame on THAT state's programs, not the warm-time one
+          this.scheduleCompile()
+          this.requestRender()
+        })
       })
       .catch(() => {
         // chunk load failure (offline dev, CSP): stay composer-less — the lit
@@ -1117,7 +2420,12 @@ export class Scene3D {
       })
   }
 
+  /** Bumped whenever the current stack is torn down — a stack still warming
+   * from before that point is stale (ensurePost). */
+  private postGen = 0
+
   private disposePost(): void {
+    this.postGen++
     this.post?.dispose()
     this.post = null
     this.composerPassCount = 0
@@ -1149,6 +2457,8 @@ export class Scene3D {
     this.env3d = env
     this.applyRenderProfile()
     const baseBg = colorAlpha(this.skin.canvas.bg).color
+    // the gradient branch re-shows it; every other background hides it
+    if (this.backdrop) setBackdropTexture(this.backdrop, null)
     if (env?.background && typeof env.background === 'object') {
       if ('asset' in env.background) {
         // equirect sky from meta.assets: base color first, texture when decoded
@@ -1165,7 +2475,17 @@ export class Scene3D {
           this.requestRender()
         })
       } else {
-        this.scene.background = gradientTexture(env.background.top, env.background.bottom)
+        // A scene-owned mesh, not `scene.background`: three's background
+        // quad is in no scene, so the async compile gate never linked its
+        // program and the first frame did, synchronously (backdrop.ts).
+        // The clear color under it is the base color, as before the texture
+        // was decoded.
+        this.scene.background = new THREE.Color(baseBg)
+        if (!this.backdrop) {
+          this.backdrop = createGradientBackdrop()
+          this.scene.add(this.backdrop)
+        }
+        setBackdropTexture(this.backdrop, gradientTexture(env.background.top, env.background.bottom), this.scene.backgroundIntensity)
       }
     } else {
       const css = typeof env?.background === 'string' ? colorAlpha(env.background).color : baseBg
@@ -1390,26 +2710,69 @@ export class Scene3D {
     if (next === prev) return
     this.sceneDecor = decor
     this.buildSignature = ''
-    this.rebuild()
+    // The rebuild runs on the next frame, not inside the store change: a
+    // decor pick arrives inside the menu's click, and the click's React
+    // commit + this rebuild made ONE long task (137-142 ms against the 150
+    // budget, loop4-r5 / me-prof2: dispatchDiscreteEvent 135 ms). Split,
+    // each half is its own task. Coalesced: several changes in one frame
+    // rebuild once. The readiness probe stays honest via decorRebuildRaf.
+    if (this.decorRebuildRaf !== null) return
+    this.decorRebuildRaf = requestAnimationFrame(() => {
+      this.decorRebuildRaf = null
+      if (this.disposed) return
+      // a full rebuild in between (setData on mount) already used this decor
+      if (this.buildSignature !== '') return
+      this.rebuild()
+    })
   }
+  /** Pending deferred decor rebuild (setSceneDecor). */
+  private decorRebuildRaf: number | null = null
 
   setShowGrid(show: boolean): void {
     if (show === this.showGrid) return
     this.showGrid = show
     const t = this.floorGridToggle
     if (t) t.uniform.value = show ? t.on : t.off
-    const lg = this.litFloorGrid
-    if (lg) {
-      lg.mat.map = show ? lg.on : lg.off
-      lg.mat.needsUpdate = false // same program — just a texture ref swap
-    }
+    this.applyLitGridMap()
     this.requestRender()
+  }
+
+  /** The lit cap's map for the grid toggle and the drag state — a texture
+   * ref swap on the same program (every map is the same size and format). */
+  private applyLitGridMap(): void {
+    const lg = this.litFloorGrid
+    if (!lg) return
+    const want = !this.showGrid ? lg.off : this.gridDragging ? lg.drag : lg.on
+    if (lg.mat.map === want) return
+    lg.mat.map = want
+    lg.mat.needsUpdate = false
+    // the map is not a shadow input
+    this.requestCameraRender()
+  }
+
+  /** Drag start/end (pointer handlers): the board shows its full pitch —
+   * the 20-unit minors a card snaps to — only while something moves. */
+  private setGridDragging(on: boolean): void {
+    if (this.gridDragging === on) return
+    this.gridDragging = on
+    this.applyLitGridMap()
   }
 
   setSelection(ids: string[]): void {
     const next = new Set(ids)
     if (next.size === this.selectedIds.size && [...next].every((id) => this.selectedIds.has(id))) return
     this.selectedIds = next
+    // Every card, drum and platform carries its own selected flag in
+    // dataSignature, so a change that leaves the signature alone touched
+    // only connections (their highlight and focus dim): rebuild those. The
+    // full rebuild here re-made every card, the floor and the decor and
+    // re-compiled the scene for a click on a cable — 611-690 ms per
+    // selection click on 0ob3fum (profiled: buildCard 112, warmDraw /
+    // compileSceneFor 165-180, connect-freeze 2026-10-11).
+    if (this.skin && this.palette && this.batchDepth === 0 && this.buildSignature !== '' && this.dataSignature() === this.buildSignature) {
+      this.buildConnections()
+      return
+    }
     this.buildSignature = ''
     this.rebuild()
   }
@@ -1441,8 +2804,146 @@ export class Scene3D {
    * a top-down pose over the preset's own framing (the no-2D-viewport case). */
   frame(intro = false, insets?: CameraViewportInsets): void {
     if (intro) this.enterMorph(null)
-    else if (insets) this.rig.goToPresetWithInsets(this.preset, this.contentBounds(), insets, false)
-    else this.rig.goToPreset(this.preset, this.contentBounds(), false)
+    else if (insets || this.safeAreaProvider) {
+      // fit-to-screen: every node's projected 3D box inside the canvas minus
+      // the floating chrome. The host's measured insets win where they are
+      // larger than the caller's nominal panel widths (CanvasView passes a
+      // fixed 340 per open side panel and nothing for the toolbars).
+      const measured = this.safeAreaProvider?.() ?? {}
+      const side = (k: keyof CameraViewportInsets) => Math.max(insets?.[k] ?? 0, measured[k] ?? 0)
+      const safe = { left: side('left'), right: side('right'), top: side('top'), bottom: side('bottom') }
+      // the desk showcase is aimed at THIS framing (buildDecor): when the
+      // chrome moved since the decor was placed, re-place it
+      const prev = this.lastFitInsets
+      this.lastFitInsets = safe
+      if (prev && (['left', 'right', 'top', 'bottom'] as const).some((k) => Math.abs(prev[k] - safe[k]) > 8)) {
+        this.scheduleDecorRefresh()
+      }
+      const points = this.nodeFitBoxes().flatMap((b) => b.corners)
+      if (points.length > 0) this.rig.goToPresetFitting(this.preset, this.contentBounds(), points, safe, false)
+      else this.rig.goToPresetWithInsets(this.preset, this.contentBounds(), safe, false)
+    } else this.rig.goToPreset(this.preset, this.contentBounds(), false)
+  }
+
+  /** The host measures what overlays the canvas (Canvas3DView: side panels,
+   * tool pill, bottom toolbars — their DOMRects) at fit time. */
+  setSafeAreaProvider(provider: (() => CameraViewportInsets) | null): void {
+    this.safeAreaProvider = provider
+  }
+
+  /** A drum's floor tag rect in board coords (storeTagRect at the preset's
+   * azimuth), or null. */
+  private storeTag(o: C4Object, r: Rect): Box | null {
+    const tag = this.storeTagLocal.get(o.id) ?? storeTagRect(o, { x: 0, y: 0, w: r.w, h: r.h }, CAMERA_PRESETS[this.preset].rz, DRUM_R)
+    return tag ? { ...tag, x: tag.x + r.x, y: tag.y + r.y } : null
+  }
+
+  /** Each drum's floor-tag rect as BUILT, relative to the drum's node origin
+   * (a positions-only move carries the tag with its drum, so every consumer
+   * keeps reading the rect the standee drew). */
+  private storeTagLocal = new Map<string, Box>()
+
+  /** Place every drum's name tag at a full build: in front of its drum
+   * (storeTagRect), slid sideways off any card's on-screen footprint
+   * (screenShadowOnFloor + slideClear). The NAME tag (restored on the user's
+   * decision of 2026-10-10) is wider than the technology tag it replaced:
+   * 'Event bus' touched Rollup worker by 0.7 px on screen in
+   * tp4-cards/workbench-tag-0.png. */
+  private placeStoreTags(): void {
+    this.storeTagLocal.clear()
+    const preset = CAMERA_PRESETS[this.preset]
+    const cards = this.data.objects
+      .filter((c) => c.type !== 'store')
+      // the slab and, under the lit profile, its 7-unit plinth rim
+      .map((c) => screenShadowOnFloor({ x: c.position.x, y: c.position.y, w: c.size.width, h: c.size.height }, preset.depth, preset.rx, preset.rz, 8))
+    for (const o of this.data.objects) {
+      if (o.type !== 'store') continue
+      const local = storeTagRect(o, { x: 0, y: 0, w: o.size.width, h: o.size.height }, preset.rz, DRUM_R)
+      if (!local) continue
+      const board = { ...local, x: local.x + o.position.x, y: local.y + o.position.y }
+      const slid = slideClear(board, preset.rz, cards, 4, 80)
+      this.storeTagLocal.set(o.id, { ...local, x: slid.x - o.position.x, y: slid.y - o.position.y })
+    }
+  }
+
+  /** Each node's 3D box as 8 world-space corners: the card slab (+ the lit
+   * plinth rim) from its base to its top face; the drum from its pad to its
+   * lid, widened to the pad ring and reaching forward to the name tag. */
+  private nodeFitBoxes(): { id: string; corners: { x: number; y: number; z: number }[] }[] {
+    const out: { id: string; corners: { x: number; y: number; z: number }[] }[] = []
+    const box = (id: string, x0: number, x1: number, y0: number, y1: number, z0: number, z1: number) => {
+      const corners: { x: number; y: number; z: number }[] = []
+      for (const x of [x0, x1]) for (const y of [y0, y1]) for (const z of [z0, z1]) corners.push({ x, y, z })
+      out.push({ id, corners })
+    }
+    for (const o of this.data.objects) {
+      const unit = this.nodeGroups.get(o.id)
+      if (!unit) continue // hidden by a tag perspective: nothing to frame
+      const baseY = (unit.userData.baseY as number | undefined) ?? 0
+      const r = this.objectRect(o)
+      if (o.type === 'store') {
+        const cx = r.x + r.w / 2
+        const cz = r.y + r.h / 2
+        const tag = this.storeTag(o, r)
+        const lidY = baseY + DRUM_H + (this.selectedIds.has(o.id) ? SELECTED_LIFT * 0.5 : 0)
+        box(
+          o.id,
+          Math.min(cx - PAD_R, tag?.x ?? Infinity),
+          Math.max(cx + PAD_R, tag ? tag.x + tag.w : -Infinity),
+          baseY,
+          lidY,
+          Math.min(cz - PAD_R, tag?.y ?? Infinity),
+          Math.max(cz + PAD_R, tag ? tag.y + tag.h : -Infinity),
+        )
+      } else {
+        const topY = (unit.userData.topY as number | undefined) ?? baseY + CAMERA_PRESETS[this.preset].depth
+        box(o.id, r.x - 7, r.x + r.w + 7, baseY, topY, r.y - 7, r.y + r.h + 7)
+      }
+    }
+    return out
+  }
+
+  /** Each node's SOLIDS as world points (quality pass "labels"): a card's
+   * slab from its base to its top face plus the lit plinth rim (7 px out,
+   * 2.6 tall); a drum's body (16 points round its foot and its lid); a drum's
+   * floor tag (flat). Their projected hulls are what a connection label
+   * plate must stay off at the default framing. */
+  private nodeSolids(): { id: string; kind: 'card' | 'drum' | 'tag'; pts: { x: number; y: number; z: number }[] }[] {
+    const out: { id: string; kind: 'card' | 'drum' | 'tag'; pts: { x: number; y: number; z: number }[] }[] = []
+    const boxPts = (x0: number, x1: number, y0: number, y1: number, z0: number, z1: number) => {
+      const pts: { x: number; y: number; z: number }[] = []
+      for (const x of [x0, x1]) for (const y of [y0, y1]) for (const z of [z0, z1]) pts.push({ x, y, z })
+      return pts
+    }
+    for (const o of this.data.objects) {
+      const unit = this.nodeGroups.get(o.id)
+      if (!unit) continue
+      const baseY = (unit.userData.baseY as number | undefined) ?? 0
+      const r = this.objectRect(o)
+      if (o.type === 'store') {
+        const cx = r.x + r.w / 2
+        const cz = r.y + r.h / 2
+        const lidY = baseY + DRUM_H + (this.selectedIds.has(o.id) ? SELECTED_LIFT * 0.5 : 0)
+        const pts: { x: number; y: number; z: number }[] = []
+        for (let i = 0; i < 16; i++) {
+          const a = (i / 16) * Math.PI * 2
+          const x = cx + Math.cos(a) * DRUM_R
+          const z = cz + Math.sin(a) * DRUM_R
+          pts.push({ x, y: baseY, z }, { x, y: lidY, z })
+        }
+        out.push({ id: o.id, kind: 'drum', pts })
+        const tag = this.storeTag(o, r)
+        if (tag) out.push({ id: o.id, kind: 'tag', pts: boxPts(tag.x, tag.x + tag.w, baseY + 0.5, baseY + 0.5, tag.y, tag.y + tag.h) })
+      } else {
+        const topY = (unit.userData.topY as number | undefined) ?? baseY + CAMERA_PRESETS[this.preset].depth
+        out.push({
+          id: o.id,
+          kind: 'card',
+          pts: [...boxPts(r.x, r.x + r.w, baseY, topY, r.y, r.y + r.h), ...boxPts(r.x - 7, r.x + r.w + 7, baseY, baseY + 2.6, r.y - 7, r.y + r.h + 7)],
+        })
+      }
+    }
+    return out
   }
 
   /** Enter choreography: the first frame is the flat 2D reading — top-down
@@ -1454,7 +2955,7 @@ export class Scene3D {
     view2d: { x: number; y: number; scale: number } | null,
     css?: { width: number; height: number },
   ): void {
-    const target = this.rig.presetPoseFor(this.preset, this.contentBounds())
+    const target = this.enterTargetPose()
     const start =
       view2d && css
         ? poseFor2dViewport(view2d, css, target.fov)
@@ -1463,8 +2964,43 @@ export class Scene3D {
     this.rig.setPose(start)
     this.floorAlpha = 0
     this.applyFloorAlpha()
-    this.rig.tweenTo(target)
-    this.startFloorFade(1)
+    // An undressed floor is a TRANSPARENT floor, which is another program
+    // variant for every faded material — compile those too, and start the
+    // tweens only once they are linked, so the morph plays from frame one
+    // instead of from wherever the clock got to during a stall.
+    const gen = ++this.enterGen
+    this.enterPending = true
+    this.scheduleCompile()
+    void this.whenCompiled().then(() => {
+      // an exit (or a newer enter) since then owns the camera
+      if (this.disposed || gen !== this.enterGen) return
+      this.enterPending = false
+      this.rig.tweenTo(target)
+      this.startFloorFade(1)
+    })
+  }
+
+  /** Where the enter morph lands: the base preset pose (the design framing).
+   * Quality loop 4 briefly landed it on the chrome-aware fit pose so the
+   * cold shot showed the whole board; that halved every card face on screen
+   * and the user rejected it (see below). The desk decor is still aimed at
+   * the fit framing (showcaseView), which fit-to-screen shows. */
+  private enterTargetPose(): CameraPose {
+    const bounds = this.contentBounds()
+    // USER FEEDBACK 2026-10-10 ("régressions sur la police et la taille de la
+    // police"): landing on the fit pose put the camera ~2x farther than the
+    // base preset pose, so every card face read at half its design size. The
+    // enter morph lands on the base preset pose again; fit-to-screen (frame())
+    // keeps the exact chrome-aware fit for whoever asks for the whole board.
+    return this.rig.presetPoseFor(this.preset, bounds)
+  }
+
+  /** The host has committed to an enter morph that will start once the
+   * programs link (Canvas3DView). Until the enter tween actually starts, the
+   * readiness probe reports the camera as animating: "nodes present and not
+   * animating" must never be true before the morph has even begun. */
+  holdForEnter(): void {
+    this.enterPending = true
   }
 
   /** Exit choreography: compute the 2D viewport the current camera hands
@@ -1474,6 +3010,9 @@ export class Scene3D {
    * when the camera lands (immediately under reduced motion; dropped if the
    * tween is interrupted — hosts keep a fallback timer). */
   exitMorph(css: { width: number; height: number }, onDone: () => void): { x: number; y: number; scale: number } {
+    // a deferred enter still waiting on its compile must not start afterwards
+    this.enterGen++
+    this.enterPending = false
     const pose = this.rig.getPose()
     const view = viewportForPose(pose, css)
     this.rig.tweenTo(poseFor2dViewport(view, css, pose.fov), CAMERA_TWEEN_MS, onDone)
@@ -1583,6 +3122,7 @@ export class Scene3D {
     this.disposed = true
     if (getActiveScene3D() === this) setActiveScene3D(null)
     if (this.raf) cancelAnimationFrame(this.raf)
+    if (this.decorRebuildRaf !== null) cancelAnimationFrame(this.decorRebuildRaf)
     if (this.showcaseResumeTimer !== null) {
       clearTimeout(this.showcaseResumeTimer)
       this.showcaseResumeTimer = null
@@ -1591,6 +3131,17 @@ export class Scene3D {
     this.clearSmartGuides(true)
     this.smartGuideLayer.removeFromParent()
     this.clearRoot()
+    this.flushRetiredMaterials() // no next frame: release them now
+    this.cityJob = null // a slice still queued sees disposed and stops
+    this.cancelLabelJob()
+    this.labelChannel?.port1.close()
+    this.labelChannel = null
+    for (const m of this.connProgramKeepers.values()) m.dispose()
+    this.connProgramKeepers.clear()
+    if (this.cityGeom) disposeCityGeometry(this.cityGeom.geom)
+    this.cityGeom = null
+    for (const g of this.slabGeoCache.values()) g.dispose()
+    this.slabGeoCache.clear()
     this.voxelTransient.clear()
     disposeIconTextures()
     disposeThemeAssets()
@@ -1598,11 +3149,16 @@ export class Scene3D {
     this.floorMapClone = null
     for (const [, tex] of sharedTextures) tex.dispose()
     sharedTextures.clear()
+    disposeCuttingMatTextures()
+    disposeWorkbenchTextures() // the desk tile + its vignette (lit/wood.ts)
+    disposeCityFacadeTextures() // the city's facade atlas (decor/cityFacade.ts)
+    this.cancelDecorRefreshIdle()
     if (this.decorRefreshTimer !== null) {
       clearTimeout(this.decorRefreshTimer)
       this.decorRefreshTimer = null
     }
     disposeDecorGeometries()
+    releaseDecorAssetGpu()
     // Lit-profile resources live OUTSIDE root (clearRoot never sees them).
     this.disposePost()
     disposeLightRig(this.scene, this.litRig)
@@ -1610,9 +3166,15 @@ export class Scene3D {
     if (this.litEnvHeld) {
       releaseRoomEnvironment(this.renderer)
       this.litEnvHeld = false
+      this.envSeq++
       this.scene.environment = null
     }
-    // Dispose-residue accounting (leak gate): after every disposal above,
+    disposeGradientBackdrop(this.backdrop)
+    this.backdrop = null
+    this.depthWarmer.dispose()
+    this.depthWarmTarget?.dispose()
+    this.depthWarmTarget = null
+    // Dispose-residue accounting (§0 leak bar): after every disposal above,
     // what does the renderer still count as allocated? Deterministic — a
     // leaked geometry/texture shows up here as residue. Stashed on a global
     // that OUTLIVES the __scene3d handle so the e2e leak drill can read it
@@ -1625,7 +3187,12 @@ export class Scene3D {
       } satisfies Scene3dDisposeResidue
     }
     this.renderer.dispose()
-    if (import.meta.env.DEV) {
+    // hosts chained on whenCompiled() must not hang on a scene that is gone
+    // (their continuations re-check `disposed` and do nothing)
+    const waiters = this.compileWaiters
+    this.compileWaiters = []
+    for (const w of waiters) w()
+    if (import.meta.env.DEV || import.meta.env.VITE_SCENE3D_PROBE === 'on') {
       if (window.__scene3d === this.devProbeIdentity) delete window.__scene3d
       this.devProbeIdentity = null
     }
@@ -1635,8 +3202,415 @@ export class Scene3D {
 
   requestRender(): void {
     if (this.disposed) return
+    // Every generic request may have moved, added or hidden a shadow caster.
+    this.shadowsDirty = true
+    this.requestCameraRender()
+  }
+
+  /** A frame whose ONLY change is the camera (the rig's onChange: orbit, pan,
+   * dolly, tweens). The lit sun's shadow camera is fitted to the board, not to
+   * the view, so the shadow map from the last scene change is still exact —
+   * re-rendering every caster into it on each orbit frame was pure cost. */
+  private requestCameraRender(): void {
+    if (this.disposed) return
     this.needsRender = true
-    if (!this.raf) this.raf = requestAnimationFrame(this.frameTick)
+    if (!this.raf && !this.compiling && !this.connCompiling) {
+      this.rafRequestedAt = performance.now()
+      this.raf = requestAnimationFrame(this.frameTick)
+    }
+  }
+
+  /** Compile every program the scene now needs WITHOUT blocking the main
+   * thread, and hold the render loop until they are linked.
+   *
+   * Measured (scripts/view3d-quality, RTX 4080 / ANGLE D3D11, 2026-10-08):
+   * the first frame after entering 3D spent 2 009 ms in three's synchronous
+   * `onFirstUse` and the first frame after picking the city background spent
+   * 983 ms in `getProgramInfoLog` — 40-47 programs linked one after another on
+   * the main thread, against ~70 ms for the whole geometry rebuild. Through
+   * `compileAsync` the driver links them in parallel (KHR_parallel_shader_compile)
+   * while the page stays responsive; the canvas simply keeps presenting its
+   * previous frame until the new programs are ready.
+   *
+   * Superseded compiles are ignored by sequence number, so a burst of rebuilds
+   * resolves once, on the LAST scene state. */
+  private scheduleCompile(): void {
+    if (this.disposed || this.contextLost) return
+    const seq = ++this.compileSeq
+    this.compiling = true
+    const t0 = performance.now()
+    if (this.compileGateSince === 0) this.compileGateSince = t0
+    // the IBL is part of every lit program's key: compile against the scene
+    // the frame will actually draw, never against a pre-environment one
+    // …and the decor GLBs: their props are built only once they settle
+    // …and the city ring when it is still being built in slices (mountCity)
+    const pending = Promise.all([this.envPending, this.decorAssetsPending, this.cityPending]).then(() =>
+      seq === this.compileSeq && !this.disposed ? this.compileSceneFor(this.post) : undefined,
+    )
+    // Ceiling: a program whose status is never reported ready (lost context
+    // mid-compile, a driver that drops the parallel-compile query) must not
+    // hold the board hostage — after this, render and let the first draw block.
+    // Anchored at the moment the gate CLOSED, not at this call: superseding
+    // rebuilds less than COMPILE_GATE_MAX_MS apart would otherwise restart it
+    // forever and hold the loop indefinitely.
+    const left = Math.max(0, COMPILE_GATE_MAX_MS - (t0 - this.compileGateSince))
+    const ceiling = new Promise<void>((resolve) => setTimeout(resolve, left))
+    let linked = false
+    void Promise.race([pending.then(() => (linked = true)), ceiling])
+      .catch(() => {
+        /* a failed program still renders (and logs) on first use — never hold the loop */
+      })
+      .then(() => {
+        if (this.disposed || seq !== this.compileSeq) return
+        // every program is linked: draw everything once, off screen, and
+        // hold until the GPU has executed it (warmDraw) — never after the
+        // ceiling, when a draw would block on an unlinked program instead
+        if (!linked) return
+        this.settlePrograms()
+        return this.warmDraw(Math.max(0, COMPILE_GATE_MAX_MS - (performance.now() - this.compileGateSince)))
+      })
+      .catch(() => {
+        /* the warm draw is an optimisation — never hold the loop on it */
+      })
+      .then(() => {
+        if (this.disposed || seq !== this.compileSeq) return
+        this.compiling = false
+        this.compileGateSince = 0
+        this.buildTimings.compileMs = performance.now() - t0
+        this.settlePrograms()
+        const waiters = this.compileWaiters
+        this.compileWaiters = []
+        for (const w of waiters) w()
+        this.requestRender()
+      })
+  }
+
+  /** Draw the WHOLE scene once — frustum culling off — into the composer's
+   * scene buffer, between frames, and resolve once the GPU has executed it
+   * (a fence polled from timers: the main thread never waits on it).
+   *
+   * Measured (view3d quality loop 4, DPR 2, Chrome trace of the enter): the
+   * 150-310 ms composed frames ~350 ms into the enter morph had no link, no
+   * upload and no resize of their own (perfInfo().slowFrames), and the trace
+   * put the whole frame in `CommandBufferHelper::WaitForAvailableEntries` on
+   * the renderer while the GPU main thread spent 237 ms inside ONE WebGL
+   * `CommandBuffer::Flush`. The morph starts from the 2D framing (tight, top
+   * down) and pulls back: props, desk and background meet the frustum for
+   * the first time mid-tween, and their first draw is where ANGLE builds the
+   * D3D executables for that geometry's input layout — work three's
+   * compileAsync cannot see (it links programs, it draws nothing). Drawn
+   * here, that cost lands while the gate already holds the previous frame.
+   * Composer-less boards are skipped: drawing into any target but the
+   * canvas would key new program variants, and drawing into the canvas
+   * outside a frame would present it. */
+  private warmDraw(budgetMs: number): Promise<void> {
+    const stack = this.post
+    if (!stack || this.contextLost || budgetMs <= 0) return Promise.resolve()
+    const renderer = this.renderer
+    const gl = renderer.getContext()
+    if (!(gl instanceof WebGL2RenderingContext)) return Promise.resolve()
+    const culled: THREE.Object3D[] = []
+    const hidden: THREE.Object3D[] = []
+    const holdsLight = (o: THREE.Object3D): boolean => {
+      let found = false
+      o.traverse((c) => {
+        if ((c as THREE.Light).isLight) found = true
+      })
+      return found
+    }
+    this.scene.traverse((o) => {
+      if (o.frustumCulled) {
+        culled.push(o)
+        o.frustumCulled = false
+      }
+      // LOD-hidden decorations (far titles, decor tiers) show up at the END
+      // of the morph, when the camera settles (updateNodeLod) — warm them
+      // too (their programs are linked: three's compile walks invisible
+      // objects). Never a light: the light set is part of every program key.
+      if (!o.visible && o !== this.scene && !holdsLight(o)) {
+        hidden.push(o)
+        o.visible = true
+      }
+    })
+    const prev = renderer.getRenderTarget()
+    // the shadow map is the frame's business (shadowsDirty / primeShadowPass)
+    const shadowNeeds = renderer.shadowMap.needsUpdate
+    renderer.shadowMap.needsUpdate = false
+    try {
+      for (const b of this.billboards) b.quaternion.copy(this.rig.camera.quaternion)
+      renderer.setRenderTarget(stack.sceneTarget)
+      renderer.render(this.scene, this.rig.camera)
+    } catch {
+      /* lost context mid-draw: the restore path rebuilds */
+    } finally {
+      renderer.setRenderTarget(prev)
+      renderer.shadowMap.needsUpdate = shadowNeeds
+      for (const o of culled) o.frustumCulled = true
+      for (const o of hidden) o.visible = false
+    }
+    this.warmDraws++
+    const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0)
+    if (!sync) return Promise.resolve()
+    gl.flush()
+    const t0 = performance.now()
+    return new Promise<void>((resolve) => {
+      const poll = () => {
+        if (this.disposed || this.contextLost || performance.now() - t0 > budgetMs) {
+          if (!this.contextLost) gl.deleteSync(sync)
+          resolve()
+          return
+        }
+        if (gl.getSyncParameter(sync, gl.SYNC_STATUS) === gl.SIGNALED) {
+          gl.deleteSync(sync)
+          this.warmDrawMs = performance.now() - t0
+          resolve()
+          return
+        }
+        setTimeout(poll, 4)
+      }
+      poll()
+    })
+  }
+
+  /** Off-screen whole-scene draws run by the compile gate (warmDraw), and
+   * how long the GPU took to execute the last one (perfInfo probe). */
+  private warmDraws = 0
+  private warmDrawMs = 0
+
+  /** Start (non-blocking) compiles of every program the NEXT frame will use
+   * and resolve when the driver reports them linked.
+   *
+   * With a post stack the scene is drawn into the composer's linear buffer,
+   * not the canvas, and three keys programs on the bound target — so the
+   * compile runs with that target bound. Getting this wrong is invisible in
+   * the code and very visible in the profile: the canvas variants compiled
+   * here, then the first composed frame linked every real variant
+   * synchronously (1 067 ms under `post.render`, enter-3D profile 2026-10-08).
+   * `stack.passMaterials()` adds the passes' own quads, which live in no scene
+   * and are compiled for both a buffer and the canvas (the last pass). */
+  private compileSceneFor(stack: PostStack | null, withPasses = false): Promise<unknown> {
+    const jobs: Promise<unknown>[] = []
+    const prev = this.renderer.getRenderTarget()
+    try {
+      if (stack) this.renderer.setRenderTarget(stack.sceneTarget)
+      jobs.push(compileAndWait(this.renderer, this.scene, this.rig.camera))
+      // The shadow pass's depth programs: invisible to the compile above
+      // (three's depth material is in no scene — lit/shadowWarm.ts). Keyed
+      // like the shadow pass draws them: a target bound (linear, untoned),
+      // the scene's lights and shadows, and NO fog (the pass draws with an
+      // empty scene). The fog is lifted only for this synchronous call.
+      if (this.renderer.shadowMap.enabled) {
+        const depthWarm = this.depthWarmer.buildWarmScene(this.scene)
+        if (depthWarm) {
+          this.depthWarmTarget ??= new THREE.WebGLRenderTarget(1, 1, { depthBuffer: false })
+          this.renderer.setRenderTarget(this.depthWarmTarget)
+          const fog = this.scene.fog
+          this.scene.fog = null
+          try {
+            jobs.push(compileAndWait(this.renderer, depthWarm, this.rig.camera, this.scene))
+          } finally {
+            this.scene.fog = fog
+            this.depthWarmer.releaseReferences()
+          }
+          this.renderer.setRenderTarget(stack ? stack.sceneTarget : null)
+        }
+      }
+      if (stack && withPasses) {
+        const warm = new THREE.Scene()
+        // position + uv ONLY, like the passes' own fullscreen triangle: a
+        // normal attribute flips three's `vertexNormals` key bit and the warm
+        // program would be a sibling nobody uses
+        const quad = new THREE.BufferGeometry()
+        quad.setAttribute('position', new THREE.Float32BufferAttribute([-1, -1, 0, 3, -1, 0, -1, 3, 0], 3))
+        quad.setAttribute('uv', new THREE.Float32BufferAttribute([0, 0, 2, 0, 0, 2], 2))
+        for (const m of stack.passMaterials()) warm.add(new THREE.Mesh(quad, m))
+        jobs.push(compileAndWait(this.renderer, warm, this.rig.camera))
+        this.renderer.setRenderTarget(null)
+        jobs.push(compileAndWait(this.renderer, warm, this.rig.camera).finally(() => quad.dispose()))
+      }
+    } catch {
+      /* compile() threw (lost context): first use will report it */
+    } finally {
+      this.renderer.setRenderTarget(prev)
+    }
+    return Promise.all(jobs)
+  }
+
+  /** Debug/perf: the last loop frames that took ≥ 40 ms (perfInfo probe) —
+   * attributes a long task to a frame, its build and its kind, and tells a
+   * program LINK (programs delta), an UPLOAD (textures/geometries delta) and
+   * a target REALLOCATION (resized since the previous frame) apart — the
+   * loop4-r1-dpr2 277 ms composed frame carried none of that and could not
+   * be attributed (report.json profile: null). */
+  private slowFrameLog: Scene3dSlowFrame[] = []
+  /** Threshold of slowFrameLog (ms). The probe lowers it for a measured
+   * window: the loop4-r3-dpr2 first-orbit hitch was 35.6 ms, under both the
+   * 40 ms default and the 50 ms floor of long tasks / LoAF entries, so
+   * nothing in the report could say what it was. */
+  private slowFrameMs = 40
+  /** setSize/pixel-ratio change since the last rendered frame (slowFrameLog). */
+  private resizedSinceFrame = false
+  /** Loop frames rendered since the post stack went live (slowFrameLog). */
+  private framesSincePost = 0
+
+  /** Programs alive when the current frame started (slowFrameLog). */
+  private programsBefore = new Set<object>()
+
+  /** Snapshot taken at a frame's start (noteSlowFrame compares against it). */
+  private frameCounters(): { textures: number; geometries: number; shadow: boolean } {
+    const info = this.renderer.info
+    this.programsBefore.clear()
+    for (const p of info.programs ?? []) this.programsBefore.add(p)
+    return {
+      textures: info.memory.textures,
+      geometries: info.memory.geometries,
+      // the frame will re-render the cached shadow map (renderFrameInner)
+      shadow: this.shadowsDirty || this.renderer.shadowMap.needsUpdate,
+    }
+  }
+
+  /** Main-thread work the scene runs OUTSIDE its render loop (decor refresh,
+   * the settle-edge LOD/label pass), timed into slowFrameLog under `kind` so
+   * a hitch between frames is attributed like a slow frame. */
+  private timedTask<T>(kind: string, fn: () => T): T {
+    const t0 = performance.now()
+    const before = this.frameCounters()
+    const resized = this.resizedSinceFrame
+    try {
+      return fn()
+    } finally {
+      this.noteSlowFrame(kind, t0, before)
+      // a task is not the frame that pays a pending resize
+      this.resizedSinceFrame = resized
+    }
+  }
+
+  private noteSlowFrame(kind: string, t0: number, before: { textures: number; geometries: number; shadow: boolean }): void {
+    const resized = this.resizedSinceFrame
+    this.resizedSinceFrame = false
+    const ms = performance.now() - t0
+    if (ms < this.slowFrameMs) return
+    const after = this.renderer.info.memory
+    // by identity, not by count: a variant switch that links one program and
+    // releases another nets to zero
+    let linked = 0
+    for (const p of this.renderer.info.programs ?? []) if (!this.programsBefore.has(p)) linked++
+    this.slowFrameLog.push({
+      atMs: Math.round(t0),
+      ms: Math.round(ms),
+      build: this.buildTimings.builds,
+      kind,
+      newPrograms: linked,
+      newTextures: after.textures - before.textures,
+      newGeometries: after.geometries - before.geometries,
+      resized,
+      shadow: before.shadow,
+      frame: this.framesSincePost,
+      floorAlpha: Math.round(this.floorAlpha * 100) / 100,
+      fadeMs: this.floorTween ? Math.round(t0 - this.floorTween.start) : -1,
+    })
+    if (this.slowFrameLog.length > 32) this.slowFrameLog.shift()
+  }
+
+  /** Programs whose first-use introspection already ran (settlePrograms). */
+  private settledPrograms = new WeakSet<object>()
+
+  /** Run three's first-use introspection of every LINKED program now, while
+   * the GPU queue is empty, instead of inside the next frame.
+   *
+   * A program's first draw calls `getUniforms()` → `onFirstUse`: the uniform
+   * and attribute tables (plus link status and info logs while
+   * `checkShaderErrors` is on) — synchronous GL queries, each of which waits
+   * for the GPU process to drain every command queued before it. Mid-frame,
+   * that is the shadow pass and the draws issued so far, once per program
+   * drawn for the first time. Measured (view3d-quality loop1-r3 enter-3D
+   * profile, 2026-10-08): 158 ms of `onFirstUse` self time inside one
+   * `post.render()`, with `postFirstNewPrograms` already empty — linked, but
+   * never asked. Asked here, between frames, each query returns at once.
+   * Unready programs are skipped (asking would block on their link). */
+  private settlePrograms(): void {
+    for (const p of this.renderer.info.programs ?? []) {
+      if (this.settledPrograms.has(p)) continue
+      const ready = (p as THREE.WebGLProgram & { isReady?: () => boolean }).isReady?.() ?? true
+      if (!ready) continue
+      p.getUniforms()
+      this.settledPrograms.add(p)
+    }
+  }
+
+  /**
+   * The compile gate of a connection build that comes WITHOUT a full
+   * rebuild's (a selection, a drag frame, a reconnect): the layer may hold a
+   * program the scene never linked — on the test board a cable click added
+   * three (the focus-dimmed cables' transparent variant and two basic ones)
+   * — and the first frame then linked them synchronously (getProgramInfoLog
+   * 72 ms self in the 120-ms task of the click, reconnect-select profile,
+   * tp5-connect3d, once setSelection stopped rebuilding the whole scene).
+   * buildConnProgramWarmers now links those in the full rebuild's gate;
+   * this gate catches the rest (a highlight style switched later, …).
+   * Compiled like compileSceneFor compiles the scene — against the target
+   * the frame draws into — and the frame held until the driver reports the
+   * layer's programs linked; programs already linked resolve at once.
+   */
+  private scheduleConnCompile(): void {
+    if (this.disposed || this.contextLost) return
+    const seq = ++this.connCompileSeq
+    const prev = this.renderer.getRenderTarget()
+    let job: Promise<unknown>
+    try {
+      if (this.post) this.renderer.setRenderTarget(this.post.sceneTarget)
+      job = compileAndWait(this.renderer, this.connLayer, this.rig.camera, this.scene)
+    } catch {
+      return // lost context: first use reports it
+    } finally {
+      this.renderer.setRenderTarget(prev)
+    }
+    this.connCompiling = true
+    const ceiling = new Promise<void>((resolve) => setTimeout(resolve, COMPILE_GATE_MAX_MS))
+    void Promise.race([job, ceiling])
+      .catch(() => {
+        /* a failed program still renders (and logs) on first use */
+      })
+      // …and their first-use introspection, between frames (settlePrograms:
+      // linked is not enough — with the compile above resolved, the next
+      // frame still spent 105 ms in getProgramInfoLog), one program per task.
+      // (Measured: the three of a cable click took 65-124 ms as one settle
+      // task, DEV shader checks. NOT measured: that slicing shortens it —
+      // the first query may wait for every link queued before it.)
+      .then(() => (seq === this.connCompileSeq && !this.disposed ? this.settleProgramsSliced() : undefined))
+      .then(() => {
+        if (seq !== this.connCompileSeq || this.disposed) return
+        this.connCompiling = false
+        this.requestRender()
+      })
+  }
+  private connCompiling = false
+  private connCompileSeq = 0
+
+  /** settlePrograms, one program per task (scheduleConnCompile). */
+  private settleProgramsSliced(): Promise<void> {
+    return new Promise((resolve) => {
+      const step = () => {
+        if (this.disposed || this.contextLost) return resolve()
+        for (const p of this.renderer.info.programs ?? []) {
+          if (this.settledPrograms.has(p)) continue
+          if (!((p as THREE.WebGLProgram & { isReady?: () => boolean }).isReady?.() ?? true)) continue
+          p.getUniforms()
+          this.settledPrograms.add(p)
+          setTimeout(step, 0)
+          return
+        }
+        resolve()
+      }
+      step()
+    })
+  }
+
+  /** Resolves once no shader compile is pending — hosts delay the enter morph
+   * on it, so the 2D board stays on screen instead of a frozen page. */
+  whenCompiled(): Promise<void> {
+    if (!this.compiling || this.disposed) return Promise.resolve()
+    return new Promise((resolve) => this.compileWaiters.push(resolve))
   }
 
   private frameTick = (now: number) => {
@@ -1645,22 +3619,55 @@ export class Scene3D {
     // Context lost: skip the frame entirely. `needsRender` stays latched; the
     // restore handler's rebuild() re-kicks the loop once the context is back.
     if (this.contextLost) return
+    // Programs still linking: keep the latch, the compile's resolution re-kicks.
+    if (this.compiling || this.connCompiling) {
+      this.lastRenderAt = 0 // a hold is not a frame time (governor)
+      return
+    }
     const animating = this.rig.step(now)
     // Camera just settled → the projected sizes are final; re-evaluate LOD once.
-    if (this.wasAnimating && !animating) this.updateNodeLod()
+    if (this.wasAnimating && !animating) this.timedTask('settle-lod', () => this.updateNodeLod())
     this.wasAnimating = animating
     const fading = this.stepFloorFade(now)
     const moving = this.stepMotion(now)
     const voxeling = this.stepVoxelFragments(now)
     const flowing = this.stepFlow(now)
+    const hovering = this.stepHandleHover(now)
     const spinning = this.stepShowcase(now, animating)
-    if (this.needsRender || animating || fading || moving || voxeling || flowing || spinning) {
+    // theme bob/spin and breakaway fragments move casters every frame; camera
+    // tweens, flow dots and the showcase drift do not
+    if (moving || voxeling) this.shadowsDirty = true
+    if (this.needsRender || animating || fading || moving || voxeling || flowing || hovering || spinning) {
       this.needsRender = false
       // billboard theme assets stay camera-facing through every orbit
       for (const b of this.billboards) b.quaternion.copy(this.rig.camera.quaternion)
+      const tFrame = performance.now()
+      const before = this.frameCounters()
+      if (this.postFirstRenderPending && this.primeShadowPass()) {
+        // the shadow map was this task's work; the composed frame is the
+        // next one (primeShadowPass). Not a frame time for the governor.
+        this.noteSlowFrame('shadow-prime', tFrame, before)
+        this.lastRenderAt = 0
+        this.requestCameraRender()
+        return
+      }
       this.renderFrame()
+      if (this.post) this.framesSincePost++
+      this.noteSlowFrame(this.post ? 'composed' : 'plain', tFrame, before)
+      this.governFramePacing(now)
+      // stamped BEFORE the continuation below requests the next rAF, so a
+      // self-sustaining loop reads zero input wait (see governFramePacing)
+      this.lastTickEnd = performance.now()
+    } else {
+      this.lastRenderAt = 0
     }
-    if (animating || fading || moving || voxeling || flowing || spinning) this.requestRender()
+    // keep the loop alive; casters that moved already marked the shadows dirty
+    // above, so a plain camera/flow frame must not (requestRender would)
+    const continuing = animating || fading || moving || voxeling || flowing || spinning
+    if (continuing) this.requestCameraRender()
+    // a drag renders on pointer moves, not on a self-sustaining loop — its
+    // frames are still consecutive; anything else idles and breaks the chain
+    else if (this.pointer.mode === 'idle') this.lastRenderAt = 0
   }
 
   /** Advance the showcase auto-orbit. Returns true while drifting (keeps the
@@ -1697,6 +3704,29 @@ export class Scene3D {
     if (this.flowUnits.length === 0) return false
     for (const u of this.flowUnits) u.tick(now)
     return true
+  }
+
+  /** Advance a hovered edit handle's growth + glow (HANDLE_HOVER_MS,
+   * --ease-out; instant under prefers-reduced-motion). True while it runs. */
+  private stepHandleHover(now: number): boolean {
+    const h = this.handleHover
+    if (!h) return false
+    const running = this.handleUniforms.uHoverT.value < 1
+    this.handleUniforms.uHoverT.value = this.rig.prefersReducedMotion() ? 1 : easeOut((now - h.start) / HANDLE_HOVER_MS)
+    // (one more frame once it lands, so 1 is drawn)
+    return running
+  }
+
+  /** Hover edit handle `id` (null: none) — the glow and the 10 → 12 growth. */
+  private setHandleHover(id: number | null): void {
+    if ((this.handleHover?.id ?? null) === id) return
+    this.handleHover = id === null ? null : { id, start: performance.now() }
+    this.handleUniforms.uHoverId.value = id ?? -1
+    this.handleUniforms.uHoverT.value = 0
+    // the head and the knob are one target grip: hovering either lights the
+    // knob (id 1) and brightens the line's halo by 20 %
+    if (this.selectHalo) this.selectHalo.mat.opacity = this.selectHalo.base * (id === 1 ? 1.2 : 1)
+    this.requestRender()
   }
 
   /** Advance theme micro-animations (spec spin/bob) — transforms only, no
@@ -2185,7 +4215,30 @@ export class Scene3D {
 
   /** Full rebuild when structure/content changed; cheap position sync + ribbon
    * refresh when only placement moved (the drag path). */
+  /** Apply several setters with ONE rebuild at the end. Every setter that
+   * would rebuild (or rebuild connections) inside `fn` only marks the scene
+   * dirty. The mount path configures skin, theme, decor, tag state and data
+   * back to back; unbatched, each of those rebuilt the floor + background
+   * world from scratch on the 3D entry task (enter3d import.then measured
+   * 114-123 ms as one task, view3d quality loop 2026-10-08). */
+  batch(fn: () => void): void {
+    this.batchDepth++
+    try {
+      fn()
+    } finally {
+      this.batchDepth--
+      if (this.batchDepth === 0 && this.batchDirty) {
+        this.batchDirty = false
+        this.rebuild()
+      }
+    }
+  }
+
   private rebuild(): void {
+    if (this.batchDepth > 0) {
+      this.batchDirty = true
+      return
+    }
     if (!this.skin || !this.palette) return
     const sig = this.dataSignature()
     if (sig === this.buildSignature) {
@@ -2207,6 +4260,11 @@ export class Scene3D {
             this.buildPlatform(grp, CAMERA_PRESETS[this.preset].plat)
           } else {
             plate.position.set(r.x, plate.position.y, r.y)
+            // same geometry, new origin: keep the built-rect record current
+            // (a same-size platform drag left it at the pre-drag origin, so
+            // groupInfo().builtRect disagreed with rect — e2e "group
+            // platforms" failed whenever the per-member snap kept the size)
+            plate.userData.rect = { ...r }
           }
         }
       }
@@ -2216,15 +4274,21 @@ export class Scene3D {
       return
     }
     this.buildSignature = sig
+    const tBuild = performance.now()
     this.clearRoot()
+    this.slabGeoUsed.clear()
     this.refreshTagFocusMembership()
 
     const preset = CAMERA_PRESETS[this.preset]
     const memberOf = new Map<string, Group>()
     for (const g of this.data.groups) for (const id of g.objectIds) memberOf.set(id, g)
 
+    const tFloor = performance.now()
     this.buildFloor()
+    const floorMs = performance.now() - tFloor
     for (const g of this.data.groups) this.buildPlatform(g, preset.plat)
+    this.cardTextRects.clear()
+    this.placeStoreTags()
     for (const o of this.data.objects) {
       const perspective = this.objectTagPerspective(o)
       if (perspective.hidden) continue
@@ -2241,8 +4305,18 @@ export class Scene3D {
     this.connLayer = new THREE.Group()
     this.connLayer.position.y = preset.plat + CONNECTION_LIFT
     this.root.add(this.connLayer)
-    this.buildConnections()
+    // inline: buildDecor below keeps its props off the PLACED label plates
+    this.buildConnections('inline')
+    this.buildConnProgramWarmers()
+    const tDecor = performance.now()
     this.buildDecor()
+    const decorMs = performance.now() - tDecor
+    // slab sizes this build no longer uses (a resized card, a theme flip)
+    for (const [key, geo] of this.slabGeoCache) {
+      if (this.slabGeoUsed.has(key)) continue
+      geo.dispose()
+      this.slabGeoCache.delete(key)
+    }
     if (this.litRig) {
       const lighting = this.theme3d?.environment?.lighting
       const bb = this.contentBounds()
@@ -2270,18 +4344,27 @@ export class Scene3D {
             }
           : lighting
         this.litRig = mountLightRig(this.scene, this.litRig, tuned)
-        fitShadowCamera(
-          this.litRig,
-          { x: bb.cx - bb.width / 2, y: bb.cz - bb.height / 2, width: bb.width, height: bb.height },
-          {
-            enabled: this.renderProfile === 'lit' && lighting.shadows?.enabled !== false,
-            mapSize: lighting.shadows?.mapSize,
-            intensity: dusk ? Math.min(0.8, (lighting.shadows?.opacity ?? 0.55) + 0.09) : lighting.shadows?.opacity,
-          },
-        )
+        this.fitSunShadow(bb)
       }
     }
     this.updateNodeLod() // apply the projected-size LOD to the freshly built nodes
+    this.buildTimings = {
+      totalMs: performance.now() - tBuild,
+      floorMs,
+      decorMs,
+      builds: this.buildTimings.builds + 1,
+      firstFrameMs: 0,
+      compileMs: 0,
+      postFirstMs: 0,
+      postFirstShadowMs: 0,
+      postFirstBuild: -1,
+      postFirstComposed: false,
+    }
+    // every build measures its OWN first presented frame (with or without
+    // the post stack) — never the previous build's number
+    this.armFirstFrameProbe()
+    this.firstFramePending = true
+    this.scheduleCompile()
     this.requestRender()
   }
 
@@ -2299,9 +4382,17 @@ export class Scene3D {
     // project under ~5 screen px (fit-all on huge boards)
     if (this.decorBuild) {
       const visible = pxPerWorld >= 0.35
-      if (this.decorBuild.group.visible !== visible) this.decorBuild.group.visible = visible
+      if (this.decorBuild.group.visible !== visible) {
+        this.decorBuild.group.visible = visible
+        this.shadowsDirty = true // props cast shadows
+      }
     }
+    // The base (edfc9c6f7) projected-size rule, nothing else: a far-title
+    // mode and a badge grow/hide rule lived here (view3d quality loop 3 r2 /
+    // pass "labels") and were removed on the user's decision of 2026-10-10
+    // (shape font, font size and icon regressed against the base).
     let changed = false
+    let casterToggled = false
     for (const unit of this.nodeGroups.values()) {
       const size = (unit.userData.lodSize as number | undefined) ?? 200
       const projW = size * pxPerWorld
@@ -2314,10 +4405,48 @@ export class Scene3D {
         if (child.visible !== want) {
           child.visible = want
           changed = true
+          if (!casterToggled) child.traverse((c) => (casterToggled ||= c.castShadow))
         }
       }
     }
-    if (changed) this.requestRender()
+    if (this.applyConnLabelScale()) changed = true
+    // …and what each shows there: a crowded label comes back whole (or
+    // longer) when another framing gives it room (TASK 2). Not mid-glide: the
+    // wheel calls this on every event while the dolly is still easing, and
+    // the glide's own settle edge comes back here once it lands.
+    if (!this.rig.isAnimating() && this.resolveConnLabelVisibility()) changed = true
+    // The LOD tiers are text and flat chips, the connection labels are
+    // plates — none of them casts a shadow, so a settle that only re-tiers
+    // them is a CAMERA frame. requestRender() marked the cached shadow map
+    // dirty on every camera settle (and after benchFrames), so the frame
+    // after a settle re-rendered every caster for a pure camera move — a
+    // candidate for the loop4-r3-dpr2 first-orbit 35.6 ms hitch, which did
+    // NOT reproduce in three later DPR 2 runs (loop4-r3-scene-a/b/c: 0
+    // hitches), so it is removed as a cost, not claimed as the cause. A tier
+    // that does carry a caster still re-renders it.
+    if (casterToggled) this.shadowsDirty = true
+    if (changed) this.requestCameraRender()
+  }
+
+  /** A material leaving the scene is RETIRED, not disposed: three destroys a
+   * program the moment its last material is disposed, so disposing the old
+   * build before the new one acquired its programs threw away every program
+   * the new build was about to ask for again — the full rebuild of a decor
+   * pick re-created and re-linked them (`compileSceneFor` + the first-frame
+   * `|depth` shadow variant in `postFirstNewPrograms`, view3d-quality
+   * 2026-10-08). Retired materials are disposed after the next presented
+   * frame, by which time the new build holds every program it needs. */
+  private retiredMaterials = new Set<THREE.Material>()
+
+  private retire(mat: THREE.Material | THREE.Material[] | undefined | null): void {
+    if (Array.isArray(mat)) for (const m of mat) this.retiredMaterials.add(m)
+    else if (mat) this.retiredMaterials.add(mat)
+  }
+
+  private flushRetiredMaterials(): void {
+    if (this.retiredMaterials.size === 0) return
+    for (const m of this.retiredMaterials) m.dispose()
+    this.retiredMaterials.clear()
   }
 
   private clearRoot(): void {
@@ -2325,20 +4454,17 @@ export class Scene3D {
       if (obj.userData.sharedAsset) {
         // Geometry stays cache-owned. A dimmed instance may own a lightweight
         // material clone so changing its opacity never affects sibling assets.
-        if (obj.userData.tagPerspectiveMaterialClone) {
-          const material = (obj as THREE.Mesh).material as THREE.Material | THREE.Material[] | undefined
-          if (Array.isArray(material)) material.forEach((entry) => entry.dispose())
-          else material?.dispose()
-        }
+        if (obj.userData.tagPerspectiveMaterialClone) this.retire((obj as THREE.Mesh).material)
         return
       }
       const mesh = obj as THREE.Mesh
       if ((mesh as THREE.InstancedMesh).isInstancedMesh) (mesh as THREE.InstancedMesh).dispose()
-      if (mesh.geometry) mesh.geometry.dispose()
-      const mat = mesh.material as THREE.Material | THREE.Material[] | undefined
-      if (Array.isArray(mat)) mat.forEach((m) => m.dispose())
-      else if (mat) mat.dispose()
+      // `sharedGeometry`: cache-owned buffers (slab / city caches), but the
+      // material is this build's own
+      if (mesh.geometry && !obj.userData.sharedGeometry) mesh.geometry.dispose()
+      this.retire(mesh.material as THREE.Material | THREE.Material[] | undefined)
     })
+    this.cityHolder = null
     this.billboards = []
     this.floorTextured = false
     for (const t of this.texts) t.dispose()
@@ -2358,7 +4484,8 @@ export class Scene3D {
     this.floorGridToggle = null
     this.litFloorGrid = null
     if (this.decorBuild) {
-      disposeDecorBuild(this.decorBuild)
+      // (disposeDecorBuild's job — materials only — through the retire list)
+      this.retire(this.decorBuild.materials)
       this.decorBuild = null
     }
   }
@@ -2386,7 +4513,7 @@ export class Scene3D {
         return
       }
       const mesh = obj as THREE.Mesh
-      if (mesh.geometry) mesh.geometry.dispose()
+      if (mesh.geometry && !obj.userData.sharedGeometry) mesh.geometry.dispose()
       const mat = mesh.material as THREE.Material | THREE.Material[] | undefined
       if (Array.isArray(mat)) mat.forEach((m) => m.dispose())
       else if (mat) mat.dispose()
@@ -2406,14 +4533,14 @@ export class Scene3D {
   private surface(
     role: SurfaceRole,
     css: string,
-    opts: { side?: THREE.Side; depthWrite?: boolean; vertexColors?: boolean } = {},
+    opts: { side?: THREE.Side; depthWrite?: boolean } = {},
   ): THREE.Material {
     const lighting = this.renderProfile === 'lit' ? this.theme3d?.environment?.lighting : null
     if (lighting) return litSurface(role, css, opts, lighting)
     return this.unlit(css, opts)
   }
 
-  private unlit(css: string, opts: { side?: THREE.Side; depthWrite?: boolean; vertexColors?: boolean } = {}): THREE.MeshBasicMaterial {
+  private unlit(css: string, opts: { side?: THREE.Side; depthWrite?: boolean } = {}): THREE.MeshBasicMaterial {
     const { color, alpha } = colorAlpha(css)
     return new THREE.MeshBasicMaterial({
       color,
@@ -2421,7 +4548,6 @@ export class Scene3D {
       opacity: alpha,
       side: opts.side ?? THREE.FrontSide,
       depthWrite: opts.depthWrite ?? alpha >= 1,
-      vertexColors: opts.vertexColors ?? false,
     })
   }
 
@@ -2709,6 +4835,17 @@ export class Scene3D {
     sideMaterial: THREE.Material,
   ): THREE.Mesh {
     if (this.renderProfile === 'lit') {
+      // cached by every input the geometry depends on (boardShape reads the
+      // theme's pixel-snap); the mesh is marked so teardown keeps the buffers
+      const snap = this.theme3d?.pixelSnap != null ? this.pixelStep(w, h) : -1
+      const key = `${w}|${h}|${r}|${depth}|${snap}`
+      this.slabGeoUsed.add(key)
+      const hit = this.slabGeoCache.get(key)
+      if (hit) {
+        const mesh = new THREE.Mesh(hit, [capMaterial, sideMaterial])
+        mesh.userData.sharedGeometry = true
+        return mesh
+      }
       // Ceramic read: a small bevel catches the key light along every edge.
       // bevelOffset pulls the core in by the bevel size so the FOOTPRINT stays
       // exactly w×h — layouts, labels and pixel probes keep their geometry.
@@ -2734,7 +4871,10 @@ export class Scene3D {
       const geo = toCreasedNormals(raw, (50 * Math.PI) / 180)
       raw.dispose()
       geo.rotateX(-Math.PI / 2)
-      return new THREE.Mesh(geo, [capMaterial, sideMaterial])
+      this.slabGeoCache.set(key, geo)
+      const mesh = new THREE.Mesh(geo, [capMaterial, sideMaterial])
+      mesh.userData.sharedGeometry = true
+      return mesh
     }
     const geo = new THREE.ExtrudeGeometry(this.boardShape(w, h, r), {
       depth,
@@ -2756,44 +4896,191 @@ export class Scene3D {
   /** (Re)build the decoration layer from the pure placement engine. Runs at
    * the END of a full rebuild (connection routes must exist for the
    * near-connection affinity) and via the debounced fast-path refresh. */
+  /** Fit the sun's shadow camera to the content bounds AND the decor layer.
+   * Runs from the full rebuild (after the rig retune) and after every
+   * decor-only build (settle / refresh), whose props may stand elsewhere on
+   * the desk band — see `fitShadowCamera`'s `cover`. */
+  private fitSunShadow(bb = this.contentBounds()): void {
+    const lighting = this.theme3d?.environment?.lighting
+    if (!this.litRig || !lighting) return
+    const dusk = this.bgWorldBuilt === 'city'
+    let cover: THREE.Box3 | null = null
+    const group = this.decorBuild?.group
+    if (group) {
+      group.updateWorldMatrix(true, true)
+      cover = new THREE.Box3().setFromObject(group)
+    }
+    fitShadowCamera(
+      this.litRig,
+      { x: bb.cx - bb.width / 2, y: bb.cz - bb.height / 2, width: bb.width, height: bb.height },
+      {
+        enabled: this.renderProfile === 'lit' && lighting.shadows?.enabled !== false,
+        mapSize: lighting.shadows?.mapSize,
+        intensity: dusk ? Math.min(0.8, (lighting.shadows?.opacity ?? 0.55) + 0.09) : lighting.shadows?.opacity,
+        cover,
+      },
+    )
+  }
+
   private buildDecor(): void {
     if (this.decorBuild) {
       this.root.remove(this.decorBuild.group)
-      disposeDecorBuild(this.decorBuild)
+      this.retire(this.decorBuild.materials) // see retiredMaterials
+      // the per-build contact-blob quads (decor/build.ts) — the archetype
+      // geometry stays cache-owned
+      for (const g of this.decorBuild.geometries) g.dispose()
       this.decorBuild = null
     }
     const decor = this.sceneDecor
     if (!decor) return
     const pack = getDecorPack(decor.packId)
     if (!pack) return
+    // The Blender meshes (decor/glbAssets.ts) arrive once per page. Until they
+    // settle the layer is NOT built: a fallback build would be compiled, shown
+    // for a few frames and thrown away. The compile gate waits on the same
+    // promise, so the first presented frame already wears the final props.
+    if (!this.decorAssetsSettled) {
+      if (!this.decorAssetsPending) {
+        // Bounded: a slow or hung fetch must not leave the desk bare (or hold
+        // the compile gate) — after DECOR_ASSET_WAIT_MS the procedural props
+        // are built, and a late arrival rebuilds them from the GLBs (the
+        // archetype cache is keyed on the asset version).
+        const loading = loadDecorAssets()
+        const budget = new Promise<void>((r) => setTimeout(r, DECOR_ASSET_WAIT_MS))
+        this.decorAssetsPending = Promise.race([loading, budget]).then(() => {
+          this.decorAssetsSettled = true
+          this.decorAssetsPending = null
+          if (this.disposed) return
+          this.timedTask('decor-settle', () => {
+            this.buildDecor()
+            this.updateNodeLod() // decor visibility follows the projected size
+          })
+          this.scheduleCompile()
+          this.requestRender()
+        })
+        void loading.then(() => {
+          if (!this.disposed && this.decorAssetsSettled && this.decorBuild) this.scheduleDecorRefresh()
+        })
+      }
+      return
+    }
     const lit = this.renderProfile === 'lit'
     // the shared WORKBENCH props ride along on lit themes (the wood desk
     // plane exists there); unlit boards keep pack-only decor
     const archetypes = lit ? [...pack.archetypes, ...DESK_ARCHETYPES] : pack.archetypes
     const b = this.contentBounds()
-    const placed = placeDecor({
+    // desk level — in the city the desk props stand on the civic podium,
+    // which fills the gap up to the slab's bottom (buildCityPodium)
+    const deskLift =
+      -(CAMERA_PRESETS[this.preset].floorD + 16) + 0.3 + (this.bgWorldBuilt === 'city' ? CITY_PODIUM_H : 0)
+    const placementInput: PlacementInput = {
+      // the default framing the desk showcase must read in (loop 3 r2: the
+      // flag stood under the left panel in a window tuned without it)
+      view: lit ? this.showcaseView(deskLift) : undefined,
       archetypes,
       density: decor.density ?? 'normal',
       seed: decor.seed ?? 1,
       bounds: { x: b.cx - b.width / 2, y: b.cz - b.height / 2, w: b.width, h: b.height },
       pad: this.lastFloorPad,
       fractureBand: this.lastFractureBand,
-      nodes: this.data.objects.map((o) => ({ id: o.id, type: o.type, rect: this.objectRect(o) })),
+      // a drum's footprint is its pad ring and the name tag in front of it
+      // (buildStandee), which can reach past the shape rect — leaves keep
+      // their clearance from what is drawn, not from the 2D box
+      nodes: this.data.objects.map((o) => {
+        const r = this.objectRect(o)
+        if (o.type !== 'store') return { id: o.id, type: o.type, rect: r }
+        const cx = r.x + r.w / 2
+        const cz = r.y + r.h / 2
+        const tag = this.storeTag(o, r)
+        const x0 = Math.min(r.x, cx - PAD_R, tag?.x ?? Infinity)
+        const z0 = Math.min(r.y, cz - PAD_R, tag?.y ?? Infinity)
+        const x1 = Math.max(r.x + r.w, cx + PAD_R, tag ? tag.x + tag.w : -Infinity)
+        const z1 = Math.max(r.y + r.h, cz + PAD_R, tag ? tag.y + tag.h : -Infinity)
+        return { id: o.id, type: o.type, rect: { x: x0, y: z0, w: x1 - x0, h: z1 - z0 } }
+      }),
       groups: this.data.groups.map((g) => this.groupRect(g)),
       connections: [...this.connGeoms.values()].map((geom) => ({ points: samplePath(geom, 12) })),
+      // a copy: a sliced label pass still running moves and adds boxes in
+      // place (runLabelJob compares it at its commit — decorAvoidSig)
+      avoid: this.connLabelBoxes.map((b) => ({ ...b })),
       deskBand: lit ? 150 : undefined,
-    })
+      // the lamp's foot (workbench only): no prop stands on it, and the
+      // greenery zone gathers beside it (quality pass "layout")
+      lamp: this.lampFoot ?? undefined,
+      // the desk is not the same place in every world: none in the void, and
+      // in the city only the bare apron inside the city hole — desk-scale
+      // props among the maquette buildings were the giant moose and the leaf
+      // through a wall (view3d quality loop 3, city-wide / city-leaf)
+      world: this.backgroundWorld(),
+    }
+    const placed = placeDecor(placementInput)
+    this.decorAvoidSig = labelBoxesSig(placementInput.avoid ?? [])
+    this.lastDecorInput = { ...placementInput, archetypes: archetypes.map((a) => a.id) }
     const build = buildDecorMeshes({ ...pack, archetypes }, placed, {
       lit,
       platformLift: CAMERA_PRESETS[this.preset].plat,
       // desk level: the workbench plane sits 16 px under the slab bottom
-      deskLift: -(CAMERA_PRESETS[this.preset].floorD + 16) + 0.3,
+      deskLift,
     })
     // decor rides the 2D↔3D morph exactly like the board dressing
     for (const m of build.materials) this.regFloorFade(m, 1)
     this.decorBuild = build
     this.root.add(build.group)
     this.applyFloorAlpha()
+    // a desk prop outside the content bounds must still cast (the full
+    // rebuild refits again after its rig retune)
+    this.fitSunShadow()
+  }
+
+  /** The board's DEFAULT framing as plain numbers for `placeDecor`: the pose
+   * fit-to-screen lands on (every node box inside the canvas minus the
+   * floating chrome) and that unobstructed rect. Null without a host that
+   * measures its chrome (share viewer, tests) — placement then keeps its
+   * legacy window. */
+  /** The chrome insets the default framing is fitted against: the last
+   * fit's, else ONE host measurement per rebuild. The host's measurement
+   * hit-tests the page (canvasSafeArea: elementFromPoint) — ~30 ms per call
+   * in the loop4 decor-pick profile — and both the label room estimate
+   * (connLabelWantK) and the desk showcase (showcaseView) need it. */
+  private chromeInsets(): CameraViewportInsets {
+    if (this.lastFitInsets) return this.lastFitInsets
+    // reused only inside the same build and the same burst of work — a
+    // later decor refresh re-measures (a panel may have opened since)
+    const builds = this.buildTimings.builds
+    const now = performance.now()
+    const memo = this.insetsMemo
+    if (memo && memo.builds === builds && now - memo.at < 250) return memo.insets
+    const insets = this.safeAreaProvider?.() ?? {}
+    this.insetsMemo = { builds, at: now, insets }
+    return insets
+  }
+
+  private insetsMemo: { builds: number; at: number; insets: CameraViewportInsets } | null = null
+
+  private showcaseView(deskY: number): ShowcaseView | undefined {
+    if (!this.safeAreaProvider) return undefined
+    const points = this.nodeFitBoxes().flatMap((box) => box.corners)
+    if (points.length === 0) return undefined
+    const m = this.chromeInsets()
+    const insets = { left: m.left ?? 0, right: m.right ?? 0, top: m.top ?? 0, bottom: m.bottom ?? 0 }
+    const vp = this.rig.getViewport()
+    if (vp.width <= 1 || vp.height <= 1) return undefined
+    const pose = this.rig.fitPoseFor(this.preset, this.contentBounds(), points, insets)
+    const cam = new THREE.PerspectiveCamera(pose.fov, vp.width / vp.height, 10, 200_000)
+    applyPose(cam, pose)
+    cam.updateMatrixWorld()
+    const viewProj = new THREE.Matrix4().multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse)
+    return {
+      viewProj: [...viewProj.elements],
+      viewport: vp,
+      safe: {
+        x: insets.left,
+        y: insets.top,
+        w: Math.max(1, vp.width - insets.left - insets.right),
+        h: Math.max(1, vp.height - insets.top - insets.bottom),
+      },
+      deskY,
+    }
   }
 
   /** Fast-path node drags reposition WITHOUT a rebuild (dataSignature skips
@@ -2802,12 +5089,42 @@ export class Scene3D {
   private scheduleDecorRefresh(): void {
     if (!this.sceneDecor) return
     if (this.decorRefreshTimer !== null) clearTimeout(this.decorRefreshTimer)
+    this.cancelDecorRefreshIdle()
     this.decorRefreshTimer = setTimeout(() => {
       this.decorRefreshTimer = null
       if (this.disposed) return
-      this.buildDecor()
-      this.requestRender()
+      // The refresh is a whole decor rebuild plus a compile gate that holds
+      // the render loop: never inside a camera gesture. Scheduled from the
+      // enter tail (enterTargetPose / frame() when the chrome moved, a late
+      // GLB arrival), it could land in the user's first orbit; an orbit, pan
+      // or drag in progress pushes it back until the pointer is released…
+      if (this.pointer.mode !== 'idle') {
+        this.scheduleDecorRefresh()
+        return
+      }
+      // …and it runs in an idle period (bounded, so it always runs)
+      const run = () => {
+        this.decorRefreshIdle = null
+        if (this.disposed) return
+        // …and never before the label placement pass has committed: the
+        // props keep off the PLACED plates (connLabelBoxes)
+        if (this.pointer.mode !== 'idle' || this.labelJob !== null) {
+          this.scheduleDecorRefresh()
+          return
+        }
+        this.timedTask('decor-refresh', () => this.buildDecor())
+        this.scheduleCompile()
+        this.requestRender()
+      }
+      if (typeof requestIdleCallback === 'function') this.decorRefreshIdle = requestIdleCallback(run, { timeout: 500 })
+      else run()
     }, 300)
+  }
+
+  private cancelDecorRefreshIdle(): void {
+    if (this.decorRefreshIdle === null) return
+    if (typeof cancelIdleCallback === 'function') cancelIdleCallback(this.decorRefreshIdle)
+    this.decorRefreshIdle = null
   }
 
   // ── floor ──────────────────────────────────────────────────────────────────
@@ -2826,8 +5143,88 @@ export class Scene3D {
     return !b || b === 'default' ? 'workbench' : b
   }
 
+  /** Mount the city ring under `floor`. A cached geometry (same footprint,
+   * same seed) is re-dressed synchronously; otherwise the geometry is built
+   * in time slices (buildCityGeometrySliced) and attached when it lands.
+   * `cityPending` is part of the compile gate, so the render loop keeps the
+   * PREVIOUS frame on screen until the new world is complete and its
+   * programs are linked — never a half-built city, never a frozen page. */
+  private mountCity(floor: THREE.Group, opts: CityGeometryOpts, makeMat: MakeMat): void {
+    const base = JSON.stringify(opts)
+    // the cache also keys on WHICH Mont-Royal the geometry wears: a city
+    // built on the procedural fallback (the GLB late or failed) is rebuilt
+    // once the Blender maquette is in (quality pass "montroyal")
+    const cityKey = (glb: boolean): string => `${base}|mount:${glb ? 'glb' : 'procedural'}`
+    const key = cityKey(decorAsset('mont-royal') !== null)
+    const holder = new THREE.Group()
+    holder.name = 'city-holder'
+    floor.add(holder)
+    this.cityHolder = holder
+    if (this.cityGeom?.key === key) {
+      this.cityJob = null // a stale job for another city stops at its next slice
+      this.cityPending = null
+      holder.add(assembleCityBackground(this.cityGeom.geom, makeMat, { sharedGeometry: true }).group)
+      return
+    }
+    let job = this.cityJob
+    if (!job || job.key !== base) {
+      // The maquette rides the decor GLBs (loadDecorAssets, fetched once per
+      // page): the build waits for them under the decor layer's own bound,
+      // DECOR_ASSET_WAIT_MS — cityPending is part of the compile gate, which
+      // waits on the same fetch for the desk props anyway, so the first
+      // presented frame wears the maquette, never a swap. The wait is idle
+      // time, not a task: no slice runs before it settles.
+      const ready =
+        decorAsset('mont-royal') !== null
+          ? Promise.resolve()
+          : Promise.race([loadDecorAssets(), new Promise<void>((r) => setTimeout(r, DECOR_ASSET_WAIT_MS))])
+      const stop = (): boolean => this.disposed || this.cityJob !== next
+      const next: { key: string; promise: Promise<CityGeometry | null> } = {
+        key: base,
+        promise: ready.then(() => (stop() ? null : buildCityGeometrySliced(opts, stop))),
+      }
+      job = next
+      this.cityJob = next
+    }
+    const owner = job
+    const pending: Promise<void> = owner.promise
+      .then((geom) => {
+        if (!geom || this.disposed) return
+        // several floors may wait on ONE job (rebuild bursts): the first
+        // handler caches the result, the others only dress their holder
+        if (this.cityGeom?.geom !== geom) {
+          if (this.cityJob !== owner) {
+            // superseded after its last slice ran: never uploaded, drop it
+            disposeCityGeometry(geom)
+            return
+          }
+          this.cityJob = null
+          // the previous city's meshes went with the clearRoot that started
+          // this build, so its buffers have no user left
+          if (this.cityGeom) disposeCityGeometry(this.cityGeom.geom)
+          // keyed on what it WEARS, not what was asked: a fallback mount
+          // built after a failed fetch is rebuilt once the maquette lands
+          this.cityGeom = { key: cityKey(geom.mount?.source === 'glb'), geom }
+        }
+        if (this.cityHolder !== holder) return // a newer floor re-dresses from the cache
+        holder.add(assembleCityBackground(geom, makeMat, { sharedGeometry: true }).group)
+        this.applyFloorAlpha()
+        this.requestRender()
+      })
+      .catch((err: unknown) => {
+        console.warn('[scene3d] city background build failed', err)
+      })
+      .finally(() => {
+        if (this.cityPending === pending) this.cityPending = null
+      })
+    this.cityPending = pending
+  }
+
   private buildFloor(): void {
     this.bgWorldBuilt = null
+    this.cityPending = null // set again by mountCity when this floor wants a city
+    // parked until a background that owns a lamp re-aims it (see practicalSpot)
+    if (this.practicalSpot) this.practicalSpot.intensity = 0
     const palette = this.palette!
     const preset = CAMERA_PRESETS[this.preset]
     const b = this.contentBounds()
@@ -2861,6 +5258,10 @@ export class Scene3D {
     const slabH = h - fractureBand * 2
     this.lastFloorPad = { x: padX, y: padY }
     this.lastFractureBand = fractureBand
+    this.lampFoot = null
+    // world footprint of the slab top (y 0) and the desk level under it —
+    // the quality harness samples board vs desk luminance on it
+    this.boardBox = { x: x0 + fractureBand, z: y0 + fractureBand, w: slabW, h: slabH, topY: 0, deskY: -floorD - 16 }
 
     const floor = new THREE.Group()
     floor.position.set(x0, 0, y0)
@@ -2907,6 +5308,7 @@ export class Scene3D {
       const tray = this.trayStyle()
       let pairOn: { map: THREE.Texture; roughnessMap: THREE.Texture }
       let pairOff: { map: THREE.Texture; roughnessMap: THREE.Texture }
+      let pairDrag: { map: THREE.Texture; roughnessMap: THREE.Texture }
       let capRough = 0.92
       // env kept LOW on every cap: the ambient IBL is what flattened the
       // board — the lamp's warm pool only reads against a quieter base.
@@ -2934,7 +5336,10 @@ export class Scene3D {
           museum: { grid: '#BEB7AA', env: 0.2, wall: '#E9E5DC', fill: null },
           clay: { grid: '#8F5433', env: 0.16, wall: '#A96844', fill: withAlpha('#B26247', 0.3) },
         }[tray]
-        pairOn = trayTexturesFor(tray, { grid: look.grid, showGrid: fs?.grid !== 'none' })
+        // at rest the 100-unit majors only; the full pitch while dragging
+        // (boards.ts TraySpec.minors — view3d quality loop 4 r3)
+        pairOn = trayTexturesFor(tray, { grid: look.grid, showGrid: fs?.grid !== 'none', minors: false })
+        pairDrag = trayTexturesFor(tray, { grid: look.grid, showGrid: fs?.grid !== 'none' })
         pairOff = trayTexturesFor(tray, { grid: look.grid, showGrid: false })
         capRough = 1 // tray roughnessMaps encode absolute bands (boards.ts)
         capEnv = look.env
@@ -2944,9 +5349,10 @@ export class Scene3D {
         const baseCss = colorAlpha(palette.floorBg).color
         const gridCol = colorAlpha(gridCss).color
         pairOn = paperBoardTextures({ base: baseCss, grid: gridCol, showGrid: fs?.grid !== 'none' })
+        pairDrag = pairOn // drafting paper keeps one look
         pairOff = paperBoardTextures({ base: baseCss, grid: gridCol, showGrid: false })
       }
-      const active = this.showGrid ? pairOn : pairOff
+      const active = this.showGrid ? (this.gridDragging ? pairDrag : pairOn) : pairOff
       const cap = new THREE.MeshPhysicalMaterial({
         map: active.map,
         roughnessMap: active.roughnessMap,
@@ -2954,7 +5360,10 @@ export class Scene3D {
         metalness: 0,
         envMapIntensity: capEnv,
       })
-      this.litFloorGrid = { mat: cap, on: pairOn.map, off: pairOff.map }
+      this.litFloorGrid = { mat: cap, on: pairOn.map, off: pairOff.map, drag: pairDrag.map }
+      // uploaded now (a 320-px tile, cached across builds), not on the first
+      // frame of the first drag
+      if (pairDrag.map !== active.map && !this.contextLost) this.renderer.initTexture(pairDrag.map)
       topMat = cap
       wallMat = litSurface('floorWall', wallCss, {}, lighting)
       this.regFloorFade(topMat, 1)
@@ -3001,11 +5410,14 @@ export class Scene3D {
 
     // The WORLD beyond the board (lit profile) — the user's background choice
     // (sceneDecor.background). 'workbench' (default): the wood desk + the
-    // brass practical lamp. 'city': the low-poly maquette ring on the desk
-    // around the board. 'studio': desk + warm cyclorama sweep. 'void': bare
-    // gradient void — board and props only. The desk plane keeps its long
-    // grain + plank seams + board-centered vignette and receives the
-    // key-light shadow; the SDF ground shadow draws above it.
+    // brass practical lamp (ref1). 'city': the low-poly maquette ring on the
+    // desk around the board (ref3). 'studio': NO desk — a seamless paper
+    // floor continuous with the warm cyclorama sweep (buildStudioBackground;
+    // the walnut desk laid under it showed in the camera's open quadrant,
+    // user 2026-10-12). 'void': bare gradient void — board and props only.
+    // The desk plane keeps its long grain + plank seams + board-centered
+    // vignette (style review round 3) and receives the key-light shadow; the
+    // SDF ground shadow draws above it.
     if (lighting) {
       const world = this.backgroundWorld()
       this.bgWorldBuilt = world
@@ -3027,38 +5439,148 @@ export class Scene3D {
         this.regFloorFade(m, 1)
         return m
       }
-      if (world !== 'void') {
+      // the wood desk belongs to the workbench and the city only: the studio
+      // world's floor is its own paper (it was laid under the studio too, and
+      // its walnut was the studio's foreground — the user's "texture qui
+      // reste avec du bois", 2026-10-12)
+      if (world === 'workbench' || world === 'city') {
         const deskSize = Math.max(6000, Math.max(w, h) * 6)
-        const wood = workbenchTextures('#C8A67D')
+        // walnut (WOOD_DESK_BASE): a value step under the board (loop 4 r4).
+        // The CITY desk is a pale birch board (CITY_DESK_BASE) — the neutral
+        // the city's pavement sits on; same grain tile, same program.
+        const city = world === 'city'
+        const wood = city ? workbenchTextures(CITY_DESK_BASE, undefined, CITY_DESK_CONTRAST) : workbenchTextures()
+        // colour, roughness and relief come from one grain tile (lit/wood.ts),
+        // so the dark grain lines sit on the relief. (The colour was ONE
+        // stretched 2048 canvas — ~3 units per texel, the "diagonal motion-
+        // blur streaks" of loop 4 r4 — held there only by its baked
+        // vignette, which is now the overlay below.) The desk is BOARDS
+        // (deskBoardsGeometry): each maps a tile row at its own offset and
+        // mirror with its tone in a vertex colour — a plane repeating the
+        // tile read as "plywood wallpaper" (tp-final-dpr1/workbench-wide.png).
+        // Its UVs carry the world scale, so the repeat is 1.
+        wood.map.repeat.set(1, 1)
+        wood.roughnessMap.repeat.set(1, 1)
+        wood.normalMap.repeat.set(1, 1)
         const deskMat = new THREE.MeshStandardMaterial({
           map: wood.map,
           roughnessMap: wood.roughnessMap,
+          normalMap: wood.normalMap,
+          // the board tones; the cutting mat carries a white colour
+          // attribute so the two still share ONE program
+          vertexColors: true,
+          // a uniform, not a define: the near-flat city board keeps the
+          // walnut desk's program
+          normalScale: city ? new THREE.Vector2(CITY_DESK_RELIEF, CITY_DESK_RELIEF) : new THREE.Vector2(WOOD_DESK_RELIEF, WOOD_DESK_RELIEF),
           roughness: 1,
           metalness: 0,
         })
         this.regFloorFade(deskMat, 1)
-        const desk = new THREE.Mesh(new THREE.PlaneGeometry(deskSize, deskSize), deskMat)
+        const desk = new THREE.Mesh(deskBoardsGeometry(deskSize, undefined, city ? CITY_DESK_CONTRAST : 1), deskMat)
         desk.rotation.x = -Math.PI / 2
         desk.position.set(fractureBand + slabW / 2, deskY, fractureBand + slabH / 2)
         desk.receiveShadow = true
         desk.renderOrder = -12 // under the SDF board shadow (-11) and the slab (-10)
+        // the desk recedes by a polygon offset: the cutting mat's 0.12 lift
+        // and the vignette's 0.05 then never z-fight with it, even zoomed out
+        // (24-bit depth, near 10: ~0.2 units of resolution at 6 000)
+        deskMat.polygonOffset = true
+        deskMat.polygonOffsetFactor = 1
+        deskMat.polygonOffsetUnits = 4
         floor.add(desk)
+        // the desk VIGNETTE (lit/wood.ts deskVignetteTexture): clear around
+        // the board, darker toward the rim — the desk recedes and the
+        // maquette owns the light. A low-frequency overlay of its own so the
+        // wood tile can repeat; drawn with the material set the card icons
+        // already link (map + transparent, no depth write, not tone-mapped),
+        // so it adds no program. Transparent: it draws after every opaque
+        // desk prop, the cutting mat and the slab, which occlude it by depth
+        // (it lies UNDER the mat: 0.05 against the mat's 0.12).
+        // Not in the city: the city ring covers the desk beyond its hole, and
+        // inside the hole the ramp only muddied the apron the city's desk
+        // props stand on (city-flag/city-moose.png, 2026-10-09).
+        if (!city) {
+          const vigMat = new THREE.MeshBasicMaterial({ map: deskVignetteTexture(), transparent: true, depthWrite: false, toneMapped: false })
+          this.regFloorFade(vigMat, 1)
+          const vignette = new THREE.Mesh(new THREE.PlaneGeometry(deskSize, deskSize), vigMat)
+          vignette.rotation.x = -Math.PI / 2
+          vignette.position.set(fractureBand + slabW / 2, deskY + 0.05, fractureBand + slabH / 2)
+          vignette.renderOrder = -12
+          vignette.userData.deskVignette = true // dev-probe marker
+          floor.add(vignette)
+        }
+        if (world === 'workbench') {
+          // VIEW3D QUALITY LOOP 4 r4 — the architect's CUTTING MAT under the
+          // board (lit/cuttingMat.ts; workbench-wide.png: "the desk still
+          // reads empty … large empty tan areas"): slate green, a 5 cm grid
+          // along the slab's edges, CUT_MAT_OVERHANG past it. Its material
+          // carries the desk's exact feature set (map + roughness + normal
+          // maps + vertex colours — white on the mat, cuttingMatGeometry),
+          // so it links no new program.
+          const cm = cuttingMatTextures()
+          const matMat = new THREE.MeshStandardMaterial({
+            map: cm.map,
+            roughnessMap: cm.roughnessMap,
+            normalMap: cm.normalMap,
+            vertexColors: true,
+            normalScale: new THREE.Vector2(0.3, 0.3),
+            roughness: 1,
+            metalness: 0,
+          })
+          this.regFloorFade(matMat, 1)
+          const cutMat = new THREE.Mesh(cuttingMatGeometry({ x: fractureBand, z: fractureBand, w: slabW, h: slabH }), matMat)
+          cutMat.position.y = deskY + CUT_MAT_LIFT
+          cutMat.receiveShadow = true
+          cutMat.renderOrder = -12
+          cutMat.userData.cuttingMat = true // dev-probe marker
+          floor.add(cutMat)
+        }
       }
       if (world === 'city') {
         // seed rides the decor seed (resolveSceneDecor defaults it from the
         // diagram id), so two diagrams never share a skyline
         // hole apron kept TIGHT (+35 a side): with the builder's street
-        // margin the first low blocks stand ~half a card-width off the board
-        // edge — a wider apron leaves a barren desk band that isolates the
-        // board from its city.
-        const city = buildCityBackground({
-          hole: { x: fractureBand + slabW / 2, z: fractureBand + slabH / 2, w: slabW + 70, h: slabH + 70 },
-          radius: Math.max(1800, Math.max(slabW, slabH) * 2.75),
-          baseY: deskY,
-          seed: (this.sceneDecor?.seed ?? 1) >>> 0,
+        // margin the first low blocks now stand ~half a card-width off the
+        // board edge — the old +60 apron plus a 96 margin left a ~200 px
+        // barren desk band that isolated the board from its city (AAA
+        // round 3 sev6; ref3's blocks run right up to the trays).
+        this.mountCity(
+          floor,
+          {
+            // CITY_HOLE_APRON is shared with placeDecor, which keeps every
+            // city desk prop's footprint inside this apron
+            hole: {
+              x: fractureBand + slabW / 2,
+              z: fractureBand + slabH / 2,
+              w: slabW + 2 * CITY_HOLE_APRON,
+              h: slabH + 2 * CITY_HOLE_APRON,
+            },
+            radius: Math.max(1800, Math.max(slabW, slabH) * 2.75),
+            baseY: deskY,
+            seed: (this.sceneDecor?.seed ?? 1) >>> 0,
+          },
           makeMat,
-        })
-        floor.add(city.group)
+        )
+        // the CIVIC PODIUM (quality pass "city": the board "sits on bare beige
+        // ground with no plinth or transition … floats like a giant crate"):
+        // granite filling the 16-unit gap between the desk and the slab's
+        // bottom, out to the apron line, with steps down to the street on the
+        // camera's two sides. The desk props stand on its top (decorDeskLift).
+        // Built here, synchronously (a few hundred triangles), in the city's
+        // material — same program, one draw.
+        const podium = new THREE.Mesh(
+          buildCityPodium({
+            slab: { x: fractureBand, z: fractureBand, w: slabW, h: slabH },
+            // the whole podium inside the city's hole (the steps apart)
+            reach: CITY_HOLE_APRON,
+            baseY: deskY,
+            stairs: ['+x', '+z'],
+          }),
+          cityMaterial(makeMat),
+        )
+        podium.receiveShadow = true // the props' and the board's shadows land on it
+        podium.userData.cityPodium = true // dev-probe marker
+        floor.add(podium)
       } else if (world === 'studio') {
         const studio = buildStudioBackground({
           // radius sized so the sweep (r = radius/2.5) stands ~2000+ world
@@ -3077,65 +5599,94 @@ export class Scene3D {
         studio.group.position.set(fractureBand + slabW / 2, 0, fractureBand + slabH / 2)
         floor.add(studio.group)
       } else if (world === 'workbench') {
+        // floor-local foot position and scale — see the two comments below
+        const lampAt: [number, number, number] = [fractureBand + slabW * 0.46, deskY, fractureBand - 35]
+        const lampScale = 0.5
+        // the plan footprint: the smallest circle along the bearing over the
+        // foot disc and the shade's disc (the pool lies between them)
+        const [bx, bz] = LAMP_BEARING
+        const footR = DESK_LAMP_FOOT_R * lampScale
+        const shadeFar = (DESK_LAMP_SHADE_REACH + DESK_LAMP_SHADE_R) * lampScale
+        const midAlong = (shadeFar - footR) / 2
+        this.lampFoot = {
+          x: x0 + lampAt[0] + bx * midAlong,
+          z: y0 + lampAt[2] + bz * midAlong,
+          r: (shadeFar + footR) / 2,
+        }
         const lamp = buildDeskLamp({
           // parked past the board's TOP edge, near centre — the iso camera
-          // (azimuth 40°) maps +x/−z to screen-right, so anchors further
-          // right project past the default crop or sink the base behind the
-          // right panel, and anchors further up behead the dome. 0.46·slabW
-          // keeps it off the panel; −35 sits at the slab lip (base disc ~8
-          // units clear). The builder's gooseneck hunches the dome LOW over
-          // the desk (backgrounds.ts) because a straight mast cannot fit
-          // between the top toolbar and the board edge — the lamp must be in
-          // shot pouring its pool, not an off-stage glow.
-          position: [fractureBand + slabW * 0.46, deskY, fractureBand - 35],
+          // (azimuth 40°) maps +x/−z to screen-right, so the old right-corner
+          // anchor (slabW+260, −80) projected ~500 css px PAST the default
+          // crop and the round-2 anchor (0.7·slabW, −200) kept the dome one
+          // zoom-out step up-frame. Round-3's 0.5·slabW/−60 STILL beheaded
+          // the dome at default framing and sank the base behind the right
+          // panel (AAA round 4 sev6) — pulled off the panel (0.46·slabW)
+          // and down-screen to the slab lip (−35 keeps the base disc ~8
+          // units clear); the rest of the fix is the lamp itself: the
+          // builder's gooseneck now hunches the dome LOW over the desk
+          // (backgrounds.ts round-4 note), because no legal desk anchor
+          // could fit the old straight-mast dome between the top toolbar
+          // and the board edge — ref1's golden key is the lamp in shot
+          // pouring its pool, not an off-stage glow.
+          position: lampAt,
           // scaled UNDER 1 so the brass dome clears the frame-top ray: at
           // full size only the stand entered the crop and the dome — the
-          // golden-key icon itself — stays beheaded above the frame
-          // (down-screen is (+x,+z) here, and more +z would park the base ON
-          // the board).
-          scale: 0.5,
-          // shade + spot aim DOWN-LEFT onto the open paper just below the
-          // top edge (the corner lamp pours across the cards, not at them).
-          // A centre aim floods the whole slab (clipping to 255 across most
-          // of it); an aim on the
-          // upper-right card blows its top to pure white. The short aim
-          // keeps incidence ~48°, bounds the pool by mid-board, and its
-          // south spill exits over the board's left edge.
-          boardCenter: [fractureBand + slabW * 0.42, 0, fractureBand + slabH * 0.18],
+          // golden-key icon itself — stayed beheaded above the frame
+          // (probe-verified; down-screen is (+x,+z) here, and more +z would
+          // park the base ON the board).
+          scale: lampScale,
+          // shade + spot aim at the DESK around the lamp's own foot, off the
+          // board (lamp pass 2026-10-10). Every aim ON the slab printed a
+          // pool on the diagram: the old one (0.42·slabW, 0.18·slabH), from
+          // a shade hung over the slab only 39 units above it, was the
+          // critic's "hot spot just right of Event bus" (+8.5 % over the
+          // board median, .probes/lamp) and reached the cards. The aim point
+          // sits LAMP_AIM_DIST along LAMP_BEARING, between the foot and the
+          // shade (which the builder hangs farther out along the same
+          // bearing), so the dome tips back toward its stem and the camera.
+          boardCenter: [lampAt[0] + bx * LAMP_AIM_DIST, deskY, lampAt[2] + bz * LAMP_AIM_DIST],
           makeMat,
         })
         floor.add(lamp.group)
         if (lamp.lamp) {
-          // decay 0: a predictable warm accent pool, not a physical falloff —
-          // the key light owns shadows, the practical stays shadowless.
-          // Intensity/angle are engine-owned (the spec's 2.4/0.5 vanishes
-          // under the studio sun + ACES). The sun/hemi are kept low
-          // (studioSkin) to open headroom and the spot owns the top of the
-          // range: measured ~250+ in the pool centre vs ~190 open paper at
-          // board bottom-left (a ~+30 % golden-key gradient), cards still
-          // unclipped.
-          // the wood tray's albedo swallows the pool that reads on paper:
-          // the practical pushes harder + tighter there
-          const woodTray = this.trayStyle() === 'wood'
-          // with the fill at 0.48 the pool must own the top of the exposure
-          // range on every tray
-          const spot = new THREE.SpotLight(
-            new THREE.Color(lamp.lamp.color),
-            woodTray ? 6.2 : 4.6,
-            0,
-            woodTray ? 0.4 : 0.43,
-            lamp.lamp.penumbra,
-            0,
-          )
-          spot.position.set(...lamp.lamp.position)
-          const target = new THREE.Object3D()
-          target.position.set(...lamp.lamp.target)
-          spot.target = target
-          spot.castShadow = false
-          floor.add(spot, target)
+          // The spot is the PERSISTENT practical (see practicalSpot): only
+          // its parameters change here, never the scene's light count. It
+          // stays shadowless (the key light owns shadows) and every
+          // parameter is the lamp spec's own (backgrounds.ts buildDeskLamp):
+          // a physically decaying desk lamp that lights its corner of the
+          // desk. History: loop 4 replaced a tight 6.2 / 0.4-rad cone (a
+          // saturated disc beside Event bus) with a wide decay-0 gradient
+          // (0.85 rad, penumbra 1, 1.8-2.3) "warm on the top of the board" —
+          // which was still a pool ON the diagram, lighting half the slab at
+          // full strength with no falloff (the critic's disc on the cards,
+          // lamp pass 2026-10-10). The pool now belongs to the desk.
+          const spot = this.practicalSpot
+          if (spot) {
+            spot.color.set(lamp.lamp.color)
+            spot.intensity = lamp.lamp.intensity
+            spot.distance = lamp.lamp.distance
+            spot.angle = lamp.lamp.angle
+            spot.penumbra = lamp.lamp.penumbra
+            spot.decay = lamp.lamp.decay
+            // the lamp spec is FLOOR-local (the old spot was a child of
+            // `floor`); the persistent spot lives in the scene, so lift both
+            // ends into world space by the floor's own offset
+            spot.position.set(...lamp.lamp.position).add(floor.position)
+            spot.target.position.set(...lamp.lamp.target).add(floor.position)
+            // no prop stands in the pool (loop 4: a leaf inside it read as a
+            // glowing orange smear): the lamp's footprint (lampFoot, above)
+            // covers it — a desk-side `avoid` box would not, placement's
+            // desk fast path skips `avoid` for clearance <= 3
+            spot.updateMatrixWorld()
+            spot.target.updateMatrixWorld()
+          }
         }
       }
     }
+
+    // left the city (or the lit profile): an in-flight build stops at its
+    // next slice; the cached geometry stays for a switch back
+    if (this.bgWorldBuilt !== 'city') this.cityJob = null
 
     // soft ground shadow under the board (kit: blur 38, offset 24/36) — drawn
     // below the depth-writing slab, so it only peeks around the board's edges
@@ -3153,7 +5704,10 @@ export class Scene3D {
       shadow.userData.shadowShape = 'roundedRect' // dev-probe marker
       shadow.renderOrder = -11 // under the slab even while both are transparent mid-fade
       shadow.rotation.x = -Math.PI / 2
-      shadow.position.set(fractureBand + slabW / 2 + 24, -floorD - 14, fractureBand + slabH / 2 + 36)
+      // in the city the board stands on its podium: the shadow lies on the
+      // podium's top (its slab-bottom level), not on the buried desk
+      const groundY = this.bgWorldBuilt === 'city' ? -floorD + 0.25 : -floorD - 14
+      shadow.position.set(fractureBand + slabW / 2 + 24, groundY, fractureBand + slabH / 2 + 36)
       floor.add(shadow)
     }
 
@@ -3379,6 +5933,14 @@ export class Scene3D {
     this.voxelMatrix.compose(fragment.position, this.voxelQuaternion, this.voxelScale)
     live.mesh.setMatrixAt(fragment.index, this.voxelMatrix)
     live.mesh.instanceMatrix.needsUpdate = true
+  }
+
+  /** The connection under the pointer: its label shows WHOLE while it rests
+   * there — the way an abbreviated or hidden label (TASK 2) is read. */
+  private setConnLabelHover(id: string | null): void {
+    if (id === this.connLabelHoverId) return
+    this.connLabelHoverId = id
+    if (this.resolveConnLabelVisibility()) this.requestCameraRender()
   }
 
   private setVoxelHover(id: string | null): void {
@@ -3728,9 +6290,8 @@ export class Scene3D {
     if (cardLighting) {
       // walnut plinth under the glass: wider than
       // the slab so the dark base rims the card and shows through the
-      // frosted walls. Height 2.6 stays under every cable plug (plugY ≥
-      // wallBase + 4.2 — cable anatomy invariant), so the plug boots keep
-      // biting the glass wall, never the wood.
+      // frosted walls. Height 2.6 (an ink head pointing at a card on a
+      // group platform rises over it: Scene3D.inkHeadLift).
       const plinthMat = new THREE.MeshPhysicalMaterial({
         color: new THREE.Color('#4E3A28'),
         roughness: 0.5,
@@ -3818,6 +6379,9 @@ export class Scene3D {
     const techTex = o.icon
       ? techIconTexture(o, () => this.requestRender(), this.resolvedTheme)
       : null
+    // The 20-px icon tile is the base design at every framing (user decision
+    // 2026-10-10: the grow/hide badge rule of pass "labels" is gone).
+    unit.userData.hasTech = !!o.icon
     if (techTex) {
       const glyph = new THREE.Mesh(
         new THREE.PlaneGeometry(20, 20),
@@ -3883,11 +6447,19 @@ export class Scene3D {
     unit.add(name)
 
     if (sub) {
+      // lit: the studio subtitle grey #9A958C is 2.98:1 on the #FFFFFF card
+      // (WCAG formula, computed 2026-10-08) — floored at AAA
+      // (LIT_SMALL_INK_CONTRAST) against the card fill; the AA floor still
+      // read near-white on cream at 10.5 px (loop 4 r3 workbench-labels.png)
+      const subCss = external ? objSkin.descriptionExternal : objSkin.description
+      const subColor = this.renderProfile === 'lit'
+        ? ensureContrast(subCss, colorAlpha(cardBg).color, LIT_SMALL_INK_CONTRAST)
+        : subCss
       const subText = this.addText({
         text: fittedDescription.lines.join('\n'),
         font: 'inter400',
         size: fittedDescription.fontSize,
-        color: colorAlpha(external ? objSkin.descriptionExternal : objSkin.description).color,
+        color: colorAlpha(subColor).color,
         anchorX: 'center',
         maxWidth: textMaxW,
         lineHeight: 1.15,
@@ -3918,7 +6490,13 @@ export class Scene3D {
       text: typeLabel,
       font: 'inter600',
       size: PILL_SIZE,
-      color: objSkin.badgeText,
+      // lit: floored on the pill it sits on (loop 4 r3: "the 'App' pill is
+      // pale pink on cream" — #56524C on #F1EFEB is 6.9:1, the warm key
+      // light lifts the pill further)
+      color:
+        this.renderProfile === 'lit'
+          ? colorAlpha(ensureContrast(objSkin.badgeText, colorAlpha(objSkin.badgeBg).color, LIT_SMALL_INK_CONTRAST)).color
+          : objSkin.badgeText,
       anchorX: 'center',
       anchorY: 'middle',
     })
@@ -3927,6 +6505,14 @@ export class Scene3D {
     pillText.userData.lod = LOD_SECONDARY
     pillText.position.set(content.centerX, z + 0.1, content.typeBadgeTopY + PILL_H / 2 + 0.5)
     unit.add(pillText)
+    // lit connection labels keep off the chip and the title (a floated
+    // 'notifies' plate printed over Rollup worker's 'App' chip — view3d
+    // quality loop 2, round 2, city-wide.png)
+    const titleW = Math.min(textMaxW, approxTextWidth(o.name, NAME_SIZE))
+    this.cardTextRects.set(o.id, [
+      { x: pillX, y: content.typeBadgeTopY, w: pillW, h: PILL_H },
+      { x: content.centerX - titleW / 2, y: content.titleTopY, w: titleW, h: NAME_SIZE * 1.3 },
+    ])
 
     // bottom accent bar — ONLY while a BottomBar "color by" tab is active, the
     // 2D engine's exact rule (no tab → no bar; deliberately no always-on tech
@@ -4086,6 +6672,14 @@ export class Scene3D {
     padRing.rotation.x = -Math.PI / 2
     padRing.position.set(cx, baseY + 0.25, cz)
     unit.add(padRing)
+    if (this.renderProfile === 'lit') {
+      // the drum's key-light shadow starts AT the drum: a pad that did not
+      // receive cut the first 13 units of it (PAD_R − DRUM_R) out of every
+      // drum's shadow, which then began past a lit cream ring — the critic's
+      // "drop shadows far from their casters" (lamp pass 2026-10-10)
+      pad.receiveShadow = true
+      padRing.receiveShadow = true
+    }
 
     const sh = colorAlpha(palette.shadowColor)
     // lit profile: the REAL key-light shadow carries the drum — the SDF blob
@@ -4255,7 +6849,11 @@ export class Scene3D {
 
     // tech badge decal standing on the drum's front face (kit TechIconBadge).
     // obj.icon → the technology icon (image or generated badge); otherwise
-    // the tinted first-letter plate.
+    // the tinted first-letter plate. The base design (edfc9c6f7), restored
+    // on the user's decision of 2026-10-10: quality loop 4 had laid it on the
+    // lid, grown it with the zoom and printed the name on the face instead.
+    unit.userData.nodeKind = 'store'
+    unit.userData.hasTech = !!o.icon || !!techName
     const drumIconTex = o.icon
       ? techIconTexture(o, () => this.requestRender(), this.resolvedTheme)
       : null
@@ -4266,6 +6864,7 @@ export class Scene3D {
         new THREE.MeshBasicMaterial({ map: drumIconTex, transparent: true, toneMapped: false }),
       )
       badge.userData.techIcon = o.icon // dev-probe marker
+      badge.userData.drumBadge = true // dev-probe marker (nodeFaces)
       badge.userData.lod = LOD_PRIMARY
       badge.position.set(cx, baseY + lift + DRUM_H / 2, cz + DRUM_R + 1.2)
       unit.add(badge)
@@ -4286,32 +6885,48 @@ export class Scene3D {
       letter.rotation.x = Math.PI / 2 // undo the flat-on-board default: stand upright
       letter.position.z = 0.2
       badge.add(letter)
+      badge.userData.drumBadge = true // dev-probe marker (nodeFaces)
       badge.userData.lod = LOD_PRIMARY
       badge.position.set(cx, baseY + lift + DRUM_H / 2, cz + DRUM_R + 1.2)
       unit.add(badge)
     }
 
-    // name tag on the pad front (kit ed3c3__tag)
-    const tagW = approxTextWidth(o.name, SUB_SIZE) + 18
-    const tag = this.plate(tagW, 18, this.pxr(7), this.surface('tagPlate', palette.tagBg))
-    tag.userData.lod = LOD_PRIMARY
-    tag.position.set(cx - tagW / 2, baseY + 0.4, cz + 49)
-    unit.add(tag)
-    const tagBorder = this.ringPlate(tagW, 18, this.pxr(7), 1, this.surface('padRing', palette.padBorder, { depthWrite: false }))
-    tagBorder.userData.lod = LOD_PRIMARY
-    tagBorder.position.set(cx - tagW / 2, baseY + 0.5, cz + 49)
-    unit.add(tagBorder)
-    const tagText = this.addText({
-      text: o.name,
-      font: 'inter600',
-      size: SUB_SIZE,
-      color: colorAlpha(palette.tagText).color,
-      anchorX: 'center',
-      anchorY: 'middle',
-    })
-    tagText.userData.lod = LOD_PRIMARY
-    tagText.position.set(cx, baseY + 0.6, cz + 49 + 9.5)
-    unit.add(tagText)
+    // name tag on the pad front (kit ed3c3__tag): the datastore NAME in
+    // Inter 600 at SUB_SIZE, LOD_PRIMARY — the base design (edfc9c6f7). It
+    // stands on the CAMERA side of the drum, clear of its pad (storeTagRect
+    // has the measurement), its text held to the lit small-ink contrast floor
+    // like the connection labels: the studio tag grey read faint on its plate
+    // (tp2-final-dpr1/workbench-labels.png).
+    const tagLabel = storeTagText(o)
+    const tagRect = this.storeTagLocal.get(o.id) ?? storeTagRect(o, { x: 0, y: 0, w, h }, CAMERA_PRESETS[this.preset].rz, DRUM_R)
+    if (tagRect) {
+      const tagW = tagRect.w
+      const tag = this.plate(tagW, STORE_TAG_H, this.pxr(7), this.surface('tagPlate', palette.tagBg))
+      tag.userData.lod = LOD_PRIMARY
+      tag.userData.storeTag = 'plate'
+      tag.position.set(tagRect.x, baseY + 0.4, tagRect.y)
+      unit.add(tag)
+      const tagBorder = this.ringPlate(tagW, STORE_TAG_H, this.pxr(7), 1, this.surface('padRing', palette.padBorder, { depthWrite: false }))
+      tagBorder.userData.lod = LOD_PRIMARY
+      tagBorder.position.set(tagRect.x, baseY + 0.5, tagRect.y)
+      unit.add(tagBorder)
+      const tagInk =
+        this.renderProfile === 'lit'
+          ? ensureContrast(palette.tagText, colorAlpha(palette.tagBg).color, LIT_SMALL_INK_CONTRAST)
+          : palette.tagText
+      const tagText = this.addText({
+        text: tagLabel,
+        font: 'inter600',
+        size: SUB_SIZE,
+        color: colorAlpha(tagInk).color,
+        anchorX: 'center',
+        anchorY: 'middle',
+      })
+      tagText.userData.lod = LOD_PRIMARY
+      tagText.userData.storeTag = 'text'
+      tagText.position.set(tagRect.x + tagW / 2, baseY + 0.6, tagRect.y + STORE_TAG_H / 2 + 0.5)
+      unit.add(tagText)
+    }
 
     // selection ring around the pad
     if (selected) {
@@ -4337,167 +6952,191 @@ export class Scene3D {
 
   // ── connections (flat ribbons on the board) ────────────────────────────────
 
-  /** Final plug POINTS for every lit solid connection (so a corner arrival
-   * never ends in the air and neighbouring boots never merge). Each
-   * un-trimmed endpoint clamps onto the FLAT stretch of its wall — out of
-   * the rounded corners — and same-wall neighbours relax to PLUG_PITCH.
-   * Deterministic: buckets sort by (natural coord, connId:end). Drum ends
-   * slot by ANGLE on the cylinder. Keyed `${connId}:${'from'|'to'}`. */
-  private computePlugSlots(
-    rects: Map<string, Rect>,
-    objectById: Map<string, C4Object>,
-  ): Map<string, { x: number; y: number }> {
-    const out = new Map<string, { x: number; y: number }>()
-    interface WallSlot { key: string; rect: Rect; face: Face; coord: number }
-    const walls = new Map<string, WallSlot[]>()
-    const drums = new Map<string, { key: string; cx: number; cz: number; angle: number }[]>()
-    for (const conn of this.data.connections) {
-      if (conn.type === 'dashed' || conn.type === 'dotted') continue
-      const fromRect = rects.get(conn.fromId)
-      const toRect = rects.get(conn.toId)
-      if (!fromRect || !toRect) continue
-      const locked = conn.lockedToAnchors === true
-      const fromEdge = locked && conn.fromAnchor !== undefined
-        ? anchorPoint(fromRect, conn.fromAnchor)
-        : edgePoint(fromRect, toRect.x + toRect.w / 2, toRect.y + toRect.h / 2)
-      const toEdge = locked && conn.toAnchor !== undefined
-        ? anchorPoint(toRect, conn.toAnchor)
-        : edgePoint(toRect, fromRect.x + fromRect.w / 2, fromRect.y + fromRect.h / 2)
-      const ends: [string, string, Rect, EdgePoint][] = [
-        [`${conn.id}:from`, conn.fromId, fromRect, fromEdge],
-        [`${conn.id}:to`, conn.toId, toRect, toEdge],
-      ]
-      for (const [key, nodeId, rect, edge] of ends) {
-        if (objectById.get(nodeId)?.type === 'store') {
-          const cx = rect.x + rect.w / 2
-          const cz = rect.y + rect.h / 2
-          const list = drums.get(nodeId) ?? []
-          list.push({ key, cx, cz, angle: Math.atan2(edge.y - cz, edge.x - cx) })
-          drums.set(nodeId, list)
-        } else {
-          const wallKey = `${nodeId}:${edge.face}`
-          const list = walls.get(wallKey) ?? []
-          list.push({ key, rect, face: edge.face, coord: edge.face === 'left' || edge.face === 'right' ? edge.y : edge.x })
-          walls.set(wallKey, list)
-        }
-      }
+  /**
+   * `labels`: 'inline' starts the lit-label placement pass inside this call
+   * with room to finish a small board's (a full rebuild: the decor built
+   * right after keeps off the placed plates); 'sliced' (default) leaves it
+   * to short slices after the frame (runLabelJob).
+   *
+   * CONNECT FREEZE (user report "quand je connecte deux shapes … ça gèle",
+   * 2026-10-11): on the dev landscape's 67-connection diagram 0ob3fum the
+   * placement pass alone measured 1072 ms of a 1187 ms connection build
+   * (connLabelPerf, connect-freeze probe, DPR 1), and this method runs on
+   * every pointermove of a connection edit, twice on its pointerup (the
+   * handler, then the store echo) and again on the write flush's echo —
+   * pointerup was ONE 2378 ms task (LoAF: CANVAS.onpointerup). The pass
+   * placed labels for a framing the user is not even looking at during a
+   * gesture; it now runs between frames and input.
+   */
+  private buildConnections(labels: 'inline' | 'sliced' = 'sliced'): void {
+    // inside batch(): the closing full rebuild rebuilds connections too
+    if (this.batchDepth > 0) {
+      this.batchDirty = true
+      return
     }
-    // 1D relaxation to PLUG_PITCH inside [lo, hi]; a wall too short for the
-    // pitch distributes evenly instead
-    const relax = (coords: number[], lo: number, hi: number): number[] => {
-      const n = coords.length
-      if (n === 0) return coords
-      if (hi <= lo) return coords.map(() => (lo + hi) / 2)
-      if (hi - lo <= PLUG_PITCH * (n - 1)) {
-        return coords.map((_, i) => (n === 1 ? (lo + hi) / 2 : lo + ((hi - lo) * i) / (n - 1)))
-      }
-      const spread = coords.map((c) => Math.min(Math.max(c, lo), hi))
-      for (let i = 1; i < n; i++) spread[i] = Math.max(spread[i], spread[i - 1] + PLUG_PITCH)
-      spread[n - 1] = Math.min(spread[n - 1], hi)
-      for (let i = n - 2; i >= 0; i--) spread[i] = Math.min(spread[i], spread[i + 1] - PLUG_PITCH)
-      return spread
-    }
-    for (const list of walls.values()) {
-      list.sort((a, b) => a.coord - b.coord || (a.key < b.key ? -1 : 1))
-      const r0 = list[0].rect
-      const horizontal = list[0].face === 'top' || list[0].face === 'bottom'
-      const lo = (horizontal ? r0.x : r0.y) + PLUG_CORNER_MARGIN
-      const hi = (horizontal ? r0.x + r0.w : r0.y + r0.h) - PLUG_CORNER_MARGIN
-      const coords = relax(list.map((s) => s.coord), lo, hi)
-      list.forEach((s, i) => {
-        const c = coords[i]
-        out.set(
-          s.key,
-          s.face === 'left'
-            ? { x: s.rect.x, y: c }
-            : s.face === 'right'
-              ? { x: s.rect.x + s.rect.w, y: c }
-              : s.face === 'top'
-                ? { x: c, y: s.rect.y }
-                : { x: c, y: s.rect.y + s.rect.h },
-        )
-      })
-    }
-    for (const list of drums.values()) {
-      list.sort((a, b) => a.angle - b.angle || (a.key < b.key ? -1 : 1))
-      const pitch = PLUG_PITCH / (DRUM_R - 1.5)
-      const angles = list.map((s) => s.angle)
-      for (let i = 1; i < angles.length; i++) angles[i] = Math.max(angles[i], angles[i - 1] + pitch)
-      list.forEach((s, i) => {
-        out.set(s.key, {
-          x: s.cx + Math.cos(angles[i]) * (DRUM_R - 1.5),
-          y: s.cz + Math.sin(angles[i]) * (DRUM_R - 1.5),
-        })
-      })
-    }
-    return out
-  }
-
-  /** Wall + plug facts for one cable end (world heights). Cards plug into
-   * the slab wall, drums into the cylinder (with an XZ snap target), group
-   * ends into the platform pedestal. The plug sits low on the wall (the
-   * reference image's ports live near the bench), clamped so the boot
-   * (radius·1.9 ≈ ≤5.5 world px) stays on porcelain even on thin walls. */
-  private cableEndpointFacts(
-    id: string,
-    obj: C4Object | undefined,
-    rect: Rect,
-    isGroup: boolean,
-  ): { wallBase: number; wallTop: number; plugY: number; snapCenter: { x: number; z: number } | null } {
-    const preset = CAMERA_PRESETS[this.preset]
-    const wallBase = this.nodeGroups.get(id)?.userData.baseY ?? 0
-    const isDrum = obj?.type === 'store'
-    const wallTop = isGroup ? preset.plat : isDrum ? wallBase + DRUM_H : wallBase + preset.depth
-    const raw = wallBase + Math.min(Math.max((wallTop - wallBase) * 0.42, 4.2), 12)
-    const plugY = Math.min(raw, Math.max(wallBase + 2.2, wallTop - 4.2))
-    return {
-      wallBase,
-      wallTop,
-      plugY,
-      snapCenter: isDrum ? { x: rect.x + rect.w / 2, z: rect.y + rect.h / 2 } : null,
-    }
-  }
-
-  private buildConnections(): void {
     const skin = this.skin
     if (!skin) return
+    const connBuildT0 = performance.now()
+    // a pending placement pass placed the labels this build disposes
+    this.cancelLabelJob()
+    // what each label shows now (the previous pass's result, or the one it
+    // carried): kept on screen by a label whose own inputs did not change
+    // until this build's pass commits — no flash of every label back to its
+    // build spot, full text, on each pointermove of a drag
+    const shownBefore = new Map<
+      string,
+      { sig: string; plate: THREE.Vector3; plateScale: THREE.Vector3; text: THREE.Vector3; textScale: THREE.Vector3; shown: LabelShow }
+    >()
+    for (const s of this.connLabelScalers) {
+      shownBefore.set(s.connId, {
+        sig: s.sig,
+        plate: s.plate.position.clone(),
+        plateScale: s.plate.scale.clone(),
+        text: s.text.position.clone(),
+        textScale: s.text.scale.clone(),
+        shown: s.shown,
+      })
+    }
+    // an abbreviated plate wears its own geometry: the whole label's is not
+    // in the layer then, so the traverse below would not dispose it
+    for (const s of this.connLabelScalers) if (s.plate.geometry !== s.fullGeo) s.fullGeo.dispose()
     // reset layer (troika texts dispose through their own API, not traverse)
     const connTextSet = new Set<THREE.Object3D>(this.connTexts)
     this.connLayer.traverse((obj) => {
       if (connTextSet.has(obj)) return
       const mesh = obj as THREE.Mesh
       if (mesh.geometry) mesh.geometry.dispose()
+      // RETIRED, not disposed (retiredMaterials): every line shares ONE
+      // program, and disposing all of its materials here destroyed it, so
+      // the frame after EVERY connection build — each pointermove of an
+      // endpoint drag, each store echo — re-linked it (getProgramInfoLog
+      // 19-23 ms self in the reconnect frames, connect-freeze profile on
+      // 0ob3fum, 2026-10-11). The first material of each program is KEPT
+      // instead (keepConnProgram).
       const mat = mesh.material as THREE.Material | THREE.Material[] | undefined
-      if (Array.isArray(mat)) mat.forEach((m) => m.dispose())
-      else if (mat) mat.dispose()
+      for (const m of Array.isArray(mat) ? mat : mat ? [mat] : []) if (!this.keepConnProgram(m)) this.retire(m)
     })
-    for (const t of this.connTexts) t.dispose()
+    // label texts are POOLED by what makeText was given: a label this build
+    // draws with the same text, font, size and color takes its old Text back
+    // (no new troika material, no re-layout). makeText was 57-75 ms of each
+    // 67-label build on 0ob3fum (profiled, connect-freeze 2026-10-11); what
+    // the build does not take back is disposed at its end.
+    const textPool = new Map<string, Text[]>()
+    for (const t of this.connTexts) {
+      const key = t.userData.poolKey as string | undefined
+      if (key === undefined) {
+        t.dispose()
+        continue
+      }
+      const bucket = textPool.get(key)
+      if (bucket) bucket.push(t)
+      else textPool.set(key, [t])
+    }
     this.connTexts = []
     this.connLayer.clear()
     this.pickables = this.pickables.filter(
       (p) => !CONN_PICK_KINDS.has((p.userData.pick as PickTarget | undefined)?.kind as PickTarget['kind']),
     )
     this.connGeoms.clear()
-    this.cableDebug = []
+    this.connLabelOffsets.clear()
+    this.connLabelBoxes = []
+    this.connLabelScalers = []
+    this.connLabelGrowth = { kWant: 1, labels: [] }
+    this.connLines.clear()
+    this.arrowDebug = []
     this.flowUnits = [] // meshes were in connLayer — already disposed above
+    this.editChrome = null // its meshes too
+    this.selectHalo = null
+    this.inkUniforms.uInkPhase.value = -1
 
     const rects = new Map<string, Rect>()
     for (const o of this.data.objects) rects.set(o.id, this.objectRect(o))
     for (const g of this.data.groups) rects.set(g.id, this.groupRect(g))
     const edit = this.connEdit
+    // lit labels steer clear of cards and drums (and of each other — placed
+    // labels are appended as they land); groups are NOT obstacles, labels
+    // legitimately sit on a group platform. Everything carries its height:
+    // connLabelPlacement tests a plate where it is SEEN at the lift it
+    // floats at, and the text-bearing features are hard.
+    const labelOccluders: Occluder[] = []
+    // the preset's view direction (stable across orbit — connections are not
+    // rebuilt per frame): labels prefer the camera side of their wire and
+    // avoid what a node hides behind it and covers in front of it
+    const presetPose = CAMERA_PRESETS[this.preset]
+    const labelToward = {
+      x: Math.sin((presetPose.rz * Math.PI) / 180),
+      y: Math.cos((presetPose.rz * Math.PI) / 180),
+    }
+    const layerY = this.connLayer.position.y
+    if (this.renderProfile === 'lit') {
+      for (const o of this.data.objects) {
+        const r = rects.get(o.id)!
+        const unit = this.nodeGroups.get(o.id)
+        const baseY = ((unit?.userData.baseY as number | undefined) ?? 0) - layerY
+        if (o.type === 'store') {
+          const cx = r.x + r.w / 2
+          const cz = r.y + r.h / 2
+          // the drum body, the flat pad ring, and the subtitle tag the
+          // standee carries on its camera side (storeTagRect) — the tag is
+          // text, so it is hard. The name printed on the drum rides the
+          // drum's own box.
+          labelOccluders.push({
+            box: { x: cx - DRUM_R - 2, y: cz - DRUM_R - 2, w: 2 * DRUM_R + 4, h: 2 * DRUM_R + 4 },
+            bottom: baseY,
+            top: baseY + DRUM_H,
+          })
+          labelOccluders.push({
+            box: { x: cx - PAD_R - 4, y: cz - PAD_R - 4, w: 2 * PAD_R + 8, h: 2 * PAD_R + 8 },
+            bottom: baseY,
+            top: baseY + 0.5,
+          })
+          const tag = this.storeTag(o, r)
+          if (tag) {
+            labelOccluders.push({
+              box: { x: tag.x - 3, y: tag.y - 3, w: tag.w + 6, h: tag.h + 6 },
+              bottom: baseY + 0.4,
+              top: baseY + 0.6,
+              hard: true,
+            })
+          }
+        } else {
+          const topY = ((unit?.userData.topY as number | undefined) ?? baseY + layerY + presetPose.depth) - layerY
+          // the slab (the lit plinth rims it by 7 px, 2.6 tall)
+          labelOccluders.push({ box: { x: r.x - 4, y: r.y - 4, w: r.w + 8, h: r.h + 8 }, bottom: baseY, top: topY })
+          labelOccluders.push({ box: { x: r.x - 7, y: r.y - 7, w: r.w + 14, h: r.h + 14 }, bottom: baseY, top: baseY + 2.6 })
+          for (const t of this.cardTextRects.get(o.id) ?? []) {
+            labelOccluders.push({
+              box: { x: r.x + t.x - 3, y: r.y + t.y - 3, w: t.w + 6, h: t.h + 6 },
+              bottom: topY,
+              top: topY + 0.5,
+              hard: true,
+            })
+          }
+        }
+      }
+    }
 
     // 2D focus parity: ANY selection enters focus mode; a connection is
     // highlighted when it is selected itself or leaves a selected shape/group
     // (isConnectionHighlighted — object and group sources are both "fromId is
     // selected"). Highlighted → highlight stroke + focus animation; the rest
-    // dim to 15%, exactly the flat engine's numbers.
+    // dim to 15%, exactly the flat engine's numbers (the lit ink: 42 %,
+    // inkLine.INK_DIM_OPACITY has the measurement).
     const focusMode = this.selectedIds.size > 0
     const styleArmed = this.connAnimationsEnabled && this.highlightStyle !== 'none'
     const anim = resolveConnectionAnimation(skin)
     const objectById = new Map(this.data.objects.map((object) => [object.id, object]))
     const groupById = new Map(this.data.groups.map((group) => [group.id, group]))
-    // lit cables: pre-slot every plug point (corner clamp + same-wall pitch)
-    const plugSlots = this.renderProfile === 'lit' ? this.computePlugSlots(rects, objectById) : null
+    // lit: every connection is an ink line (inkLine.ts) — casing + core,
+    // their render order assigned after the loop (highlighted last)
+    const lit = this.renderProfile === 'lit'
+    const inkSet = lit ? this.inkSet() : null
+    const inks: { halo: THREE.Mesh | null; casing: THREE.Mesh | null; core: THREE.Mesh; highlighted: boolean }[] = []
+    // the ONE selected connection wears the selection halo (2D isSelected)
+    const singleSelected = this.singleSelectedConnId()
+    // 'Point mobile' on a lit ink line is a bead painted in the core (no
+    // mesh): never under reduced motion — the static selected look is whole
+    const beadOn = styleArmed && this.highlightStyle === 'traveling-dot' && !this.rig.prefersReducedMotion()
 
     for (const conn of this.data.connections) {
       const fromObject = objectById.get(conn.fromId)
@@ -4567,9 +7206,6 @@ export class Scene3D {
       const strokeCss = highlighted
         ? skin.connections.highlight
         : perspectiveColor ?? (isLower ? skin.connections.lower : skin.connections.normal)
-      const width = highlighted
-        ? Math.max(2.6, skin.connections.strokeWidthHighlight * 1.2)
-        : Math.max(2.2, skin.connections.strokeWidth * 1.2)
       const hiddenPreviewAlpha = connectionHidden.temporarilyRevealed
         || fromHidden?.temporarilyRevealed
         || toHidden?.temporarilyRevealed
@@ -4589,143 +7225,126 @@ export class Scene3D {
       // in-flight bend drag routes through the working copy (committed on pointerup)
       const effConn =
         edit?.mode === 'waypoint' && edit.connId === conn.id ? { ...conn, waypoints: edit.working } : conn
+      // the 2D route, in both profiles (Clean's: it stops 4 px off the source
+      // and 14 px short of the target, where the flat arrowhead's tip lands)
       const geom = connectionPath(effConn, fromRect, toRect)
       this.connGeoms.set(conn.id, geom)
       const pts = samplePath(geom, 24)
-      const dash: [number, number] | null = conn.type === 'dashed' ? [5, 4] : conn.type === 'dotted' ? [2, 3] : null
-      const liveCable = this.renderProfile === 'lit' && !dash
-      let cableProfile: CableProfile | null = null
-      let body: THREE.BufferGeometry | null
-      if (liveCable) {
-        // Physical plug anchoring (cables must visibly connect) — each end
-        // enters ITS node's wall at a plug height computed from that node's
-        // REAL base (group platform vs board), and the run rests just above
-        // the HIGHER of the two supports. A single global layer height would
-        // bury the mid-span inside group platforms and leave ends floating
-        // beside the walls. Drum ends first snap from the rect
-        // border onto the cylinder so the boot touches porcelain, not air.
-        const layerY = CAMERA_PRESETS[this.preset].plat + CONNECTION_LIFT
-        const cableR = highlighted ? 2.9 : 2.4
-        const from = this.cableEndpointFacts(conn.fromId, fromObject, fromRect, groupById.has(conn.fromId))
-        const to = this.cableEndpointFacts(conn.toId, toObject, toRect, groupById.has(conn.toId))
-        // final plug points (computePlugSlots): un-trimmed (the drawn 2D
-        // path stops 4 px / 14 px short for the flat arrowhead), clamped off
-        // the rounded corners, same-wall neighbours spread to PLUG_PITCH
-        pts[0] = plugSlots?.get(`${conn.id}:from`) ?? { x: geom.fromEdge.x, y: geom.fromEdge.y }
-        pts[pts.length - 1] = plugSlots?.get(`${conn.id}:to`) ?? { x: geom.toEdge.x, y: geom.toEdge.y }
-        if (from.snapCenter) snapOntoDrum(pts, 0, from.snapCenter)
-        if (to.snapCenter) snapOntoDrum(pts, pts.length - 1, to.snapCenter)
-        // plugs enter PERPENDICULAR to their wall (radially for drums),
-        // whatever the routed approach angle
-        const inwardFrom = from.snapCenter ? drumInward(pts[0], from.snapCenter) : FACE_INWARD[geom.fromEdge.face]
-        const inwardTo = to.snapCenter ? drumInward(pts[pts.length - 1], to.snapCenter) : FACE_INWARD[geom.toEdge.face]
-        let total = 0
-        for (let i = 1; i < pts.length; i++) total += Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y)
-        const supportY = Math.max(from.wallBase, to.wallBase)
-        cableProfile = cableProfileFor(
-          from.plugY - layerY,
-          to.plugY - layerY,
-          supportY + cableR + 1.0 - layerY,
-          total,
-        )
-        // Cable tint: light appearance = WHITE PLASTIC — near-cream tubes,
-        // a whisper of the theme
-        // stroke kept for hue; ports mold a step deeper for the socket read.
-        // Dark appearance keeps the warm cocoa so wires stay readable on
-        // dark boards. Both bake as vertex colors (one draw).
-        const lightMode = !this.palette!.dark
-        const cableCss = highlighted
-          ? strokeCss
-          : lightMode
-            ? mixColors(strokeCss, '#EFE7D9', 0.78)
-            : mixColors(strokeCss, '#8F7A5E', 0.46)
-        const plugCss = lightMode
-          ? mixColors(cableCss, '#A2957F', 0.42)
-          : mixColors(cableCss, '#241E18', 0.58)
-        body = buildCableTube(
-          pts,
-          cableR,
-          cableProfile,
-          new THREE.Color(colorAlpha(cableCss).color),
-          new THREE.Color(colorAlpha(plugCss).color),
-          inwardFrom,
-          inwardTo,
-        )
-        this.cableDebug.push({
-          id: conn.id,
-          from: cableEndDebug(
-            from,
-            pts[0],
-            inwardFrom,
-            fromRect,
-            from.snapCenter ? `${conn.fromId}:drum` : `${conn.fromId}:${geom.fromEdge.face}`,
-          ),
-          to: cableEndDebug(
-            to,
-            pts[pts.length - 1],
-            inwardTo,
-            toRect,
-            to.snapCenter ? `${conn.toId}:drum` : `${conn.toId}:${geom.toEdge.face}`,
-          ),
-          restY: cableProfile.yRest + layerY,
-          supportY,
-        })
-      } else {
-        body = buildRibbon(pts, width, dash)
-      }
-      if (body) {
-        // Ribbon (unlit / dashed): DoubleSide — the strip's winding follows
-        // the path direction, so a single-sided material would cull (and
-        // un-pick) half the connections. Cable (lit): a closed tube — normal
-        // front-side depth-written surface that sits IN the scene, WHITE css
-        // so the baked vertex colors show verbatim.
-        const mesh = liveCable
-          ? new THREE.Mesh(body, dim(this.surface('ribbon', '#FFFFFF', { vertexColors: true })))
-          : new THREE.Mesh(body, dim(this.surface('ribbon', strokeCss, { depthWrite: false, side: THREE.DoubleSide })))
-        mesh.userData.pick = { kind: 'connection', id: conn.id } satisfies PickTarget
-        if (liveCable) {
-          // The wire's own shadow is the reference image's tangibility cue —
-          // worth its depth-pass cost (~1 draw per connection).
-          mesh.castShadow = true
-          mesh.receiveShadow = true
-          // Surface finish: glossy white plastic in the light appearance (a
-          // braid bump reads as coarse ribs up close); dark boards keep
-          // a satin finish so the cocoa wire doesn't glare.
-          const m = mesh.material as THREE.MeshStandardMaterial
-          if ('roughness' in m) {
-            m.roughness = this.palette!.dark ? 0.55 : 0.32
-            m.needsUpdate = true
-          }
-        }
-        this.connLayer.add(mesh)
-        this.pickables.push(mesh)
-      }
-
-      // focus animation on the highlighted (source/selected) connection
-      if (highlighted && styleArmed) this.buildFlowEffect(geom, pts, width, anim, cableProfile)
-
-      // arrowhead (engine: 14px, at the target edge point) — the cable body
-      // already carries its cone; only the flat ribbon needs the triangle
-      if (!liveCable) {
       const a = geom.arrowTip
-      const arrowGeo = new THREE.BufferGeometry()
-      const ax = a.x
-      const ay = a.y
-      const cosA = Math.cos(a.angle)
-      const sinA = Math.sin(a.angle)
-      const bx = ax - 14 * cosA
-      const by = ay - 14 * sinA
-      const nx = -sinA * 5
-      const ny = cosA * 5
-      arrowGeo.setAttribute(
-        'position',
-        new THREE.BufferAttribute(new Float32Array([ax, 0, ay, bx + nx, 0, by + ny, bx - nx, 0, by - ny]), 3),
-      )
-      arrowGeo.setIndex([0, 2, 1])
-      this.connLayer.add(
-        new THREE.Mesh(arrowGeo, dim(this.surface('ribbon', strokeCss, { depthWrite: false, side: THREE.DoubleSide }))),
-      )
+      let width: number
+      if (inkSet) {
+        // LIT: Clean's flat ribbon and flat 2D arrowhead, inked for the
+        // board (inkLine.ts has the measurement): casing + core, one mesh
+        // each with the head merged in, plus an invisible pick strip
+        const ink = inkStyle({
+          set: inkSet,
+          highlighted,
+          lower: isLower,
+          perspectiveCss: perspectiveColor,
+          highlightCss: skin.connections.highlight,
+          focusDimmed: focusMode && !highlighted,
+          previewAlpha: hiddenPreviewAlpha,
+          selected: conn.id === singleSelected,
+        })
+        width = ink.width
+        const dash = conn.type === 'dashed' ? INK_DASHED : conn.type === 'dotted' ? INK_DOTTED : null
+        // a drum is a circle in its rect: the line meets its pad circle at
+        // both ends, the 2D route kept up to there (inkHeadOnDisc)
+        const padOf = (o: C4Object | undefined, r: Rect): InkDisc | null =>
+          o?.type === 'store' ? { x: r.x + r.w / 2, z: r.y + r.h / 2, r: PAD_R } : null
+        const toDisc = padOf(toObject, toRect)
+        const fromDisc = padOf(fromObject, fromRect)
+        let head: InkHead = { x: a.x, z: a.y, angle: a.angle, y: this.inkHeadLift(conn.toId) }
+        let route = fromDisc ? inkStartOnDisc(pts, fromDisc) : pts
+        if (toDisc) ({ pts: route, head } = inkHeadOnDisc(route, head, toDisc))
+        // the route as drawn: closed straight into its head (inkRouteToHead)
+        const inkPts = inkRouteToHead(route, head)
+        this.connLines.set(
+          conn.id,
+          inkPts.map((p) => ({ x: p.x, y: 0, z: p.y })),
+        )
+        const bead = highlighted && beadOn
+        const made = this.addInkLine(conn.id, inkPts, head, ink, dash, bead)
+        if (made) inks.push({ ...made, highlighted })
+        this.arrowDebug.push({
+          connId: conn.id,
+          toId: conn.toId,
+          kind: 'flat',
+          head,
+          length: INK_HEAD_LEN,
+          halfW: INK_HEAD_HALF_W,
+          target: toRect,
+          dash,
+          highlighted,
+          alpha: ink.opacity,
+          strokeCss,
+          ink,
+        })
+        // focus animation on the highlighted (source/selected) connection:
+        // 'Point mobile' is the bead the core paints (addInkLine) — its unit
+        // only drives the shared phase; the other styles keep their port
+        if (bead) this.addInkBead(conn.id, geom, inkPts, made?.beadKs ?? [])
+        else if (highlighted && styleArmed && this.highlightStyle !== 'traveling-dot')
+          this.buildFlowEffect(geom, pts, width, anim, { coreCss: ink.core, rimCss: INK_SETS[inkSet].rim })
+      } else {
+        width = highlighted
+          ? Math.max(2.6, skin.connections.strokeWidthHighlight * 1.2)
+          : Math.max(2.2, skin.connections.strokeWidth * 1.2)
+        this.connLines.set(
+          conn.id,
+          pts.map((p) => ({ x: p.x, y: 0, z: p.y })),
+        )
+        const dash: [number, number] | null = conn.type === 'dashed' ? [5, 4] : conn.type === 'dotted' ? [2, 3] : null
+        const body = buildRibbon(pts, width, dash)
+        if (body) {
+          // DoubleSide — the strip's winding follows the path direction, so a
+          // single-sided material would cull (and un-pick) half the connections
+          const mesh = new THREE.Mesh(body, dim(this.surface('ribbon', strokeCss, { depthWrite: false, side: THREE.DoubleSide })))
+          mesh.userData.pick = { kind: 'connection', id: conn.id } satisfies PickTarget
+          this.connLayer.add(mesh)
+          this.pickables.push(mesh)
+        }
+
+        // focus animation on the highlighted (source/selected) connection
+        if (highlighted && styleArmed) this.buildFlowEffect(geom, pts, width, anim)
+
+        // arrowhead (engine: 14px, at the target edge point)
+        const arrowGeo = new THREE.BufferGeometry()
+        const ax = a.x
+        const ay = a.y
+        const cosA = Math.cos(a.angle)
+        const sinA = Math.sin(a.angle)
+        const bx = ax - 14 * cosA
+        const by = ay - 14 * sinA
+        const nx = -sinA * 5
+        const ny = cosA * 5
+        arrowGeo.setAttribute(
+          'position',
+          new THREE.BufferAttribute(new Float32Array([ax, 0, ay, bx + nx, 0, by + ny, bx - nx, 0, by - ny]), 3),
+        )
+        arrowGeo.setIndex([0, 2, 1])
+        this.connLayer.add(
+          new THREE.Mesh(arrowGeo, dim(this.surface('ribbon', strokeCss, { depthWrite: false, side: THREE.DoubleSide }))),
+        )
+        this.arrowDebug.push({
+          connId: conn.id,
+          toId: conn.toId,
+          kind: 'flat',
+          head: { x: ax, z: ay, angle: a.angle, y: 0 },
+          length: 14,
+          halfW: 5,
+          target: toRect,
+          dash: null,
+          highlighted,
+          alpha,
+          strokeCss,
+          ink: null,
+        })
       }
+      // the lit labels sit on a flat line (connLabelPlacement: a level
+      // profile at the layer's height, the core's half width for "radius")
+      const labelProfile: CableProfile | null = inkSet ? cableProfileFor(0, 0, 0, pathLength(pts)) : null
+      const labelLineR = width / 2
 
       // label plate + SDF text (kit: h17 r5 plate, 10.5 muted text). Offset is
       // applied along the path normal — the 2D engine's label placement — and
@@ -4737,39 +7356,1786 @@ export class Scene3D {
         const offset = Math.max(-40, Math.min(40, rawOffset))
         const pt = pathPoint(geom, t)
         const tan = pathTangent(geom, t)
-        const mid = { x: pt.x - tan.y * offset, y: pt.y + tan.x * offset }
-        const lw = approxTextWidth(conn.label, SUB_SIZE) + 14
-        // lit profile: the label hovers just above the CABLE at its t (the
-        // cable now dives to its supports — a label left at layer height
-        // would float mid-air far from its wire)
-        const labelLift = cableProfile ? cableYAt(cableProfile, t) + 5.5 : 0
-        const plate = this.plate(lw, 17, this.pxr(5), this.surface('connLabel', skin.connections.labelBg))
+        // lit profile: a larger label (the flat kit's 10.5 px read ~6 css px
+        // at the iso framing of a 9-node board — illegible at 1600x1000
+        // DPR 1, view3d quality loop 2026-10-08) on a taller plate
+        const labelSize = labelProfile ? CONN_LABEL_SIZE_LIT : SUB_SIZE
+        const plateH = labelProfile ? CONN_LABEL_PLATE_H_LIT : 17
+        const lw = approxTextWidth(conn.label, labelSize) + 14
+        // lit profile: the label sits ON its line, clear of the cards, drums
+        // and other labels (connLabelPlacement.ts has the measurement); flat
+        // profile: on the line, the 2D rule
+        let mid = { x: pt.x - tan.y * offset, y: pt.y + tan.x * offset }
+        let labelLift = 0
+        if (labelProfile) {
+          const placed = litLabelPlacement({
+            sample: (s) => ({ pt: pathPoint(geom, s), tan: pathTangent(geom, s) }),
+            t,
+            offset,
+            plateW: lw,
+            plateH,
+            cableR: labelLineR,
+            profile: labelProfile,
+            occluders: labelOccluders,
+            polarDeg: presetPose.rx,
+            toward: labelToward,
+            dragging: draggingLabel,
+          })
+          mid = { x: placed.x, y: placed.y }
+          labelLift = placed.lift
+          this.connLabelOffsets.set(conn.id, { t: placed.appliedT, offset: placed.appliedOffset })
+          // later labels avoid this one too (it is text: hard), and so does
+          // the decor
+          labelOccluders.push({
+            box: { x: mid.x - lw / 2 - 3, y: mid.y - plateH / 2 - 3, w: lw + 6, h: plateH + 6 },
+            bottom: labelLift,
+            top: labelLift + 0.6,
+            hard: true,
+          })
+          this.connLabelBoxes.push({ x: mid.x - lw / 2, y: mid.y - plateH / 2, w: lw, h: plateH })
+        }
+        // OPAQUE plate (view3d quality loop 2, round 2: the 'App' chip and
+        // the 'Event bus' tag printed through 'notifies' / 'consumes'). The
+        // plate was opaque in color but drew in the OPAQUE pass without
+        // writing depth (lit decals never do — litSurface: the half-res AO
+        // reads depth-writing decals as geometry and draws ghost halos), so
+        // whatever decal or text drew after it — the card chip, the troika
+        // text in the transparent pass — printed on top. It now draws in the
+        // transparent pass AFTER every card/tag decal and text (renderOrder),
+        // at full opacity: depth-tested against the slabs and cables, so a
+        // plate behind a card still hides, and nothing beneath shows through.
+        // The flat profile keeps the 2D rule (the skin's plate, on the line).
+        const plateMat = this.surface(
+          'connLabel',
+          labelProfile ? colorAlpha(skin.connections.labelBg).color : skin.connections.labelBg,
+        )
+        if (labelProfile) plateMat.transparent = true
+        const plate = this.plate(lw, plateH, this.pxr(5), plateMat)
         dim(plate.material as THREE.MeshBasicMaterial)
-        plate.position.set(mid.x - lw / 2, labelLift + 0.4, mid.y - 8.5)
+        if (labelProfile) plate.renderOrder = CONN_LABEL_PLATE_ORDER
+        plate.position.set(mid.x - lw / 2, labelLift + 0.4, mid.y - plateH / 2)
         plate.userData.pick = { kind: 'connLabel', id: conn.id } satisfies PickTarget
         this.connLayer.add(plate)
         this.pickables.push(plate)
-        const label = this.addText(
-          {
-            text: conn.label,
-            font: 'inter400',
-            size: SUB_SIZE,
-            color: colorAlpha(skin.connections.labelText).color,
-            anchorX: 'center',
-            anchorY: 'middle',
-          },
-          this.connTexts,
-        )
+        // lit: the studio skin's muted label grey #8C877F is 2.86:1 on its
+        // #E7E6E2 plate (WCAG formula, computed 2026-10-08) — floored at
+        // AAA (LIT_SMALL_INK_CONTRAST) against the plate it sits on: at AA
+        // it read "light grey on cream" (loop 4 r3 workbench-labels.png)
+        const labelCss = labelProfile
+          ? ensureContrast(skin.connections.labelText, colorAlpha(skin.connections.labelBg).color, LIT_SMALL_INK_CONTRAST)
+          : skin.connections.labelText
+        const textSpec = {
+          text: conn.label,
+          font: labelProfile ? ('inter600' as const) : ('inter400' as const),
+          size: labelSize,
+          color: colorAlpha(labelCss).color,
+          anchorX: 'center' as const,
+          anchorY: 'middle' as const,
+        }
+        const poolKey = `${textSpec.text}|${textSpec.font}|${textSpec.size}|${textSpec.color}`
+        let label = textPool.get(poolKey)?.pop()
+        if (label) {
+          // back to what makeText made (showConnLabel may have abbreviated
+          // it, the scaler grown or hidden it)
+          this.connTexts.push(label)
+          if (String(label.text) !== textSpec.text) {
+            label.text = textSpec.text
+            label.sync(() => this.requestRender())
+          }
+          label.visible = true
+          label.scale.setScalar(1)
+          label.renderOrder = 0
+        } else {
+          label = this.addText(textSpec, this.connTexts)
+          label.userData.poolKey = poolKey
+        }
         label.fillOpacity = alpha
+        if (labelProfile) label.renderOrder = CONN_LABEL_PLATE_ORDER + 1
         label.position.set(mid.x, labelLift + 0.55, mid.y)
         this.connLayer.add(label)
+        // lit: the label may GROW at far framings (labelLegibility.ts) —
+        // never while it is being dragged (the gesture reads its plate)
+        if (labelProfile && !draggingLabel) {
+          // it grows about its wire point (connLabelPlacement.wireAnchor):
+          // the wire stays under the plate at every scale
+          const at = this.connLabelOffsets.get(conn.id)?.t ?? t
+          const anchor = wireAnchor(mid, lw, plateH, pathPoint(geom, at))
+          const applied = this.connLabelOffsets.get(conn.id)
+          const profile = labelProfile
+          const sample = (s: number) => ({ pt: pathPoint(geom, s), tan: pathTangent(geom, s) })
+          const sig = `${this.preset}|${labelLift}|${conn.label}|${t}|${offset}|${labelLineR}|${pts.map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(';')}`
+          this.connLabelScalers.push({
+            plate,
+            text: label,
+            cx: mid.x,
+            cz: mid.y,
+            w: lw,
+            h: plateH,
+            anchor,
+            kFree: 1,
+            k: 1,
+            connId: conn.id,
+            boxIndex: this.connLabelBoxes.length - 1,
+            t: applied?.t ?? t,
+            offset: applied?.offset ?? offset,
+            tPref: t,
+            side: offset !== 0 ? Math.sign(offset) : cameraSide(pathTangent(geom, t), labelToward),
+            sample,
+            placeAt: (s, off) => {
+              const p = litLabelPlacement({
+                sample,
+                t: s,
+                offset: off,
+                plateW: lw,
+                plateH,
+                cableR: labelLineR,
+                profile,
+                dragging: true,
+              })
+              return { x: p.x, y: p.y, lift: p.lift, t: p.appliedT, offset: p.appliedOffset }
+            },
+            cableR: labelLineR,
+            fullText: conn.label,
+            shown: { state: 'full', text: conn.label },
+            fullGeo: plate.geometry,
+            plateR: this.pxr(5),
+            spots: [],
+            lift: labelLift,
+            sig,
+          })
+          const before = shownBefore.get(conn.id)
+          if (before && before.sig === sig) {
+            const s = this.connLabelScalers[this.connLabelScalers.length - 1]
+            plate.position.copy(before.plate)
+            plate.scale.copy(before.plateScale)
+            label.position.copy(before.text)
+            label.scale.copy(before.textScale)
+            this.showConnLabel(s, before.shown)
+          }
+        }
       }
+    }
+
+    // the ink lines' draw order: per connection its casing, then its core,
+    // in loop order with the highlighted ones last (on top)
+    if (inks.length > 0) {
+      const ordered = [...inks.filter((k) => !k.highlighted), ...inks.filter((k) => k.highlighted)]
+      const step = INK_ORDER_SPAN / (2 * ordered.length)
+      ordered.forEach((k, i) => {
+        // the selection halo under its rim (above the previous line's core)
+        if (k.halo) k.halo.renderOrder = Math.max(0.25, INK_ORDER_BASE + (2 * i - 0.5) * step)
+        if (k.casing) k.casing.renderOrder = INK_ORDER_BASE + 2 * i * step
+        k.core.renderOrder = INK_ORDER_BASE + (2 * i + 1) * step
+      })
+    }
+
+    // label texts this build did not take back
+    for (const bucket of textPool.values()) for (const t of bucket) t.dispose()
+
+    if (this.connLabelScalers.length > 0) {
+      const job = this.connLabelLayout(rects, presetPose, labelToward)
+      this.runLabelJob(job, labels === 'inline')
     }
 
     // edit chrome for the single selected connection (write mode only)
     const selectedConnId = this.singleSelectedConnId()
     if (!this.readonly_ && selectedConnId) this.buildConnEditHandles(selectedConnId, rects)
+    // lit: what the layer draws over the lines (the flow effect, the edit
+    // chrome — default order 0, which the ink lines' 1-21 would paint over)
+    if (inks.length > 0) this.liftOverInk(this.connLayer)
+    const connBuildMs = performance.now() - connBuildT0
+    this.connLabelPerf.connBuildMs = connBuildMs
+    this.connLabelPerf.connBuildMaxMs = Math.max(this.connLabelPerf.connBuildMaxMs, connBuildMs)
+    this.connLabelPerf.connBuilds++
+    // a full rebuild's own compile gate covers the layer
+    if (labels === 'sliced') this.scheduleConnCompile()
     this.requestRender()
+  }
+
+  /** The ink set the lit lines wear: the one reading the higher contrast on
+   * the BOARD's base colour (the tray's paint, else the theme's board) — a
+   * honey-wood tray keeps the dark ink in the dark appearance too. */
+  private inkSet(): InkSetId {
+    const tray = this.trayStyle()
+    const base = tray && tray !== 'paper-grid' ? TRAY_BASE_CSS[tray] : colorAlpha(this.palette!.floorBg).color
+    return inkSetFor(base).id
+  }
+
+  /** Layer-local height of a flat head pointing at `toId`: the lit card's
+   * plinth rims the slab 7 px out and 2.6 tall, and the 2D tip lands on the
+   * slab's edge — inside that rim. A head the rim would cover (a card on a
+   * group platform, its rim above the layer) rises just over it. */
+  private inkHeadLift(toId: string): number {
+    const o = this.data.objects.find((x) => x.id === toId)
+    if (!o || o.type === 'store') return 0
+    const baseY = (this.nodeGroups.get(toId)?.userData.baseY as number | undefined) ?? 0
+    return Math.max(0, baseY + 2.6 + 0.3 - this.connLayer.position.y)
+  }
+
+  /** One lit connection's ink: its casing (when it has one) and its core,
+   * each ONE mesh with the head merged in, and an invisible pick strip. The
+   * material is the unlit 'connInk' role patched by inkLine.patchInkMaterial
+   * — one program for every ink mesh, the per-line colour and opacity are
+   * uniforms. Flat printed ink: no shadow cast or received. */
+  private addInkLine(
+    connId: string,
+    pts: { x: number; y: number }[],
+    head: InkHead,
+    ink: InkStyle,
+    dash: readonly [number, number] | null,
+    bead = false,
+  ): { halo: THREE.Mesh | null; casing: THREE.Mesh | null; core: THREE.Mesh; beadKs: THREE.IUniform<number>[] } | null {
+    const shape = { pts, head, width: ink.width, minCss: ink.minCss, maxCss: ink.maxCss, headCap: ink.headCap, screen: ink.screen }
+    const coreGeo = buildInkGeometry({ ...shape, casing: 0, casingMinCss: 0, dash, bead })
+    if (!coreGeo) return null
+    const material = (css: string, opacity: number) => this.inkMaterial(css, opacity)
+    let casing: THREE.Mesh | null = null
+    if (ink.casing && ink.casing.opacity > 0) {
+      const g = buildInkGeometry({
+        ...shape,
+        casing: ink.casing.width,
+        casingMinCss: ink.casing.minCss,
+        casingMaxCss: ink.casing.maxCss,
+        dash,
+      })
+      if (g) {
+        casing = new THREE.Mesh(g, material(ink.casing.css, ink.casing.opacity))
+        casing.userData.ink = 'casing'
+        casing.name = 'ink-casing'
+        this.connLayer.add(casing)
+      }
+    }
+    // the selection halo: the rim's outline grown by a soft band (css),
+    // undashed — a selected dashed line glows along its whole run
+    let halo: THREE.Mesh | null = null
+    if (ink.select && ink.select.opacity > 0) {
+      const g = buildInkGeometry({
+        ...shape,
+        casing: ink.casing?.width ?? 0,
+        casingMinCss: ink.casing?.minCss ?? 0,
+        casingMaxCss: ink.casing?.maxCss ?? 0,
+        soft: ink.select.widthCss,
+        // the dark board's glow brightens round the bead (INK_PACKET.glintCss)
+        bead: bead && this.inkSet() === 'lightInk',
+        dash: null,
+      })
+      if (g) {
+        const hm = material(ink.select.css, ink.select.opacity)
+        halo = new THREE.Mesh(g, hm)
+        halo.userData.ink = 'halo'
+        halo.name = 'ink-select-halo'
+        this.connLayer.add(halo)
+        // hovering the head or the target knob brightens it (+20 %, §4.2)
+        this.selectHalo = { mat: hm, base: ink.select.opacity }
+        if (this.handleUniforms.uHoverId.value === 1) hm.opacity = ink.select.opacity * 1.2
+      }
+    }
+    const core = new THREE.Mesh(coreGeo, material(ink.core, ink.opacity))
+    core.userData.ink = 'core'
+    core.userData.connId = connId
+    core.name = 'ink-core'
+    this.connLayer.add(core)
+    // the bead's fade, set per frame on every mesh that paints it
+    const beadKs = bead ? [core, halo].filter((m): m is THREE.Mesh => !!m).map((m) => inkBeadUniform(m.material as THREE.Material)) : []
+    return { halo, casing, core, beadKs }
+  }
+
+  /** The unlit 'connInk' role patched by inkLine.patchInkMaterial: ONE
+   * program for every ink mesh (lines, halos, the drag preview), colour and
+   * opacity per material. */
+  private inkMaterial(css: string, opacity: number): THREE.MeshBasicMaterial {
+    const m = this.surface('connInk', css) as THREE.MeshBasicMaterial
+    m.transparent = true
+    m.opacity = opacity
+    m.depthWrite = false
+    m.depthTest = true
+    m.side = THREE.DoubleSide
+    m.polygonOffset = true
+    m.polygonOffsetFactor = -2
+    m.polygonOffsetUnits = -2
+    patchInkMaterial(m, this.inkUniforms)
+    return m
+  }
+
+  /** 'Point mobile' on a lit ink line: the bead its core paints
+   * (INK_FRAGMENT_COLOR) runs on the shared phase uInkPhase — this unit
+   * only advances it (2D timing: INK_PACKET.cycleMs) and reports where the
+   * bead is, for the probe. Its fade (uInkBeadK on the meshes that paint it)
+   * is set per frame from the screen (updateInkBeads). */
+  private addInkBead(connId: string, geom: PathGeometry, inkPts: { x: number; y: number }[], beadKs: THREE.IUniform<number>[]): void {
+    let total = 0
+    for (let i = 1; i < inkPts.length; i++) total += Math.hypot(inkPts[i].x - inkPts[i - 1].x, inkPts[i].y - inkPts[i - 1].y)
+    const unit: FlowUnit = { kind: 'traveling-dot', geom, tick: () => {}, bead: { connId, ks: beadKs, fade: 0, clearPx: 0 } }
+    unit.tick = (now) => {
+      const t = (now % INK_PACKET.cycleMs) / INK_PACKET.cycleMs
+      unit.lastT = t
+      this.inkUniforms.uInkPhase.value = t
+      let left = t * total
+      for (let i = 1; i < inkPts.length; i++) {
+        const l = Math.hypot(inkPts[i].x - inkPts[i - 1].x, inkPts[i].y - inkPts[i - 1].y)
+        if (l >= left || i === inkPts.length - 1) {
+          const k = l > 0 ? Math.min(1, left / l) : 0
+          unit.pos = { x: inkPts[i - 1].x + (inkPts[i].x - inkPts[i - 1].x) * k, z: inkPts[i - 1].y + (inkPts[i].y - inkPts[i - 1].y) * k }
+          break
+        }
+        left -= l
+      }
+    }
+    unit.tick(performance.now())
+    this.flowUnits.push(unit)
+    this.requestRender()
+  }
+
+  /**
+   * The lit ink line under client point (x, y), picked in SCREEN space: the
+   * nearest line whose projected centreline passes within INK_PICK_PX, or
+   * whose head (as the shader draws it) holds the point. The ink meshes'
+   * own positions are zero-width anchors (the shader pushes them out), so a
+   * raycast cannot see them; and a fixed-width world pick strip (the design
+   * spec's 10 world px) missed 4-css-px-off clicks on 9 of 10 lines at the
+   * default framing, where a css px is >1 world px and the line is seen
+   * slanted (sl-r1-lines report.json, pick: 5 of 60 hits). `distance`: from
+   * the camera to the line's point, for the caller to weigh against what the
+   * raycast met first (a card in front still wins).
+   */
+  private inkLineAt(clientX: number, clientY: number): { id: string; point: THREE.Vector3; distance: number } | null {
+    if (this.renderProfile !== 'lit' || this.arrowDebug.length === 0 || !this.connLayer.visible) return null
+    const rect = this.canvas.getBoundingClientRect()
+    const cam = this.rig.camera
+    cam.updateMatrixWorld()
+    this.connLayer.updateWorldMatrix(true, false)
+    const layerM = this.connLayer.matrixWorld
+    const camPos = cam.getWorldPosition(new THREE.Vector3())
+    const v = new THREE.Vector3()
+    const toScreen = (p: { x: number; y: number; z: number }) => {
+      v.set(p.x, p.y, p.z).applyMatrix4(layerM).project(cam)
+      return { x: rect.left + ((v.x + 1) / 2) * rect.width, y: rect.top + ((1 - v.y) / 2) * rect.height, front: v.z > -1 && v.z < 1 }
+    }
+    let best: { id: string; d: number; local: { x: number; y: number; z: number } } | null = null
+    for (const a of this.arrowDebug) {
+      if (!a.ink) continue
+      const line = this.connLines.get(a.connId) ?? []
+      let prev: ReturnType<typeof toScreen> | null = null
+      for (let i = 0; i < line.length; i++) {
+        const s = toScreen(line[i])
+        if (prev && prev.front && s.front) {
+          const dx = s.x - prev.x
+          const dy = s.y - prev.y
+          const l2 = dx * dx + dy * dy
+          const t = l2 > 0 ? Math.max(0, Math.min(1, ((clientX - prev.x) * dx + (clientY - prev.y) * dy) / l2)) : 0
+          const d = Math.hypot(prev.x + dx * t - clientX, prev.y + dy * t - clientY)
+          if (d <= INK_PICK_PX && (!best || d < best.d)) {
+            const p0 = line[i - 1]
+            const p1 = line[i]
+            best = { id: a.connId, d, local: { x: p0.x + (p1.x - p0.x) * t, y: p0.y + (p1.y - p0.y) * t, z: p0.z + (p1.z - p0.z) * t } }
+          }
+        }
+        prev = s
+      }
+      // the head, as drawn
+      const tri = this.inkHeadAt(a, cam, rect.height).tri
+      const [p, q, r] = tri.map(toScreen)
+      const side = (a1: { x: number; y: number }, b1: { x: number; y: number }) => (b1.x - a1.x) * (clientY - a1.y) - (b1.y - a1.y) * (clientX - a1.x)
+      const s1 = side(p, q)
+      const s2 = side(q, r)
+      const s3 = side(r, p)
+      if (p.front && ((s1 >= 0 && s2 >= 0 && s3 >= 0) || (s1 <= 0 && s2 <= 0 && s3 <= 0)) && (!best || best.d > 0)) {
+        best = { id: a.connId, d: 0, local: { x: (tri[0].x + tri[1].x + tri[2].x) / 3, y: a.head.y, z: (tri[0].z + tri[1].z + tri[2].z) / 3 } }
+      }
+    }
+    if (!best) return null
+    const point = new THREE.Vector3(best.local.x, best.local.y, best.local.z).applyMatrix4(layerM)
+    return { id: best.id, point, distance: point.distanceTo(camPos) }
+  }
+
+  /** Lift what `root` holds at the default order 0 over the ink lines
+   * (flow effects, edit chrome — the label plates keep their own order). */
+  private liftOverInk(root: THREE.Object3D): void {
+    root.traverse((o) => {
+      if (o.userData.ink || o.renderOrder !== 0 || this.connTexts.includes(o as Text)) return
+      o.renderOrder = INK_ORDER_OVER
+    })
+  }
+
+  /** The shared ink uniforms for the frame about to render: the canvas
+   * height (css px) the projected floors are measured in, and the world px
+   * per css px at the orbit target (the dash rhythm's scale). */
+  private updateInkUniforms(): void {
+    const vp = this.rig.getViewport()
+    const pose = this.rig.getPose()
+    this.inkUniforms.uInkViewH.value = vp.height
+    this.inkUniforms.uInkViewW.value = vp.width
+    this.inkUniforms.uInkWppTarget.value = (2 * pose.distance * Math.tan((pose.fov * Math.PI) / 360)) / Math.max(1, vp.height)
+  }
+
+  /** How `cam` draws lit head `a` (the shader's math, inkLine's CPU
+   * mirror): world px per css px at its tip, its floor scale and grazing
+   * stretch, and its triangle (layer-local). Unlit heads: scale 1. */
+  private inkHeadAt(
+    a: (typeof this.arrowDebug)[number],
+    cam: THREE.PerspectiveCamera,
+    vpH: number,
+  ): { wpp: number; s: number; along: number; across: number; tri: { x: number; y: number; z: number }[] } {
+    this.connLayer.updateWorldMatrix(true, false)
+    const layerM = this.connLayer.matrixWorld
+    const view = cam.matrixWorldInverse
+    const tipV = new THREE.Vector3(a.head.x, a.head.y, a.head.z).applyMatrix4(layerM).applyMatrix4(view)
+    const wpp = (2 * Math.max(-tipV.z, 1e-3)) / (cam.projectionMatrix.elements[5] * Math.max(1, vpH))
+    const cap = a.ink?.screen === true
+    const proj = (x: number, z: number) => {
+      const d = new THREE.Vector3(x, 0, z).transformDirection(layerM)
+      const m = view.elements
+      // the view matrix's linear part applied to d (unit), its xy part —
+      // with the perspective term for the highlight (screenDir, the shader)
+      const v = { x: m[0] * d.x + m[4] * d.y + m[8] * d.z, y: m[1] * d.x + m[5] * d.y + m[9] * d.z, z: m[2] * d.x + m[6] * d.y + m[10] * d.z }
+      return cap ? screenDir(v, tipV) : { x: v.x, y: v.y }
+    }
+    const ax = Math.cos(a.head.angle)
+    const az = Math.sin(a.head.angle)
+    const ink = a.ink !== null
+    const tV = proj(ax, az)
+    const nV = proj(-az, ax)
+    // the highlight's base, sheared square to its on-screen axis (headShear)
+    const shear = cap ? headShear(tV, nV) : 0
+    const nWv = { x: nV.x - shear * tV.x, y: nV.y - shear * tV.y }
+    const fit = ink ? headFit(wpp, Math.hypot(tV.x, tV.y), stripFacing(tV, nV), a.ink?.headCap === true, Math.hypot(nWv.x, nWv.y)) : { s: 1, along: 1, across: 1 }
+    const { s, along, across } = fit
+    const tri = ink
+      ? inkHeadTriangle(a.head, s, along, across, shear)
+      : [
+          { x: a.head.x, z: a.head.z },
+          { x: a.head.x - ax * a.length - az * a.halfW, z: a.head.z - az * a.length + ax * a.halfW },
+          { x: a.head.x - ax * a.length + az * a.halfW, z: a.head.z - az * a.length - ax * a.halfW },
+        ]
+    return { wpp, s, along, across, tri: tri.map((p) => ({ x: p.x, y: a.head.y, z: p.z })) }
+  }
+
+  /** Every lit head's triangle on screen as `cam` draws it — the label
+   * passes keep every plate clear of them. */
+  private inkHeadHulls(
+    cam: THREE.PerspectiveCamera,
+    vpH: number,
+    screen: (p: { x: number; y: number; z: number }) => { x: number; y: number },
+  ): { x: number; y: number }[][] {
+    cam.updateMatrixWorld()
+    const out: { x: number; y: number }[][] = []
+    for (const a of this.arrowDebug) {
+      if (!a.ink) continue
+      out.push(convexHull(this.inkHeadAt(a, cam, vpH).tri.map(screen)))
+    }
+    return out
+  }
+
+  /** arrowheadInfo probe (quality pass "arrows"): every connection's flat
+   * arrowhead and its line, measured through the live camera — the head's
+   * projected size at the scale the shader gives it, the client-px points
+   * the harness reads the screenshot at (inside the head, round it, and
+   * along the line with a point 8 css px off either side), and what of it
+   * the camera sees (a ray to each point meets no node and no label plate
+   * first). */
+  private arrowheadProbe(): Scene3dArrowhead[] {
+    this.scene.updateMatrixWorld()
+    const cam = this.rig.camera
+    cam.updateMatrixWorld()
+    const rect = this.canvas.getBoundingClientRect()
+    const layerM = this.connLayer.matrixWorld
+    const toWorld = (p: { x: number; y: number; z: number }) => new THREE.Vector3(p.x, p.y, p.z).applyMatrix4(layerM)
+    const ndc = new THREE.Vector3()
+    const project = (w: THREE.Vector3) => {
+      ndc.copy(w).project(cam)
+      return {
+        x: rect.left + ((ndc.x + 1) / 2) * rect.width,
+        y: rect.top + ((1 - ndc.y) / 2) * rect.height,
+        front: ndc.z > -1 && ndc.z < 1,
+      }
+    }
+    const inCanvas = (p: { x: number; y: number; front: boolean }) =>
+      p.front && p.x >= rect.left && p.x <= rect.right && p.y >= rect.top && p.y <= rect.bottom
+    const r1 = (p: { x: number; y: number }) => ({ x: +p.x.toFixed(1), y: +p.y.toFixed(1) })
+    // occluders: the node solids and the label plates (the ink meshes are
+    // zero-width anchors to a raycaster; the pick strips are not drawn)
+    const plates = this.connLabelScalers.filter((s) => s.plate.visible).map((s) => s.plate)
+    const targets: THREE.Object3D[] = [...this.nodeGroups.values(), ...plates]
+    const raycaster = new THREE.Raycaster()
+    const camPos = cam.getWorldPosition(new THREE.Vector3())
+    // a node's SOLID parts (depth-written: slab, plinth, drum, pad) and every
+    // label plate — not the soft contact-shadow decals a node lays on the
+    // board round it (transparent, no depth write)
+    const plateSet = new Set<THREE.Object3D>(plates)
+    const blocks = (o: THREE.Object3D): boolean => {
+      for (let n: THREE.Object3D | null = o; n; n = n.parent) if (!n.visible) return false
+      if (plateSet.has(o)) return true
+      const m = (o as THREE.Mesh).material as THREE.Material | THREE.Material[] | undefined
+      return !!m && !Array.isArray(m) && m.depthWrite
+    }
+    const seen = (w: THREE.Vector3): boolean => {
+      const toP = w.clone().sub(camPos)
+      const d = toP.length()
+      raycaster.set(camPos, toP.normalize())
+      raycaster.far = d - 0.6
+      return !raycaster.intersectObjects(targets, true).some((hit) => blocks(hit.object))
+    }
+    /** Is the surface at client point `p` the board: outside every node
+     * solid's silhouette on screen (nodeSolids: card slab + plinth rim, drum,
+     * drum tag — the label passes' own solids) and with no label plate on
+     * the ray through it? (A raycast against the card units let points on
+     * the walnut plinth through: sl-r1-arrows az0, 'Query API -> Log
+     * store'.) */
+    const solidHulls = this.nodeSolids().map((n) => convexHull(n.pts.map((q) => project(new THREE.Vector3(q.x, q.y, q.z)))))
+    const inHull = (p: { x: number; y: number }, h: readonly { x: number; y: number }[]): boolean => {
+      if (h.length < 3) return false
+      let sign = 0
+      for (let i = 0; i < h.length; i++) {
+        const a0 = h[i]
+        const b0 = h[(i + 1) % h.length]
+        const cr = (b0.x - a0.x) * (p.y - a0.y) - (b0.y - a0.y) * (p.x - a0.x)
+        if (Math.abs(cr) < 1e-9) continue
+        if (sign === 0) sign = Math.sign(cr)
+        else if (Math.sign(cr) !== sign) return false
+      }
+      return true
+    }
+    const ndcRay = new THREE.Vector2()
+    const onBoard = (p: { x: number; y: number }): boolean => {
+      if (solidHulls.some((h) => inHull(p, h))) return false
+      ndcRay.set(((p.x - rect.left) / rect.width) * 2 - 1, -((p.y - rect.top) / rect.height) * 2 + 1)
+      raycaster.setFromCamera(ndcRay, cam)
+      raycaster.far = Infinity
+      return !raycaster.intersectObjects(plates, false).length
+    }
+    const vpH = rect.height
+    // every line's centreline on screen: a sample is graded against the
+    // board only away from ANOTHER line (a crossing, two runs side by side:
+    // there the "surface round it" is the other line's ink)
+    const screenLines = this.arrowDebug.map((a) => ({
+      id: a.connId,
+      pts: (this.connLines.get(a.connId) ?? []).map((p) => project(toWorld(p))),
+    }))
+    const otherInkNear = (p: { x: number; y: number }, self: string, px: number): boolean =>
+      screenLines.some(({ id, pts }) => {
+        if (id === self) return false
+        for (let i = 1; i < pts.length; i++) {
+          const a0 = pts[i - 1]
+          const b0 = pts[i]
+          const dx = b0.x - a0.x
+          const dy = b0.y - a0.y
+          const l2 = dx * dx + dy * dy
+          const t = l2 > 0 ? Math.max(0, Math.min(1, ((p.x - a0.x) * dx + (p.y - a0.y) * dy) / l2)) : 0
+          if (Math.hypot(a0.x + dx * t - p.x, a0.y + dy * t - p.y) <= px) return true
+        }
+        return false
+      })
+    const storeIds = new Set(this.data.objects.filter((o) => o.type === 'store').map((o) => o.id))
+    const out: Scene3dArrowhead[] = []
+    for (const a of this.arrowDebug) {
+      const at = this.inkHeadAt(a, cam, vpH)
+      const [tipL, wingA, wingB] = at.tri
+      const baseL = { x: (wingA.x + wingB.x) / 2, y: a.head.y, z: (wingA.z + wingB.z) / 2 }
+      const tipW = toWorld(tipL)
+      const baseW = toWorld(baseL)
+      const pt = project(tipW)
+      const pb = project(baseW)
+      const pa = project(toWorld(wingA))
+      const pc = project(toWorld(wingB))
+      const span = Math.max(Math.hypot(pt.x - pa.x, pt.y - pa.y), Math.hypot(pt.x - pc.x, pt.y - pc.y), Math.hypot(pa.x - pc.x, pa.y - pc.y))
+      // inside the head: barycentric points away from its edges, most of
+      // them in its back half (the point meets its target's wall)
+      const bary = [
+        [0.34, 0.33, 0.33],
+        [0.5, 0.25, 0.25],
+        [0.2, 0.4, 0.4],
+        [0.15, 0.6, 0.25],
+        [0.15, 0.25, 0.6],
+        [0.25, 0.5, 0.25],
+        [0.25, 0.25, 0.5],
+        [0.1, 0.45, 0.45],
+      ]
+      const facePts = bary.map(([u, v, w]) => ({
+        x: tipL.x * u + wingA.x * v + wingB.x * w,
+        y: a.head.y,
+        z: tipL.z * u + wingA.z * v + wingB.z * w,
+      }))
+      const faceSeen = facePts.map((p) => toWorld(p)).filter((w) => seen(w))
+      const face = faceSeen.map(project).filter(inCanvas).map(r1)
+      // round it: off each flank's middle and off the point, 8 css px past
+      // the casing (never off the base: its own line runs there)
+      const casingW = a.ink?.casing ? Math.max(a.ink.casing.width, a.ink.casing.minCss * at.wpp) : 0
+      const gap = casingW + 8 * at.wpp
+      const centroid = { x: (tipL.x + wingA.x + wingB.x) / 3, z: (tipL.z + wingA.z + wingB.z) / 3 }
+      const outward = (p: { x: number; z: number }, q: { x: number; z: number }, f: number) => {
+        const m = { x: p.x + (q.x - p.x) * f, z: p.z + (q.z - p.z) * f }
+        let nx = -(q.z - p.z)
+        let nz = q.x - p.x
+        const l = Math.hypot(nx, nz) || 1
+        nx /= l
+        nz /= l
+        if ((m.x - centroid.x) * nx + (m.z - centroid.z) * nz < 0) {
+          nx = -nx
+          nz = -nz
+        }
+        return { x: m.x + nx * gap, y: a.head.y, z: m.z + nz * gap }
+      }
+      const ringL = [0.45, 0.65, 0.85].flatMap((f) => [outward(tipL, wingA, f), outward(tipL, wingB, f)])
+      // (the support a viewer sees there: the board, not a node behind it)
+      const ring = ringL.map((p) => toWorld(p)).filter((w) => seen(w)).map(project).filter(inCanvas).filter(onBoard).map(r1)
+      const hullPts = [pt, pa, pc].filter((p) => p.front)
+      const hull = convexHull(hullPts)
+      let area = 0
+      for (let i = 0; i < hull.length; i++) {
+        const p = hull[i]
+        const q = hull[(i + 1) % hull.length]
+        area += p.x * q.y - q.x * p.y
+      }
+      // the line: up to 24 samples (its ends aside), each with a point 8 css
+      // px off either side, square to the line ON SCREEN
+      const line = this.connLines.get(a.connId) ?? []
+      const linePts: Scene3dArrowhead['line']['pts'] = []
+      let lineSamples = 0
+      if (line.length >= 4) {
+        const n = Math.min(24, line.length - 2)
+        for (let k = 0; k < n; k++) {
+          const i = 1 + Math.round((k * (line.length - 3)) / Math.max(1, n - 1))
+          const w = toWorld(line[i])
+          const c = project(w)
+          if (!inCanvas(c)) continue
+          lineSamples++
+          if (!seen(w)) continue
+          const p0 = project(toWorld(line[i - 1]))
+          const p1 = project(toWorld(line[i + 1]))
+          let tx = p1.x - p0.x
+          let ty = p1.y - p0.y
+          const tl = Math.hypot(tx, ty) || 1
+          tx /= tl
+          ty /= tl
+          // the core's projected width there (the shader's floor + grazing)
+          const view = cam.matrixWorldInverse
+          const tipV = w.clone().applyMatrix4(view)
+          const wpp = (2 * Math.max(-tipV.z, 1e-3)) / (cam.projectionMatrix.elements[5] * Math.max(1, vpH))
+          const q0 = toWorld(line[i - 1])
+          const q1 = toWorld(line[i + 1])
+          const dx = q1.x - q0.x
+          const dz = q1.z - q0.z
+          const dl = Math.hypot(dx, dz) || 1
+          // (the view matrix is rigid: transformDirection's renormalising
+          // changes nothing)
+          const nW = new THREE.Vector3(-dz / dl, 0, dx / dl).transformDirection(view)
+          const tW = new THREE.Vector3(dx / dl, 0, dz / dl).transformDirection(view)
+          // the highlight measures on screen (screenDir, the shader)
+          const f = a.ink?.screen ? stripFacing(screenDir(tW, tipV), screenDir(nW, tipV)) : stripFacing(tW, nW)
+          const widthPx = a.ink ? stripCoreWidthPx(a.ink.width, a.ink.minCss, wpp, f, a.ink.maxCss) : 0
+          // what an UNSELECTED ink core would draw right there (the
+          // hierarchy gate: selected >= 1.33x it at the same spot)
+          const fPlain = stripFacing(tW, nW)
+          const plainWidthPx = a.ink ? stripCoreWidthPx(INK_CORE_W, INK_CORE_MIN_CSS, wpp, fPlain, INK_CORE_MAX_CSS) : 0
+          const cs = a.ink?.casing
+          const rimPx = cs ? stripCasingWidthPx(cs.width, cs.minCss, cs.maxCss, wpp, f) : 0
+          const off = (d: number) => ({ x: c.x - ty * d, y: c.y + tx * d })
+          const l = off(8)
+          const rr = off(-8)
+          // the board at 4 and 8 css px either side (no node solid, no
+          // plate — the rim and the halo lie inside 4), no other line near,
+          // and clear of its own head (its sides there are the head's ink)
+          const board =
+            Math.hypot(c.x - pt.x, c.y - pt.y) > span + 8 &&
+            [l, rr, off(4), off(-4)].every(onBoard) &&
+            !otherInkNear(c, a.connId, 10) &&
+            !otherInkNear(l, a.connId, 4) &&
+            !otherInkNear(rr, a.connId, 4)
+          linePts.push({
+            c: r1(c),
+            l: r1(l),
+            r: r1(rr),
+            board,
+            widthPx: +widthPx.toFixed(2),
+            plainWidthPx: +plainWidthPx.toFixed(2),
+            rimPx: +rimPx.toFixed(2),
+            capK: +inkCapGrowth(wpp).toFixed(4),
+            f: +f.toFixed(3),
+          })
+        }
+      }
+      // plan distance from the tip to the target's 3D silhouette (< 0:
+      // inside it): a lit drum's pad circle (as buildStandee lays it: PAD_R
+      // round the rect's centre — read from the model here, never from the
+      // head placement it checks), else the rect (a card's slab)
+      const t = a.target
+      const dxIn = Math.max(t.x - a.head.x, 0, a.head.x - (t.x + t.w))
+      const dzIn = Math.max(t.y - a.head.z, 0, a.head.z - (t.y + t.h))
+      const drum = a.ink !== null && storeIds.has(a.toId)
+      const discD = drum ? Math.hypot(a.head.x - (t.x + t.w / 2), a.head.z - (t.y + t.h / 2)) - PAD_R : null
+      const outside = discD !== null ? Math.max(0, discD) : Math.hypot(dxIn, dzIn)
+      const inside = discD !== null ? -discD : Math.min(a.head.x - t.x, t.x + t.w - a.head.x, a.head.z - t.y, t.y + t.h - a.head.z)
+      // a dashed / dotted lit line: its centreline every 0.5 world px of arc
+      // (the shader's aArc: the same polyline), 20 px clear of either end,
+      // where the camera sees open board round it
+      let dashInfo: Scene3dArrowhead['dash'] = null
+      if (a.ink && a.dash && line.length >= 2) {
+        const period = a.dash[0] + a.dash[1]
+        const scale = Math.max(1, (INK_DASH_MIN_CSS * this.inkUniforms.uInkWppTarget.value) / period)
+        const pts: { arc: number; x: number; y: number }[] = []
+        let total = 0
+        for (let i = 1; i < line.length; i++) total += Math.hypot(line[i].x - line[i - 1].x, line[i].z - line[i - 1].z)
+        let arc0 = 0
+        for (let i = 1; i < line.length; i++) {
+          const p0 = line[i - 1]
+          const p1 = line[i]
+          const len = Math.hypot(p1.x - p0.x, p1.z - p0.z)
+          for (let s = Math.ceil(arc0 / 0.5) * 0.5; s < arc0 + len; s += 0.5) {
+            if (s < 20 || s > total - 20) continue
+            const k = len > 0 ? (s - arc0) / len : 0
+            const w = toWorld({ x: p0.x + (p1.x - p0.x) * k, y: p0.y + (p1.y - p0.y) * k, z: p0.z + (p1.z - p0.z) * k })
+            const c = project(w)
+            if (!inCanvas(c) || !seen(w) || !onBoard(c) || otherInkNear(c, a.connId, 8)) continue
+            pts.push({ arc: +s.toFixed(2), x: +c.x.toFixed(2), y: +c.y.toFixed(2) })
+          }
+          arc0 += len
+        }
+        dashInfo = { on: a.dash[0], period, scale: +scale.toFixed(4), pts }
+      }
+      out.push({
+        connId: a.connId,
+        toId: a.toId,
+        kind: 'flat',
+        ink: a.ink !== null,
+        drawn: true,
+        tip: { x: tipW.x, y: tipW.y, z: tipW.z },
+        base: { x: baseW.x, y: baseW.y, z: baseW.z },
+        lengthPx: Math.hypot(pt.x - pb.x, pt.y - pb.y),
+        widthPx: Math.hypot(pa.x - pc.x, pa.y - pc.y),
+        thicknessPx: (() => {
+          const l = Math.hypot(pt.x - pb.x, pt.y - pb.y) || 1
+          return Math.abs((pa.x - pc.x) * (pt.y - pb.y) - (pa.y - pc.y) * (pt.x - pb.x)) / l
+        })(),
+        screenTri: { tip: r1(pt), base: r1(pb), a: r1(pa), b: r1(pc) },
+        sizePx: span,
+        scale: at.s,
+        capK: +inkCapGrowth(at.wpp).toFixed(4),
+        onScreen: inCanvas(pt) && inCanvas(pb),
+        visibleFraction: faceSeen.length / facePts.length,
+        tipClear: outside > 0 ? outside : -Math.max(0, inside),
+        dash: dashInfo,
+        highlighted: a.highlighted,
+        alpha: a.alpha,
+        css: a.ink ? a.ink.core : a.strokeCss,
+        strokeCss: a.strokeCss,
+        casing: a.ink?.casing ? { kind: a.ink.casing.kind, css: a.ink.casing.css, opacity: a.ink.casing.opacity } : null,
+        hull: { areaPx: +Math.abs(area / 2).toFixed(1), pts: hull.map(r1) },
+        face,
+        ring,
+        line: { samples: lineSamples, seen: linePts.length, pts: linePts },
+        selected: a.ink?.select != null,
+        selectHalo: a.ink?.select ? { ...a.ink.select } : null,
+      })
+    }
+    return out
+  }
+
+  /**
+   * Hidden stand-ins, built with every FULL rebuild, for the connection-layer
+   * materials only a SELECTION draws: the focus-dimmed variant of each
+   * opaque material (dim(): transparent), the selected cable's flow effect
+   * and its edit chrome as an endpoint drag shows it (dots, dashed preview,
+   * anchor rings). The full rebuild's compile gate links their programs
+   * (three's compile walks invisible objects, warmDraw draws them) — a
+   * click on a cable then links nothing: it added three programs (the
+   * dimmed cable's transparent physical variant and two basic ones) and
+   * their first use was a 119-133 ms task (reconnect-select on the test
+   * board, tp5-connect3d, DEV shader checks). They live in `root`, so
+   * clearRoot retires them with the build they belong to.
+   */
+  private buildConnProgramWarmers(): void {
+    const skin = this.skin
+    const first = this.data.connections.find((c) => this.connGeoms.has(c.id))
+    if (!skin || !first) return
+    const warm = new THREE.Group()
+    warm.name = 'conn-program-warmers'
+    warm.visible = false
+    warm.position.copy(this.connLayer.position)
+    // 1) the dimmed variant of every opaque connection-layer material
+    const seen = new Set<THREE.Material>()
+    this.connLayer.traverse((o) => {
+      const mesh = o as THREE.Mesh
+      if (!mesh.isMesh || this.connTexts.includes(o as Text)) return
+      const m = mesh.material as THREE.Material
+      if (!m || Array.isArray(m) || m.transparent || seen.has(m)) return
+      seen.add(m)
+      const c = m.clone()
+      c.transparent = true
+      c.opacity *= 0.15
+      const w = new THREE.Mesh(mesh.geometry, c)
+      // the geometry is the layer's, not the warmer's
+      w.userData.sharedGeometry = true
+      w.castShadow = mesh.castShadow
+      w.receiveShadow = mesh.receiveShadow
+      warm.add(w)
+    })
+    // 2) a selected connection's flow effect and edit chrome, built by the
+    // code that draws them, into the hidden group
+    const layer = this.connLayer
+    const pickables = this.pickables.length
+    const flowUnits = this.flowUnits
+    const edit = this.connEdit
+    const chrome = this.editChrome
+    const pressId = this.handleUniforms.uPressId.value
+    try {
+      this.connLayer = warm
+      this.flowUnits = []
+      const geom = this.connGeoms.get(first.id)!
+      if (this.connAnimationsEnabled && this.highlightStyle !== 'none') {
+        const width = Math.max(2.6, skin.connections.strokeWidthHighlight * 1.2)
+        this.buildFlowEffect(geom, samplePath(geom, 24), width, resolveConnectionAnimation(skin), null)
+      }
+      if (!this.readonly_) {
+        const rects = new Map<string, Rect>()
+        for (const o of this.data.objects) rects.set(o.id, this.objectRect(o))
+        for (const g of this.data.groups) rects.set(g.id, this.groupRect(g))
+        this.connEdit = { mode: 'endpoint', connId: first.id, end: 'target', preview: { x: geom.toEdge.x, y: geom.toEdge.y }, hoverShapeId: first.toId }
+        this.buildConnEditHandles(first.id, rects)
+      }
+    } finally {
+      this.connLayer = layer
+      this.pickables.length = pickables
+      this.flowUnits = flowUnits
+      this.connEdit = edit
+      this.editChrome = chrome
+      this.handleUniforms.uPressId.value = pressId
+    }
+    this.root.add(warm)
+  }
+
+  /**
+   * Keep `m` (never disposed while the scene lives) when it is the first
+   * connection-layer material seen with its program: a program dies with
+   * the last material using it, and a selection's programs (the
+   * focus-dimmed cables' variant, the flow effect, the edit chrome) are
+   * used by nothing else on the board — each deselect destroyed them and
+   * each selection linked them again (65-133 ms first-use tasks on the test
+   * board, reconnect-select, tp5-connect3d, DEV shader checks). One
+   * material per program: a few dozen at most. True when kept.
+   */
+  private keepConnProgram(m: THREE.Material): boolean {
+    const key = (this.renderer.properties.get(m) as { currentProgram?: { cacheKey?: string } }).currentProgram?.cacheKey
+    if (!key || this.connProgramKeepers.has(key)) return false
+    this.connProgramKeepers.set(key, m)
+    return true
+  }
+  private connProgramKeepers = new Map<string, THREE.Material>()
+
+  /** Drop a pending placement pass (a newer build replaces what it placed,
+   * or the scene is going away). */
+  private cancelLabelJob(): void {
+    if (!this.labelJob) return
+    this.labelJob = null
+    this.labelHold = false
+    this.labelSliceFn = null
+    this.connLabelPerf.jobsCancelled++
+  }
+
+  /**
+   * Run placement pass `gen` in slices of LABEL_SLICE_MS, one per frame
+   * (postLabelSlice). `inline` (a full rebuild) runs a first slice of
+   * LABEL_INLINE_MS inside this call — a small board's whole pass (25-29 ms
+   * on the 9-node test board, me-tp4 labelPerf), so its decor still keeps
+   * off the placed plates; a pass that outruns it (1008 ms on 0ob3fum, in a
+   * quality-tier rebuild, profiled) finishes sliced and refreshes the decor
+   * when it commits. Each step of the pass is a label, a relocation or a
+   * candidate spot, so a slice overruns its budget by one step at most.
+   */
+  private runLabelJob(gen: Generator<void, void, void>, inline: boolean): void {
+    const job = { gen, t0: performance.now(), cpuMs: 0, slices: 0, maxSliceMs: 0 }
+    this.labelJob = job
+    this.labelHold = true
+    const step = (budget: number) => {
+      if (this.labelJob !== job || this.disposed) return
+      const s0 = performance.now()
+      let done: boolean
+      try {
+        do done = job.gen.next().done === true
+        while (!done && performance.now() - s0 < budget)
+      } catch (err) {
+        // never leave the labels frozen behind a pass that threw
+        this.labelJob = null
+        this.labelHold = false
+        throw err
+      }
+      const ms = performance.now() - s0
+      job.cpuMs += ms
+      job.slices++
+      job.maxSliceMs = Math.max(job.maxSliceMs, ms)
+      if (!done) {
+        this.postLabelSlice(() => step(LABEL_SLICE_MS))
+        return
+      }
+      this.labelJob = null
+      this.connLabelPerf.buildMs = job.cpuMs
+      this.connLabelPerf.jobSlices = job.slices
+      this.connLabelPerf.jobMaxSliceMs = job.maxSliceMs
+      this.connLabelPerf.jobWallMs = performance.now() - job.t0
+      // a full rebuild's pass done in its inline slice: the decor is built
+      // right after it, around the placed plates, and the build renders
+      if (inline && job.slices === 1) return
+      // else the decor keeps off the PLACED plates: one built while the pass
+      // was pending (a full rebuild whose pass outran its inline slice), or
+      // around plates the pass has since moved, is refreshed
+      if (this.decorBuild && labelBoxesSig(this.connLabelBoxes) !== this.decorAvoidSig) this.scheduleDecorRefresh()
+      // the plates moved / re-scaled / re-texted: a camera frame (plates and
+      // label text cast no shadow)
+      this.requestCameraRender()
+    }
+    // a full rebuild starts its pass inside the build (its decor needs the
+    // placed plates); any other build leaves the whole pass to the slices
+    // after its frame — the task that rebuilt (a pointermove, the pointerup,
+    // the store echo) pays the geometry only
+    if (inline) step(LABEL_INLINE_MS)
+    else this.postLabelSlice(() => step(LABEL_SLICE_MS))
+  }
+
+  /** Queue the next slice of the placement pass right AFTER the next frame
+   * (a frame callback posts it as a task): one slice per frame. Slices
+   * posted back to back starved the frames instead — 12-13 slices of 8 ms
+   * ran between two frames, long animation frames of 117-150 ms (LoAF,
+   * connect-freeze on 0ob3fum), and the frame-pacing governor read those as
+   * slow frames and dropped the quality tier, whose full rebuild was a
+   * 1530-ms task (profiled). A timer stands in for the frame callback in a
+   * hidden tab (no frames there; the pass must still finish). Measured
+   * after: headless Chrome still showed ~10 slices inside one long
+   * animation frame on 0ob3fum (why it frames them so is not established),
+   * each slice an 8-13 ms task — input runs between them (blockingMs 0 on
+   * those frames). */
+  private postLabelSlice(fn: () => void): void {
+    if (!this.labelChannel) {
+      const ch = new MessageChannel()
+      ch.port1.onmessage = () => {
+        const f = this.labelSliceFn
+        this.labelSliceFn = null
+        f?.()
+      }
+      this.labelChannel = ch
+    }
+    this.labelSliceFn = fn
+    const ch = this.labelChannel
+    let posted = false
+    const post = () => {
+      if (posted) return
+      posted = true
+      cancelAnimationFrame(raf)
+      clearTimeout(timer)
+      ch.port2.postMessage(0)
+    }
+    const raf = requestAnimationFrame(post)
+    const timer = setTimeout(post, 100)
+  }
+
+  /**
+   * The lit-label placement pass (it was the tail of buildConnections): grow
+   * room on the board, relocations along each wire, the pairwise settle, the
+   * SCREEN pass at the default framing, then the commit — scale, spots, and
+   * what each label shows. A generator: it yields between steps so
+   * runLabelJob can slice it; the result is the same whether it runs inline
+   * or sliced (nothing it reads changes between slices without a rebuild,
+   * and a rebuild cancels it).
+   */
+  private *connLabelLayout(
+    rects: Map<string, Rect>,
+    presetPose: (typeof CAMERA_PRESETS)[CameraPresetId],
+    labelToward: { x: number; y: number },
+  ): Generator<void, void, void> {
+    // how far each label may grow before it touches a card, a drum, a cable
+    // it does not already float over, or another (growing) label
+    {
+      const obstacles: { x: number; y: number; w: number; h: number; strict?: boolean }[] = []
+      // a TALL body also hides the board behind it, as seen from the preset
+      // camera: its footprint is stretched away from the camera by
+      // height x tan(polar) (loop3-r2-fix-e: 'reads' grew in behind the Log
+      // store drum and was cut by it on screen)
+      const behind = Math.tan((presetPose.rx * Math.PI) / 180)
+      /** The footprint swept away from the camera by height x tan(polar),
+       * as a chain of footprint copies — a diagonal band, not its bounding
+       * box (one box over-claimed: 'searches' froze beside the Log store
+       * drum in loop3-r2-fix-h with nothing on screen in its way). */
+      const tall = (b: { x: number; y: number; w: number; h: number }, height: number) => {
+        const dx = -labelToward.x * height * behind
+        const dz = -labelToward.y * height * behind
+        const steps = 6
+        return Array.from({ length: steps + 1 }, (_, i) => ({ ...b, x: b.x + (dx * i) / steps, y: b.y + (dz * i) / steps }))
+      }
+      for (const o of this.data.objects) {
+        const r = rects.get(o.id)!
+        if (o.type === 'store') {
+          const cx = r.x + r.w / 2
+          const cz = r.y + r.h / 2
+          const tag = this.storeTag(o, r)
+          // NOT the drum's pad ring: it is a 0.5-tall disk flat on the board
+          // — a plate floating over its rim hides nothing that reads, and as
+          // a hard limit it froze 'searches' and 'reads' at k = 1 beside the
+          // Log store (loop4-r1 legibility.labels: 5.8 / 6.0 px)
+          // strict: a label already tucked partly behind it must not grow
+          // further in (it would be cut by the drum on screen)
+          for (const s of tall({ x: cx - DRUM_R, y: cz - DRUM_R, w: 2 * DRUM_R, h: 2 * DRUM_R }, DRUM_H)) obstacles.push({ ...s, strict: true })
+          if (tag) obstacles.push(tag)
+        } else obstacles.push(...tall({ x: r.x - 7, y: r.y - 7, w: r.w + 14, h: r.h + 14 }, presetPose.depth))
+      }
+      // the wires (the node zones above are board-plane stand-ins; the
+      // screen pass below tests the nodes themselves)
+      const wireObstacles: { x: number; y: number; w: number; h: number }[] = []
+      const wireOwner: string[] = []
+      for (const [connId, geom] of this.connGeoms) {
+        for (const p of samplePath(geom, 12)) {
+          wireObstacles.push({ x: p.x - 3, y: p.y - 3, w: 6, h: 6 })
+          wireOwner.push(connId)
+        }
+      }
+      const nodeObstacleCount = obstacles.length
+      obstacles.push(...wireObstacles)
+      // ONE index over the node zones and every wire sample for the whole
+      // pass; each label's view of it drops what it may overlap
+      // (labelLegibility.BoxGrid has the measurement)
+      const grid = new BoxGrid(obstacles)
+      const ownWire = (idx: number, own: string) => idx >= nodeObstacleCount && wireOwner[idx - nodeObstacleCount] === own
+      /** Every obstacle label i must respect at its own size: the node zones
+       * and every wire but its OWN — it sits on that one by construction
+       * (connLabelPlacement: on the wire, always), and growing along it is
+       * not a collision. */
+      const obstacleCache = new Map<number, ObstacleSource>()
+      const baseFor = (i: number): ObstacleSource => {
+        let b = obstacleCache.get(i)
+        if (!b) {
+          const own = this.connLabelScalers[i].connId
+          b = exceptSource(grid, (idx) => ownWire(idx, own))
+          obstacleCache.set(i, b)
+        }
+        return b
+      }
+      /** …and the wires alone (every one but label i's own). */
+      const otherWiresFor = (i: number): ObstacleSource => {
+        const own = this.connLabelScalers[i].connId
+        return exceptSource(grid, (idx) => idx < nodeObstacleCount || ownWire(idx, own))
+      }
+      const boxOf =(s: (typeof this.connLabelScalers)[number]) => ({ x: s.cx - s.w / 2, y: s.cz - s.h / 2, w: s.w, h: s.h })
+      let boxes = this.connLabelScalers.map(boxOf)
+      let anchors = this.connLabelScalers.map((s) => s.anchor)
+      const free: number[] = []
+      for (let i = 0; i < boxes.length; i++) {
+        free.push(freeScale(boxes[i], baseFor(i), CONN_LABEL_MAX_GROW, anchors[i]))
+        yield
+      }
+      // A label boxed in where the placement left it SLIDES along its own
+      // wire to the stretch with room for the scale the default framing asks
+      // of it (labelLegibility.roomiestSpot), most constrained first.
+      const framing = this.defaultFramingPose()
+      const kWant = legibleScale(this.connLabelCapPx(framing), CONN_LABEL_MAX_GROW)
+      const moved = new Set<number>()
+      /** Move label i to the roomiest spot along its wire, every other label
+       * reserving `reserve[j]` of growth, when that buys real growth over
+       * the `have` it has now. True when it moved. */
+      type LabelSpot = {
+        box: Box
+        anchor: { x: number; y: number }
+        at: { x: number; y: number; lift: number; t: number; offset: number }
+      }
+      /** Every obstacle label i's growth must respect: the cards, drums and
+       * wires, and every OTHER label at the size it reserves (`reserve[j]`,
+       * capped at kWant — never steal its room). */
+      const labelsFor = (i: number, reserve: readonly number[]): Box[] => {
+        const others: Box[] = []
+        boxes.forEach((b, j) => {
+          if (j !== i) others.push(scaleAbout(b, Math.max(1, Math.min(reserve[j], kWant)), anchors[j]))
+        })
+        return others
+      }
+      const othersFor = (i: number, reserve: readonly number[], base: ObstacleSource = baseFor(i)) =>
+        unionSource(base, labelsFor(i, reserve))
+      /** Label i's candidate spots in preference order: where it sits, then
+       * the spots ON its wire nearest its preferred arc position
+       * (connLabelPlacement.onWireSpots — the only candidates any stage
+       * draws from). The old list reached clearance + 120 px off the wire
+       * ('consumes' / 'searches' found room to grow out there, loop4) and is
+       * what left 'notifies' / 'writes' floating ~150 css px from any wire
+       * (tp2-final-dpr1/workbench-wide.png; connLabelWireInfo: 41-183
+       * world px for all ten labels). A label boxed in on its wire is shrunk
+       * by the screen pass below instead. */
+      const spotsFor = (i: number): LabelSpot[] => {
+        const s = this.connLabelScalers[i]
+        const spots: LabelSpot[] = []
+        const pushSpot = (at: ReturnType<typeof s.placeAt>) => {
+          spots.push({
+            box: { x: at.x - s.w / 2, y: at.y - s.h / 2, w: s.w, h: s.h },
+            anchor: wireAnchor(at, s.w, s.h, s.sample(at.t).pt),
+            at,
+          })
+        }
+        pushSpot({ x: s.cx, y: s.cz, lift: s.lift, t: s.t, offset: s.offset })
+        for (const w of onWireSpots(s.sample, s.tPref, s.h, s.side)) pushSpot(s.placeAt(w.t, w.offset))
+        return spots
+      }
+      /** Put label i at `spot` (k = 1 until applyConnLabelScale), with
+       * `room` as its free scale there. State only: the commit below puts
+       * every plate where its state says. */
+      const moveTo = (i: number, spot: LabelSpot, room: number) => {
+        const s = this.connLabelScalers[i]
+        const { at, anchor } = spot
+        const dx = at.x - s.cx
+        const dz = at.y - s.cz
+        s.cx = at.x
+        s.cz = at.y
+        s.anchor = anchor
+        s.t = at.t
+        s.offset = at.offset
+        s.lift = at.lift
+        s.k = 1
+        this.connLabelOffsets.set(s.connId, { t: at.t, offset: at.offset })
+        const lb = this.connLabelBoxes[s.boxIndex]
+        if (lb) {
+          lb.x += dx
+          lb.y += dz
+        }
+        boxes = this.connLabelScalers.map(boxOf)
+        anchors = this.connLabelScalers.map((o) => o.anchor)
+        free[i] = room
+        moved.add(i)
+      }
+      const relocate = (i: number, reserve: readonly number[], have = reserve[i]): boolean => {
+        const spots = spotsFor(i)
+        const best = roomiestSpot(spots, othersFor(i, reserve), CONN_LABEL_MAX_GROW, kWant)
+        // a move must buy real growth over what the label has now (its own
+        // free room on the first pass, what the settle left it on the second)
+        if (!best || best.index === 0 || best.k <= have + 0.05) return false
+        moveTo(i, spots[best.index], best.k)
+        return true
+      }
+      const byRoom = (ks: readonly number[]) =>
+        ks.map((k, i) => ({ k, i })).filter((e) => e.k < kWant - 1e-9).sort((a, b) => a.k - b.k)
+      for (const { i } of byRoom(free)) {
+        relocate(i, free)
+        yield
+      }
+      // the room with every label where it now sits, then the pairs settled
+      const settle = function* (): Generator<void, number[], void> {
+        for (let i = 0; i < boxes.length; i++) {
+          free[i] = freeScale(boxes[i], baseFor(i), CONN_LABEL_MAX_GROW, anchors[i])
+          yield
+        }
+        return settleScales(boxes, free, anchors)
+      }
+      let settled = yield* settle()
+      // a second pass for the labels the pairwise settle shrank: they look
+      // again with every neighbour reserving what it actually got
+      // ('writes' was settled from x2 to x1.4 against 'notifies' stuck at x1.1)
+      // …repeated while anything moves (a move frees the room it left:
+      // 'notifies' had none until 'writes' left its spot), bounded
+      // A label still boxed in may claim room a neighbour only RESERVED for
+      // its growth (never its plate): the neighbour, shrunk by the settle,
+      // looks again on the next pass. Without it the result hung on the
+      // order connections arrive in — 'notifies' read 5.6 px on one run and
+      // 10.5 on another with the same board (loop4 final, DPR 1 vs 2).
+      const unreserved = this.connLabelScalers.map(() => 1)
+      for (let pass = 0; pass < 3; pass++) {
+        let again = false
+        for (const { i } of byRoom(settled)) {
+          again = relocate(i, settled) || relocate(i, unreserved, settled[i]) || again
+          yield
+        }
+        if (!again) break
+        settled = yield* settle()
+      }
+      // SCREEN TRUTH at the default framing (quality pass "labels",
+      // tp-final-dpr1/workbench-wide.png: 'evaluates' tucked under Alert
+      // manager, 'queries' jammed between Query API and Web console). Every
+      // rule above reasons on the board plane with an orthographic stand-in
+      // for the preset view, and growth ignores an obstacle a label already
+      // touches at k = 1; measured through the real fit camera, 'queries'
+      // overlapped both cards by 4-5 px and 'evaluates' Alert manager by
+      // 0.4 px. Each plate is projected at the scale it wears there, against
+      // each card's slab + plinth, each drum's body and the other plates;
+      // one that touches first tries a smaller scale where it sits, then the
+      // free stretch of its own wire nearest its preferred arc position that
+      // is clear on screen and still reads (LABEL_SCREEN_MIN_CAP_PX at its
+      // own depth); with none, it stays on its wire at that floor — the gates
+      // are scripts/view3d-quality/run.mjs "every connection label plate sits
+      // on its own wire" and "no connection label plate overlaps a card or a
+      // drum on screen where its wire had a free stretch".
+      const vp = this.rig.getViewport()
+      if (vp.width > 1 && vp.height > 1) {
+        const cam = new THREE.PerspectiveCamera(framing.fov, vp.width / vp.height, 10, 200_000)
+        applyPose(cam, framing)
+        cam.updateMatrixWorld()
+        this.connLayer.updateWorldMatrix(true, false)
+        const layerM = this.connLayer.matrixWorld
+        const v = new THREE.Vector3()
+        const screen = (x: number, y: number, z: number, local: boolean) => {
+          v.set(x, y, z)
+          if (local) v.applyMatrix4(layerM)
+          v.project(cam)
+          return { x: ((v.x + 1) / 2) * vp.width, y: ((1 - v.y) / 2) * vp.height }
+        }
+        // the drums' floor tags are obstacles too (TASK 2: 'consumes' lay
+        // over the Kafka / 'Event bus' tag in tp3-final-dpr1 and tp4-cards-3
+        // workbench-labels.png) — flat, so they hide nothing (no blocker)
+        const allSolids = this.nodeSolids()
+        const solidPts = allSolids.filter((n) => n.kind !== 'tag')
+        const tagPts = allSolids.filter((n) => n.kind === 'tag')
+        // ...and every head, fixed at its target wall (fifth arrow
+        // iteration: a head stood through 'reads' / 'queries' / 'consumes',
+        // connLabelPlacement.resolveScreenLabels has the measurement) — it
+        // hides nothing a plate needs (no blocker), it must not be covered
+        const headHulls = this.inkHeadHulls(cam, vp.height, (p) => screen(p.x, p.y, p.z, true))
+        const solids = [
+          ...[...solidPts, ...tagPts].map((n) => convexHull(n.pts.map((p) => screen(p.x, p.y, p.z, false)))),
+          ...headHulls,
+        ]
+        /** Does a node stand between the camera and this world point? (a
+         * plate drawn over a node's wall still reads; one behind it does
+         * not.) Cards: their slab + plinth box; drums: their cylinder. */
+        const ray = new THREE.Ray()
+        const hit = new THREE.Vector3()
+        // a card's solid is its slab box (points 0-7) and its plinth rim box
+        // (8-15) — not their hull, which would wrap the 7-px rim the whole
+        // slab height and call a plate in front of the wall hidden
+        // (index = its solid's, so only the solids a plate meets on screen
+        // are ray-tested — the fallback below runs this for every spot)
+        const blockers = [
+          ...solidPts.map((n) => {
+            const groups = n.kind === 'card' ? [n.pts.slice(0, 8), n.pts.slice(8)] : [n.pts]
+            return groups
+              .filter((g) => g.length > 0)
+              .map((g) => {
+                const b = new THREE.Box3().setFromPoints(g.map((p) => new THREE.Vector3(p.x, p.y, p.z)))
+                return { kind: n.kind, box: b, cx: (b.min.x + b.max.x) / 2, cz: (b.min.z + b.max.z) / 2, r: (b.max.x - b.min.x) / 2 }
+              })
+          }),
+          ...tagPts.map(() => []),
+          ...headHulls.map(() => []),
+        ]
+        const rayHit = new THREE.Vector3()
+        const occluded = (p: THREE.Vector3, near: readonly number[]): boolean => {
+          const o = cam.position
+          const len = p.distanceTo(o)
+          const dx = (p.x - o.x) / len
+          const dy = (p.y - o.y) / len
+          const dz = (p.z - o.z) / len
+          for (const b of near.flatMap((i) => blockers[i])) {
+            if (b.kind === 'card') {
+              ray.set(o, hit.set(dx, dy, dz))
+              const at = ray.intersectBox(b.box, rayHit)
+              if (at && at.distanceTo(o) < len - 0.5) return true
+              continue
+            }
+            // the drum's lid disk, then its wall
+            const sLid = (b.box.max.y - o.y) / dy
+            if (sLid > 0 && sLid < len - 0.5 && Math.hypot(o.x + dx * sLid - b.cx, o.z + dz * sLid - b.cz) <= b.r) return true
+            const ox = o.x - b.cx
+            const oz = o.z - b.cz
+            const qa = dx * dx + dz * dz
+            const qb = 2 * (ox * dx + oz * dz)
+            const qc = ox * ox + oz * oz - b.r * b.r
+            const disc = qb * qb - 4 * qa * qc
+            if (qa < 1e-12 || disc < 0) continue
+            for (const s of [(-qb - Math.sqrt(disc)) / (2 * qa), (-qb + Math.sqrt(disc)) / (2 * qa)]) {
+              const y = o.y + dy * s
+              if (s > 0 && s < len - 0.5 && y >= b.box.min.y && y <= b.box.max.y) return true
+            }
+          }
+          return false
+        }
+        /** How many of the plate's 3 x 3 sample points a node hides — only
+         * a node its screen quad `q` meets can. */
+        const sampleP = new THREE.Vector3()
+        const plateHidden = (box: Box, k: number, anchor: { x: number; y: number } | undefined, lift: number, q: { x: number; y: number }[]): number => {
+          const near: number[] = []
+          const qb = bbox(q)
+          solids.forEach((h, i) => {
+            if (!apart(qb, solidBoxes[i], 0) && convexOverlap(q, h, 0)) near.push(i)
+          })
+          if (near.length === 0) return 0
+          const g = scaleAbout(box, k, anchor)
+          const y = lift + 0.4
+          let n = 0
+          for (const fx of [0, 0.5, 1]) {
+            for (const fz of [0, 0.5, 1]) {
+              if (occluded(sampleP.set(g.x + g.w * fx, y, g.y + g.h * fz).applyMatrix4(layerM), near)) n++
+            }
+          }
+          return n
+        }
+        /** The scale at which a label at this spot reads LABEL_SCREEN_MIN_CAP_PX
+         * through the framing camera AT ITS OWN DEPTH. The view-centre
+         * estimate (capFit) undersold the far labels: 'consumes' / 'notifies'
+         * held to it measured 7.2 / 7.7 px at the top of the board
+         * (textLegibility, this pass's first on-wire probe, DPR 1). */
+        const CAP = CONN_LABEL_SIZE_LIT * INTER_CAP_EM
+        const floorAt = (spot: LabelSpot): number => {
+          const y = spot.at.lift + 0.55
+          const a = screen(spot.at.x, y, spot.at.y, true)
+          const b = screen(spot.at.x, y, spot.at.y - CAP, true)
+          const px = Math.hypot(b.x - a.x, b.y - a.y)
+          return Math.max(1, LABEL_SCREEN_MIN_CAP_PX / Math.max(1e-6, px))
+        }
+        const quad = (box: Box, k: number, anchor: { x: number; y: number } | undefined, lift: number) => {
+          const g = scaleAbout(box, k, anchor)
+          const y = lift + 0.4
+          return convexHull([
+            screen(g.x, y, g.y, true),
+            screen(g.x + g.w, y, g.y, true),
+            screen(g.x + g.w, y, g.y + g.h, true),
+            screen(g.x, y, g.y + g.h, true),
+          ])
+        }
+        // …and of every OTHER label plate as it stands on screen: the board
+        // settle keeps plates from overlapping, not from touching ('queries'
+        // and 'searches' printed edge to edge in tp2-labels probes)
+        let mates: { x: number; y: number }[][] = []
+        /** Screen bounding boxes: two hulls whose boxes are `margin` apart
+         * along x or y are at least that far apart, so the exact
+         * separating-axis test is skipped for them (the on-wire search runs
+         * it for ~75 spots x every node; the label pass measured 24-26 ms a
+         * build without this, tp3 probe, DPR 1). */
+        type Hull = { x: number; y: number }[]
+        const bbox = (h: Hull) => {
+          let x0 = Infinity
+          let y0 = Infinity
+          let x1 = -Infinity
+          let y1 = -Infinity
+          for (const p of h) {
+            x0 = Math.min(x0, p.x)
+            y0 = Math.min(y0, p.y)
+            x1 = Math.max(x1, p.x)
+            y1 = Math.max(y1, p.y)
+          }
+          return { x0, y0, x1, y1 }
+        }
+        const solidBoxes = solids.map(bbox)
+        let mateBoxes: ReturnType<typeof bbox>[] = []
+        const apart = (a: ReturnType<typeof bbox>, b: ReturnType<typeof bbox>, margin: number) =>
+          a.x0 - b.x1 >= margin || b.x0 - a.x1 >= margin || a.y0 - b.y1 >= margin || b.y0 - a.y1 >= margin
+        const clear = (q: Hull) => {
+          const qb = bbox(q)
+          return (
+            solids.every((h, j) => apart(qb, solidBoxes[j], LABEL_SCREEN_GAP_PX) || !convexOverlap(q, h, LABEL_SCREEN_GAP_PX)) &&
+            mates.every((m, j) => apart(qb, mateBoxes[j], LABEL_SCREEN_GAP_PX) || !convexOverlap(q, m, LABEL_SCREEN_GAP_PX))
+          )
+        }
+        // the scale a label wears at the default framing (applyConnLabelScale)
+        const wear = (room: number) => Math.max(1, Math.min(room, kWant))
+        /** The largest scale <= `room` (and kWant) at which a plate at this
+         * spot is clear of every node on screen, on the growth grid, never
+         * under the readable floor `kMin` (the floor wins over the board
+         * room: a label that does not read labels nothing); 0 when not even
+         * the floor is clear. */
+        const clearK = (box: Box, anchor: { x: number; y: number } | undefined, lift: number, room: number, kMin: number): number => {
+          // clear(k) only ever turns false as k grows (nested plates): a
+          // bisection over the grid top - n x 0.05
+          const top = Math.max(wear(room), kMin)
+          const at = (n: number) => top - n * 0.05
+          let lo = 0 // largest k first
+          let hi = Math.floor((top - kMin) / 0.05 + 1e-9)
+          if (!clear(quad(box, at(hi), anchor, lift))) return 0
+          while (lo < hi) {
+            const mid = (lo + hi) >> 1
+            if (clear(quad(box, at(mid), anchor, lift))) hi = mid
+            else lo = mid + 1
+          }
+          return at(lo)
+        }
+        /** How deep plate `q` reaches into `hulls` on screen (0 = clear by
+         * the gap). */
+        const depth = (q: Hull, hulls: readonly Hull[], boxes: readonly ReturnType<typeof bbox>[]) => {
+          const qb = bbox(q)
+          // The same maximum, without the exact test for every hull: two
+          // convex shapes that overlap penetrate (minus convexGap: the
+          // smallest push that separates them, in any direction) by at most
+          // the push that separates them along x or along y — and along x
+          // that push is their screen boxes' (the projection on x IS the
+          // box): min(q.x1 - b.x0, b.x1 - q.x0). Two that do not overlap
+          // are >= 0 apart on some edge axis. So a hull adds at most
+          // GAP + max(0, min(px, py)) (screenClearance.test.ts holds the
+          // bound on 12 720 pairs). Largest bound first; stop once no bound
+          // can raise the depth found. (This pass was 597 of 1008 ms of the
+          // label pass on 0ob3fum, nearly all in convexGap, connect-freeze
+          // profile 2026-10-11.)
+          const cand: { u: number; j: number }[] = []
+          for (let j = 0; j < hulls.length; j++) {
+            const b = boxes[j]
+            if (apart(qb, b, LABEL_SCREEN_GAP_PX)) continue
+            const px = Math.min(qb.x1 - b.x0, b.x1 - qb.x0)
+            const py = Math.min(qb.y1 - b.y0, b.y1 - qb.y0)
+            cand.push({ u: LABEL_SCREEN_GAP_PX + Math.max(0, Math.min(px, py)), j })
+          }
+          cand.sort((a, b) => b.u - a.u)
+          let d = 0
+          for (const { u, j } of cand) {
+            if (u + 1e-9 <= d) break
+            d = Math.max(d, LABEL_SCREEN_GAP_PX - convexGap(q, hulls[j]))
+          }
+          return d
+        }
+        for (let i = 0; i < this.connLabelScalers.length; i++) {
+          yield
+          const s = this.connLabelScalers[i]
+          mates = this.connLabelScalers.flatMap((o, j) =>
+            j === i ? [] : [quad(boxes[j], wear(settled[j]), anchors[j], o.lift)],
+          )
+          mateBoxes = mates.map(bbox)
+          const here: LabelSpot = { box: boxes[i], anchor: anchors[i], at: { x: s.cx, y: s.cz, lift: s.lift, t: s.t, offset: s.offset } }
+          if (wear(settled[i]) >= floorAt(here) - 1e-9 && clear(quad(boxes[i], wear(settled[i]), anchors[i], here.at.lift))) continue
+          // the board-plane node zones are what failed here: the nodes are
+          // tested on screen instead, the other wires and the other labels
+          // (at what they reserve) still bound the growth on the board
+          const otherWires = otherWiresFor(i)
+          const labelObstacles = labelsFor(i, settled)
+          const others = unionSource(otherWires, labelObstacles)
+          /** The largest scale `spot` is clear and readable at, else null. */
+          const tryAt = (spot: LabelSpot, current: boolean): { spot: LabelSpot; k: number } | null => {
+            // another label, or another wire (the plate would hide it)
+            if (!current && (overlapsAny(spot.box, labelObstacles) || overlapsAny(spot.box, otherWires))) return null
+            // the scaled plates are nested (the anchor is on the box): not
+            // clear at the readable floor = not clear at any larger scale
+            const kMin = floorAt(spot)
+            if (!clear(quad(spot.box, kMin, spot.anchor, spot.at.lift))) return null
+            const k = clearK(spot.box, spot.anchor, spot.at.lift, freeScale(spot.box, others, CONN_LABEL_MAX_GROW, spot.anchor), kMin)
+            return k > 0 ? { spot, k } : null
+          }
+          // where it sits (smaller, if that clears it); else the free stretch
+          // of its OWN wire nearest its preferred arc position (spotsFor is
+          // in that order). The old fallback ranked spots by distance and
+          // added rings up to 200 px round the wire point — 'notifies' was
+          // left 183 world px off its wire (connLabelWireInfo, tp2 board).
+          const spots = spotsFor(i)
+          let pick = tryAt(spots[0], true)
+          if (!pick) {
+            for (const sp of spots.slice(1)) {
+              yield
+              if ((pick = tryAt(sp, false))) break
+            }
+          }
+          if (!pick) {
+            // no stretch of its wire is clear for the WHOLE label at the
+            // readable floor: the spot where the longest ABBREVIATION is
+            // (labelAbbreviations, nearest its preferred arc position on a
+            // tie). What it shows at each framing is decided when the camera
+            // settles (resolveConnLabelVisibility) — this only picks where.
+            const ladder = labelAbbreviations(s.fullText).slice(1)
+            let best: { spot: LabelSpot; k: number; n: number } | null = null
+            for (const sp of spots) {
+              yield
+              if (sp !== spots[0] && overlapsAny(sp.box, labelObstacles)) continue
+              const k = floorAt(sp)
+              for (let n = 0; n < ladder.length && (!best || n < best.n); n++) {
+                const w = approxTextWidth(ladder[n], CONN_LABEL_SIZE_LIT) + 14
+                const sub = { x: sp.box.x + (sp.box.w - w) / 2, y: sp.box.y, w, h: sp.box.h }
+                if (clear(quad(sub, k, sp.anchor, sp.at.lift))) {
+                  best = { spot: sp, k, n }
+                  break
+                }
+              }
+              if (best?.n === 0) break
+            }
+            if (best) pick = { spot: best.spot, k: best.k }
+          }
+          if (!pick) {
+            // no stretch of its wire is clear on screen even for its shortest
+            // abbreviation at the readable floor: it is HIDDEN at this
+            // framing (resolveConnLabelVisibility) and keeps the spot it
+            // comes back on when a closer framing gives it room — on the
+            // wire, at the floor, where it is seen whole (no node in front of
+            // it), touching no other plate, and reaching least into the
+            // nodes — the earliest (nearest its preferred arc position) on a
+            // tie.
+            // A wire whose whole run lies in the zone a tall drum hides has
+            // no such spot at cable height ('searches': 3 of 9 plate points
+            // behind the Log store drum at best, tp3 probe): the plate may
+            // then float higher over its own wire, as far as the on-wire
+            // tolerance allows (centre within half its height + the slack of
+            // the cable, in 3D), lowest first.
+            const lt = (a: [number, number, number], b: [number, number, number]) =>
+              a[0] < b[0] || (a[0] === b[0] && (a[1] < b[1] - 1e-6 || (Math.abs(a[1] - b[1]) <= 1e-6 && a[2] < b[2] - 1e-6)))
+            // the drawn centreline (connLines — what the harness measures)
+            const line = this.connLines.get(s.connId) ?? []
+            const toLine = (x: number, y: number, z: number) => {
+              let d = Infinity
+              for (let j = 1; j < line.length; j++) {
+                const a = line[j - 1]
+                const b = line[j]
+                const ab = [b.x - a.x, b.y - a.y, b.z - a.z]
+                const l2 = ab[0] ** 2 + ab[1] ** 2 + ab[2] ** 2
+                const f = l2 > 0 ? Math.max(0, Math.min(1, ((x - a.x) * ab[0] + (y - a.y) * ab[1] + (z - a.z) * ab[2]) / l2)) : 0
+                d = Math.min(d, Math.hypot(x - a.x - ab[0] * f, y - a.y - ab[1] * f, z - a.z - ab[2] * f))
+              }
+              return d
+            }
+            let best: { spot: LabelSpot; k: number; score: [number, number, number] } | null = null
+            for (const sp0 of spots) {
+              yield
+              if (sp0 !== spots[0] && overlapsAny(sp0.box, labelObstacles)) continue
+              const k = floorAt(sp0)
+              const g = scaleAbout(sp0.box, k, sp0.anchor)
+              const within = (lift: number) =>
+                toLine(g.x + g.w / 2, lift + 0.4, g.y + g.h / 2) <= onWireMaxDistance(s.h, k) - 1.5
+              for (const d of [0, 4, 8, 12, 16]) {
+                const lift = sp0.at.lift + d
+                if (d > 0 && !within(lift)) break // farther still only rises higher
+                const q = quad(sp0.box, k, sp0.anchor, lift)
+                const dm = depth(q, mates, mateBoxes)
+                const ds = depth(q, solids, solidBoxes)
+                // a spot seen whole already won: only a better [mates, nodes]
+                // pair can beat it, and hiding can only make this one worse
+                if (best && best.score[0] === 0 && !lt([0, dm, ds], best.score)) continue
+                const score: [number, number, number] = [plateHidden(sp0.box, k, sp0.anchor, lift, q), dm, ds]
+                const sp = d === 0 ? sp0 : { ...sp0, at: { ...sp0.at, lift } }
+                if (!best || lt(score, best.score)) best = { spot: sp, k, score }
+                if (score[0] === 0) break // seen whole: no higher float
+              }
+            }
+            pick = { spot: best!.spot, k: best!.k }
+          }
+          if (pick.spot !== spots[0]) moveTo(i, pick.spot, pick.k)
+          // the room it may grow into is now what is clear on screen
+          settled[i] = pick.k
+          free[i] = pick.k
+        }
+      }
+      // where the settle pass may draw each label (TASK 2): here, then the
+      // spots on its own wire whose plate would not cover another wire
+      const spotLists: (typeof this.connLabelScalers)[number]['spots'][] = []
+      for (let i = 0; i < this.connLabelScalers.length; i++) {
+        const otherWires = otherWiresFor(i)
+        spotLists.push(
+          spotsFor(i)
+            .filter((sp, j) => j === 0 || !overlapsAny(sp.box, otherWires))
+            .map((sp) => ({ x: sp.at.x, z: sp.at.y, lift: sp.at.lift, t: sp.at.t, offset: sp.at.offset, anchor: sp.anchor })),
+        )
+        yield
+      }
+      // COMMIT, in one step: every plate shows its state from here on
+      this.labelHold = false
+      this.connLabelGrowth = {
+        kWant,
+        labels: this.connLabelScalers.map((s, i) => ({ connId: s.connId, kFree: settled[i], moved: moved.has(i) })),
+      }
+      this.connLabelScalers.forEach((s, i) => {
+        s.kFree = settled[i]
+        // the decor keeps off the label at its LARGEST size too
+        if (s.kFree > 1) this.connLabelBoxes.push(scaleAbout(boxes[i], s.kFree, s.anchor))
+        s.spots = spotLists[i]
+        // home, at k = 1 (a carried plate showed the previous pass's spot
+        // and scale): applyConnLabelScale grows it, the resolve below moves
+        // it to the spot it shows at
+        s.k = 1
+        s.plate.position.set(s.cx - s.w / 2, s.lift + 0.4, s.cz - s.h / 2)
+        s.plate.scale.set(1, 1, 1)
+        s.text.position.set(s.cx, s.lift + 0.55, s.cz)
+        s.text.scale.setScalar(1)
+      })
+      this.applyConnLabelScale()
+      // whole, abbreviated or hidden at the current framing (TASK 2)
+      this.resolveConnLabelVisibility()
+    }
+  }
+
+  /** Projected cap height (css px) of a k = 1 lit connection label at the
+   * target of `pose` (orthographic estimate: the view-centre scale, the
+   * glyph's up axis foreshortened by the polar/azimuth). */
+  private connLabelCapPx(pose: { distance: number; fov: number; azimuth: number; polar: number }): number {
+    const vh = this.renderer.getSize(this._lodSize).y
+    const pxPerWorld = vh / (2 * pose.distance * Math.tan((pose.fov / 2) * (Math.PI / 180)))
+    const az = (pose.azimuth * Math.PI) / 180
+    const polar = (Math.max(0.5, pose.polar) * Math.PI) / 180
+    const upFore = Math.hypot(Math.sin(az), Math.cos(az) * Math.cos(polar))
+    return CONN_LABEL_SIZE_LIT * INTER_CAP_EM * pxPerWorld * upFore
+  }
+
+  /** The scale a lit label needs at the board's DEFAULT framing — the pose
+   * fit-to-screen lands on, clear of the floating chrome (showcaseView's
+   * framing), else the bare preset pose — what buildConnections finds room
+   * for. (The bare preset pose alone frames ~2x closer than fit-to-screen
+   * with both panels open: it asked for k = 1 while the fit shot read
+   * 4.7-7.2 px, loop4 fix2.) buildConnections derives the wanted label
+   * scale from it (legibleScale of connLabelCapPx) and checks every plate
+   * against the cards through a camera at it. */
+  private defaultFramingPose(): CameraPose {
+    const bounds = this.contentBounds()
+    const points = this.safeAreaProvider ? this.nodeFitBoxes().flatMap((b) => b.corners) : []
+    const vp = this.rig.getViewport()
+    let pose = this.rig.presetPoseFor(this.preset, bounds)
+    if (points.length > 0 && vp.width > 1 && vp.height > 1) {
+      const m = this.chromeInsets()
+      pose = this.rig.fitPoseFor(this.preset, bounds, points, {
+        left: m.left ?? 0,
+        right: m.right ?? 0,
+        top: m.top ?? 0,
+        bottom: m.bottom ?? 0,
+      })
+    }
+    return pose
+  }
+
+  /** Grow each lit connection label toward MIN_CAP_PX of projected cap
+   * height, within the room `buildConnections` measured for it (kFree).
+   * Called when the camera settles (updateNodeLod) and after a rebuild. */
+  private applyConnLabelScale(): boolean {
+    // a pending placement pass owns the plates until it commits
+    if (this.connLabelScalers.length === 0 || this.labelHold) return false
+    const capPx = this.connLabelCapPx(this.rig.getPose())
+    let changed = false
+    for (const s of this.connLabelScalers) {
+      const k = legibleScale(capPx, s.kFree)
+      if (Math.abs(k - s.k) < 1e-3) continue
+      s.k = k
+      const grown = scaleAbout({ x: s.cx - s.w / 2, y: s.cz - s.h / 2, w: s.w, h: s.h }, k, s.anchor)
+      s.text.scale.setScalar(k)
+      s.text.position.x = grown.x + grown.w / 2
+      s.text.position.z = grown.y + grown.h / 2
+      s.plate.scale.set(k, 1, k)
+      s.plate.position.x = grown.x
+      s.plate.position.z = grown.y
+      changed = true
+    }
+    return changed
+  }
+
+  /** What each lit connection label SHOWS at the current framing (quality
+   * pass "labels", TASK 2 — connLabelPlacement.resolveScreenLabels has the
+   * measurement): whole when its plate, as drawn at the scale it wears, is
+   * clear on screen of every card, drum, drum tag and every plate already
+   * drawn; else its longest abbreviation that is; else hidden. The hovered
+   * connection and the selected ones show whole. Runs when the camera
+   * settles (updateNodeLod), after a connection build and when the hovered
+   * connection changes — a handful of projections per label and node, no
+   * material and no light, so no program is ever linked by it. True when a
+   * label changed. */
+  private resolveConnLabelVisibility(): boolean {
+    // a pending placement pass resolves when it commits
+    if (this.connLabelScalers.length === 0 || this.labelHold) return false
+    const resolveT0 = performance.now()
+    const vp = this.rig.getViewport()
+    if (vp.width <= 1 || vp.height <= 1) return false
+    const cam = this.rig.camera
+    cam.updateMatrixWorld()
+    this.connLayer.updateWorldMatrix(true, false)
+    const layerM = this.connLayer.matrixWorld
+    const v = new THREE.Vector3()
+    const screen = (x: number, y: number, z: number, local: boolean) => {
+      v.set(x, y, z)
+      if (local) v.applyMatrix4(layerM)
+      v.project(cam)
+      return { x: ((v.x + 1) / 2) * vp.width, y: ((1 - v.y) / 2) * vp.height }
+    }
+    const obstacles = this.nodeSolids().map((n) => convexHull(n.pts.map((p) => screen(p.x, p.y, p.z, false))))
+    const forced = new Set<string>(this.selectedIds)
+    if (this.connLabelHoverId) forced.add(this.connLabelHoverId)
+    const spotsOf = (s: (typeof this.connLabelScalers)[number]) =>
+      s.spots.length > 0 ? s.spots : [{ x: s.cx, z: s.cz, lift: s.lift, t: s.t, offset: s.offset, anchor: s.anchor }]
+    const labels: ScreenLabel[] = this.connLabelScalers.map((s) => {
+      const spots = spotsOf(s)
+      // each spot's WHOLE plate projected once (its four corners at the scale
+      // it wears); a narrower abbreviated plate is centred in it, so its
+      // corners lie on the whole plate's top and bottom edges — taken by
+      // interpolation (a straight edge projects straight; the parameter is
+      // off by under a tenth of a pixel across a ~100-px plate, inside the
+      // 2.5-px gap)
+      const corners: { x: number; y: number }[][] = []
+      const cornersAt = (j: number) => {
+        let c = corners[j]
+        if (!c) {
+          const sp = spots[j]
+          const g = scaleAbout({ x: sp.x - s.w / 2, y: sp.z - s.h / 2, w: s.w, h: s.h }, s.k, sp.anchor)
+          const y = sp.lift + 0.4
+          c = corners[j] = [
+            screen(g.x, y, g.y, true),
+            screen(g.x + g.w, y, g.y, true),
+            screen(g.x + g.w, y, g.y + g.h, true),
+            screen(g.x, y, g.y + g.h, true),
+          ]
+        }
+        return c
+      }
+      return {
+        id: s.connId,
+        text: s.fullText,
+        forced: forced.has(s.connId),
+        spots: spots.length,
+        hullFor: (shown: string, j: number) => {
+          const [a, b, c, d] = cornersAt(j)
+          if (shown === s.fullText) return convexHull([a, b, c, d])
+          const u = (1 - this.connLabelPlateW(shown) / s.w) / 2
+          const lerp = (p: { x: number; y: number }, q: { x: number; y: number }, f: number) => ({ x: p.x + (q.x - p.x) * f, y: p.y + (q.y - p.y) * f })
+          return convexHull([lerp(a, b, u), lerp(a, b, 1 - u), lerp(d, c, 1 - u), lerp(d, c, u)])
+        },
+      }
+    })
+    // the heads stand first (fixed at their target edges): every label
+    // keeps clear of them on screen
+    const heads = this.inkHeadHulls(cam, vp.height, (p) => screen(p.x, p.y, p.z, true))
+    const shows = resolveScreenLabels(labels, obstacles, LABEL_SCREEN_GAP_PX, undefined, heads)
+    const resolveMs = performance.now() - resolveT0
+    this.connLabelPerf.resolveMs = resolveMs
+    this.connLabelPerf.resolveMaxMs = Math.max(this.connLabelPerf.resolveMaxMs, resolveMs)
+    this.connLabelPerf.resolves++
+    let changed = false
+    for (const s of this.connLabelScalers) {
+      const show = shows.get(s.connId)
+      if (!show) continue
+      const sp = spotsOf(s)[show.spot]
+      if (show.text !== null && this.placeConnLabel(s, sp)) changed = true
+      if (show.state === s.shown.state && show.text === s.shown.text) continue
+      this.showConnLabel(s, show)
+      changed = true
+    }
+    return changed
+  }
+
+  /** Draw label `s` at on-wire spot `sp` at the scale it wears (its home,
+   * `cx`/`cz`, is left alone — the next framing may bring it back there).
+   * True when it moved. */
+  private placeConnLabel(
+    s: (typeof this.connLabelScalers)[number],
+    sp: (typeof this.connLabelScalers)[number]['spots'][number],
+  ): boolean {
+    const g = scaleAbout({ x: sp.x - s.w / 2, y: sp.z - s.h / 2, w: s.w, h: s.h }, s.k, sp.anchor)
+    const y = sp.lift + 0.4
+    const p = s.plate.position
+    if (Math.abs(p.x - g.x) < 1e-6 && Math.abs(p.y - y) < 1e-6 && Math.abs(p.z - g.y) < 1e-6) return false
+    p.set(g.x, y, g.y)
+    s.text.position.set(g.x + g.w / 2, sp.lift + 0.55, g.y + g.h / 2)
+    // a grab starts from where it is drawn
+    this.connLabelOffsets.set(s.connId, { t: sp.t, offset: sp.offset })
+    return true
+  }
+
+  /** A lit label plate's width for `text` (buildConnections' rule). */
+  private connLabelPlateW(text: string): number {
+    return approxTextWidth(text, CONN_LABEL_SIZE_LIT) + 14
+  }
+
+  /** Put `show` on label `s`: hidden, or its text and a plate as wide as
+   * that text, centred where the whole plate is (so it stays on its wire). */
+  private showConnLabel(s: (typeof this.connLabelScalers)[number], show: LabelShow): void {
+    s.shown = show
+    if (show.text === null) {
+      s.plate.visible = false
+      s.text.visible = false
+      return
+    }
+    s.plate.visible = true
+    s.text.visible = true
+    if (String(s.text.text) !== show.text) {
+      s.text.text = show.text
+      s.text.sync(() => this.requestRender())
+    }
+    const want = show.state === 'full' ? s.fullGeo : null
+    if (want && s.plate.geometry === want) return
+    if (!want && s.plate.userData.plateText === show.text) return
+    if (s.plate.geometry !== s.fullGeo) s.plate.geometry.dispose()
+    if (want) {
+      s.plate.geometry = want
+      s.plate.userData.plateText = s.fullText
+      return
+    }
+    const w = this.connLabelPlateW(show.text)
+    const geo = new THREE.ShapeGeometry(this.boardShape(w, s.h, s.plateR))
+    geo.rotateX(-Math.PI / 2)
+    geo.translate((s.w - w) / 2, 0, 0)
+    s.plate.geometry = geo
+    s.plate.userData.plateText = show.text
   }
 
   /** A flat, per-frame-rewritable stroke on the board (see DynamicStroke) —
@@ -4920,7 +9286,10 @@ export class Scene3D {
     pts: { x: number; y: number }[],
     width: number,
     anim: ResolvedConnectionAnimation,
-    cableProfile: CableProfile | null = null,
+    /** Lit ink lines: the line's core and its rim colour — a traveling dot
+     * whose colour is within 2:1 of the core (the coral 'Point mobile' dot on
+     * the coral highlight) is drawn cream, ringed in the rim ink. */
+    guard: { coreCss: string; rimCss: string } | null = null,
   ): void {
     const style = this.highlightStyle
     const unit: FlowUnit = { kind: style, geom, tick: () => {} }
@@ -4946,25 +9315,37 @@ export class Scene3D {
     }
 
     // 2D traveling-dot anatomy: base glow r8 @.25 → white r4 → base core r2.5.
-    // Under the lit profile the spark rides ON the cable (same height profile
-    // as buildCableTube — plug, dive, rest, rise) instead of gliding on a
-    // flat plane — the reference image's glowing-particle-on-a-wire read.
+    // Lit ink line, dot colour within 2:1 of the line's core: the core disc
+    // goes cream and a ring of the rim ink circles the white disc, so the
+    // packet still reads on its own line.
     const travelingDot = (cycle: number): ((now: number) => void) => {
       const dot = new THREE.Group()
+      const clash = guard !== null && contrastRatio(colorAlpha(anim.color).color, colorAlpha(guard.coreCss).color) < 2
       dot.add(
         disc(9, anim.color, 0.35, true, 0).mesh,
         disc(4, '#FFFFFF', 0.95, false, 0.1).mesh,
-        disc(2.5, anim.color, 1, false, 0.2).mesh,
+        disc(2.5, clash ? '#FBF4E8' : anim.color, 1, false, 0.2).mesh,
       )
+      if (clash && guard) {
+        const ring = new THREE.Mesh(
+          new THREE.RingGeometry(4, 5, 24),
+          new THREE.MeshBasicMaterial({ color: colorAlpha(guard.rimCss).color, transparent: true, depthWrite: false, toneMapped: false }),
+        )
+        ring.rotation.x = -Math.PI / 2
+        ring.position.y = 0.15
+        dot.add(ring)
+      }
       dot.position.y = 1.0
+      // a translucent spark that travels: the arrow probe does not count it
+      // as covering a line
+      dot.userData.flowSpark = true
       this.connLayer.add(dot)
       unit.dot = dot
       return (now) => {
         const t = (now % cycle) / cycle
         unit.lastT = t
         const p = pathPoint(geom, t)
-        const y = cableProfile ? cableYAt(cableProfile, t) + 3.4 : dot.position.y
-        dot.position.set(p.x, y, p.y)
+        dot.position.set(p.x, dot.position.y, p.y)
       }
     }
 
@@ -5309,6 +9690,12 @@ export class Scene3D {
    * Anchor dots render at the shape's LIFTED top face: floor-level dots would
    * hide under neighbouring slabs and steal pointerdowns. */
   private buildConnEditHandles(connId: string, rects: Map<string, Rect>): void {
+    // the lit ink line wears the redesigned chrome (editHandle.ts); the
+    // unlit skins keep their board-decal dots unchanged
+    if (this.renderProfile === 'lit' && this.connLines.has(connId) && this.arrowDebug.some((a) => a.connId === connId && a.ink)) {
+      this.buildInkEditHandles(connId, rects)
+      return
+    }
     const skin = this.skin!
     const conn = this.data.connections.find((c) => c.id === connId)
     const geom = this.connGeoms.get(connId)
@@ -5382,6 +9769,275 @@ export class Scene3D {
     }
   }
 
+  /**
+   * The lit board's edit chrome for the selected connection (selected spec
+   * v1 §4): screen-aligned billboard handles of constant css size
+   * (editHandle.ts) ON the drawn line at its own height — the source handle
+   * on the line's first point, the target KNOB on the head's tip (shown per
+   * frame: updateEditHandles), bends at their waypoints — the dashed drag
+   * preview as an ink line, and the hovered drop shape's 12 anchors on its
+   * top face. Front + x-ray meshes share one geometry; both draw above the
+   * label plates (order 40+, CONN_LABEL_PLATE_ORDER is 30).
+   */
+  private buildInkEditHandles(connId: string, rects: Map<string, Rect>): void {
+    const skin = this.skin!
+    const conn = this.data.connections.find((c) => c.id === connId)
+    const line = this.connLines.get(connId)
+    const arrow = this.arrowDebug.find((a) => a.connId === connId)
+    if (!conn || !line || line.length < 2 || !arrow) return
+    const edit = this.connEdit
+    const dark = this.palette?.dark === true
+    const coral = skin.connections.highlight
+    setHandleAppearance(this.handleUniforms, dark, coral)
+    type H = NonNullable<typeof this.editChrome>['items'][number]
+    const handles: H[] = []
+    const draggingEnd = edit?.mode === 'endpoint' && edit.connId === connId ? edit.end : null
+    if (draggingEnd !== 'source') {
+      handles.push({ role: 'source', kind: 'endpoint', id: 0, x: line[0].x, y: line[0].y, z: line[0].z, visible: true, pick: { kind: 'connEndpoint', id: connId, end: 'source' } })
+    }
+    if (draggingEnd !== 'target') {
+      // shown / hidden every frame (updateEditHandles): visibility is camera-dependent
+      handles.push({ role: 'knob', kind: 'endpoint', id: 1, x: arrow.head.x, y: arrow.head.y, z: arrow.head.z, visible: false, pick: { kind: 'connEndpoint', id: connId, end: 'target' } })
+    }
+    const waypoints = edit?.mode === 'waypoint' && edit.connId === connId ? edit.working : (conn.waypoints ?? [])
+    waypoints.forEach((wp, i) =>
+      handles.push({ role: 'bend', kind: 'bend', id: 2 + i, x: wp.x, y: 0, z: wp.y, visible: true, pick: { kind: 'connWaypoint', id: connId, index: i } }),
+    )
+    // pressed: the dragged end (it rides the cursor) or the dragged bend
+    let pressId = -1
+    if (edit?.mode === 'waypoint' && edit.connId === connId) pressId = 2 + edit.index
+    if (edit?.mode === 'endpoint' && edit.connId === connId && edit.preview) {
+      pressId = 100
+      // the dashed re-route preview: a coral ink line, 2 css px, no rim,
+      // from the fixed end's handle to the cursor, under the handles
+      const geom = this.connGeoms.get(connId)
+      const face = edit.end === 'source' ? geom?.toEdge.face : geom?.fromEdge.face
+      const fixed = edit.end === 'source' ? { x: arrow.head.x, y: arrow.head.z } : { x: line[0].x, y: line[0].z }
+      const route = face ? endpointDragPreview({ ...fixed, face }, edit.preview) : [fixed, edit.preview]
+      // dash 6 / 4 css px: world lengths at the orbit target's scale (the
+      // camera holds still during a drag; the layer rebuilds on every move)
+      this.updateInkUniforms()
+      const wppT = this.inkUniforms.uInkWppTarget.value
+      const dashCss: [number, number] = [INK_DASHED[0] * wppT, INK_DASHED[1] * wppT]
+      const g = buildInkGeometry({ pts: route, head: null, width: 0, minCss: 2, maxCss: 2, casing: 0, casingMinCss: 0, dash: dashCss })
+      if (g) {
+        const m = new THREE.Mesh(g, this.inkMaterial(coral, 0.9))
+        m.userData.ink = 'preview'
+        m.name = 'ink-drag-preview'
+        m.renderOrder = 38
+        this.connLayer.add(m)
+      }
+      handles.push({ role: 'drag', kind: 'endpoint', id: 100, x: edit.preview.x, y: 0, z: edit.preview.y, visible: true, pick: null })
+      // the hovered drop shape: its 12 anchors on its top face
+      if (edit.hoverShapeId) {
+        const rect = rects.get(edit.hoverShapeId)
+        const unitOfShape = this.nodeGroups.get(edit.hoverShapeId) ?? this.groupPlates.get(edit.hoverShapeId)
+        if (rect) {
+          const yLocal = ((unitOfShape?.userData.topY as number | undefined) ?? 0) + 0.4 - this.connLayer.position.y
+          const snapped = nearestAnchorIndex(rect, edit.preview.x, edit.preview.y)
+          for (let i = 0; i < ANCHOR_COUNT; i++) {
+            const a = anchorPoint(rect, i)
+            handles.push({ role: 'anchor', kind: i === snapped ? 'anchorSnapped' : 'anchor', id: 200 + i, x: a.x, y: yLocal, z: a.y, visible: true, pick: null })
+          }
+        }
+      }
+    }
+    this.handleUniforms.uPressId.value = pressId
+    if (handles.length === 0) return
+    const geo = buildHandleGeometry(handles, dark, coral)
+    // x-ray first (the ghost behind a card), then the front pass over it
+    const xray = new THREE.Mesh(geo, createHandleMaterial(this.inkUniforms, this.handleUniforms, true))
+    xray.renderOrder = 40
+    xray.name = 'edit-handles-xray'
+    xray.userData.sharedGeometry = true
+    const front = new THREE.Mesh(geo, createHandleMaterial(this.inkUniforms, this.handleUniforms, false))
+    front.renderOrder = 41
+    front.name = 'edit-handles'
+    this.connLayer.add(xray, front)
+    this.editChrome = { connId, geo, items: handles }
+    this.updateEditHandles()
+  }
+
+  /**
+   * Place the target KNOB for this frame's camera (selected spec §4.2):
+   * on the head's tip (the 2D destination dot) — and apply the short-line
+   * rules (editHandleVisibility) and the occlusion by its own target.
+   */
+  private updateEditHandles(): void {
+    const chrome = this.editChrome
+    if (!chrome) return
+    const knobIndex = chrome.items.findIndex((h) => h.role === 'knob')
+    const srcIndex = chrome.items.findIndex((h) => h.role === 'source')
+    const arrow = this.arrowDebug.find((a) => a.connId === chrome.connId)
+    const line = this.connLines.get(chrome.connId)
+    if (!arrow || !line) return
+    const cam = this.rig.camera
+    const vp = this.rig.getViewport()
+    cam.updateMatrixWorld()
+    this.connLayer.updateWorldMatrix(true, false)
+    const layerM = this.connLayer.matrixWorld
+    const v = new THREE.Vector3()
+    const screen = (x: number, y: number, z: number) => {
+      v.set(x, y, z).applyMatrix4(layerM).project(cam)
+      return { x: ((v.x + 1) / 2) * vp.width, y: ((1 - v.y) / 2) * vp.height }
+    }
+    const tip = screen(arrow.head.x, arrow.head.y, arrow.head.z)
+    // ON the tip, as the 2D canvas draws its destination dot on toEdge: the
+    // design spec's knob 5 css px behind the head's base left a gap the user
+    // read as "le dot est avant" the arrow (2026-10-12)
+    const knob = { x: arrow.head.x, z: arrow.head.z }
+    const src = line[0]
+    const s0 = screen(src.x, src.y, src.z)
+    let linePx = 0
+    let prev = tip
+    for (let i = line.length - 1; i >= 0; i--) {
+      const s = screen(line[i].x, line[i].y, line[i].z)
+      linePx += Math.hypot(s.x - prev.x, s.y - prev.y)
+      prev = s
+    }
+    const vis = editHandleVisibility({ knobToSourcePx: Math.hypot(tip.x - s0.x, tip.y - s0.y), linePx })
+    const dark = this.palette?.dark === true
+    if (knobIndex >= 0) {
+      const h = chrome.items[knobIndex]
+      // behind its OWN target (the camera beyond a drum): the head is hidden
+      // there too, and the x-ray ghost of a knob with no head beside it read
+      // as a stray decal on the drum wall (design review round 2,
+      // workbench-arrows-selected-line.png, 'ships' into Log store) — the
+      // knob hides with its head. Behind any other shape it ghosts (§6).
+      const hiddenByTarget = this.occludedByNode(arrow.toId, new THREE.Vector3(knob.x, arrow.head.y, knob.z).applyMatrix4(layerM))
+      chrome.knobOccluded = hiddenByTarget
+      const show = vis.knob && !hiddenByTarget
+      const d = show ? handleStyle(h.kind, dark).diameter : 0
+      h.x = knob.x
+      h.y = arrow.head.y
+      h.z = knob.z
+      if (h.visible !== show || show) {
+        h.visible = show
+        setHandleAnchor(chrome.geo, knobIndex, h.x, h.y, h.z, d)
+      }
+    }
+    if (srcIndex >= 0 && chrome.items[srcIndex].visible !== vis.source) {
+      const h = chrome.items[srcIndex]
+      h.visible = vis.source
+      setHandleAnchor(chrome.geo, srcIndex, h.x, h.y, h.z, vis.source ? handleStyle(h.kind, dark).diameter : 0)
+    }
+  }
+
+  private occRay = new THREE.Raycaster()
+  /** Does node `id`'s SOLID body (depth-written, visible meshes — not its
+   * soft shadow decals) stand between the camera and world point `w`? */
+  private occludedByNode(id: string, w: THREE.Vector3): boolean {
+    const group = this.nodeGroups.get(id)
+    if (!group) return false
+    const cam = this.rig.camera
+    const from = cam.getWorldPosition(new THREE.Vector3())
+    const dir = w.clone().sub(from)
+    const d = dir.length()
+    this.occRay.set(from, dir.normalize())
+    this.occRay.far = d - 0.6
+    return this.occRay.intersectObject(group, true).some((hit) => {
+      for (let n: THREE.Object3D | null = hit.object; n; n = n.parent) if (!n.visible) return false
+      const m = (hit.object as THREE.Mesh).material as THREE.Material | THREE.Material[] | undefined
+      return !!m && !Array.isArray(m) && m.depthWrite && !this.connTexts.includes(hit.object as Text)
+    })
+  }
+
+  /** The drawn diameter (css px) of edit handle `h` this frame: hovered or
+   * pressed grow to HANDLE_D_HOT. */
+  private handleDrawnDiameter(h: { kind: EditHandleKind; id: number }): number {
+    const u = this.handleUniforms
+    const hot = h.id === u.uPressId.value ? 1 : h.id === u.uHoverId.value ? u.uHoverT.value : 0
+    return handleStyle(h.kind, this.palette?.dark === true).diameter * (1 + (HANDLE_D_HOT / 10 - 1) * hot)
+  }
+
+  /**
+   * The flow bead's fade for this frame (selected spec §5, acceptance "never
+   * within 12 css px of a handle or the head"): its centre projected, its
+   * clearance measured ON SCREEN to the line's start (the source handle's
+   * edge when shown), every other drawn handle's edge and the drawn head
+   * triangle, and inkPacketFade of it written to the meshes that paint it.
+   */
+  private updateInkBeads(): void {
+    if (this.inkUniforms.uInkPhase.value < 0) return
+    const units = this.flowUnits.filter((u) => u.bead && u.pos)
+    if (units.length === 0) return
+    const cam = this.rig.camera
+    const vp = this.rig.getViewport()
+    cam.updateMatrixWorld()
+    this.connLayer.updateWorldMatrix(true, false)
+    const layerM = this.connLayer.matrixWorld
+    const v = new THREE.Vector3()
+    const screen = (x: number, y: number, z: number) => {
+      v.set(x, y, z).applyMatrix4(layerM).project(cam)
+      return { x: ((v.x + 1) / 2) * vp.width, y: ((1 - v.y) / 2) * vp.height }
+    }
+    for (const u of units) {
+      const b = u.bead!
+      const line = this.connLines.get(b.connId)
+      const arrow = this.arrowDebug.find((a) => a.connId === b.connId)
+      if (!line || line.length < 2 || !arrow) continue
+      const c = screen(u.pos!.x, line[0].y, u.pos!.z)
+      const discs: { x: number; y: number; r: number }[] = []
+      const chrome = this.editChrome?.connId === b.connId ? this.editChrome : null
+      const src = chrome?.items.find((h) => h.role === 'source' && h.visible)
+      discs.push({ ...screen(line[0].x, line[0].y, line[0].z), r: src ? this.handleDrawnDiameter(src) / 2 : 0 })
+      for (const h of chrome?.items ?? []) {
+        if (!h.visible || h === src) continue
+        discs.push({ ...screen(h.x, h.y, h.z), r: this.handleDrawnDiameter(h) / 2 })
+      }
+      let clear = Infinity
+      for (const d of discs) clear = Math.min(clear, Math.hypot(c.x - d.x, c.y - d.y) - d.r)
+      const tri = this.inkHeadAt(arrow, cam, vp.height).tri.map((q) => screen(q.x, q.y, q.z))
+      clear = Math.min(clear, discTriangleGap(c, 0, tri))
+      b.clearPx = clear
+      b.fade = inkPacketFade(clear)
+      for (const k of b.ks) k.value = b.fade
+    }
+  }
+
+  /** The lit edit handle under client point (x, y), picked on SCREEN (§7):
+   * within max(radius + 4, 9) css px of a drawn handle's centre — or, for
+   * the target end, anywhere in the selected line's drawn head (the head is
+   * part of the target grip). Null otherwise. */
+  private editHandleAt(clientX: number, clientY: number): { target: PickTarget; point: THREE.Vector3; id: number } | null {
+    const chrome = this.editChrome
+    if (!chrome) return null
+    const rect = this.canvas.getBoundingClientRect()
+    const cam = this.rig.camera
+    cam.updateMatrixWorld()
+    this.connLayer.updateWorldMatrix(true, false)
+    const layerM = this.connLayer.matrixWorld
+    const dark = this.palette?.dark === true
+    let best: { target: PickTarget; point: THREE.Vector3; id: number; d: number } | null = null
+    for (const h of chrome.items) {
+      if (!h.visible || !h.pick) continue
+      const w = new THREE.Vector3(h.x, h.y, h.z).applyMatrix4(layerM)
+      const p = w.clone().project(cam)
+      if (p.z < -1 || p.z > 1) continue
+      const sx = rect.left + ((p.x + 1) / 2) * rect.width
+      const sy = rect.top + ((1 - p.y) / 2) * rect.height
+      const d = Math.hypot(sx - clientX, sy - clientY)
+      if (d <= handleHitRadius(handleStyle(h.kind, dark).diameter) && (!best || d < best.d)) best = { target: h.pick, point: w, id: h.id, d }
+    }
+    if (best) return best
+    // the head: the target grip
+    const arrow = this.arrowDebug.find((a) => a.connId === chrome.connId)
+    if (!arrow || !chrome.items.some((h) => h.role === 'knob')) return null
+    const tri = this.inkHeadAt(arrow, cam, rect.height).tri.map((q) => {
+      const w = new THREE.Vector3(q.x, q.y, q.z).applyMatrix4(layerM)
+      const p = w.clone().project(cam)
+      return { x: rect.left + ((p.x + 1) / 2) * rect.width, y: rect.top + ((1 - p.y) / 2) * rect.height, w }
+    })
+    const side = (a: { x: number; y: number }, b: { x: number; y: number }) => (b.x - a.x) * (clientY - a.y) - (b.y - a.y) * (clientX - a.x)
+    const s1 = side(tri[0], tri[1])
+    const s2 = side(tri[1], tri[2])
+    const s3 = side(tri[2], tri[0])
+    if ((s1 >= 0 && s2 >= 0 && s3 >= 0) || (s1 <= 0 && s2 <= 0 && s3 <= 0)) {
+      return { target: { kind: 'connEndpoint', id: chrome.connId, end: 'target' }, point: tri[0].w, id: 1 }
+    }
+    return null
+  }
+
   // ── picking & pointer interaction ──────────────────────────────────────────
 
   private ndc(e: PointerEvent | WheelEvent): THREE.Vector2 {
@@ -5397,6 +10053,12 @@ export class Scene3D {
     clientY: number,
     kinds?: ReadonlySet<PickTarget['kind']>,
   ): { target: PickTarget; point: THREE.Vector3 } | null {
+    // the lit edit handles draw above everything on the layer (plates
+    // included) and pick first, on screen (selected spec §7)
+    if (!this.readonly_ && (!kinds || kinds.has('connEndpoint') || kinds.has('connWaypoint'))) {
+      const h = this.editHandleAt(clientX, clientY)
+      if (h && (!kinds || kinds.has(h.target.kind))) return { target: h.target, point: h.point }
+    }
     const rect = this.canvas.getBoundingClientRect()
     this.raycaster.setFromCamera(
       new THREE.Vector2(((clientX - rect.left) / rect.width) * 2 - 1, -((clientY - rect.top) / rect.height) * 2 + 1),
@@ -5407,10 +10069,19 @@ export class Scene3D {
     // them and hit whatever sits behind. Refresh matrices before picking.
     this.scene.updateMatrixWorld()
     const hits = this.raycaster.intersectObjects(this.pickables, false)
+    // a lit ink line is picked on screen (inkLineAt); what the ray meets
+    // before the line's plane — a card, a label plate — still wins (the
+    // ray's distance to the line's own height, not to its centreline: a
+    // click a few px nearer the camera than the line meets a platform under
+    // it nearer than the centreline point)
+    const line = !kinds || kinds.has('connection') ? this.inkLineAt(clientX, clientY) : null
+    const lineHit = line ? { target: { kind: 'connection', id: line.id } satisfies PickTarget, point: line.point } : null
+    const lineDist = line ? (this.raycaster.ray.distanceToPlane(new THREE.Plane(new THREE.Vector3(0, 1, 0), -line.point.y)) ?? line.distance) : 0
     for (const hit of hits) {
       // Raycaster does NOT skip invisible meshes — an LOD-hidden decoration
       // (e.g. the expand glyph on a far-away card) must not swallow the click.
       if (!hit.object.visible) continue
+      if (lineHit && lineDist < hit.distance - 0.5) return lineHit
       const voxelIds = hit.object.userData.voxelIds as string[] | undefined
       if (voxelIds && hit.instanceId !== undefined) {
         const id = voxelIds[hit.instanceId]
@@ -5420,7 +10091,7 @@ export class Scene3D {
       const pick = hit.object.userData.pick as PickTarget | undefined
       if (pick && (!kinds || kinds.has(pick.kind))) return { target: pick, point: hit.point }
     }
-    return null
+    return lineHit
   }
 
   private pick(e: PointerEvent): { target: PickTarget; point: THREE.Vector3 } | null {
@@ -5442,8 +10113,11 @@ export class Scene3D {
       fn: (e: HTMLElementEventMap[K]) => void,
       opts?: AddEventListenerOptions,
     ) => {
-      canvas.addEventListener(type, fn as EventListener, opts)
-      this.detachFns.push(() => canvas.removeEventListener(type, fn as EventListener))
+      // every canvas handler is attributed in slowFrameLog as `on:<type>`
+      // (a gesture's first pick can be the hitch, not the frame)
+      const timed = (e: Event) => this.timedTask(`on:${type}`, () => fn(e as HTMLElementEventMap[K]))
+      canvas.addEventListener(type, timed, opts)
+      this.detachFns.push(() => canvas.removeEventListener(type, timed))
     }
 
     // GL context resilience: three's own handlers run first (registered
@@ -5467,6 +10141,10 @@ export class Scene3D {
       // Renderer-level profile state and the PMREM env texture died with the
       // old GL context — re-apply before the rebuild repaints.
       this.applyRenderProfile({ forceEnvRefresh: true })
+      // the kept connection programs died with the context too: keep the
+      // new context's own (keepConnProgram keys by the program cache key)
+      for (const m of this.connProgramKeepers.values()) m.dispose()
+      this.connProgramKeepers.clear()
       this.buildSignature = '' // bust the signature → rebuild() does the full pass
       this.rebuild()
     }
@@ -5514,10 +10192,15 @@ export class Scene3D {
         if (t.kind === 'connEndpoint') {
           p.mode = 'connEdit'
           this.connEdit = { mode: 'endpoint', connId: t.id, end: t.end, preview: null, hoverShapeId: null }
+          // pressed: coral-800 (the lit handles)
+          this.handleUniforms.uPressId.value = t.end === 'source' ? 0 : 1
+          this.requestRender()
           return
         }
         if (t.kind === 'connWaypoint') {
           const conn = this.data.connections.find((c) => c.id === t.id)
+          this.handleUniforms.uPressId.value = 2 + t.index
+          this.requestRender()
           p.mode = 'connEdit'
           this.connEdit = {
             mode: 'waypoint',
@@ -5536,8 +10219,11 @@ export class Scene3D {
             this.connEdit = {
               mode: 'label',
               connId: t.id,
-              t: conn.labelPosition ?? 0.5,
-              offset: Math.max(-40, Math.min(40, conn.labelOffset ?? 0)),
+              // start from where the label is DRAWN: a lit label may have
+              // slid along its wire (or nudged across it) to miss a card, so
+              // its stored (t, offset) is not where the pointer grabbed it
+              t: this.connLabelOffsets.get(t.id)?.t ?? conn.labelPosition ?? 0.5,
+              offset: Math.max(-40, Math.min(40, this.connLabelOffsets.get(t.id)?.offset ?? conn.labelOffset ?? 0)),
             }
           }
           return
@@ -5606,6 +10292,21 @@ export class Scene3D {
         const hit = this.pick(e)
         const kind = hit?.target.kind
         this.setVoxelHover(hit?.target.kind === 'voxel' ? hit.target.id : null)
+        this.setConnLabelHover(hit && (hit.target.kind === 'connection' || hit.target.kind === 'connLabel') ? hit.target.id : null)
+        // a lit edit handle (or the selected head, the target grip): glow +
+        // grow — the head and the knob light together (id 1)
+        const ht = hit?.target
+        this.setHandleHover(
+          this.editChrome && ht
+            ? ht.kind === 'connEndpoint'
+              ? ht.end === 'source'
+                ? 0
+                : 1
+              : ht.kind === 'connWaypoint'
+                ? 2 + ht.index
+                : null
+            : null,
+        )
         canvas.style.cursor =
           !this.readonly_ && (kind === 'connEndpoint' || kind === 'connWaypoint')
             ? 'crosshair'
@@ -5654,6 +10355,7 @@ export class Scene3D {
         case 'dragNode':
         case 'dragGroup': {
           if (!p.id) break
+          this.setGridDragging(true)
           const baseY = this.nodeGroups.get(p.id)?.userData.baseY ?? 0
           const fp = this.floorPoint(e, baseY)
           if (!fp) break
@@ -5740,6 +10442,7 @@ export class Scene3D {
         const edit = this.connEdit
         p.mode = 'idle'
         this.connEdit = null
+        const buildsBefore = this.connLabelPerf.connBuilds
         if (edit && p.moved) {
           if (edit.mode === 'endpoint') {
             if (edit.preview && edit.hoverShapeId) {
@@ -5759,17 +10462,35 @@ export class Scene3D {
               edit.working.map((w) => ({ ...w })),
             )
           } else if (edit.mode === 'label') {
-            this.callbacks.onConnectionLabelMove?.(edit.connId, edit.t, edit.offset)
+            // the offset as DRAWN (a lit plate stays on its wire: the drag
+            // clamps it to the nudge — connLabelPlacement), not the pointer's
+            this.callbacks.onConnectionLabelMove?.(edit.connId, edit.t, this.connLabelOffsets.get(edit.connId)?.offset ?? edit.offset)
           }
           this.callbacks.onDragEnd?.()
         }
-        this.buildConnections() // drop in-flight overrides; store echo re-syncs
+        // drop in-flight overrides; store echo re-syncs — unless the echo
+        // already arrived inside the callbacks above (the store writes
+        // synchronously, and its setData rebuilt the layer from the new data
+        // with connEdit cleared): building the same data twice put two
+        // connection builds and two label first-slices in the pointerup task
+        // (connBuildMs 14-15 ms each on 0ob3fum, connect-freeze 2026-10-11)
+        if (this.connLabelPerf.connBuilds === buildsBefore) this.buildConnections()
         return
       }
       const wasDrag = p.mode === 'dragNode' || p.mode === 'dragGroup'
       const wasNode = p.mode === 'dragNode'
+      const wasCamera = p.mode === 'orbit' || p.mode === 'pan'
       const dragId = p.id
       const clicked = !p.moved
+      // An orbit / pan moves the camera IMMEDIATELY (rig.orbitBy / panBy, no
+      // tween), so the frameTick settle edge never fires for it: the camera
+      // has settled when the pointer is released. Without this the LOD and
+      // the connection labels' whole / abbreviated / hidden reading (TASK 2)
+      // stayed those of the framing the orbit started from: with it removed,
+      // a real-pointer orbit to polar 14 still read 4 whole / 6 hidden
+      // (reports/view3d-quality/tp4-labels-mutB) against 9 / 1 with it
+      // (tp4-labels-5, workbench).
+      if (wasCamera && p.moved) this.updateNodeLod()
       p.mode = 'idle'
       p.id = null
       if (wasDrag && !clicked) {
@@ -5800,6 +10521,7 @@ export class Scene3D {
       p.lastPos = null
       p.groupDrag = null
       this.clearSmartGuides(true)
+      this.setGridDragging(false)
       if (!clicked) return
       // click semantics: select what was under the pointer, clear on background
       const hit = this.pick(e)
@@ -5838,7 +10560,9 @@ export class Scene3D {
       p.lastPos = null
       p.groupDrag = null
       this.clearSmartGuides(true)
+      this.setGridDragging(false)
       if (wasPlacementDrag && p.moved) this.callbacks.onDragEnd?.()
+      this.handleUniforms.uPressId.value = -1
       canvas.style.cursor = 'default'
     })
 
@@ -5846,7 +10570,7 @@ export class Scene3D {
       e.preventDefault()
       // wheel dolly never sets pointer.mode — hold the showcase drift explicitly
       if (this.showcase) this.showcaseHoldUntil = performance.now() + SHOWCASE_RESUME_MS
-      this.rig.dollyBy(Math.exp((e.deltaY / 100) * 0.18))
+      this.rig.dollySmooth(Math.exp((e.deltaY / 100) * 0.18))
       // Dolly is immediate (no tween) so the settle-edge in frameTick never
       // fires — without this, labels hidden by the projected-size LOD stayed
       // hidden after wheel-zooming in until something else forced a rebuild
@@ -5855,6 +10579,12 @@ export class Scene3D {
     }, { passive: false })
 
     on('contextmenu', (e) => e.preventDefault())
+
+    // the pointer left the board: no connection is hovered any more
+    on('pointerleave', () => {
+      this.setConnLabelHover(null)
+      this.setHandleHover(null)
+    })
 
     on('dblclick', (e) => {
       const hit = this.pick(e as unknown as PointerEvent)
@@ -5931,199 +10661,22 @@ function blobTexture(): THREE.CanvasTexture {
   return tex
 }
 
+/** A comparable form of the label boxes the decor keeps off (0.01 px). */
+function labelBoxesSig(boxes: readonly { x: number; y: number; w: number; h: number }[]): string {
+  return boxes.map((b) => `${b.x.toFixed(2)},${b.y.toFixed(2)},${b.w.toFixed(2)},${b.h.toFixed(2)}`).join(';')
+}
+
+/** Arc length of a sampled route (world px). */
+function pathLength(pts: readonly { x: number; y: number }[]): number {
+  let total = 0
+  for (let i = 1; i < pts.length; i++) total += Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y)
+  return total
+}
+
 /** Flat ribbon (y=0 strip) through `pts` with the given width; optional
  * [dash, gap] pattern measured along arc length. `withT` adds per-vertex
  * `aT` (normalized arc 0=source→1=target) and `aV` (cross-axis −1→+1)
  * attributes for the focus-flow band shaders. */
-/** How far the cable body reaches past the routed border point INTO the node
- * wall — swallows the slab's bevel recession so the tube and boot always
- * touch porcelain, never hover beside it. */
-const CABLE_EMBED = 2.5
-/** Minimum spacing between two plugs on the SAME wall (the boot flares to
- * ~±5 px around its point — closer plugs merge into one blob). */
-const PLUG_PITCH = 14
-/** Plug points keep clear of the slab's rounded corners (CARD_RADIUS 14 —
- * an arriving tube there would end in the air): corner
- * radius + collar radius + breathing room. */
-const PLUG_CORNER_MARGIN = 20
-
-/** Inward (into the wall) horizontal direction for each rect face — plugs
- * enter PERPENDICULAR to the wall like real patch connectors, whatever the
- * routed approach angle. */
-const FACE_INWARD: Record<Face, { x: number; z: number }> = {
-  top: { x: 0, z: 1 },
-  bottom: { x: 0, z: -1 },
-  left: { x: 1, z: 0 },
-  right: { x: -1, z: 0 },
-}
-
-function drumInward(p: { x: number; y: number }, c: { x: number; z: number }): { x: number; z: number } {
-  const dx = c.x - p.x
-  const dz = c.z - p.y
-  const l = Math.hypot(dx, dz) || 1
-  return { x: dx / l, z: dz / l }
-}
-
-/** Point-in-rounded-rect (the slab SOLID, not its bounding rect): inside the
- * rect AND, within a corner square, inside the quarter circle. The e2e
- * `endInside` gate MUST test this solid — the rect version stayed green
- * while a corner arrival visibly died in the air. */
-function pointInRoundedRect(px: number, pz: number, rect: Rect, r: number): boolean {
-  if (px < rect.x || px > rect.x + rect.w || pz < rect.y || pz > rect.y + rect.h) return false
-  const qx = Math.max(rect.x + r - px, 0, px - (rect.x + rect.w - r))
-  const qz = Math.max(rect.y + r - pz, 0, pz - (rect.y + rect.h - r))
-  return qx * qx + qz * qz <= r * r
-}
-
-/** One cable end's wall facts (world heights) + the e2e-facing verdicts. */
-interface CableEndDebug {
-  plugY: number
-  wallBase: number
-  wallTop: number
-  endInside: boolean
-  /** Final plug point (world XZ) — pitch assertions. */
-  at: { x: number; z: number }
-  /** `${nodeId}:${face|drum}` — plugs sharing a wall must keep PLUG_PITCH. */
-  wallKey: string
-}
-interface CableDebugEntry {
-  id: string
-  from: CableEndDebug
-  to: CableEndDebug
-  /** World height of the mid-run rest. */
-  restY: number
-  /** World top of the higher support under the two ends. */
-  supportY: number
-}
-
-/** Move a routed endpoint from the standee's RECT border onto its drum wall:
- * the 2D anchor rides the rectangle, but the 3D store is a cylinder inset in
- * that footprint — without the snap the plug floats in the gap. */
-function snapOntoDrum(pts: { x: number; y: number }[], idx: number, c: { x: number; z: number }): void {
-  const p = pts[idx]
-  const dx = p.x - c.x
-  const dz = p.y - c.z
-  const len = Math.hypot(dx, dz)
-  const r = DRUM_R - 1.5
-  if (len <= r || len < 1e-3) return
-  pts[idx] = { x: c.x + (dx / len) * r, y: c.z + (dz / len) * r }
-}
-
-/** e2e-facing verdict for one end: where the plug lands on the wall span and
- * whether the embedded tube end is truly INSIDE the node SOLID (rounded rect
- * for cards/groups, cylinder for drums) — the regression net for cables that
- * visibly fail to connect. Mirrors buildCableTube's embed math exactly. */
-function cableEndDebug(
-  facts: { wallBase: number; wallTop: number; plugY: number; snapCenter: { x: number; z: number } | null },
-  p: { x: number; y: number },
-  inward: { x: number; z: number },
-  rect: Rect,
-  wallKey: string,
-): CableEndDebug {
-  const ex = p.x + inward.x * CABLE_EMBED
-  const ez = p.y + inward.z * CABLE_EMBED
-  const endInside = facts.snapCenter
-    ? Math.hypot(ex - facts.snapCenter.x, ez - facts.snapCenter.z) <= DRUM_R
-    : pointInRoundedRect(ex, ez, rect, CARD_RADIUS)
-  return {
-    plugY: facts.plugY,
-    wallBase: facts.wallBase,
-    wallTop: facts.wallTop,
-    endInside,
-    at: { x: p.x, z: p.y },
-    wallKey,
-  }
-}
-
-/** LIT-profile connection body — the reference image's patch cable. A round
- * tube follows the routed XZ samples with `cableYAt`'s vertical shape (leave
- * the source wall at plug height, ease down onto the support, rise into the
- * target wall), entering both walls horizontally through molded plugs:
- * collar flange straddling the wall face + boot on the cable, and on the
- * arrival end a widening cone tucked into the boot — the direction cue (no
- * floating flat arrow in the lit profile). Every part bakes its tone into
- * vertex colors and merges — ONE draw call per connection, exactly like the
- * ribbon it replaces. Dashed/dotted connections keep the flat ribbon (dash
- * gaps have no round-cable reading). */
-function buildCableTube(
-  pts: { x: number; y: number }[],
-  radius: number,
-  profile: CableProfile,
-  cableColor: THREE.Color,
-  plugColor: THREE.Color,
-  inwardFrom?: { x: number; z: number },
-  inwardTo?: { x: number; z: number },
-): THREE.BufferGeometry | null {
-  if (pts.length < 2) return null
-  let total = 0
-  const arcs: number[] = [0]
-  for (let i = 1; i < pts.length; i++) {
-    total += Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y)
-    arcs.push(total)
-  }
-  if (total < 6) return null
-
-  const v3 = pts.map((p, i) => new THREE.Vector3(p.x, cableYAt(profile, arcs[i] / total), p.y))
-  const safeDir = (a: THREE.Vector3, b: THREE.Vector3) => {
-    const d = new THREE.Vector3(a.x - b.x, 0, a.z - b.z)
-    return d.lengthSq() < 1e-6 ? new THREE.Vector3(1, 0, 0) : d.normalize()
-  }
-  // horizontal entry directions INTO each wall (perpendicular, from the
-  // caller's wall facts; chord fallback) + the border points, captured
-  // before the embed extension mutates the ends
-  const dirFrom = inwardFrom ? new THREE.Vector3(inwardFrom.x, 0, inwardFrom.z) : safeDir(v3[0], v3[1])
-  const dirTo = inwardTo ? new THREE.Vector3(inwardTo.x, 0, inwardTo.z) : safeDir(v3[v3.length - 1], v3[v3.length - 2])
-  const borderFrom = v3[0].clone()
-  const borderTo = v3[v3.length - 1].clone()
-  v3.unshift(borderFrom.clone().addScaledVector(dirFrom, CABLE_EMBED))
-  v3.push(borderTo.clone().addScaledVector(dirTo, CABLE_EMBED))
-
-  const curve = new THREE.CatmullRomCurve3(v3, false, 'centripetal', 0.5)
-  const tubularSegments = Math.max(32, Math.min(140, Math.round(total / 12)))
-  const parts: THREE.BufferGeometry[] = []
-  const bake = (geo: THREE.BufferGeometry, c: THREE.Color) => {
-    const count = geo.getAttribute('position').count
-    const colors = new Float32Array(count * 3)
-    for (let i = 0; i < count; i++) {
-      colors[i * 3] = c.r
-      colors[i * 3 + 1] = c.g
-      colors[i * 3 + 2] = c.b
-    }
-    geo.setAttribute('color', new THREE.BufferAttribute(colors, 3))
-    return geo
-  }
-  parts.push(bake(new THREE.TubeGeometry(curve, tubularSegments, radius, 10, false), cableColor))
-
-  // Flush GROMMET port (a collar+cone reads as a ribbed puck and a faceted
-  // spike up close; cables enter clean rounded ports; direction lives in the
-  // label + traveling dot, not an arrow cone). `along` is the part center's offset along the INWARD
-  // direction from the border point (negative = outside the wall):
-  //   cable → [strain-relief taper −4.8] → [sleeve −1.2] →
-  //   [grommet ring −0.2, hugging the wall face] → wall
-  const UP = new THREE.Vector3(0, 1, 0)
-  const plug = (border: THREE.Vector3, inward: THREE.Vector3) => {
-    const q = new THREE.Quaternion().setFromUnitVectors(UP, inward)
-    const at = (geo: THREE.BufferGeometry, along: number) => {
-      geo.applyQuaternion(q)
-      geo.translate(border.x + inward.x * along, border.y, border.z + inward.z * along)
-      parts.push(bake(geo, plugColor))
-    }
-    const ring = new THREE.TorusGeometry(radius * 1.45, radius * 0.55, 10, 18)
-    ring.rotateX(Math.PI / 2) // torus axis Z → Y, so the quaternion aims it
-    at(ring, -0.2)
-    at(new THREE.CylinderGeometry(radius * 1.25, radius * 1.25, 3.4, 18), -1.2)
-    // molded taper: wide at the sleeve, easing onto the cable — smooth side
-    // normals, no cone apex
-    at(new THREE.CylinderGeometry(radius * 1.4, radius * 1.05, 4.5, 18), -4.8)
-  }
-  plug(borderFrom, dirFrom)
-  plug(borderTo, dirTo)
-
-  const merged = mergeGeometries(parts)
-  for (const part of parts) part.dispose()
-  return merged
-}
-
 function buildRibbon(
   pts: { x: number; y: number }[],
   width: number,

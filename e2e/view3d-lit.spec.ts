@@ -198,9 +198,9 @@ test.describe('3D lit profile (Studio flagship)', () => {
       'the board ring around a caster carries a shadowed arc (real key-light shadows)',
     ).toBeGreaterThan(12)
 
-    // Cables render visibly: scan pointer-reachable connection picks and
+    // Lines render visibly: scan pointer-reachable connection picks and
     // require at least one pixel that clearly contrasts with bare board
-    // (the lit tube is a real depth-written surface — this must be easy).
+    // (the lit line is a dark ink on the board — this must be easy).
     const cable = await page.evaluate(() => {
       const s = window.__scene3d!
       const conns: number[] = []
@@ -220,46 +220,30 @@ test.describe('3D lit profile (Studio flagship)', () => {
       const f = floorPx.r + floorPx.g + floorPx.b
       return { maxDelta: Math.max(...conns.map((c) => Math.abs(c - f))), samples: conns.length }
     })
-    expect(cable, 'cables are pointer-reachable over bare board').not.toBeNull()
-    expect(cable!.maxDelta, 'the lit cable paints visibly against the paper').toBeGreaterThan(20)
+    expect(cable, 'lines are pointer-reachable over bare board').not.toBeNull()
+    expect(cable!.maxDelta, 'the lit line paints visibly against the paper').toBeGreaterThan(20)
 
-    // REGRESSION (USER BUG "ça ne se connecte pas") — cable anatomy: every
-    // end embeds inside its node's footprint with the plug ON the wall span
-    // (not hovering at layer height beside it), and the mid-run rests ABOVE
-    // the group platform the nodes stand on (the old board-relative sag
-    // buried the span inside the pedestal). This diagram covers both bug
-    // shapes: grouped cards AND a drum endpoint (rect-border → cylinder
-    // snap).
-    const cables = await page.evaluate(() => window.__scene3d!.cableInfo())
-    expect(cables.length, 'both solid connections build as cables').toBeGreaterThanOrEqual(2)
-    for (const c of cables) {
-      for (const [side, end] of [['from', c.from], ['to', c.to]] as const) {
-        // endInside tests the ROUNDED slab solid (CARD_RADIUS): the plain
-        // rect version stays green while a corner arrival dies in the air
-        expect(end.endInside, `${c.id} ${side} tip embeds inside its node solid`).toBe(true)
-        expect(end.plugY, `${c.id} ${side} plug above its wall base`).toBeGreaterThan(end.wallBase + 1)
-        expect(end.plugY, `${c.id} ${side} plug below its wall top`).toBeLessThan(end.wallTop - 1)
-      }
-      expect(c.restY, `${c.id} run rests above its support`).toBeGreaterThanOrEqual(c.supportY + 1)
+    // USER ROUND 2026-10-12 ("Remet les lignes connections comme le theme
+    // Clean"): every lit connection is Clean's flat ribbon + flat 2D head,
+    // inked (inkLine.ts) — no tube, cone or torus left in the layer, nothing
+    // of it casts a shadow, one ink core (+ at most one casing) per line, and
+    // each head's point on its target's edge (connectionPath's arrowTip, 2D
+    // parity). This diagram covers grouped cards AND a drum target.
+    const heads = await page.evaluate(() => window.__scene3d!.arrowheadInfo())
+    const layer = await page.evaluate(() => window.__scene3d!.connLayerInfo())
+    expect(heads.length, 'both connections draw').toBeGreaterThanOrEqual(2)
+    for (const h of heads) {
+      expect(h.kind, `${h.connId} draws a flat head`).toBe('flat')
+      expect(h.ink, `${h.connId} is an ink line`).toBe(true)
+      expect(Math.abs(h.tipClear), `${h.connId} head's point on its target's edge`).toBeLessThanOrEqual(1)
     }
-    // plugs sharing a wall keep their pitch — closer boots merge into one
-    // molten pretzel
-    const byWall = new Map<string, { x: number; z: number }[]>()
-    for (const c of cables) {
-      for (const end of [c.from, c.to]) {
-        const list = byWall.get(end.wallKey) ?? []
-        list.push(end.at)
-        byWall.set(end.wallKey, list)
-      }
+    for (const t of ['TubeGeometry', 'ConeGeometry', 'TorusGeometry', 'CylinderGeometry']) {
+      expect(layer.geometryTypes[t] ?? 0, `no ${t} in the connection layer`).toBe(0)
     }
-    for (const [wall, plugs] of byWall) {
-      for (let i = 0; i < plugs.length; i++) {
-        for (let j = i + 1; j < plugs.length; j++) {
-          const d = Math.hypot(plugs[i].x - plugs[j].x, plugs[i].z - plugs[j].z)
-          expect(d, `${wall} plugs keep their pitch`).toBeGreaterThanOrEqual(12)
-        }
-      }
-    }
+    expect(layer.shadowCasters, 'flat printed ink casts no shadow').toBe(0)
+    expect(layer.inkCores, 'one ink core per line').toBe(heads.length)
+    expect(layer.inkMeshes, 'at most a casing and a core per line').toBeLessThanOrEqual(2 * heads.length)
+    expect(layer.inkSet, 'the paper board takes the dark ink').toBe('darkInk')
 
     // WORKBENCH decor rides along on lit themes: pick a pack through the
     // REAL popover and the desk annulus outside the slab dresses too

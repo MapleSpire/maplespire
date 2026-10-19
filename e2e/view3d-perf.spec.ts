@@ -183,9 +183,24 @@ test.describe('3D perf gate', () => {
     expect(nearTexts).toBeGreaterThan(farTexts)
   })
 
-  // Fidelity guard: LOD must NEVER hide anything at a normal-sized diagram's
-  // default framing — the user works at a zoom where every card is clearly
-  // readable, so the full design (names, tiles, subtitles, pills) must render.
+  // Fidelity guard: LOD must NEVER hide anything at a zoom where every card is
+  // clearly readable — the full design (names, tiles, subtitles, pills) must
+  // render — and at a normal-sized diagram's DEFAULT framing every card keeps
+  // its identity.
+  //
+  // Why two framings (2026-10-09): this asserted the full design at the enter
+  // framing itself, which was then the bare preset pose — it ignored the
+  // floating side panels, so at this 1280x720 viewport the 8-card board was
+  // framed ~2.7x closer than what fits beside them (distance 896 vs 2385,
+  // measured) — at 1600x1000 the same pose put two cards off-screen and a
+  // drum under the bottom chrome (view3d quality loop 4 critic, cold
+  // reload). The enter framing is now the fit-to-screen one. A far-title
+  // mode once swapped every card's face there for a big Inter 700 title and
+  // hid its badge; the user rejected it on 2026-10-10 (shape font, font size
+  // and icon regressed against the base), so at the default framing every
+  // card shows its BASE title and icon tile — only the base projected-size
+  // LOD may thin the secondary content — and the full design is held at the
+  // readable zoom.
   test('LOD hides nothing at a normal-sized diagram default framing (no fidelity loss)', async ({ page }) => {
     await loginIfNeeded(page)
     await importDsl(page, bigDsl(8))
@@ -193,6 +208,23 @@ test.describe('3D perf gate', () => {
     await enter3d(page)
     const s = await page.evaluate(() => window.__scene3d!.sceneStats())
     expect(s.nodes).toBe(8)
-    expect(s.visibleTexts).toBe(s.texts) // every built text block is on screen
+    // default framing: every card shows its base title and icon tile
+    const faces = await page.evaluate(() => window.__scene3d!.nodeFaces())
+    expect(faces).toHaveLength(8)
+    for (const f of faces) {
+      expect(f.title, `card ${f.id}: base title`).toEqual({ font: 'inter600', size: 13, visible: true })
+      expect(f.badge, `card ${f.id}: icon tile`).toEqual({ visible: true, scale: 1 })
+      expect(f.foreignFonts).toEqual([])
+    }
+    // a readable zoom (about half the fit distance: near titles ~9.6 px caps)
+    await page.evaluate(() => {
+      const sc = window.__scene3d!
+      const pose = sc.getPose()
+      sc.focusWorld(pose.targetX, pose.targetZ, pose.distance * 0.45)
+    })
+    await page.waitForFunction(() => !window.__scene3d!.isCameraAnimating(), undefined, { timeout: 15000 })
+    await page.waitForTimeout(300)
+    const near = await page.evaluate(() => window.__scene3d!.sceneStats())
+    expect(near.visibleTexts).toBe(near.texts) // every built text block is on screen
   })
 })

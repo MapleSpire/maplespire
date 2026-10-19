@@ -99,6 +99,64 @@ export function isDark(color: string): boolean {
   return (c.r * 299 + c.g * 587 + c.b * 114) / 1000 < 128
 }
 
+function channelLuminance(v: number): number {
+  const s = v / 255
+  return s <= 0.03928 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4
+}
+
+function luminance(c: RGBA): number {
+  return 0.2126 * channelLuminance(c.r) + 0.7152 * channelLuminance(c.g) + 0.0722 * channelLuminance(c.b)
+}
+
+/** WCAG 2 contrast ratio of `fg` over `bg` (fg alpha is composited onto an
+ * opaque bg first — a translucent grey reads as the blend, not the grey).
+ * Unparseable input returns 21 so callers never "fix" what they cannot read. */
+export function contrastRatio(fg: string, bg: string): number {
+  const f = parseColor(fg)
+  const b = parseColor(bg)
+  if (!f || !b) return 21
+  const over = {
+    r: f.r * f.a + b.r * (1 - f.a),
+    g: f.g * f.a + b.g * (1 - f.a),
+    b: f.b * f.a + b.b * (1 - f.a),
+    a: 1,
+  }
+  const l1 = luminance(over)
+  const l2 = luminance(b)
+  return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05)
+}
+
+/** The contrast floor of the lit board's SMALL ink — card subtitles (10.5
+ * Inter), type pills (10) and connection labels — against the surface it is
+ * printed on: WCAG AAA (7:1), not AA. These glyphs are 1-2 device px thick at
+ * the default framings, so antialiasing alone mixes most of each stroke with
+ * the surface: at 4.5:1 the subtitle grey read "near-white on cream" in
+ * view3d quality loop 4 r3 (workbench-labels.png). */
+export const LIT_SMALL_INK_CONTRAST = 7
+
+/** `fg` as an OPAQUE color with at least `min`:1 contrast on `bg`: the
+ * composited color is mixed toward black (light bg) or white (dark bg) in
+ * small steps until it clears the floor. Already-readable colors come back
+ * opaque but otherwise unchanged. */
+export function ensureContrast(fg: string, bg: string, min = 4.5): string {
+  const f = parseColor(fg)
+  const b = parseColor(bg)
+  if (!f || !b) return fg
+  const opaque = rgbaStr({
+    r: f.r * f.a + b.r * (1 - f.a),
+    g: f.g * f.a + b.g * (1 - f.a),
+    b: f.b * f.a + b.b * (1 - f.a),
+    a: 1,
+  })
+  if (contrastRatio(opaque, bg) >= min) return opaque
+  const pole = isDark(bg) ? '#FFFFFF' : '#000000'
+  for (let t = 0.05; t < 1; t += 0.05) {
+    const next = mixColors(opaque, pole, t)
+    if (contrastRatio(next, bg) >= min) return next
+  }
+  return mixColors(opaque, pole, 1)
+}
+
 /** Split a css color into an opaque color string + alpha (three materials take
  * color and opacity separately). */
 export function colorAlpha(css: string): { color: string; alpha: number } {

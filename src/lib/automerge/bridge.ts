@@ -56,7 +56,8 @@ import {
   resolvedWorkspaceFor,
   type WorkspaceBinding,
 } from './workspaceBinding'
-import { reconcile } from './reconcile'
+import { applyCollectionReconcile, planCollectionReconcile, reconcile, reconcileIsNoop } from './reconcile'
+import { applyDiagramViewFields, classifyDiagramViewEdit } from './diagramViewWrite'
 import { syncModelIndex, resetModelIndexSync, applyOffWindowEditsToIndex, notifyServerInvalidation } from '../modelQuery/indexSync'
 import { isBootFromServerEnabled } from '../modelQuery/flag'
 import { isServerReadModelEnabled } from '../modelQuery/tierFlag'
@@ -287,6 +288,10 @@ const writeScheduler = new PlacementWriteScheduler(() => {
   }
 })
 let pendingNormalWrite = false
+/** Diagrams whose only pending durable change is a VIEW field
+ * (`diagramViewWrite.ts`). Drained by flushWrite's targeted branch when the
+ * diagram is the active one and no full write is pending. */
+let pendingViewDiagramIds = new Set<string>()
 let switching: Promise<void> | null = null
 let netCleanups: Array<() => void> = []
 let serverProjectionRequestSequence = 0
@@ -1514,7 +1519,38 @@ function rebuildConnectionRoute(docs: (ConnectionShard | undefined)[]): void {
 }
 
 /**
- * Per-shard model write — replaces the monolithic
+ * `reconcile(shard[key], byIdMap(bucket))` restricted to the entities that
+ * differ from what the shard already holds (`planCollectionReconcile`, read
+ * against the materialized doc before the change). Measured 2026-10-11
+ * (a Playwright connect-freeze probe, never committed; 739-diagram landscape): with the registry
+ * pre-diff in place, this full-bucket walk was the largest remaining piece of
+ * a connect's flush — 55 of ~100 ms — to add ONE connection. A shard whose doc
+ * cannot be read, or holds no such collection, takes the original call.
+ */
+function reconcileModelShardBucket(
+  handle: DocHandle<ObjectShard> | DocHandle<ConnectionShard>,
+  key: 'objects' | 'connections',
+  bucket: readonly { id: string }[],
+): void {
+  const target = byIdMap(bucket) as Record<string, unknown>
+  const materialized = (handle.doc() as unknown as Record<string, Record<string, unknown> | undefined> | undefined)?.[key]
+  // Only a by-id MAP can be planned key by key; an array (a corrupt or
+  // foreign shard) takes the original call, whose reconcile handles kinds.
+  if (!materialized || typeof materialized !== 'object' || Array.isArray(materialized)) {
+    changeAndTrack(handle as unknown as DocHandle<Record<string, unknown>>, (s) => reconcile(s[key], target))
+    return
+  }
+  const plan = planCollectionReconcile(materialized, target)
+  if (!plan) return
+  changeAndTrack(handle as unknown as DocHandle<Record<string, unknown>>, (s) => {
+    const draft = s[key]
+    if (draft && typeof draft === 'object' && !Array.isArray(draft)) applyCollectionReconcile(draft as Record<string, unknown>, target, plan)
+    else reconcile(draft, target)
+  })
+}
+
+/**
+ * Per-shard model write (Slice 3) — replaces the monolithic
  * `modelHandle.change(reconcile(wholeModel))`. Routes objects/connections to shards
  * (stable fill, new shards on overflow) and reconciles ONLY the shards whose slice
  * actually changed (per-shard ref guard via `lastObject|ConnectionShardSlices`), so
@@ -1557,7 +1593,7 @@ function writeModelShards(
   const objBuckets = partitionByShard(objects, objPlan.route, objectShardHandles.length)
   for (let i = 0; i < objBuckets.length; i++) {
     if (!sameRefs(objBuckets[i], lastObjectShardSlices[i] ?? [])) {
-      changeAndTrack(objectShardHandles[i], (s) => reconcile(s.objects, byIdMap(objBuckets[i])))
+      reconcileModelShardBucket(objectShardHandles[i], 'objects', objBuckets[i])
       lastObjectShardSlices[i] = objBuckets[i]
     }
   }
@@ -1582,7 +1618,7 @@ function writeModelShards(
   const connBuckets = partitionByShard(connections, connPlan.route, connectionShardHandles.length)
   for (let i = 0; i < connBuckets.length; i++) {
     if (!sameRefs(connBuckets[i], lastConnectionShardSlices[i] ?? [])) {
-      changeAndTrack(connectionShardHandles[i], (s) => reconcile(s.connections, byIdMap(connBuckets[i])))
+      reconcileModelShardBucket(connectionShardHandles[i], 'connections', connBuckets[i])
       lastConnectionShardSlices[i] = connBuckets[i]
     }
   }
@@ -4925,31 +4961,61 @@ function flushWrite(): void {
   // Common drag path: only diagram-scoped positions changed. Avoid rebuilding
   // 30k registry metas or reconciling every DiagramDoc field; one targeted
   // Automerge change is proportional to the shapes in this coalesced batch.
+  //
+  // View-settings edits (3D decor, skin, connection animation style) take the
+  // same door: they live only in the active DiagramDoc, so one targeted
+  // change replaces the ensureDiagramDoc loop + registry meta rebuild +
+  // whole-doc reconcile that froze a decor pick for 305 ms
+  // (diagramViewWrite.ts carries the measurement). A view edit for a
+  // diagram that is no longer active, or for a session-local summary diagram
+  // (whose bootstrap cache `writeSummaryLocalRegistry` refreshes), falls
+  // through to the full write, which (as before this fast path) persists only
+  // the ACTIVE diagram's doc: a view edit on a non-active diagram is not
+  // written by either path. The store-driven switch flushes first
+  // (onStoreChange → writeScheduler.flushNow before switchActiveDiagram), so
+  // the ordinary pick-then-navigate sequence still lands.
   const placementOnly = !pendingNormalWrite
   pendingNormalWrite = false
+  const viewDiagramIds = pendingViewDiagramIds
+  pendingViewDiagramIds = new Set()
+  const placementTargetable = !placementSnapshot || (
+    placementSnapshot.connections.length === 0
+    && placementSnapshot.groups.every((group) => group.autoSize === undefined)
+  )
+  const viewDiagram = viewDiagramIds.size > 0
+    && activeDiagramId
+    && [...viewDiagramIds].every((id) => id === activeDiagramId)
+    && !(registrySummaryOnly && summaryLocalDiagramIds.has(activeDiagramId))
+    ? state.diagrams.find((diagram) => diagram.id === activeDiagramId)
+    : undefined
+  const viewTargetable = viewDiagramIds.size === 0 || viewDiagram !== undefined
   if (
     placementOnly
-    && placementSnapshot
-    && placementSnapshot.connections.length === 0
-    && placementSnapshot.groups.every((group) => group.autoSize === undefined)
+    && (placementSnapshot || viewDiagram)
+    && placementTargetable
+    && viewTargetable
     && activeDiagramHandle
     && activeDiagramId
   ) {
     changeAndTrack(activeDiagramHandle, (doc) => {
-      applyPlacementSnapshotToDiagramDoc(doc, placementSnapshot)
+      if (placementSnapshot) applyPlacementSnapshotToDiagramDoc(doc, placementSnapshot)
+      if (viewDiagram) applyDiagramViewFields(doc, viewDiagram)
     })
-    acknowledgePlacementSnapshot(
-      placementWorkspaceKey,
-      activeDiagramId,
-      placementSnapshot,
-      activeDiagramHandle.documentId,
-    )
-    markClientTimeline('placement.flush', {
-      mode: 'targeted',
-      objects: placementSnapshot.objects.length,
-      groups: placementSnapshot.groups.length,
-      coalescedRevision: placementSnapshot.throughRevision,
-    })
+    if (placementSnapshot) {
+      acknowledgePlacementSnapshot(
+        placementWorkspaceKey,
+        activeDiagramId,
+        placementSnapshot,
+        activeDiagramHandle.documentId,
+      )
+      markClientTimeline('placement.flush', {
+        mode: 'targeted',
+        objects: placementSnapshot.objects.length,
+        groups: placementSnapshot.groups.length,
+        coalescedRevision: placementSnapshot.throughRevision,
+      })
+    }
+    if (viewDiagram) markClientTimeline('diagramView.flush', { mode: 'targeted' })
     return
   }
 
@@ -5052,7 +5118,7 @@ function flushWrite(): void {
   // A FROZEN contract gets the same empty plan a summary session gets, and for
   // the same reason one level up: the server owns registry membership now. Both
   // loops below iterate the plan, so an empty plan is the whole freeze —
-  // `desiredMetas` is emptied alongside it so nothing is even built for it.
+  // nothing is even built for it (metas are built per planned id only).
   const registryPlan = contractFrozen
     ? { reconcile: [], placeIds: [] }
     : planRegistryWrites({
@@ -5063,13 +5129,18 @@ function flushWrite(): void {
       })),
     })
 
-  // Build the desired meta for every store diagram.
+  // The desired meta of a diagram NOT yet in any shard (the placement loop
+  // below is its only consumer). Built on demand: building it for every store
+  // diagram up front cost ~200 ms per flush on a 739-diagram landscape (the
+  // non-active branch copies each existing meta's composition out of its shard
+  // doc) to place, usually, nothing. Same inputs as before: the reconcile loop
+  // below only deletes `shardByDiagramId` / `docUrlById` entries of REMOVED
+  // ids, which a placement id (present in the store) never is.
   // For the active diagram use the store's current composition (authoritative).
   // For non-active diagrams preserve the existing shard meta composition so we
   // never clobber it with empty arrays — the DiagramDoc is the authoritative
   // source when that diagram is active; the meta is kept in sync then.
-  const desiredMetas = new Map<string, DiagramMeta>()
-  for (const dg of registrySummaryOnly || contractFrozen ? [] : state.diagrams) {
+  const desiredMetaFor = (dg: Diagram): DiagramMeta => {
     const isActive = dg.id === activeDiagramId
     // For non-active diagrams, preserve the existing shard meta composition so we
     // never clobber it with the stub's arrays. But a BRAND-NEW non-active diagram
@@ -5100,16 +5171,58 @@ function flushWrite(): void {
           tombstoneConnections,
           tombstoneGroups
         )
-    desiredMetas.set(dg.id, buildMeta(dg, composition, docUrlById.get(dg.id) ?? ''))
+    return buildMeta(dg, composition, docUrlById.get(dg.id) ?? '')
   }
 
   // For each existing shard, reconcile it: remove deleted diagrams, update existing.
+  // First occurrence wins, as the `state.diagrams.find` it replaces did.
+  const storeDiagramById = new Map<string, Diagram>()
+  for (const diagram of state.diagrams) {
+    if (!storeDiagramById.has(diagram.id)) storeDiagramById.set(diagram.id, diagram)
+  }
+  // The meta an EXISTING registry entry must hold. ONE function for both the
+  // pre-diff (against the materialized shard doc) and the write (against the
+  // change draft), so the two can never disagree about what "current" means.
+  const registryMetaFor = (dg: Diagram, existing: DiagramMeta | undefined): DiagramMeta => {
+    const isActive = dg.id === activeDiagramId
+    // Non-active: preserve the existing composition, but still strip ids deleted this
+    // session so a delete reaches every diagram's registry (the bug a reload exposed:
+    // the deleted member lingered in non-active diagrams' objectIds). Active: the store
+    // is authoritative (deleteObject already cleaned it).
+    const composition = isActive
+      ? { objectIds: dg.objectIds, connectionIds: withoutLower(dg.connectionIds), groupIds: dg.groupIds }
+      : stripDeletedFromComposition(
+          {
+            objectIds: existing?.objectIds ?? [],
+            connectionIds: existing?.connectionIds ?? [],
+            groupIds: existing?.groupIds ?? [],
+          },
+          tombstoneObjects,
+          tombstoneConnections,
+          tombstoneGroups
+        )
+    return buildMeta(dg, composition, docUrlById.get(dg.id) ?? existing?.docUrl ?? '')
+  }
   for (const shardPlan of registryPlan.reconcile) {
     const handle = shardHandles[shardPlan.shardIndex]
     const shard = handle.doc()
     if (!shard) continue
     const toRemove = shardPlan.removeIds
-    const toUpdate = shardPlan.updateIds
+    // PRE-DIFF (perf, 2026-10-11): reconcile only the metas that differ from
+    // what the shard already holds. The reconcile of an equal meta writes
+    // nothing, but walking it through the change draft is what cost: connecting
+    // two shapes on a 739-diagram landscape spent 548 of a 655 ms flush here,
+    // rebuilding and re-reconciling 739 metas to persist ONE diagram's
+    // connectionIds (the connect-freeze probe, never committed; reconcile.ts
+    // `reconcileIsNoop` carries the read-vs-draft measurement). The check
+    // reads the materialized doc this change starts from, and a removal is
+    // never pre-diffed.
+    const toUpdate = shardPlan.updateIds.filter((id) => {
+      const dg = storeDiagramById.get(id)
+      if (!dg) return false
+      const existing = shard.diagrams[id]
+      return !reconcileIsNoop(existing, registryMetaFor(dg, existing))
+    })
     if (toRemove.length === 0 && toUpdate.length === 0) continue
     changeAndTrack(handle, (s) => {
       for (const id of toRemove) {
@@ -5118,31 +5231,12 @@ function flushWrite(): void {
         docUrlById.delete(id)
       }
       for (const id of toUpdate) {
-        const dg = state.diagrams.find((d) => d.id === id)
+        const dg = storeDiagramById.get(id)
         if (!dg) continue
-        const isActive = id === activeDiagramId
         // Read the shard's CURRENT meta from inside the change callback (the live
         // doc), not a pre-built lookup that can miss — so non-active composition
         // is preserved reliably and never clobbered with empty arrays.
-        const existing = s.diagrams[id]
-        // Non-active: preserve the existing composition, but still strip ids deleted this
-        // session so a delete reaches every diagram's registry (the bug a reload exposed:
-        // the deleted member lingered in non-active diagrams' objectIds). Active: the store
-        // is authoritative (deleteObject already cleaned it).
-        const composition = isActive
-          ? { objectIds: dg.objectIds, connectionIds: withoutLower(dg.connectionIds), groupIds: dg.groupIds }
-          : stripDeletedFromComposition(
-              {
-                objectIds: existing?.objectIds ?? [],
-                connectionIds: existing?.connectionIds ?? [],
-                groupIds: existing?.groupIds ?? [],
-              },
-              tombstoneObjects,
-              tombstoneConnections,
-              tombstoneGroups
-            )
-        const meta = buildMeta(dg, composition, docUrlById.get(id) ?? existing?.docUrl ?? '')
-        reconcile(s.diagrams[id], meta)
+        reconcile(s.diagrams[id], registryMetaFor(dg, s.diagrams[id]))
       }
     })
     // Dependent intents die with the removed diagrams: their carrier's
@@ -5179,7 +5273,7 @@ function flushWrite(): void {
     if (pendingDurableDiagramDocs.has(id)) continue
     const selection = findOrCreateShardForNew()
     const targetShard = selection.handle
-    const meta = desiredMetas.get(dg.id)!
+    const meta = desiredMetaFor(dg)
     changeAndTrack(targetShard, (s) => {
       s.diagrams[dg.id] = meta
     })
@@ -5573,6 +5667,14 @@ function scheduleWrite(kind: WriteKind = 'normal'): void {
   if (syncTransportConnected) useAutomergeStatus.getState().setStatus('saving')
 }
 
+/** A view-settings-only edit of one diagram (`classifyDiagramViewEdit`): same
+ * debounce as a normal edit, but it does not arm the full write. */
+function scheduleViewWrite(diagramId: string): void {
+  pendingViewDiagramIds.add(diagramId)
+  writeScheduler.request('normal')
+  if (syncTransportConnected) useAutomergeStatus.getState().setStatus('saving')
+}
+
 function acknowledgePlacementSnapshot(
   workspaceKey: string,
   diagramId: string,
@@ -5813,7 +5915,13 @@ function onStoreChange(state: ModelStoreSnapshot, previous: ModelStoreSnapshot):
   }
   // `currentDiagramId` is browser-local. A pure navigation must never publish
   // a no-op DiagramDoc/registry revision and invalidate the render cache.
-  if (durableSlicesChanged || explicitDeletesChanged) scheduleWrite(placementChanged ? 'placement' : 'normal')
+  if (durableSlicesChanged || explicitDeletesChanged) {
+    const viewOnlyDiagramId = !explicitDeletesChanged && !placementChanged
+      ? classifyDiagramViewEdit(state, previous)
+      : null
+    if (viewOnlyDiagramId) scheduleViewWrite(viewOnlyDiagramId)
+    else scheduleWrite(placementChanged ? 'placement' : 'normal')
+  }
   // Placements recorded for a NON-active diagram (applyDiagramLayout from a
   // list view) have no other in-session drain trigger.
   if (placementChanged) scheduleOffActivePlacementDrain()
@@ -7065,6 +7173,7 @@ export function stopBridge(): void {
     console.warn('pending overlay batch lifecycle persistence failed', error)
   })
   pendingNormalWrite = false
+  pendingViewDiagramIds = new Set()
   // The entity-intent journal itself is NOT cleared — surviving teardown is its
   // purpose; the per-workspace keying isolates the next session.
   entityIntentsHydrated = false
