@@ -9,6 +9,7 @@
 
 <p align="center">
   <a href="https://maplespire.ca">Website</a> ·
+  <a href="https://www.youtube.com/watch?v=ZCAHP50Zly8">Video tour</a> ·
   <a href="docs/getting-started.md">Get started</a> ·
   <a href="docs/running-locally.md">Develop locally</a> ·
   <a href="#sponsors">Sponsors</a> ·
@@ -17,7 +18,20 @@
 </p>
 
 <p align="center">
-  <img src="docs/screenshots/editor-2d-light.png" alt="The MapleSpire diagram editor: a System Context diagram with two systems and a labelled connection, the model outline on the left and diagram settings on the right" width="900">
+  <img src="docs/screenshots/tour-00-cover.jpg" alt="One living C4 model for every architecture diagram: the same FoodDash container diagram in the 2D editor and as a 3D board" width="900">
+</p>
+
+## Watch the 2½-minute tour
+
+<p align="center">
+  <a href="https://www.youtube.com/watch?v=ZCAHP50Zly8"><img src="docs/screenshots/youtube-tour.jpg" alt="Watch the MapleSpire product tour on YouTube" width="640"></a>
+</p>
+
+<p align="center">
+  From a system description to a living C4 model: AI, connected views, offline editing, decision records,
+  drafts, live collaboration, MCP and 3D.<br>
+  Audio and captions in 11 languages: pick yours in the player's settings.
+  More on the <a href="https://www.youtube.com/@MapleSpire">MapleSpire YouTube channel</a>.
 </p>
 
 ---
@@ -66,20 +80,28 @@ what, and keep the decisions that shaped it right next to it.
 
 <table>
   <tr>
-    <td width="50%"><img src="docs/screenshots/editor-3d-scenery.png" alt="The same diagram as an interactive 3D board, set in decorative scenery"></td>
-    <td width="50%"><img src="docs/screenshots/ai-assistant-3d.png" alt="The AI assistant summarising the architecture next to the 3D board, using a local LM Studio model"></td>
+    <td width="50%"><img src="docs/screenshots/tour-02-ai.jpg" alt="The AI assistant panel next to the FoodDash container diagram it generated from a description"></td>
+    <td width="50%"><img src="docs/screenshots/tour-03-model.jpg" alt="Order Service expanded in place: its components inside the container diagram"></td>
   </tr>
   <tr>
-    <td><b>3D board</b> — any diagram becomes an interactive 3D view, with optional scenery.</td>
-    <td><b>AI assistant</b> — ask about or edit the model with your own provider, here a local model (French interface).</td>
+    <td><b>AI assistant</b> — describe your system and it builds a real C4 model, with your own provider key.</td>
+    <td><b>One model</b> — every box is a real object: rename it once and every diagram, table and export follows.</td>
   </tr>
   <tr>
-    <td><img src="docs/screenshots/draft-merge.png" alt="Merging a draft: the list of changed connections and layouts before applying them to the live model"></td>
-    <td><img src="docs/screenshots/editor-2d-dark.png" alt="The diagram editor in dark mode with the French interface"></td>
+    <td><img src="docs/screenshots/tour-04-flows.jpg" alt="A flow playing on the diagram: the steps of a customer placing an order, the active message highlighted"></td>
+    <td><img src="docs/screenshots/tour-05-draft.jpg" alt="Merging a draft: the merge dialog listing the changes before they are applied to the live model"></td>
   </tr>
   <tr>
-    <td><b>Drafts</b> — propose changes on a fork of the model, review them, then merge.</td>
-    <td><b>Dark mode</b> — light, dark or system appearance, in English or French.</td>
+    <td><b>Flows</b> — step-by-step message sequences, played right on the diagram.</td>
+    <td><b>Drafts</b> — fork the model, review exactly what changed, resolve conflicts, merge.</td>
+  </tr>
+  <tr>
+    <td><img src="docs/screenshots/tour-06-adr.jpg" alt="An architecture decision record drafted by the AI assistant, linked to the elements it affects"></td>
+    <td><img src="docs/screenshots/tour-07-3d.jpg" alt="The FoodDash diagram as an interactive 3D board with scenery"></td>
+  </tr>
+  <tr>
+    <td><b>Decision records</b> — let the AI draft the ADR from your model; the "why" stays linked to the architecture.</td>
+    <td><b>3D board</b> — present any diagram in 3D, with themes, skins and decorations.</td>
   </tr>
 </table>
 
@@ -232,6 +254,7 @@ anglais.
 
 - Démarrer : [docs/getting-started.md](docs/getting-started.md)
 - Site web : [maplespire.ca](https://maplespire.ca)
+- Visite guidée en vidéo (audio et sous-titres en 11 langues, dont le français) : [YouTube](https://www.youtube.com/watch?v=ZCAHP50Zly8) · [chaîne MapleSpire](https://www.youtube.com/@MapleSpire)
 - Licence : AGPL-3.0-or-later.
 
 </details>
