@@ -42,7 +42,14 @@ export interface IconSearchInput {
   offset?: number
 }
 
-/** Ranked substring search: exact > prefix > word-start > substring > keyword. */
+/** A wordmark (artwork wider than 2.2:1) drops this much: below a square mark
+ * one tier down (an exact wordmark ranks under a prefix match), so the AI and
+ * the picker reach a legible logo first — a wordmark at 20 px is a grey line
+ * (defect 2026-10-18). Still listed: it can be the only artwork a brand has. */
+export const WORDMARK_PENALTY = 30
+
+/** Ranked substring search: exact > prefix > word-start > substring > keyword,
+ * wordmarks demoted by WORDMARK_PENALTY. */
 export function searchIcons(input: IconSearchInput): { total: number; icons: IconCatalogEntry[] } {
   const q = input.q?.trim().toLowerCase()
   const pack = input.pack?.trim().toLowerCase()
@@ -51,7 +58,7 @@ export function searchIcons(input: IconSearchInput): { total: number; icons: Ico
     if (pack && !(entry.packs ?? []).some((p) => p.toLowerCase() === pack)) continue
     if (input.shapeType && !iconCompatible(entry, input.shapeType)) continue
     if (!q) {
-      scored.push({ score: 0, entry })
+      scored.push({ score: entry.wordmark ? -WORDMARK_PENALTY : 0, entry })
       continue
     }
     const name = entry.name.toLowerCase()
@@ -64,7 +71,7 @@ export function searchIcons(input: IconSearchInput): { total: number; icons: Ico
       [...(entry.framework ?? []), ...(entry.protocol ?? [])].some((k) => k.toLowerCase().includes(q))
     )
       score = 20
-    if (score > 0) scored.push({ score, entry })
+    if (score > 0) scored.push({ score: entry.wordmark ? score - WORDMARK_PENALTY : score, entry })
   }
   scored.sort((a, b) => b.score - a.score || a.entry.name.localeCompare(b.entry.name))
   const offset = Math.max(0, Math.floor(input.offset ?? 0))

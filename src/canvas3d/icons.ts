@@ -29,6 +29,7 @@ import * as THREE from 'three'
 import type { C4Type, ShapeIconAssignment } from '../types'
 import { resolveTechnologyIconPath } from '../lib/technologies/iconPath'
 import { catalogIconArtwork, loadIconCatalog, shapeIconArtwork } from '../lib/technologies/shapeIconArtwork'
+import { containIconRect } from '../lib/technologies/iconFit'
 
 type IconElement =
   | { k: 'path'; d: string }
@@ -219,7 +220,9 @@ export function techIconTexture(
       ctx.beginPath()
       ctx.roundRect(0, 0, size, size, size * 0.2) // the 2D 4px@20px clip, scaled
       ctx.clip()
-      ctx.drawImage(img, 0, 0, size, size)
+      // Aspect-fit, as the 2D renderTechnologyIcon: never stretch a wide logo.
+      const fit = containIconRect(img.naturalWidth, img.naturalHeight, 0, 0, size)
+      ctx.drawImage(img, fit.x, fit.y, fit.width, fit.height)
       ctx.restore()
       tex.needsUpdate = true
       onReady?.()

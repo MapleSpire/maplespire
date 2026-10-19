@@ -71,7 +71,45 @@ npm run tech-icons:add -- --batch docs/tech-icons/batches/<file>.json --dry-run
 #   look at reports/tech-icons/add-preview.png (light on white, dark on #1E1E24)
 npm run tech-icons:add -- --batch docs/tech-icons/batches/<file>.json
 npm run tech-icons:audit -- --flag wordmark --sheet   # → reports/tech-icons/audit*.{json,png}
+node scripts/tech-icons/marks.mjs --out docs/tech-icons/batches/<date>-square-marks.json
+#   square symbols for wide entries; review reports/tech-icons/marks-preview-NN.png,
+#   drop the wrong-brand rows, then run add.mjs --batch on the file
+node scripts/tech-icons/audit.mjs --write-wide        # refresh src/lib/technologies/wideIconNames.json
 ```
+
+## Wordmarks (defect 2026-10-18)
+
+A wordmark drawn in the 20 px shape-icon box is a grey line. Three things now
+hold the line:
+
+* **The gate.** `src/lib/technologies/wideIconNames.json` lists every entry
+  whose light artwork is wider than 2.2:1, measured from the PNGs.
+  `tech-icons.test.mjs` fails when a new entry is wide and unlisted, when a
+  listed one is square now, and when the generated server catalog's
+  `wordmark` flags disagree with the list. Adding a name to the list is a
+  deliberate, reviewable act (`--write-wide`): do it only when the brand has no
+  symbol.
+* **Search.** `gen-icon-catalog.ts` marks those entries `wordmark: true`;
+  `searchIcons` (the AI's `search_icons` and the picker's `/api/icons`) drops
+  them 30 points, so an exact wordmark ranks under a prefix-matching square
+  mark, and the AI tool labels them in its result.
+* **Rendering.** 2D (`renderTechnologyIcon`, which the share viewer and the
+  PNG/PDF exports also draw through) and the 3D texture aspect-fit the image
+  (`src/lib/technologies/iconFit.ts`) instead of stretching it into the
+  square. Catalog PNGs are already 128×128, so this protects uploaded
+  technology logos of any shape; it cannot make a letterboxed wordmark
+  legible — only a square mark does.
+
+`batches/2026-10-18-square-marks.json` replaced 172 of the 713 wide entries
+(svgl → Devicon → Simple Icons, exact name or leading-words match). Thirteen
+candidates were rejected on review as a different brand or a worse picture:
+Atlassian Opsgenie (Atlassian), Adobe Commerce (Magento) (Adobe), Graphite
+(graphite.dev), Defender Web Guiding System and Defender Relay (Microsoft
+Defender), Element UI (Matrix Element), Neon by Marex (Neon DB), Copilot AI
+(Microsoft Copilot), Redox (Redox OS), Okta Fine-Grained Authorization (a
+Devicon mark that is not Okta's), Unity Catalog (Unity game engine), Gulp.js
+(a script wordmark, worse than the cup) and Elastic Application Performance
+Monitoring (monochrome outline, worse than the coloured cluster).
 
 * `discover` ranks what the catalog does **not** have: CNCF maturity, presence
   in several registries, a technology signal (consumer brands from Simple Icons
@@ -129,7 +167,18 @@ they can be reinstated with their reason:
 * JDBC shows the Oracle mark, as it showed the ORACLE wordmark before; a Java
   mark would arguably fit a Java API better.
 * 635 entries are flagged `wordmark` by the audit (2026-10-11). Only the Oracle
-  family was replaced; the rest need a symbol found per brand.
+  family was replaced then; on 2026-10-18 172 more got a square mark, and 541
+  entries wider than 2.2:1 remain (`wideIconNames.json`), with no symbol in
+  svgl, Devicon or Simple Icons under a matching name. CNCF square icons and
+  vendor kits were not searched for them.
+* The governed technology picker ("Choisir une icône", the org catalog from
+  `/api/technologies`) lists alphabetically and does not demote wordmarks;
+  only `/api/icons` (generic icons) and the AI's `search_icons` do.
+* The SVG export draws a type glyph, not the technology logo, so it has no
+  icon to fit.
+* Some Simple Icons marks are one dark brand colour (Apache Avro, WireGuard,
+  Elastic Cloud): their dark variant passes the 0.5 visibility check but reads
+  dim on the dark chrome.
 * `syslog-ng` currently shows the ORACLE wordmark — a wrong artwork, not just a
   bad framing; no trusted syslog-ng symbol was found in the registries above.
 * Valkey, Wasmtime, TiKV and OpenFeature exist in the registries only as

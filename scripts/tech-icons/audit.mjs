@@ -20,6 +20,7 @@
  *   node scripts/tech-icons/audit.mjs
  *   node scripts/tech-icons/audit.mjs --flag wordmark --sheet   # visual review
  *   node scripts/tech-icons/audit.mjs --name "Oracle Database" --sheet
+ *   node scripts/tech-icons/audit.mjs --write-wide   # refresh wideIconNames.json
  *
  * Flags (an entry can carry several):
  *   size              the PNG is not 128×128
@@ -41,9 +42,10 @@ import { basename, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
 import {
-  DARK_BG, ICONS_ROOT, LIGHT_BG, REPORTS_DIR, contactSheet, contentBox, decodePng,
+  DARK_BG, ICONS_ROOT, LIGHT_BG, REPORTS_DIR, ROOT, contactSheet, contentBox, decodePng,
   iconFilePath, parseCatalog, readCatalog, visibility,
 } from './lib.mjs'
+import { MAX_ASPECT } from './add.mjs'
 
 export function measure(png) {
   const image = decodePng(png)
@@ -57,6 +59,29 @@ export function measure(png) {
     rgba: image.rgba,
   }
 }
+
+/**
+ * Catalog names whose light artwork is wider than add.mjs's MAX_ASPECT —
+ * measured from the PNGs, sorted. `WIDE_ICONS_PATH` is the committed copy:
+ * tech-icons.test.mjs fails when a new entry joins it unlisted, and
+ * gen-icon-catalog.ts marks these `wordmark` so the AI's search_icons and the
+ * picker's /api/icons rank a square mark first (defect 2026-10-18: a
+ * wordmark drawn at 20 px is a grey line).
+ */
+export async function measureWideIcons(entries) {
+  const wide = new Set()
+  const cache = new Map()
+  for (const entry of entries) {
+    if (!entry.iconLight) continue
+    const path = iconFilePath(entry.iconLight)
+    if (!existsSync(path)) continue
+    if (!cache.has(path)) cache.set(path, measure(await readFile(path)).aspect)
+    if (cache.get(path) > MAX_ASPECT) wide.add(entry.name)
+  }
+  return [...wide].sort((a, b) => a.localeCompare(b, 'en'))
+}
+
+export const WIDE_ICONS_PATH = resolve(ROOT, 'src/lib/technologies/wideIconNames.json')
 
 export function flagsFor(light, dark) {
   const flags = []
@@ -76,9 +101,17 @@ async function main() {
       name: { type: 'string', multiple: true },
       sheet: { type: 'boolean', default: false },
       limit: { type: 'string', default: '80' },
+      'write-wide': { type: 'boolean', default: false },
     },
   })
   const entries = parseCatalog(await readCatalog())
+  if (args['write-wide']) {
+    const wide = await measureWideIcons(entries)
+    await writeFile(WIDE_ICONS_PATH, `${JSON.stringify(wide, null, 2)}\n`)
+    console.log(`${wide.length} entries wider than ${MAX_ASPECT}:1 → ${WIDE_ICONS_PATH}`)
+    console.log('Regenerate the server catalog: cd server && npx tsx scripts/gen-icon-catalog.ts')
+    return
+  }
   const wanted = args.name ? new Set(args.name) : null
   const results = []
   const cache = new Map()

@@ -15,6 +15,7 @@
 import type { C4Object, Connection, Group, Flow, Tag, SelectedItem, ConnectionHighlightStyle, ConnectionShape, Position, Comment, ShapeIconAssignment } from '../../types'
 import { resolveTechnologyIconPath } from '../../lib/technologies/iconPath'
 import { cancelIconCatalogWait, isIconCatalogLoading, shapeIconArtwork } from '../../lib/technologies/shapeIconArtwork'
+import { containIconRect } from '../../lib/technologies/iconFit'
 import { objectShortDescription } from '../../lib/objectDescription'
 import { objectTypeBadgeLabel } from '../../lib/objectTypeBadge'
 import { safeExternalHref } from '../../lib/objectLinks'
@@ -5279,7 +5280,10 @@ export class CanvasEngine {
         const icy = cy - 1
         ctx.roundRect(cx - half, icy - half, size, size, 4)
         ctx.clip()
-        ctx.drawImage(img, cx - half, icy - half, size, size)
+        // Aspect-fit: a non-square logo (a governed technology's upload) was
+        // stretched into the square (defect 2026-10-18).
+        const fit = containIconRect(img.naturalWidth, img.naturalHeight, cx - half, icy - half, size)
+        ctx.drawImage(img, fit.x, fit.y, fit.width, fit.height)
         ctx.restore()
         return
       }

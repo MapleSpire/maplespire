@@ -1,4 +1,330 @@
 {
+  "Akamai": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/akamai.svg",
+    "lightSha256": "6ad08dc2620f4a6bafae34cd3c8787ddf01c1cda5f0d940a53ae1800b820382c",
+    "dark": "derived (house dark rule)",
+    "fill": "#0096D6",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://www.akamai.com",
+    "files": [
+      "/icons/light/akamai-b2115028.png",
+      "/icons/dark/akamai-b2115028.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "American Express": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/americanexpress.svg",
+    "lightSha256": "ff353acb8288d8466d45f757dd02106fbf464362a663160edd3f8d3f2347e0f4",
+    "dark": "derived (house dark rule)",
+    "fill": "#2E77BC",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://commons.wikimedia.org/wiki/File:American_Express_logo_(2018).svg",
+    "files": [
+      "/icons/light/american-express-9770f503.png",
+      "/icons/dark/american-express-9770f503.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Apache Arrow": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/apachearrow.svg",
+    "lightSha256": "ad07fa0b330acdc12dfa8e08973d8902fd06af0f5cbb29f34aad068e120ad825",
+    "dark": "derived (house dark rule)",
+    "fill": "#000000",
+    "license": "Apache-2.0 (mark), CC0-1.0 (Simple Icons data)",
+    "origin": "https://arrow.apache.org/visual_identity",
+    "files": [
+      "/icons/light/apache-arrow-da1e2cae.png",
+      "/icons/dark/apache-arrow-cd9ffd1e.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Apache Avro": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/apacheavro.svg",
+    "lightSha256": "367cc4cbf3161316dc9beba7f0c5d7d2ee8f68bc05787ed0c04f4dc149371543",
+    "dark": "derived (house dark rule)",
+    "fill": "#30638E",
+    "license": "Apache-2.0 (mark), CC0-1.0 (Simple Icons data)",
+    "origin": "https://apache.org/logos",
+    "files": [
+      "/icons/light/apache-avro-7734cf4b.png",
+      "/icons/dark/apache-avro-7734cf4b.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Apache CloudStack": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/apachecloudstack.svg",
+    "lightSha256": "e8012fcd8b46b746715dfedfa5edb0fa887bca1525b0e6dfb3f9c0ae6c1c4e80",
+    "dark": "derived (house dark rule)",
+    "fill": "#2AA5DC",
+    "license": "Apache-2.0 (mark), CC0-1.0 (Simple Icons data)",
+    "origin": "https://apache.org/logos",
+    "files": [
+      "/icons/light/apache-cloudstack-523e1bbd.png",
+      "/icons/dark/apache-cloudstack-523e1bbd.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Apache Doris": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/apachedoris.svg",
+    "lightSha256": "469f482fc0b89eca254c5b01343d386dd6f5e5b81d519caa734f2f06f9f7885f",
+    "dark": "derived (house dark rule)",
+    "fill": "#444FD9",
+    "license": "Apache-2.0 (mark), CC0-1.0 (Simple Icons data)",
+    "origin": "https://apache.org/logos",
+    "files": [
+      "/icons/light/apache-doris-c2e0899f.png",
+      "/icons/dark/apache-doris-c2e0899f.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Apache ECharts": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/apacheecharts.svg",
+    "lightSha256": "fe74dda401d075f03aeb294f6476c981dd75f8b2008bd28737cd46dbf8b8a56f",
+    "dark": "derived (house dark rule)",
+    "fill": "#AA344D",
+    "license": "Apache-2.0 (mark), CC0-1.0 (Simple Icons data)",
+    "origin": "https://apache.org/logos",
+    "files": [
+      "/icons/light/apache-echarts-bd5b624a.png",
+      "/icons/dark/apache-echarts-bd5b624a.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Apache Jackrabbit": {
+    "source": "devicon",
+    "light": "https://cdn.jsdelivr.net/gh/devicons/devicon@2.17.0/icons/apache/apache-original.svg",
+    "lightSha256": "843d8cb7cf9a54eb70e09669d2fadf0b1b59419f92526e94b4359d9366b40ece",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; Devicon artwork (MIT)",
+    "files": [
+      "/icons/light/apache-jackrabbit-494f471c.png",
+      "/icons/dark/apache-jackrabbit-f896db34.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Apache NiFi": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/apachenifi.svg",
+    "lightSha256": "80fceb52e2e787c9f90063cf08dac981a9c5bd6699c0c3f67b774d8814a179c5",
+    "dark": "derived (house dark rule)",
+    "fill": "#728E9B",
+    "license": "Apache-2.0 (mark), CC0-1.0 (Simple Icons data)",
+    "origin": "https://apache.org/logos",
+    "files": [
+      "/icons/light/apache-nifi-b42ebb0f.png",
+      "/icons/dark/apache-nifi-f80c75ec.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Apache Parquet": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/apacheparquet.svg",
+    "lightSha256": "6ab5025044fab7e92b6845f212fe1125109cda39ac8b64514389a7e0480f47c6",
+    "dark": "derived (house dark rule)",
+    "fill": "#50ABF1",
+    "license": "Apache-2.0 (mark), CC0-1.0 (Simple Icons data)",
+    "origin": "https://apache.org/logos",
+    "files": [
+      "/icons/light/apache-parquet-415e5456.png",
+      "/icons/dark/apache-parquet-415e5456.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Apache Storm": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/apachestorm.svg",
+    "lightSha256": "c4bc680b27afc10e57b0450a973ea11e5a7b4efd407c3888e354fd6fb89c09a2",
+    "dark": "derived (house dark rule)",
+    "fill": "#225593",
+    "license": "Apache-2.0 (mark), CC0-1.0 (Simple Icons data)",
+    "origin": "https://apache.org/logos",
+    "files": [
+      "/icons/light/apache-storm-32dd608c.png",
+      "/icons/dark/apache-storm-32dd608c.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Apache Tika": {
+    "source": "devicon",
+    "light": "https://cdn.jsdelivr.net/gh/devicons/devicon@2.17.0/icons/apache/apache-original.svg",
+    "lightSha256": "843d8cb7cf9a54eb70e09669d2fadf0b1b59419f92526e94b4359d9366b40ece",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; Devicon artwork (MIT)",
+    "files": [
+      "/icons/light/apache-tika-494f471c.png",
+      "/icons/dark/apache-tika-f896db34.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Apollo GraphQL": {
+    "source": "devicon",
+    "light": "https://cdn.jsdelivr.net/gh/devicons/devicon@2.17.0/icons/apollographql/apollographql-original.svg",
+    "lightSha256": "35788a3c4cbe441da0ab29277d8e7bb764a79c2bcfb680e8bee6920d58acfa9f",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; Devicon artwork (MIT)",
+    "files": [
+      "/icons/light/apollo-graphql-4453d864.png",
+      "/icons/dark/apollo-graphql-d944ae0d.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Appium": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/appium.svg",
+    "lightSha256": "0abf1392bf00d1566c1326a143a7d58fd743b54b746c3c784aaaa04ac15ec40e",
+    "dark": "derived (house dark rule)",
+    "fill": "#EE376D",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://github.com/openjs-foundation/artwork/blob/270575392800eb17a02612203f6f0d5868c634a7/projects/appium/appium-icon-mono.svg",
+    "files": [
+      "/icons/light/appium-6d1cc5da.png",
+      "/icons/dark/appium-6d1cc5da.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Apple Pay": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/applepay.svg",
+    "lightSha256": "52e5e55305141d21eb560e0d217da9f5bf99de8cbaf456710e1e07e683a464a1",
+    "dark": "derived (house dark rule)",
+    "fill": "#000000",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://developer.apple.com/apple-pay/marketing",
+    "files": [
+      "/icons/light/apple-pay-dc362159.png",
+      "/icons/dark/apple-pay-170fc2df.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Argo Events": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/argo.svg",
+    "lightSha256": "82f01ed1da4aa8f87d0d88bbd6c86c45c051bdd0c513262d48022018dfad8259",
+    "dark": "derived (house dark rule)",
+    "fill": "#EF7B4D",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://github.com/cncf/artwork/blob/c2e619cdf85e8bac090ceca7c0834c5cfedf9426/projects/argo/icon/black/argo-icon-black.svg",
+    "files": [
+      "/icons/light/argo-events-de719e72.png",
+      "/icons/dark/argo-events-de719e72.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Argo Workflows": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/argo.svg",
+    "lightSha256": "82f01ed1da4aa8f87d0d88bbd6c86c45c051bdd0c513262d48022018dfad8259",
+    "dark": "derived (house dark rule)",
+    "fill": "#EF7B4D",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://github.com/cncf/artwork/blob/c2e619cdf85e8bac090ceca7c0834c5cfedf9426/projects/argo/icon/black/argo-icon-black.svg",
+    "files": [
+      "/icons/light/argo-workflows-de719e72.png",
+      "/icons/dark/argo-workflows-de719e72.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Aurelia": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/aurelia.svg",
+    "lightSha256": "00d1a5f0f9f91007794b048bf3e4e50022b1f99340d5e46b054950b742ab44e3",
+    "dark": "derived (house dark rule)",
+    "fill": "#ED2B88",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://aurelia.io",
+    "files": [
+      "/icons/light/aurelia-d8a67e21.png",
+      "/icons/dark/aurelia-d8a67e21.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Azure AI": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/azure.svg",
+    "lightSha256": "942a851dff182edca939226bbac4d2de98c36806db466ef008699cfce22478c1",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/azure-ai-c3c47dc1.png",
+      "/icons/dark/azure-ai-c3c47dc1.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Babylon.js": {
+    "source": "devicon",
+    "light": "https://cdn.jsdelivr.net/gh/devicons/devicon@2.17.0/icons/babylonjs/babylonjs-original.svg",
+    "lightSha256": "fd228ee81926305bad613b70ddfd50a43c43ae22897523a0434677c6ffe902de",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; Devicon artwork (MIT)",
+    "files": [
+      "/icons/light/babylon-js-e85ee1be.png",
+      "/icons/dark/babylon-js-e85ee1be.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Backblaze B2 Cloud Storage": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/backblaze.svg",
+    "lightSha256": "6d14c7226eafd00abf0b9eb633fd106dbfad2eae7d69faf48562a3676d71c734",
+    "dark": "derived (house dark rule)",
+    "fill": "#E21E29",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://www.backblaze.com/company/news.html",
+    "files": [
+      "/icons/light/backblaze-b2-cloud-storage-406e0463.png",
+      "/icons/dark/backblaze-b2-cloud-storage-406e0463.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Bank of America Online": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/bankofamerica.svg",
+    "lightSha256": "4af97000b06a925cf8ce6359855de2fbc502c59edcb10d26302e231d86fb8a02",
+    "dark": "derived (house dark rule)",
+    "fill": "#012169",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://www.bankofamerica.com",
+    "files": [
+      "/icons/light/bank-of-america-online-d8db197a.png",
+      "/icons/dark/bank-of-america-online-e624a9ac.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Barclays Online Banking": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/barclays.svg",
+    "lightSha256": "25330b9967dcfbe89e77cee37bfd2c76ce7073173a303a045df32ab2012f1b42",
+    "dark": "derived (house dark rule)",
+    "fill": "#00AEEF",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://home.barclays",
+    "files": [
+      "/icons/light/barclays-online-banking-5d899035.png",
+      "/icons/dark/barclays-online-banking-5d899035.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Baserow": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/baserow.svg",
+    "lightSha256": "19132895ad4bf5bc2642ea0f2359f982dc54f60468b80b1d9d0979521286e74f",
+    "dark": "derived (house dark rule)",
+    "fill": "#5190EF",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://baserow.io",
+    "files": [
+      "/icons/light/baserow-67d0995a.png",
+      "/icons/dark/baserow-67d0995a.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
   "Bazel": {
     "source": "devicon",
     "sourceVersion": "2.17.0",
@@ -25,6 +351,20 @@
     ],
     "addedAt": "2026-10-11"
   },
+  "Better Stack": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/betterstack.svg",
+    "lightSha256": "641d8d3b8c1bfa3a775f41c2da1f9f47b36358256b05b584653bf070099c302c",
+    "dark": "derived (house dark rule)",
+    "fill": "#000000",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://betterstack.com",
+    "files": [
+      "/icons/light/better-stack-0b9ea635.png",
+      "/icons/dark/better-stack-85ec8db6.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
   "Biome": {
     "source": "devicon",
     "sourceVersion": "2.17.0",
@@ -38,6 +378,20 @@
     ],
     "addedAt": "2026-10-11"
   },
+  "BNB Chain": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/bnbchain.svg",
+    "lightSha256": "f87fc08ebc90756e01b522392e1fd6396f72bc111d421ecf400b64869e6472f7",
+    "dark": "derived (house dark rule)",
+    "fill": "#F0B90B",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://www.bnbchain.org",
+    "files": [
+      "/icons/light/bnb-chain-f2aa36fb.png",
+      "/icons/dark/bnb-chain-f2aa36fb.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
   "Buildpacks": {
     "source": "cncf",
     "light": "https://raw.githubusercontent.com/cncf/artwork/main/projects/buildpacks/icon/color/buildpacks-icon-color.svg",
@@ -49,6 +403,62 @@
       "/icons/dark/buildpacks-dc64ea32.png"
     ],
     "addedAt": "2026-10-11"
+  },
+  "Bunny.net": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/bunnydotnet.svg",
+    "lightSha256": "bfc98bfc3ec157835184ea8b0ed2db19da3ddb8900d9a30e3ced0414c145837e",
+    "dark": "derived (house dark rule)",
+    "fill": "#FFAA49",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://bunny.net",
+    "files": [
+      "/icons/light/bunny-net-6f0ad750.png",
+      "/icons/dark/bunny-net-6f0ad750.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Caddy": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/caddy.svg",
+    "lightSha256": "3ce50619d72dd473413d0b774f8956691b36f7224f3850a08e23b4da1f69f3ff",
+    "dark": "derived (house dark rule)",
+    "fill": "#1F88C0",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://caddyserver.com",
+    "files": [
+      "/icons/light/caddy-8a6b858e.png",
+      "/icons/dark/caddy-8a6b858e.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Camunda": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/camunda.svg",
+    "lightSha256": "1f89f9f812f3b79a67c12809aa3760adb3cdaccadefe95feddba9e5c1e402ed3",
+    "dark": "derived (house dark rule)",
+    "fill": "#FC5D0D",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://camunda.com/brand",
+    "files": [
+      "/icons/light/camunda-7cfe6bbe.png",
+      "/icons/dark/camunda-7cfe6bbe.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Celery": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/celery.svg",
+    "lightSha256": "10deb22e3e052358ab1722b2e41619bdef863b2aeaf81475bd14d2031b236c67",
+    "dark": "derived (house dark rule)",
+    "fill": "#37814A",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://github.com/celery/celery/blob/4d77ddddb10797011dc10dd2e4e1e7a7467b8431/docs/images/favicon.ico",
+    "files": [
+      "/icons/light/celery-5b622e71.png",
+      "/icons/dark/celery-5b622e71.png"
+    ],
+    "addedAt": "2026-10-19"
   },
   "Ceph": {
     "source": "simple-icons",
@@ -89,6 +499,32 @@
     ],
     "addedAt": "2026-10-11"
   },
+  "Checkmarx": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/checkmarx.svg",
+    "lightSha256": "35ec9c97548055dcfac45ab8dca90349073468744f18230fe7c7bea3e8d48401",
+    "dark": "derived (house dark rule)",
+    "fill": "#54B848",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://www.checkmarx.com/resources/datasheets/",
+    "files": [
+      "/icons/light/checkmarx-4843b7c1.png",
+      "/icons/dark/checkmarx-4843b7c1.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Claude AI": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/claude-ai-icon.svg",
+    "lightSha256": "0df6dad23995f5a76c6db8cc2a4e646ff45bd7a0626ef98662a7025646e5eea1",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/claude-ai-60436faf.png",
+      "/icons/dark/claude-ai-60436faf.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
   "Cloud Custodian": {
     "source": "cncf",
     "light": "https://raw.githubusercontent.com/cncf/artwork/main/projects/cloudcustodian/icon/color/cloudcustodian-icon-color.svg",
@@ -100,6 +536,20 @@
       "/icons/dark/cloud-custodian-e0248534.png"
     ],
     "addedAt": "2026-10-11"
+  },
+  "Cloudera Data Platform": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/cloudera.svg",
+    "lightSha256": "9560b6826bdcade03cebeb5d34ae1ae8ee27589ed3bf02bacae016448950c0f2",
+    "dark": "derived (house dark rule)",
+    "fill": "#F96702",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://www.cloudera.com",
+    "files": [
+      "/icons/light/cloudera-data-platform-3cb16f93.png",
+      "/icons/dark/cloudera-data-platform-3cb16f93.png"
+    ],
+    "addedAt": "2026-10-19"
   },
   "CloudEvents": {
     "source": "cncf",
@@ -113,6 +563,20 @@
     ],
     "addedAt": "2026-10-11"
   },
+  "Coder": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/coder.svg",
+    "lightSha256": "a6d7395f0b062be87921ca07ded21a5a0e398eabdd28eda23929574941fa77ea",
+    "dark": "derived (house dark rule)",
+    "fill": "#090B0B",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://coder.com/brand#3-logos",
+    "files": [
+      "/icons/light/coder-0287c3b8.png",
+      "/icons/dark/coder-6c67805f.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
   "containerd": {
     "source": "cncf",
     "light": "https://raw.githubusercontent.com/cncf/artwork/main/projects/containerd/icon/color/containerd-icon-color.svg",
@@ -124,6 +588,20 @@
       "/icons/dark/containerd-02a075bf.png"
     ],
     "addedAt": "2026-10-11"
+  },
+  "Contentstack": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/contentstack.svg",
+    "lightSha256": "29f22597808f8ea9e263d6d6cace87a793ed9d71822affd13d55f5506981235e",
+    "dark": "derived (house dark rule)",
+    "fill": "#E74C3D",
+    "license": "custom (mark), CC0-1.0 (Simple Icons data)",
+    "origin": "https://www.contentstack.com",
+    "files": [
+      "/icons/light/contentstack-7b525e86.png",
+      "/icons/dark/contentstack-7b525e86.png"
+    ],
+    "addedAt": "2026-10-19"
   },
   "Contour": {
     "source": "cncf",
@@ -137,6 +615,32 @@
     ],
     "addedAt": "2026-10-11"
   },
+  "Convex": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/convex.svg",
+    "lightSha256": "4dafe466c51191efc7c1da64f7a8f46157d7aa5631f5d96e84a9e39abc3d1f17",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/convex-33a2a26a.png",
+      "/icons/dark/convex-33a2a26a.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Corona Renderer": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/coronarenderer.svg",
+    "lightSha256": "41a8b2184f59d5c92c06b7ea67a2241f970143e6b47586a0cdfe4b973ef43c7a",
+    "dark": "derived (house dark rule)",
+    "fill": "#E6502A",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://corona-renderer.com/about",
+    "files": [
+      "/icons/light/corona-renderer-93eb9210.png",
+      "/icons/dark/corona-renderer-93eb9210.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
   "Cortex": {
     "source": "cncf",
     "light": "https://raw.githubusercontent.com/cncf/artwork/main/projects/cortex/icon/color/cortex-icon-color.svg",
@@ -148,6 +652,20 @@
       "/icons/dark/cortex-57db3ed3.png"
     ],
     "addedAt": "2026-10-11"
+  },
+  "CrewAI": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/crewai.svg",
+    "lightSha256": "6551b4dae99b4143b7105280fc878ff465a762fd9149ea7bd80200fbe1285461",
+    "dark": "derived (house dark rule)",
+    "fill": "#FF5A50",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://github.com/crewAIInc/crewAI/blob/a7696d5aed7a85333735dde370fd9f0547aaabf5/docs/favicon.svg",
+    "files": [
+      "/icons/light/crewai-128b17e0.png",
+      "/icons/dark/crewai-128b17e0.png"
+    ],
+    "addedAt": "2026-10-19"
   },
   "CRI-O": {
     "source": "cncf",
@@ -161,6 +679,281 @@
     ],
     "addedAt": "2026-10-11"
   },
+  "Crossplane": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/crossplane.svg",
+    "lightSha256": "f07119b7eee065cf2d1b3eb1a3ae0456e404a35164f985527ab2604d9ab0ce6e",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/crossplane-1c65f0da.png",
+      "/icons/dark/crossplane-1c65f0da.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Cursor": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/cursor_light.svg",
+    "lightSha256": "c483c02f78eb2619778fdd959e72a9adfac4844854472cd2653d4cbfd60e4d71",
+    "dark": "https://svgl.app/library/cursor_dark.svg",
+    "darkSha256": "cd0e3e5d8991a4cdd4577f8896cd063105207665165c73e25a1ff918dd367eb7",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/cursor-098be0a4.png",
+      "/icons/dark/cursor-eda118a6.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "daisyUI": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/daisyui.svg",
+    "lightSha256": "abfef856207fa654b63cf52fd0cca64d7b6abdbda15007d656652769ece1ee18",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/daisyui-a711e35a.png",
+      "/icons/dark/daisyui-c8696e68.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Dask": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/dask.svg",
+    "lightSha256": "c004449d0f6efdadfbb19432d4ec0d91c463ad650a65eb75342185e46e28a110",
+    "dark": "derived (house dark rule)",
+    "fill": "#FC6E6B",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://github.com/dask/dask/blob/67e648922512615f94f8a90726423e721d0e3eb2/docs/source/images/dask_icon_black.svg",
+    "files": [
+      "/icons/light/dask-ce7f4d5a.png",
+      "/icons/dark/dask-ce7f4d5a.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Databricks": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/databricks.svg",
+    "lightSha256": "454aa3efdb318c655e3da2ea844e3577a9c47a20e24d20fff6489362176e5fe4",
+    "dark": "derived (house dark rule)",
+    "fill": "#FF3621",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://www.databricks.com",
+    "files": [
+      "/icons/light/databricks-f5f824cb.png",
+      "/icons/dark/databricks-f5f824cb.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Databricks DBRX LLM": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/databricks.svg",
+    "lightSha256": "454aa3efdb318c655e3da2ea844e3577a9c47a20e24d20fff6489362176e5fe4",
+    "dark": "derived (house dark rule)",
+    "fill": "#FF3621",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://www.databricks.com",
+    "files": [
+      "/icons/light/databricks-dbrx-llm-f5f824cb.png",
+      "/icons/dark/databricks-dbrx-llm-f5f824cb.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Databricks Genie API": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/databricks.svg",
+    "lightSha256": "454aa3efdb318c655e3da2ea844e3577a9c47a20e24d20fff6489362176e5fe4",
+    "dark": "derived (house dark rule)",
+    "fill": "#FF3621",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://www.databricks.com",
+    "files": [
+      "/icons/light/databricks-genie-api-f5f824cb.png",
+      "/icons/dark/databricks-genie-api-f5f824cb.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Databricks Notebook": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/databricks.svg",
+    "lightSha256": "454aa3efdb318c655e3da2ea844e3577a9c47a20e24d20fff6489362176e5fe4",
+    "dark": "derived (house dark rule)",
+    "fill": "#FF3621",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://www.databricks.com",
+    "files": [
+      "/icons/light/databricks-notebook-f5f824cb.png",
+      "/icons/dark/databricks-notebook-f5f824cb.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Databricks ODBC Drivers": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/databricks.svg",
+    "lightSha256": "454aa3efdb318c655e3da2ea844e3577a9c47a20e24d20fff6489362176e5fe4",
+    "dark": "derived (house dark rule)",
+    "fill": "#FF3621",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://www.databricks.com",
+    "files": [
+      "/icons/light/databricks-odbc-drivers-f5f824cb.png",
+      "/icons/dark/databricks-odbc-drivers-f5f824cb.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Databricks SQL Statement Execution API": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/databricks.svg",
+    "lightSha256": "454aa3efdb318c655e3da2ea844e3577a9c47a20e24d20fff6489362176e5fe4",
+    "dark": "derived (house dark rule)",
+    "fill": "#FF3621",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://www.databricks.com",
+    "files": [
+      "/icons/light/databricks-sql-statement-execution-api-f5f824cb.png",
+      "/icons/dark/databricks-sql-statement-execution-api-f5f824cb.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Databricks Token Management": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/databricks.svg",
+    "lightSha256": "454aa3efdb318c655e3da2ea844e3577a9c47a20e24d20fff6489362176e5fe4",
+    "dark": "derived (house dark rule)",
+    "fill": "#FF3621",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://www.databricks.com",
+    "files": [
+      "/icons/light/databricks-token-management-f5f824cb.png",
+      "/icons/dark/databricks-token-management-f5f824cb.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Databricks Unity Catalog": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/databricks.svg",
+    "lightSha256": "454aa3efdb318c655e3da2ea844e3577a9c47a20e24d20fff6489362176e5fe4",
+    "dark": "derived (house dark rule)",
+    "fill": "#FF3621",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://www.databricks.com",
+    "files": [
+      "/icons/light/databricks-unity-catalog-f5f824cb.png",
+      "/icons/dark/databricks-unity-catalog-f5f824cb.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Databricks Vector Database": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/databricks.svg",
+    "lightSha256": "454aa3efdb318c655e3da2ea844e3577a9c47a20e24d20fff6489362176e5fe4",
+    "dark": "derived (house dark rule)",
+    "fill": "#FF3621",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://www.databricks.com",
+    "files": [
+      "/icons/light/databricks-vector-database-f5f824cb.png",
+      "/icons/dark/databricks-vector-database-f5f824cb.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Databricks Vector Search Indexes": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/databricks.svg",
+    "lightSha256": "454aa3efdb318c655e3da2ea844e3577a9c47a20e24d20fff6489362176e5fe4",
+    "dark": "derived (house dark rule)",
+    "fill": "#FF3621",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://www.databricks.com",
+    "files": [
+      "/icons/light/databricks-vector-search-indexes-f5f824cb.png",
+      "/icons/dark/databricks-vector-search-indexes-f5f824cb.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Databricks Workflow": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/databricks.svg",
+    "lightSha256": "454aa3efdb318c655e3da2ea844e3577a9c47a20e24d20fff6489362176e5fe4",
+    "dark": "derived (house dark rule)",
+    "fill": "#FF3621",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://www.databricks.com",
+    "files": [
+      "/icons/light/databricks-workflow-f5f824cb.png",
+      "/icons/dark/databricks-workflow-f5f824cb.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Dataiku": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/dataiku.svg",
+    "lightSha256": "5e890dfaa006ca434a9d01872ea2db3a2c23c58121483f1285d8248d6a6ef018",
+    "dark": "derived (house dark rule)",
+    "fill": "#2AB1AC",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://www.dataiku.com/company/media-kit/",
+    "files": [
+      "/icons/light/dataiku-6fa9ae04.png",
+      "/icons/dark/dataiku-6fa9ae04.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "date-fns": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/datefns.svg",
+    "lightSha256": "31c6058540754e04fafa70dbc2b717f8ded59be08bc2b23c503fcc5d8f3acd7b",
+    "dark": "derived (house dark rule)",
+    "fill": "#770C56",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://date-fns.org",
+    "files": [
+      "/icons/light/date-fns-917475dc.png",
+      "/icons/dark/date-fns-917475dc.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "DatoCMS": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/datocms.svg",
+    "lightSha256": "bee4811a8a630ddbc32d09acc120d8c4a8d0b6726909163dc8186eff8ea1b9a4",
+    "dark": "derived (house dark rule)",
+    "fill": "#FF7751",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://www.datocms.com/company/brand-assets",
+    "files": [
+      "/icons/light/datocms-db6df7a6.png",
+      "/icons/dark/datocms-db6df7a6.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Deepgram": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/deepgram.svg",
+    "lightSha256": "e6904363c90592bbb689e47aae10dc6ca5ae2f32ed9e1573a87c973be04bafb9",
+    "dark": "derived (house dark rule)",
+    "fill": "#13EF93",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://deepgram.com/company/newsroom",
+    "files": [
+      "/icons/light/deepgram-6500f7b8.png",
+      "/icons/dark/deepgram-6500f7b8.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "DeepL": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/deepl.svg",
+    "lightSha256": "e4d4aae5d6b2e48aae119bf1b787b4adbd1f4583c5ae729cce2016499f414493",
+    "dark": "derived (house dark rule)",
+    "fill": "#0F2B46",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://www.deepl.com/press.html",
+    "files": [
+      "/icons/light/deepl-2c20d686.png",
+      "/icons/dark/deepl-1dbe01eb.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
   "DeepSeek": {
     "source": "svgl",
     "light": "https://svgl.app/library/deepseek.svg",
@@ -172,6 +965,20 @@
       "/icons/dark/deepseek-998b69d3.png"
     ],
     "addedAt": "2026-10-11"
+  },
+  "DevExpress": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/devexpress.svg",
+    "lightSha256": "6bb796a0d85159d047a6a0ddc3b32db8137c3c120d86933e377962c8caa2137a",
+    "dark": "derived (house dark rule)",
+    "fill": "#FF7200",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://www.devexpress.com/aboutus/",
+    "files": [
+      "/icons/light/devexpress-3e7114e8.png",
+      "/icons/dark/devexpress-3e7114e8.png"
+    ],
+    "addedAt": "2026-10-19"
   },
   "Dex": {
     "source": "cncf",
@@ -185,6 +992,128 @@
     ],
     "addedAt": "2026-10-11"
   },
+  "Directus": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/directus.svg",
+    "lightSha256": "ca1542dfcad1903f6bab41ffa0ff3561fed5d2b611e3e264a6961c732cc0e0bb",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/directus-290de86c.png",
+      "/icons/dark/directus-290de86c.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Django Project": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/django.svg",
+    "lightSha256": "a4b590f977591f7e8530d4110cf59c98a729df2141954bddd62af1275707ddb7",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/django-project-69ca1c6f.png",
+      "/icons/dark/django-project-69ca1c6f.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Elastic Agent": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/elastic.svg",
+    "lightSha256": "4588a66adba4a9e28820d54d5c7e3f39e490f0e0ecfaf97fbc6dee2541536293",
+    "dark": "derived (house dark rule)",
+    "fill": "#005571",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://www.elastic.co/brand",
+    "files": [
+      "/icons/light/elastic-agent-8ba59b9f.png",
+      "/icons/dark/elastic-agent-8ba59b9f.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Elastic Cloud": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/elasticcloud.svg",
+    "lightSha256": "012c4cf3032fccd1240c9a9c40c782651a4342d23fa933b4622c1ee44a4e72b5",
+    "dark": "derived (house dark rule)",
+    "fill": "#005571",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://www.elastic.co/brand",
+    "files": [
+      "/icons/light/elastic-cloud-8740323b.png",
+      "/icons/dark/elastic-cloud-8740323b.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Elastic Cloud on Kubernetes": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/elasticcloud.svg",
+    "lightSha256": "012c4cf3032fccd1240c9a9c40c782651a4342d23fa933b4622c1ee44a4e72b5",
+    "dark": "derived (house dark rule)",
+    "fill": "#005571",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://www.elastic.co/brand",
+    "files": [
+      "/icons/light/elastic-cloud-on-kubernetes-8740323b.png",
+      "/icons/dark/elastic-cloud-on-kubernetes-8740323b.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Elastic Integration": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/elastic.svg",
+    "lightSha256": "4588a66adba4a9e28820d54d5c7e3f39e490f0e0ecfaf97fbc6dee2541536293",
+    "dark": "derived (house dark rule)",
+    "fill": "#005571",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://www.elastic.co/brand",
+    "files": [
+      "/icons/light/elastic-integration-8ba59b9f.png",
+      "/icons/dark/elastic-integration-8ba59b9f.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Element": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/element.svg",
+    "lightSha256": "d46a6195c43ce1dbb17d340d1fce59625eea59363f08dd0bb89644efef694cc9",
+    "dark": "derived (house dark rule)",
+    "fill": "#0DBD8B",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://element.io",
+    "files": [
+      "/icons/light/element-22c6fbda.png",
+      "/icons/dark/element-22c6fbda.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Eleven Labs": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/elevenlabs.svg",
+    "lightSha256": "e7bf01c62c849c3bd59eb117b7479cc8cc47daf941a3cdaaafc4791610fb2a40",
+    "dark": "derived (house dark rule)",
+    "fill": "#000000",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://elevenlabs.io/brand",
+    "files": [
+      "/icons/light/eleven-labs-b10d281b.png",
+      "/icons/dark/eleven-labs-55589e96.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "ElevenLabs Text-to-Speech": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/elevenlabs.svg",
+    "lightSha256": "e7bf01c62c849c3bd59eb117b7479cc8cc47daf941a3cdaaafc4791610fb2a40",
+    "dark": "derived (house dark rule)",
+    "fill": "#000000",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://elevenlabs.io/brand",
+    "files": [
+      "/icons/light/elevenlabs-text-to-speech-b10d281b.png",
+      "/icons/dark/elevenlabs-text-to-speech-55589e96.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
   "EMQX": {
     "source": "cncf",
     "light": "https://raw.githubusercontent.com/cncf/landscape/master/hosted_logos/emqx.svg",
@@ -196,6 +1125,20 @@
       "/icons/dark/emqx-ccf2675a.png"
     ],
     "addedAt": "2026-10-11"
+  },
+  "etcd": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/etcd.svg",
+    "lightSha256": "547451df94e413731a7d45f6d62bce98d4085e9a9c8462570c0f43d744054e44",
+    "dark": "derived (house dark rule)",
+    "fill": "#419EDA",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://cncf-branding.netlify.app/projects/etcd/",
+    "files": [
+      "/icons/light/etcd-3b597d79.png",
+      "/icons/dark/etcd-3b597d79.png"
+    ],
+    "addedAt": "2026-10-19"
   },
   "External Secrets Operator": {
     "source": "cncf",
@@ -221,6 +1164,87 @@
     ],
     "addedAt": "2026-10-11"
   },
+  "Fastly": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/fastly.svg",
+    "lightSha256": "fabacbab5d67d7d7d99517d9fad7fb15d29cfed7b2fb3bfa70522b95416d6cba",
+    "dark": "derived (house dark rule)",
+    "fill": "#FF282D",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://assets.fastly.com/style-guide/docs/",
+    "files": [
+      "/icons/light/fastly-aa633a61.png",
+      "/icons/dark/fastly-aa633a61.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "FFmpeg": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/ffmpeg.svg",
+    "lightSha256": "076e200007de7d3f03ddc970e63a23f7cb46a772d1f4e7c670ceb22a9d46ed35",
+    "dark": "derived (house dark rule)",
+    "fill": "#007808",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://commons.wikimedia.org/wiki/File:FFmpeg_Logo_new.svg",
+    "files": [
+      "/icons/light/ffmpeg-816ff151.png",
+      "/icons/dark/ffmpeg-816ff151.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Firebase Realtime Database": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/firebase.svg",
+    "lightSha256": "d7237deed92953b176ebf4d2010b121efecaa381fc3469cd879d2f99d8b18d8b",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/firebase-realtime-database-d4b09f68.png",
+      "/icons/dark/firebase-realtime-database-d4b09f68.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Firecrawl": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/firecrawl.svg",
+    "lightSha256": "f5ecdf6ffce04ed6bc2fac2ed409f566bf5ea98c687b8d405942de1556174c9b",
+    "dark": "https://svgl.app/library/firecrawl-dark.svg",
+    "darkSha256": "925752e210b3a9d943d35a95b1cd08bd8e94f016f97c6d43f7c5fc20a20275d5",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/firecrawl-2982698f.png",
+      "/icons/dark/firecrawl-17c293cd.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "FluentD": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/fluentd.svg",
+    "lightSha256": "f37050e9aa78e9782f444bf5f65dbf5feffb7d98b351b6fbe873c0edea2cab1c",
+    "dark": "derived (house dark rule)",
+    "fill": "#0E83C8",
+    "license": "Apache-2.0 (mark), CC0-1.0 (Simple Icons data)",
+    "origin": "https://docs.fluentd.org/quickstart/logo",
+    "files": [
+      "/icons/light/fluentd-d6c10132.png",
+      "/icons/dark/fluentd-d6c10132.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Fly.io": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/flydotio.svg",
+    "lightSha256": "8497d184fd8ad4cb6a9faf1961f95b60905d529088099d4c3467b1fed2bdc55f",
+    "dark": "derived (house dark rule)",
+    "fill": "#24175B",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://fly.io/docs/about/brand",
+    "files": [
+      "/icons/light/fly-io-b875ebcc.png",
+      "/icons/dark/fly-io-e703a933.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
   "Forgejo": {
     "source": "devicon",
     "sourceVersion": "2.17.0",
@@ -234,6 +1258,70 @@
     ],
     "addedAt": "2026-10-11"
   },
+  "Fortinet": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/fortinet.svg",
+    "lightSha256": "5feafff8531436630ccd7d5c2e80819ee74c1820fdba23d98057eebe02553b86",
+    "dark": "derived (house dark rule)",
+    "fill": "#EE3124",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://www.fortinet.com",
+    "files": [
+      "/icons/light/fortinet-a5f23fcb.png",
+      "/icons/dark/fortinet-a5f23fcb.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Frontify": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/frontify.svg",
+    "lightSha256": "3b9e6a4fe3b4159d14eae92d95a3c69712a7005b0ce2f3965feb09a96602d53a",
+    "dark": "derived (house dark rule)",
+    "fill": "#2D3232",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://brand.frontify.com",
+    "files": [
+      "/icons/light/frontify-c13d5013.png",
+      "/icons/dark/frontify-0b3fae4c.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Gemini": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/gemini.svg",
+    "lightSha256": "c11d94a9e3ecb32f67dd9350848cf3124d617680533275c672e1e6bf61ce8cd4",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/gemini-442a2b46.png",
+      "/icons/dark/gemini-442a2b46.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "GitLab Runner": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/gitlab.svg",
+    "lightSha256": "f113a0879aae4d458ac1de8f6ff3c8c6f9793299069fa1e422350ca24128a1fa",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/gitlab-runner-4f7097d9.png",
+      "/icons/dark/gitlab-runner-4f7097d9.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "GitLab Secret Detection": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/gitlab.svg",
+    "lightSha256": "f113a0879aae4d458ac1de8f6ff3c8c6f9793299069fa1e422350ca24128a1fa",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/gitlab-secret-detection-4f7097d9.png",
+      "/icons/dark/gitlab-secret-detection-4f7097d9.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
   "Gleam": {
     "source": "svgl",
     "light": "https://svgl.app/library/gleam.svg",
@@ -245,6 +1333,70 @@
       "/icons/dark/gleam-64805f9e.png"
     ],
     "addedAt": "2026-10-11"
+  },
+  "Google Developers": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/google.svg",
+    "lightSha256": "a60266dab17c1c00981c7077fa025aa84c92782e0657ca2f78b7f70cbb8d5a56",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/google-developers-96c3dcae.png",
+      "/icons/dark/google-developers-96c3dcae.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Google Play Console": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/googleplay.svg",
+    "lightSha256": "c4720abfe9edd80259ce7891534867e85060beea67f919afb5ebb9bd3a331dfb",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/google-play-console-ba4920a7.png",
+      "/icons/dark/google-play-console-ba4920a7.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Grafana Agent": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/grafana.svg",
+    "lightSha256": "0b7f85edd76a69eee78c7781a037d982c6168cb2c2238d13683c7f7ddfd07b0f",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/grafana-agent-bc4a8723.png",
+      "/icons/dark/grafana-agent-bc4a8723.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Graylog": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/graylog.svg",
+    "lightSha256": "895731bc966d912c539a58f9c247439a66ae41a861f5ac2bafd8667a8ac9aeae",
+    "dark": "derived (house dark rule)",
+    "fill": "#FF3633",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://www.graylog.org",
+    "files": [
+      "/icons/light/graylog-cc29bacf.png",
+      "/icons/dark/graylog-cc29bacf.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Greenhouse": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/greenhouse.svg",
+    "lightSha256": "24fff1d86443f2b5ba429f602ce23aa1e1a9333b78b8fcee2a1b539949582ce2",
+    "dark": "derived (house dark rule)",
+    "fill": "#24A47F",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://brand.greenhouse.io/brand-portal/p/6",
+    "files": [
+      "/icons/light/greenhouse-1be2e8be.png",
+      "/icons/dark/greenhouse-1be2e8be.png"
+    ],
+    "addedAt": "2026-10-19"
   },
   "Groq": {
     "source": "svgl",
@@ -258,6 +1410,34 @@
     ],
     "addedAt": "2026-10-11"
   },
+  "Handlebars": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/handlebarsdotjs.svg",
+    "lightSha256": "79be7bcd51ca73921d7a72fbf5415f71176829ea21aa0c50b01bb86eddad19ff",
+    "dark": "derived (house dark rule)",
+    "fill": "#000000",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://github.com/handlebars-lang/docs/blob/13a2e2d9e31ebff4295924ea366abf3062e47ede/src/.vuepress/public/icons/handlebarsjs-icon.svg",
+    "files": [
+      "/icons/light/handlebars-211e605c.png",
+      "/icons/dark/handlebars-9ab1f6e3.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Haystack": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/haystack.svg",
+    "lightSha256": "a93d22f3fdbed36b5fa98b6742049bafd9f0b4d105433fde15de1a43ec973e2b",
+    "dark": "derived (house dark rule)",
+    "fill": "#0EAF9C",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://github.com/simple-icons/simple-icons/issues/12288#issuecomment-2567870921",
+    "files": [
+      "/icons/light/haystack-339aeb03.png",
+      "/icons/dark/haystack-339aeb03.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
   "Headlamp": {
     "source": "cncf",
     "light": "https://raw.githubusercontent.com/cncf/artwork/main/projects/headlamp/icon/color/headlamp-icon-color.svg",
@@ -269,6 +1449,60 @@
       "/icons/dark/headlamp-cc34fbfb.png"
     ],
     "addedAt": "2026-10-11"
+  },
+  "Heroku Connect": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/heroku.svg",
+    "lightSha256": "eed8d3cb106c7d1047cbf85d974011911c46aed78616dc748133fe6b7740ee33",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/heroku-connect-107a272b.png",
+      "/icons/dark/heroku-connect-85aa1e22.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Hetzner Online": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/hetzner.svg",
+    "lightSha256": "df276671b4076812a5a4b46f4113b0c38f56109f6bd368d1a6f09915b67961b4",
+    "dark": "derived (house dark rule)",
+    "fill": "#D50C2D",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://www.hetzner.com",
+    "files": [
+      "/icons/light/hetzner-online-5ff88644.png",
+      "/icons/dark/hetzner-online-5ff88644.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "HiBob": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/hibob.svg",
+    "lightSha256": "a7ed5e1ee14d976b2e9e22e7278348e6763cf94852e327a181f1111834074963",
+    "dark": "derived (house dark rule)",
+    "fill": "#E42C51",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://www.hibob.com",
+    "files": [
+      "/icons/light/hibob-b464f47e.png",
+      "/icons/dark/hibob-b464f47e.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Honeybadger": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/honeybadger.svg",
+    "lightSha256": "5b9b2a7ab29c9f8ced8de8b89ae231389877b90fbd35f7de613cf1dc6cffdd40",
+    "dark": "derived (house dark rule)",
+    "fill": "#EA5937",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://www.honeybadger.io/assets",
+    "files": [
+      "/icons/light/honeybadger-1beb08e6.png",
+      "/icons/dark/honeybadger-1beb08e6.png"
+    ],
+    "addedAt": "2026-10-19"
   },
   "Hono": {
     "source": "svgl",
@@ -295,6 +1529,18 @@
     ],
     "addedAt": "2026-10-11"
   },
+  "Inertia.js": {
+    "source": "devicon",
+    "light": "https://cdn.jsdelivr.net/gh/devicons/devicon@2.17.0/icons/inertiajs/inertiajs-original.svg",
+    "lightSha256": "ddc6b3b9fd5e46d6c0e14af2da20caca3bb7cc6b17271435d398aab203082801",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; Devicon artwork (MIT)",
+    "files": [
+      "/icons/light/inertia-js-4a20b8af.png",
+      "/icons/dark/inertia-js-4a20b8af.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
   "Java Database Connectivity (JDBC)": {
     "source": "oracle-official",
     "light": "docs/tech-icons/sources/oracle-o.svg",
@@ -320,6 +1566,20 @@
       "/icons/dark/jetpack-compose-caaadf2b.png"
     ],
     "addedAt": "2026-10-11"
+  },
+  "Jinja": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/jinja.svg",
+    "lightSha256": "6df63e7d99c872b8396c234be267fa32f30372b64ba5e54dc56adafa45d071c0",
+    "dark": "derived (house dark rule)",
+    "fill": "#7E0C1B",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://jinja.palletsprojects.com",
+    "files": [
+      "/icons/light/jinja-f696ec19.png",
+      "/icons/dark/jinja-f696ec19.png"
+    ],
+    "addedAt": "2026-10-19"
   },
   "k0s": {
     "source": "cncf",
@@ -358,6 +1618,19 @@
     ],
     "addedAt": "2026-10-11"
   },
+  "Kafka Connect": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/apache-kafka-light.svg",
+    "lightSha256": "9c27fa5034f867ba8921b3aa4cb1b729666d9bc75917dffe60cf204e1b68cc53",
+    "dark": "https://svgl.app/library/apache-kafka-dark.svg",
+    "darkSha256": "5bd456c54dbc962805d31a065a9343cd1ab3d422ee418a14e472d577a8a8d155",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/kafka-connect-691f27f0.png",
+      "/icons/dark/kafka-connect-e338914b.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
   "Karpenter": {
     "source": "cncf",
     "light": "https://raw.githubusercontent.com/cncf/landscape/master/hosted_logos/karpenter.svg",
@@ -381,6 +1654,20 @@
       "/icons/dark/keda-ca916556.png"
     ],
     "addedAt": "2026-10-11"
+  },
+  "Klarna": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/klarna.svg",
+    "lightSha256": "1ae8a83bce48bb43d8eeb3e478e74535004cde6f9d4a06868c819f417b1856db",
+    "dark": "derived (house dark rule)",
+    "fill": "#FFB3C7",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://klarna.design",
+    "files": [
+      "/icons/light/klarna-6599b226.png",
+      "/icons/dark/klarna-6599b226.png"
+    ],
+    "addedAt": "2026-10-19"
   },
   "Knative": {
     "source": "cncf",
@@ -478,6 +1765,32 @@
     ],
     "addedAt": "2026-10-11"
   },
+  "Laravel": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/laravel.svg",
+    "lightSha256": "41b8d143dbaa0606712ef9163aa7cfd56865e670331f1bdcb0ec77cc350f00e0",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/laravel-45fb2c7f.png",
+      "/icons/dark/laravel-45fb2c7f.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "LaTeX": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/latex.svg",
+    "lightSha256": "d2d9d35c11f907be5b9273dfc3a5ee57f0cf31839020d3e18792f33f6ae2aeb5",
+    "dark": "derived (house dark rule)",
+    "fill": "#008080",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://github.com/latex3/branding/tree/9def6b5f6075567d62b67424e11dbe6d4d5245b4",
+    "files": [
+      "/icons/light/latex-9c2aa631.png",
+      "/icons/dark/latex-9c2aa631.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
   "Linkerd": {
     "source": "cncf",
     "light": "https://raw.githubusercontent.com/cncf/artwork/main/projects/linkerd/icon/color/linkerd-icon-color.svg",
@@ -489,6 +1802,46 @@
       "/icons/dark/linkerd-1e6c356f.png"
     ],
     "addedAt": "2026-10-11"
+  },
+  "LiveKit": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/livekit.svg",
+    "lightSha256": "c7e4f0f291b7bf6ef8ecc7d729eb3c9be38e8d4f78509cd791a8ec2b0d00f75e",
+    "dark": "derived (house dark rule)",
+    "fill": "#FFFFFF",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://livekit.io/brand",
+    "files": [
+      "/icons/light/livekit-0091f190.png",
+      "/icons/dark/livekit-44b5c208.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Make": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/make.svg",
+    "lightSha256": "3985e5ed42709d253a772f99e56c5436af98c35d45bebc36b0aef29a9c9e7828",
+    "dark": "derived (house dark rule)",
+    "fill": "#6D00CC",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://www.make.com/en/press",
+    "files": [
+      "/icons/light/make-5230ae6d.png",
+      "/icons/dark/make-5230ae6d.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Mantine": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/mantine.svg",
+    "lightSha256": "ab04c8ba341843d744b2a9b652f45543621e5374be040f55a3dcda588416273b",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/mantine-d01d0f8f.png",
+      "/icons/dark/mantine-d01d0f8f.png"
+    ],
+    "addedAt": "2026-10-19"
   },
   "Mattermost": {
     "source": "svgl",
@@ -503,6 +1856,110 @@
     ],
     "addedAt": "2026-10-11"
   },
+  "MeiliSearch": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/meilisearch.svg",
+    "lightSha256": "ed4366b985f794a5364e164a770ff6c0bd4029f1cdc849ccb9a934c15137f163",
+    "dark": "derived (house dark rule)",
+    "fill": "#FF5CAA",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://www.meilisearch.com",
+    "files": [
+      "/icons/light/meilisearch-70af05fb.png",
+      "/icons/dark/meilisearch-70af05fb.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Microsoft Advertising": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/microsoft.svg",
+    "lightSha256": "726aa11548b3771591ccbd747f744fbc8acc6879594c14edc740f2c0a00f016b",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/microsoft-advertising-5654cb00.png",
+      "/icons/dark/microsoft-advertising-5654cb00.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Microsoft Component Services": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/microsoft.svg",
+    "lightSha256": "726aa11548b3771591ccbd747f744fbc8acc6879594c14edc740f2c0a00f016b",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/microsoft-component-services-5654cb00.png",
+      "/icons/dark/microsoft-component-services-5654cb00.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Microsoft IIS": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/microsoft.svg",
+    "lightSha256": "726aa11548b3771591ccbd747f744fbc8acc6879594c14edc740f2c0a00f016b",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/microsoft-iis-5654cb00.png",
+      "/icons/dark/microsoft-iis-5654cb00.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "MLFlow": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/mlflow.svg",
+    "lightSha256": "686679a10a6bdf1029ec4103bec15d8aec365a2be39f6b840992c597e2c76d45",
+    "dark": "derived (house dark rule)",
+    "fill": "#0194E2",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://github.com/mlflow/mlflow/blob/855881f93703b15ffe643003fb4d7c84f0ec2502/assets/icon.svg",
+    "files": [
+      "/icons/light/mlflow-f1b70058.png",
+      "/icons/dark/mlflow-f1b70058.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Model Context Protocol": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/model-context-protocol-light.svg",
+    "lightSha256": "7b1a39135aff77616de792f253e38e2d0c308fb09e81586a2ce0454156f9ae4f",
+    "dark": "https://svgl.app/library/model-context-protocol-dark.svg",
+    "darkSha256": "ac789162cbc24f8be20f17fe8390d9d95ac6f58d1444ec8d8d5fddd3339b894e",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/model-context-protocol-2fade12a.png",
+      "/icons/dark/model-context-protocol-320279ae.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "MongoDB in Materialized Views ": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/mongodb-icon-light.svg",
+    "lightSha256": "873cf00837b6cc30a01c878ba5656444299e562b032fdcd2d1222759c6e405fe",
+    "dark": "https://svgl.app/library/mongodb-icon-dark.svg",
+    "darkSha256": "43c4f5a1261601683e1403e9f4a5497b6fe0ee17448b5b12dfb289e7b637b770",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/mongodb-in-materialized-views-7b124fe1.png",
+      "/icons/dark/mongodb-in-materialized-views-fb73ce16.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Mongoose.js": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/mongoosedotws.svg",
+    "lightSha256": "18a1566a0d64c3fb593bce045dfb28821e8a15911d8b811061aa721d5b3081d9",
+    "dark": "derived (house dark rule)",
+    "fill": "#F04D35",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://mongoose.ws",
+    "files": [
+      "/icons/light/mongoose-js-2c72b150.png",
+      "/icons/dark/mongoose-js-2c72b150.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
   "n8n": {
     "source": "svgl",
     "light": "https://svgl.app/library/n8n.svg",
@@ -515,6 +1972,46 @@
     ],
     "addedAt": "2026-10-11"
   },
+  "NATS": {
+    "source": "devicon",
+    "light": "https://cdn.jsdelivr.net/gh/devicons/devicon@2.17.0/icons/nats/nats-original.svg",
+    "lightSha256": "bc610b84ac6516797bd2bce4a2ae14265197b1adab6110222f70ee6a0ee93fa6",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; Devicon artwork (MIT)",
+    "files": [
+      "/icons/light/nats-4d89455a.png",
+      "/icons/dark/nats-4d89455a.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "NetApp": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/netapp.svg",
+    "lightSha256": "17a0f25cd3eff3e42c24bfbb725903aee443d0f12d5dafa34010a37f2d68ed59",
+    "dark": "derived (house dark rule)",
+    "fill": "#0067C5",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://www.netapp.com",
+    "files": [
+      "/icons/light/netapp-6325c5aa.png",
+      "/icons/dark/netapp-6325c5aa.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Nextflow": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/nextflow.svg",
+    "lightSha256": "4e6308841791163c07cc76d4c4ca046334a78de581f1698cad0ab65c57be50e2",
+    "dark": "derived (house dark rule)",
+    "fill": "#0DC09D",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://github.com/seqeralabs/logos/blob/a8d4906b8fa7359541e520882f93a4bf029af44c/nextflow/nextflow_icon_color.svg",
+    "files": [
+      "/icons/light/nextflow-b8564cae.png",
+      "/icons/dark/nextflow-b8564cae.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
   "Notary Project": {
     "source": "cncf",
     "light": "https://raw.githubusercontent.com/cncf/artwork/main/projects/notary/icon/color/notary-project-icon-color.svg",
@@ -526,6 +2023,18 @@
       "/icons/dark/notary-project-adff0d94.png"
     ],
     "addedAt": "2026-10-11"
+  },
+  "NPM": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/npm.svg",
+    "lightSha256": "8fe7a9b3c30d7c44a4b7a431d6f943e30e374d8bde032d83377f2ab4e6a34544",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/npm-053d334f.png",
+      "/icons/dark/npm-053d334f.png"
+    ],
+    "addedAt": "2026-10-19"
   },
   "Nx": {
     "source": "svgl",
@@ -540,6 +2049,45 @@
     ],
     "addedAt": "2026-10-11"
   },
+  "Ollama": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/ollama_light.svg",
+    "lightSha256": "b5ee1874b69d216fbc420c6118fac9b2fcc9eeb6ab6a7fc374c6a6512e48b993",
+    "dark": "https://svgl.app/library/ollama_dark.svg",
+    "darkSha256": "04d95aa0e2cccdd24f8f6c9c58ac2f312464d0f8280a6744fdd48b28b15aebab",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/ollama-e6dfa443.png",
+      "/icons/dark/ollama-6b044632.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "ONNX": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/onnx.svg",
+    "lightSha256": "531d7a9aad43bc520f7a3a4d8f6c68df5e1b28ec8e91c27d53c63e158ef01eef",
+    "dark": "derived (house dark rule)",
+    "fill": "#005CED",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://github.com/onnx/onnx.github.io/blob/382e7036b616ce1555499ac41730245a2478513c/images/ONNX-ICON.svg",
+    "files": [
+      "/icons/light/onnx-38313215.png",
+      "/icons/dark/onnx-38313215.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "OpenAPI Spec": {
+    "source": "devicon",
+    "light": "https://cdn.jsdelivr.net/gh/devicons/devicon@2.17.0/icons/openapi/openapi-original.svg",
+    "lightSha256": "ddb256e268a9e147d4edc6411062fe02b3c9fdd4b3b657d74aee15c4e6206e16",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; Devicon artwork (MIT)",
+    "files": [
+      "/icons/light/openapi-spec-d3e692aa.png",
+      "/icons/dark/openapi-spec-fe883d6f.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
   "OpenCost": {
     "source": "cncf",
     "light": "https://raw.githubusercontent.com/cncf/artwork/main/projects/opencost/icon/color/Opencost_Icon_Color.svg",
@@ -551,6 +2099,20 @@
       "/icons/dark/opencost-4312a1ae.png"
     ],
     "addedAt": "2026-10-11"
+  },
+  "OpenID": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/openid.svg",
+    "lightSha256": "13c58bd0f71b495b5323fbc603f74d3e03b0ade66a269e65e2b91ac740a70602",
+    "dark": "derived (house dark rule)",
+    "fill": "#F78C40",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://openid.net/add-openid/logos/",
+    "files": [
+      "/icons/light/openid-53d54062.png",
+      "/icons/dark/openid-53d54062.png"
+    ],
+    "addedAt": "2026-10-19"
   },
   "OpenTofu": {
     "source": "cncf",
@@ -668,6 +2230,61 @@
     ],
     "addedAt": "2026-10-11"
   },
+  "Palantir": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/palantir.svg",
+    "lightSha256": "0ea58cb945cc09a7edbb96ca6de7ee3854f16d0a559014e9d3fcb4bdbbbb1cc7",
+    "dark": "derived (house dark rule)",
+    "fill": "#101113",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://github.com/palantir/conjure/blob/1b0d450dc52c4822b4c9d1da8c61ad7f78855fe5/docs/media/palantir-logo.svg",
+    "files": [
+      "/icons/light/palantir-b0719c38.png",
+      "/icons/dark/palantir-ee04b167.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Palo Alto Networks": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/paloaltonetworks.svg",
+    "lightSha256": "47b46a688d2117b938251c0a36568593562a07c221493f9d04bd1e0e536b1456",
+    "dark": "derived (house dark rule)",
+    "fill": "#F04E23",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://www.paloaltonetworks.com",
+    "files": [
+      "/icons/light/palo-alto-networks-3af76dc3.png",
+      "/icons/dark/palo-alto-networks-3af76dc3.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Payload CMS": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/payload.svg",
+    "lightSha256": "cf3d7617dc3919bfc778ef8bed7ae6cd3aa9d58c811f18afbb7036e2c4f89495",
+    "dark": "https://svgl.app/library/payload_dark.svg",
+    "darkSha256": "eda1c2d87051007a677d7bcfaea508181ca36b59a2db8f5868ad9f3b686c4e77",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/payload-cms-c83f483d.png",
+      "/icons/dark/payload-cms-815c3e33.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "PaySafe": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/paysafe.svg",
+    "lightSha256": "35895a3b90457e810043737a841ca33f270ca3ea1f08f4a8967b4837f5e8e3a7",
+    "dark": "derived (house dark rule)",
+    "fill": "#5A28FF",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://brand.paysafe.com",
+    "files": [
+      "/icons/light/paysafe-814a96e2.png",
+      "/icons/dark/paysafe-814a96e2.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
   "PlanetScale": {
     "source": "svgl",
     "light": "https://svgl.app/library/planetscale.svg",
@@ -680,6 +2297,20 @@
       "/icons/dark/planetscale-45fdaddb.png"
     ],
     "addedAt": "2026-10-11"
+  },
+  "PlayCanvas": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/playcanvas.svg",
+    "lightSha256": "c1189116e4bd1bff2b6a85a134878f4fa3bb2579e6acfb6c54f45769aa4c2299",
+    "dark": "derived (house dark rule)",
+    "fill": "#E05F2C",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://playcanvas.com",
+    "files": [
+      "/icons/light/playcanvas-f99e08ad.png",
+      "/icons/dark/playcanvas-f99e08ad.png"
+    ],
+    "addedAt": "2026-10-19"
   },
   "PM2": {
     "source": "svgl",
@@ -720,6 +2351,127 @@
     ],
     "addedAt": "2026-10-11"
   },
+  "Preact": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/preact.svg",
+    "lightSha256": "21acecc5f28a719ac3aa16a458032e3bbf2bc2ec993c4c7c6aedf66299f7d720",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/preact-750b43de.png",
+      "/icons/dark/preact-750b43de.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "PrimeNG": {
+    "source": "devicon",
+    "light": "https://cdn.jsdelivr.net/gh/devicons/devicon@2.17.0/icons/primeng/primeng-original.svg",
+    "lightSha256": "bdbf80e7f355d14255afa49963fa3a4575535672b4446a047bde64dff7c1cfb8",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; Devicon artwork (MIT)",
+    "files": [
+      "/icons/light/primeng-e3106769.png",
+      "/icons/dark/primeng-e3106769.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Prisma ORM": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/prisma.svg",
+    "lightSha256": "ae59021bf39c95cff16bfdd634d2e266e9ad4f152fc1f014509d56b120a81c1f",
+    "dark": "https://svgl.app/library/prisma_dark.svg",
+    "darkSha256": "e1644113be3d0aaf749c72bee12776d0f87d4dad96bef1bc580a88db5088dbe2",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/prisma-orm-57ffb98e.png",
+      "/icons/dark/prisma-orm-a578e3fb.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Pydantic": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/pydantic.svg",
+    "lightSha256": "68cfc07f02413da0c03bb7f768e38dc5cf385b0b0a830909b5cb7507ad6f0c84",
+    "dark": "derived (house dark rule)",
+    "fill": "#E92063",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://github.com/pydantic/pydantic/blob/94c748001a32992a587694b999fb1f3d2f1fc1fe/docs/logo-white.svg",
+    "files": [
+      "/icons/light/pydantic-bc32342a.png",
+      "/icons/dark/pydantic-bc32342a.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Pydantic AI": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/pydantic.svg",
+    "lightSha256": "68cfc07f02413da0c03bb7f768e38dc5cf385b0b0a830909b5cb7507ad6f0c84",
+    "dark": "derived (house dark rule)",
+    "fill": "#E92063",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://github.com/pydantic/pydantic/blob/94c748001a32992a587694b999fb1f3d2f1fc1fe/docs/logo-white.svg",
+    "files": [
+      "/icons/light/pydantic-ai-bc32342a.png",
+      "/icons/dark/pydantic-ai-bc32342a.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Pydantic LogFire": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/pydantic.svg",
+    "lightSha256": "68cfc07f02413da0c03bb7f768e38dc5cf385b0b0a830909b5cb7507ad6f0c84",
+    "dark": "derived (house dark rule)",
+    "fill": "#E92063",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://github.com/pydantic/pydantic/blob/94c748001a32992a587694b999fb1f3d2f1fc1fe/docs/logo-white.svg",
+    "files": [
+      "/icons/light/pydantic-logfire-bc32342a.png",
+      "/icons/dark/pydantic-logfire-bc32342a.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "QGIS": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/qgis.svg",
+    "lightSha256": "7a6da1325256b5872a2cc62d5a4c8ad263e0a4c1822b2bc2718f831656b499a4",
+    "dark": "derived (house dark rule)",
+    "fill": "#589632",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://www.qgis.org/en/site/getinvolved/styleguide.html",
+    "files": [
+      "/icons/light/qgis-26aa9f31.png",
+      "/icons/dark/qgis-26aa9f31.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Qlik": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/qlik.svg",
+    "lightSha256": "68e7f124589388c7f18791507074eccb720ee5e5636d2c6dbd14beba5bcbd26b",
+    "dark": "derived (house dark rule)",
+    "fill": "#009848",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://www.qlik.com",
+    "files": [
+      "/icons/light/qlik-ce279acf.png",
+      "/icons/dark/qlik-ce279acf.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Qlik Sense": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/qlik.svg",
+    "lightSha256": "68e7f124589388c7f18791507074eccb720ee5e5636d2c6dbd14beba5bcbd26b",
+    "dark": "derived (house dark rule)",
+    "fill": "#009848",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://www.qlik.com",
+    "files": [
+      "/icons/light/qlik-sense-ce279acf.png",
+      "/icons/dark/qlik-sense-ce279acf.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
   "Railway": {
     "source": "svgl",
     "light": "https://svgl.app/library/railway.svg",
@@ -732,6 +2484,79 @@
       "/icons/dark/railway-71ef8772.png"
     ],
     "addedAt": "2026-10-11"
+  },
+  "React Router": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/reactrouter.svg",
+    "lightSha256": "7c5e08979214dae70a40d49a96fbaaee8b91cbcc8606af0533d8dbd5fb685d01",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/react-router-0f7b29d4.png",
+      "/icons/dark/react-router-bde3246a.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Redis Cloud": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/redis.svg",
+    "lightSha256": "0588a304be52b7a96f531268ea68624d504d4c93175e41d2feba7bce9ae22fbb",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/redis-cloud-cbce14a4.png",
+      "/icons/dark/redis-cloud-651dbdb5.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Redis Serialization Protocol": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/redis.svg",
+    "lightSha256": "0588a304be52b7a96f531268ea68624d504d4c93175e41d2feba7bce9ae22fbb",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/redis-serialization-protocol-cbce14a4.png",
+      "/icons/dark/redis-serialization-protocol-651dbdb5.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Redis Streams": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/redis.svg",
+    "lightSha256": "0588a304be52b7a96f531268ea68624d504d4c93175e41d2feba7bce9ae22fbb",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/redis-streams-cbce14a4.png",
+      "/icons/dark/redis-streams-651dbdb5.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Redux Toolkit": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/redux.svg",
+    "lightSha256": "e6780d6facbc66e6afd29d5cfae2e27b66f8462dd29b42b193b3338ff069d4a6",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/redux-toolkit-6103080e.png",
+      "/icons/dark/redux-toolkit-6103080e.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Refine": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/refine_dark.svg",
+    "lightSha256": "7ab697f296b32ed15577e616e595c696de2068f54209a96a59f5bf71d8e99adc",
+    "dark": "https://svgl.app/library/refine_light.svg",
+    "darkSha256": "bfa9826c5de4286be84dc73507ec3eb4d5484d83b3df137f090ac902f253b174",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/refine-31a037aa.png",
+      "/icons/dark/refine-fdc69192.png"
+    ],
+    "addedAt": "2026-10-19"
   },
   "Reflex": {
     "source": "devicon",
@@ -771,6 +2596,18 @@
     ],
     "addedAt": "2026-10-11"
   },
+  "Rsbuild": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/rsbuild.svg",
+    "lightSha256": "92b5b9d1f702ea12e24d12bf64deabd6bf5312dd0d414207932a45e67b8f57c0",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/rsbuild-c6098dac.png",
+      "/icons/dark/rsbuild-4f84b192.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
   "Rspack": {
     "source": "svgl",
     "light": "https://svgl.app/library/rspack.svg",
@@ -794,6 +2631,34 @@
       "/icons/dark/rxjs-08281f89.png"
     ],
     "addedAt": "2026-10-11"
+  },
+  "Sage": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/sage.svg",
+    "lightSha256": "cd54b9932be5e114a12384049c549d2a569d0e7b1d99c79d96d3d26fc7c46025",
+    "dark": "derived (house dark rule)",
+    "fill": "#00D639",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://www.sage.com",
+    "files": [
+      "/icons/light/sage-73130160.png",
+      "/icons/dark/sage-73130160.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Sails": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/sailsdotjs.svg",
+    "lightSha256": "10f433512f70cfcaee404b656f8015656d8f7462cd85beee1486e8adb75d8451",
+    "dark": "derived (house dark rule)",
+    "fill": "#14ACC2",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://sailsjs.com/logos",
+    "files": [
+      "/icons/light/sails-300b5e24.png",
+      "/icons/dark/sails-300b5e24.png"
+    ],
+    "addedAt": "2026-10-19"
   },
   "SOPS": {
     "source": "cncf",
@@ -830,6 +2695,42 @@
       "/icons/dark/spire-cc4aa654.png"
     ],
     "addedAt": "2026-10-11"
+  },
+  "Spring Batch": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/spring.svg",
+    "lightSha256": "c63a5d0029b815f240f2d48e1552ac94b125485c3bb9e064b61cba8a2c1c9100",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/spring-batch-0dfb9494.png",
+      "/icons/dark/spring-batch-0dfb9494.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Spring Cloud Gateway": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/spring.svg",
+    "lightSha256": "c63a5d0029b815f240f2d48e1552ac94b125485c3bb9e064b61cba8a2c1c9100",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/spring-cloud-gateway-0dfb9494.png",
+      "/icons/dark/spring-cloud-gateway-0dfb9494.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Spring Framework": {
+    "source": "devicon",
+    "light": "https://cdn.jsdelivr.net/gh/devicons/devicon@2.17.0/icons/spring/spring-original.svg",
+    "lightSha256": "4bae92720d27acb7d8cde3bed758a26aed07cd81c353f59ab379b8dd651ff973",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; Devicon artwork (MIT)",
+    "files": [
+      "/icons/light/spring-framework-4582dcf3.png",
+      "/icons/dark/spring-framework-4582dcf3.png"
+    ],
+    "addedAt": "2026-10-19"
   },
   "SST": {
     "source": "svgl",
@@ -868,6 +2769,34 @@
     ],
     "addedAt": "2026-10-11"
   },
+  "Teradata": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/teradata.svg",
+    "lightSha256": "9eb9e4f6a0585f129de6207a1e3e6539ab68f21762a1b3718064c3e1315b51dd",
+    "dark": "derived (house dark rule)",
+    "fill": "#F37440",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://github.com/Teradata/teradata.github.io/blob/0fb3886aaeefea7bea4951c300f49ac8f9c2476f/src/assets/icons/teradata-icon.svg",
+    "files": [
+      "/icons/light/teradata-5763a772.png",
+      "/icons/dark/teradata-5763a772.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Teradata ClearScape Analytics": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/teradata.svg",
+    "lightSha256": "9eb9e4f6a0585f129de6207a1e3e6539ab68f21762a1b3718064c3e1315b51dd",
+    "dark": "derived (house dark rule)",
+    "fill": "#F37440",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://github.com/Teradata/teradata.github.io/blob/0fb3886aaeefea7bea4951c300f49ac8f9c2476f/src/assets/icons/teradata-icon.svg",
+    "files": [
+      "/icons/light/teradata-clearscape-analytics-5763a772.png",
+      "/icons/dark/teradata-clearscape-analytics-5763a772.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
   "TiDB": {
     "source": "simple-icons",
     "sourceVersion": "16.35.0",
@@ -884,6 +2813,74 @@
     ],
     "addedAt": "2026-10-11"
   },
+  "TikTok": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/tiktok.svg",
+    "lightSha256": "6f54ac8d325faacea8935bdc44cbed60206a6b408641799e5fea1cba7c1a0af7",
+    "dark": "derived (house dark rule)",
+    "fill": "#000000",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://tiktok.com",
+    "files": [
+      "/icons/light/tiktok-7542a5f5.png",
+      "/icons/dark/tiktok-f1e086d4.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "TikTok for Business": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/tiktok.svg",
+    "lightSha256": "6f54ac8d325faacea8935bdc44cbed60206a6b408641799e5fea1cba7c1a0af7",
+    "dark": "derived (house dark rule)",
+    "fill": "#000000",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://tiktok.com",
+    "files": [
+      "/icons/light/tiktok-for-business-7542a5f5.png",
+      "/icons/dark/tiktok-for-business-f1e086d4.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Trivy": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/trivy.svg",
+    "lightSha256": "bef45d7760bb16e6d3379921220cd31753e8e3fbb6523066b166fcc9c8c8456d",
+    "dark": "derived (house dark rule)",
+    "fill": "#1904DA",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://www.aquasec.com/brand",
+    "files": [
+      "/icons/light/trivy-4da03fec.png",
+      "/icons/dark/trivy-4da03fec.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "tRPC": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/trpc.svg",
+    "lightSha256": "72193d723ea34d3c2bf9fe1715d40bd3844ec38f7dbadb12ac3eec3a7ee5ba66",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/trpc-07955f55.png",
+      "/icons/dark/trpc-07955f55.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Trustpilot": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/trustpilot.svg",
+    "lightSha256": "a5fbfe1a9ec7410d5d78153de49849bf402e3565220f5d5bbca2a4f0c62e6648",
+    "dark": "derived (house dark rule)",
+    "fill": "#00B67A",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://support.trustpilot.com/hc/en-us/articles/206289947-Trustpilot-Brand-Assets-Style-Guide",
+    "files": [
+      "/icons/light/trustpilot-462ea095.png",
+      "/icons/dark/trustpilot-462ea095.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
   "Turbopack": {
     "source": "svgl",
     "light": "https://svgl.app/library/turbopack-icon-light.svg",
@@ -898,6 +2895,19 @@
     ],
     "addedAt": "2026-10-11"
   },
+  "Turborepo": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/turborepo-icon-light.svg",
+    "lightSha256": "6f7346aa3bde0e824e6aa523d804a0d17a02f9f6b5853202f95d0c044e812e93",
+    "dark": "https://svgl.app/library/turborepo-icon-dark.svg",
+    "darkSha256": "dbbcf730bd0fde6852a18ece41faf99c9d35bc98e74d7f664cbda4172250aa76",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/turborepo-4f481207.png",
+      "/icons/dark/turborepo-2a10d026.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
   "Turso": {
     "source": "svgl",
     "light": "https://svgl.app/library/turso-light.svg",
@@ -911,6 +2921,32 @@
     ],
     "addedAt": "2026-10-11"
   },
+  "TypeORM": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/typeorm.svg",
+    "lightSha256": "554547d8b9f0d92fc1e28f404b58b28dd8b9f5fd65e057c47b3cf56f8b8702e3",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/typeorm-4f3b5ff4.png",
+      "/icons/dark/typeorm-4f3b5ff4.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Umami": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/umami.svg",
+    "lightSha256": "aead19c8457dea1afb5bbae2e1508cf85f166d03ffa4102791f2743316253514",
+    "dark": "derived (house dark rule)",
+    "fill": "#000000",
+    "license": "MIT (mark), CC0-1.0 (Simple Icons data)",
+    "origin": "https://github.com/umami-software/umami/blob/3572df0a09503f357a06fe7f816295ba2c878325/assets/logo.svg",
+    "files": [
+      "/icons/light/umami-088b55b1.png",
+      "/icons/dark/umami-0b2d7ff5.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
   "uv": {
     "source": "svgl",
     "light": "https://svgl.app/library/uv.svg",
@@ -922,6 +2958,46 @@
       "/icons/dark/uv-95829feb.png"
     ],
     "addedAt": "2026-10-11"
+  },
+  "Vimeo": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/vimeo.svg",
+    "lightSha256": "8769e0252009f9babc5f1de2ba6c0638411a2104e7f6f3af6b13cc8310cbd992",
+    "dark": "derived (house dark rule)",
+    "fill": "#1AB7EA",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://press.vimeo.com/brand-guidelines",
+    "files": [
+      "/icons/light/vimeo-7e1335a2.png",
+      "/icons/dark/vimeo-7e1335a2.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Vitess": {
+    "source": "devicon",
+    "light": "https://cdn.jsdelivr.net/gh/devicons/devicon@2.17.0/icons/vitess/vitess-original.svg",
+    "lightSha256": "2586663de734309e04ea358f7913f3abbd960621c21144df3f564231893aad01",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; Devicon artwork (MIT)",
+    "files": [
+      "/icons/light/vitess-fabf6b00.png",
+      "/icons/dark/vitess-fabf6b00.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "vLLM": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/vllm.svg",
+    "lightSha256": "1b55a37f4deae2956f4a9e3a7b6eea50f73ee1b056e0e4e86060c25f48f546f8",
+    "dark": "derived (house dark rule)",
+    "fill": "#30A2FF",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://github.com/vllm-project/media-kit/blob/79b2ea5db25b723f2d81dae203a87c5b9a076722/vLLM-Logo.svg",
+    "files": [
+      "/icons/light/vllm-f043cf44.png",
+      "/icons/dark/vllm-f043cf44.png"
+    ],
+    "addedAt": "2026-10-19"
   },
   "Volcano": {
     "source": "cncf",
@@ -935,6 +3011,76 @@
     ],
     "addedAt": "2026-10-11"
   },
+  "Vonage": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/vonage.svg",
+    "lightSha256": "9e106bf0ed90c550e938ab4915665eacc03c33413aa5894ccecc366be2bac695",
+    "dark": "derived (house dark rule)",
+    "fill": "#000000",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://www.vonage.com",
+    "files": [
+      "/icons/light/vonage-c141ddef.png",
+      "/icons/dark/vonage-cd17a259.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Vonage API Developer Platform": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/vonage.svg",
+    "lightSha256": "9e106bf0ed90c550e938ab4915665eacc03c33413aa5894ccecc366be2bac695",
+    "dark": "derived (house dark rule)",
+    "fill": "#000000",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://www.vonage.com",
+    "files": [
+      "/icons/light/vonage-api-developer-platform-c141ddef.png",
+      "/icons/dark/vonage-api-developer-platform-cd17a259.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Vonage Communications APIs": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/vonage.svg",
+    "lightSha256": "9e106bf0ed90c550e938ab4915665eacc03c33413aa5894ccecc366be2bac695",
+    "dark": "derived (house dark rule)",
+    "fill": "#000000",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://www.vonage.com",
+    "files": [
+      "/icons/light/vonage-communications-apis-c141ddef.png",
+      "/icons/dark/vonage-communications-apis-cd17a259.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "VTEX": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/vtex.svg",
+    "lightSha256": "c0019ab902bb9f55086b2efd10de9920c831b6f773c2f4b560589d2e402d4cea",
+    "dark": "derived (house dark rule)",
+    "fill": "#ED125F",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://vtex.com",
+    "files": [
+      "/icons/light/vtex-35e3265a.png",
+      "/icons/dark/vtex-35e3265a.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "wagmi": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/wagmi.svg",
+    "lightSha256": "9c3de74843a280b195919549f62558fcc0ea5cb0d0ec2a85f7aed062b62c4838",
+    "dark": "derived (house dark rule)",
+    "fill": "#000000",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://wagmi.sh",
+    "files": [
+      "/icons/light/wagmi-ef16d71a.png",
+      "/icons/dark/wagmi-1feb0378.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
   "wasmCloud": {
     "source": "cncf",
     "light": "https://raw.githubusercontent.com/cncf/artwork/main/projects/wasmcloud/icon/color/wasmcloud.icon_green.svg",
@@ -946,6 +3092,148 @@
       "/icons/dark/wasmcloud-a951b786.png"
     ],
     "addedAt": "2026-10-11"
+  },
+  "Watchtower": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/watchtower.svg",
+    "lightSha256": "45fde57fcd4db47dfc3ae46f6e436eb65c8c5609859691e59a2dd4576daa327d",
+    "dark": "derived (house dark rule)",
+    "fill": "#416271",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://containrrr.dev/watchtower",
+    "files": [
+      "/icons/light/watchtower-471f24fa.png",
+      "/icons/dark/watchtower-471f24fa.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Wechat": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/wechat.svg",
+    "lightSha256": "74b48b3d315337ce79cb644933b5f975e19996f564fcc4138ed67d45674c43ca",
+    "dark": "derived (house dark rule)",
+    "fill": "#07C160",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://wechat.design/tool/brand",
+    "files": [
+      "/icons/light/wechat-46bd9074.png",
+      "/icons/dark/wechat-46bd9074.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Windows Server": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/windows.svg",
+    "lightSha256": "449a3893f905fd5a3206ff6cd7ca9cb4b26f64f23d480bec2e335ccb5a395b96",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/windows-server-3c054cb9.png",
+      "/icons/dark/windows-server-3c054cb9.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Windows Server 2019": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/windows.svg",
+    "lightSha256": "449a3893f905fd5a3206ff6cd7ca9cb4b26f64f23d480bec2e335ccb5a395b96",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/windows-server-2019-3c054cb9.png",
+      "/icons/dark/windows-server-2019-3c054cb9.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Windows Server 2022": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/windows.svg",
+    "lightSha256": "449a3893f905fd5a3206ff6cd7ca9cb4b26f64f23d480bec2e335ccb5a395b96",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/windows-server-2022-3c054cb9.png",
+      "/icons/dark/windows-server-2022-3c054cb9.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Windows Server 2025": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/windows.svg",
+    "lightSha256": "449a3893f905fd5a3206ff6cd7ca9cb4b26f64f23d480bec2e335ccb5a395b96",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/windows-server-2025-3c054cb9.png",
+      "/icons/dark/windows-server-2025-3c054cb9.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Windsurf": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/windsurf-light.svg",
+    "lightSha256": "35a676cd1038849de4acd21bb03aebd452d0206369b33d3c695fc36ce9aaaec1",
+    "dark": "https://svgl.app/library/windsurf-dark.svg",
+    "darkSha256": "e961c08c7e84e90d74e67830cc4812298af404f2e205a9b120a16bff80b1d617",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/windsurf-fc8dbbd3.png",
+      "/icons/dark/windsurf-dd9a34dd.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "WireGuard": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/wireguard.svg",
+    "lightSha256": "687151a9d0fc75f0fbc214f73a2edc96d89ff5df7a6c3451127ab386b9c941e0",
+    "dark": "derived (house dark rule)",
+    "fill": "#88171A",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://www.wireguard.com",
+    "files": [
+      "/icons/light/wireguard-2b9a40ab.png",
+      "/icons/dark/wireguard-2b9a40ab.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "WorkOS": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/workos.svg",
+    "lightSha256": "564931f909334c5269b2029dfc1ffb52cd87b91a6d2d3bb76b027b99e0b0c219",
+    "dark": "https://svgl.app/library/workos-light.svg",
+    "darkSha256": "b1744548e1975e820bb75a4bbb4150fae5433297607d16cee5860a8e1543e387",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/workos-62ded0bf.png",
+      "/icons/dark/workos-3fc94fc6.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "Xendit": {
+    "source": "simple-icons",
+    "light": "https://cdn.jsdelivr.net/npm/simple-icons@16.35.0/icons/xendit.svg",
+    "lightSha256": "eddede7b0b7244dab02de30bc9c6358a04d3ee683c6858634a8212d083565ada",
+    "dark": "derived (house dark rule)",
+    "fill": "#4573FF",
+    "license": "CC0-1.0 (Simple Icons data); the mark is its owner's trademark",
+    "origin": "https://www.xendit.co/en/company/asset-and-branding",
+    "files": [
+      "/icons/light/xendit-2bea289e.png",
+      "/icons/dark/xendit-2bea289e.png"
+    ],
+    "addedAt": "2026-10-19"
+  },
+  "YouTube": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/youtube.svg",
+    "lightSha256": "419a6bc647bab83c249709bed0ae67c8f44ce42d8dda1be202ab5a3cdb187372",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/youtube-618f8cc4.png",
+      "/icons/dark/youtube-618f8cc4.png"
+    ],
+    "addedAt": "2026-10-19"
   },
   "YugabyteDB": {
     "source": "devicon",
@@ -959,5 +3247,17 @@
       "/icons/dark/yugabytedb-305e6748.png"
     ],
     "addedAt": "2026-10-11"
+  },
+  "Zoom": {
+    "source": "svgl",
+    "light": "https://svgl.app/library/zoom.svg",
+    "lightSha256": "5d1bf4d38bc5fc437578292dafc3cb4a678682e3124f1e2910d817aee9658615",
+    "dark": "derived (house dark rule)",
+    "license": "Trademark of its owner; collected by svgl (repository MIT, the mark is not licensed by it)",
+    "files": [
+      "/icons/light/zoom-39f27df9.png",
+      "/icons/dark/zoom-39f27df9.png"
+    ],
+    "addedAt": "2026-10-19"
   }
 }

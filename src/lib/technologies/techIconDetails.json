@@ -1,4 +1,170 @@
 {
+  "Akamai": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/akamai-474a78f4.png",
+      "/icons/dark/akamai-474a78f4.png"
+    ]
+  },
+  "American Express": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/american-express-c71da5b0.png",
+      "/icons/dark/american-express-3f9d985e.png"
+    ]
+  },
+  "Apache Arrow": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/apache-arrow-41cedc0e.png",
+      "/icons/dark/apache-arrow-e2f68902.png"
+    ]
+  },
+  "Apache Avro": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/apache-avro-34eb0519.png",
+      "/icons/dark/apache-avro-6652755e.png"
+    ]
+  },
+  "Apache CloudStack": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/apache-cloudstack-e89f2619.png",
+      "/icons/dark/apache-cloudstack-f590e38f.png"
+    ]
+  },
+  "Apache Doris": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/apache-doris-de90d0f9.png",
+      "/icons/dark/apache-doris-de90d0f9.png"
+    ]
+  },
+  "Apache ECharts": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/microsoft-defender-for-cloud-561590dd.png",
+      "/icons/dark/microsoft-defender-for-cloud-24740e2e.png"
+    ]
+  },
+  "Apache Jackrabbit": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/apache-jackrabbit-305238ab.png",
+      "/icons/dark/apache-jackrabbit-305238ab.png"
+    ]
+  },
+  "Apache NiFi": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/apache-nifi-bf820287.png",
+      "/icons/dark/apache-nifi-bf820287.png"
+    ]
+  },
+  "Apache Parquet": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/apache-parquet-b3e250c4.png",
+      "/icons/dark/apache-parquet-b3e250c4.png"
+    ]
+  },
+  "Apache Storm": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/apache-storm-1c77220e.png",
+      "/icons/dark/apache-storm-84f15cf8.png"
+    ]
+  },
+  "Apache Tika": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/apache-tika-4b1745f8.png",
+      "/icons/dark/apache-tika-4b1745f8.png"
+    ]
+  },
+  "Apollo GraphQL": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/apollo-graphql-ca2d51ec.png",
+      "/icons/dark/apollo-graphql-9e58400b.png"
+    ]
+  },
+  "Appium": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/appium-3f4c3065.png"
+    ]
+  },
+  "Apple Pay": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/apple-pay-56a16e0a.png",
+      "/icons/dark/apple-pay-080cf6f2.png"
+    ]
+  },
+  "Argo Events": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/argo-events-7d090237.png",
+      "/icons/dark/argo-events-bc2ffb1d.png"
+    ]
+  },
+  "Argo Workflows": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/argo-workflows-a987f6bb.png",
+      "/icons/dark/argo-workflows-f641aadf.png"
+    ]
+  },
+  "Aurelia": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/aurelia-63cf7bdf.png",
+      "/icons/dark/aurelia-8b50e899.png"
+    ]
+  },
+  "Azure AI": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/azure-ai-103f7837.png",
+      "/icons/dark/azure-ai-103f7837.png"
+    ]
+  },
+  "Babylon.js": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/dark/redis-queue-7996f127.png"
+    ]
+  },
+  "Backblaze B2 Cloud Storage": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/backblaze-b2-cloud-storage-4086edf8.png",
+      "/icons/dark/backblaze-b2-cloud-storage-0001d276.png"
+    ]
+  },
+  "Bank of America Online": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/bank-of-america-online-32b5be4a.png",
+      "/icons/dark/bank-of-america-online-02bff2f4.png"
+    ]
+  },
+  "Barclays Online Banking": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/barclays-online-banking-d0b0a10d.png",
+      "/icons/dark/barclays-online-banking-d0b0a10d.png"
+    ]
+  },
+  "Baserow": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/baserow-6dd76389.png",
+      "/icons/dark/baserow-facce4c8.png"
+    ]
+  },
   "Bazel": {
     "description": "Multi-language build and test tool for large codebases."
   },
@@ -6,12 +172,54 @@
     "description": "Authentication and authorization framework for TypeScript.",
     "website": "https://www.better-auth.com/"
   },
+  "Better Stack": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/better-stack-021077db.png",
+      "/icons/dark/better-stack-c59d3240.png"
+    ]
+  },
   "Biome": {
     "description": "Fast formatter and linter for JavaScript, TypeScript, JSON and CSS."
+  },
+  "BNB Chain": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/bnb-chain-ca156c9f.png",
+      "/icons/dark/bnb-chain-ca156c9f.png"
+    ]
   },
   "Buildpacks": {
     "description": "Cloud Native Buildpacks: turn source code into OCI images without Dockerfiles.",
     "website": "https://buildpacks.io/"
+  },
+  "Bunny.net": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/bunny-net-807d749e.png",
+      "/icons/dark/bunny-net-7eb7f094.png"
+    ]
+  },
+  "Caddy": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/caddy-c7194070.png",
+      "/icons/dark/caddy-88109948.png"
+    ]
+  },
+  "Camunda": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/camunda-0dcbfdd2.png",
+      "/icons/dark/camunda-1c30b5f4.png"
+    ]
+  },
+  "Celery": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/leanplum-bfce013f.png",
+      "/icons/dark/leanplum-bfce013f.png"
+    ]
   },
   "Ceph": {
     "description": "Distributed object, block and file storage.",
@@ -25,41 +233,310 @@
     "description": "Chaos engineering platform for Kubernetes.",
     "website": "https://chaos-mesh.org/"
   },
+  "Checkmarx": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/checkmarx-e6906686.png",
+      "/icons/dark/checkmarx-c0871081.png"
+    ]
+  },
+  "Claude AI": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/claude-ai-fa937b82.png",
+      "/icons/dark/claude-ai-938104f6.png"
+    ]
+  },
   "Cloud Custodian": {
     "description": "Rules engine for cloud governance, security and cost policies.",
     "website": "https://cloudcustodian.io/"
+  },
+  "Cloudera Data Platform": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/cloudera-data-platform-e964a25b.png",
+      "/icons/dark/cloudera-data-platform-e964a25b.png"
+    ]
   },
   "CloudEvents": {
     "description": "Specification for describing event data in a common way.",
     "website": "https://cloudevents.io/"
   },
+  "Coder": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/coder-a20524f4.png",
+      "/icons/dark/coder-1fbf8edc.png"
+    ]
+  },
   "containerd": {
     "description": "Industry-standard container runtime.",
     "website": "https://containerd.io/"
+  },
+  "Contentstack": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/contentstack-eacd6e76.png",
+      "/icons/dark/contentstack-fe6c1e0c.png"
+    ]
   },
   "Contour": {
     "description": "Envoy-based ingress controller for Kubernetes.",
     "website": "https://projectcontour.io"
   },
+  "Convex": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/convex-26bc549a.png",
+      "/icons/dark/convex-6478fde8.png"
+    ]
+  },
+  "Corona Renderer": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/corona-renderer-dfc7d7ca.png",
+      "/icons/dark/corona-renderer-372d082c.png"
+    ]
+  },
   "Cortex": {
     "description": "Horizontally scalable, long-term storage for Prometheus metrics.",
     "website": "https://cortexmetrics.io/"
+  },
+  "CrewAI": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/crewai-0333cdbe.png",
+      "/icons/dark/crewai-0333cdbe.png"
+    ]
   },
   "CRI-O": {
     "description": "Lightweight container runtime implementing the Kubernetes CRI.",
     "website": "https://cri-o.io/"
   },
+  "Crossplane": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/crossplane-d67b53c6.png",
+      "/icons/dark/crossplane-ccd104a0.png"
+    ]
+  },
+  "Cursor": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/cursor-fcdc2647.png",
+      "/icons/dark/cursor-6af1eb20.png"
+    ]
+  },
+  "daisyUI": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/daisyui-cefe0e63.png",
+      "/icons/dark/daisyui-29405552.png"
+    ]
+  },
+  "Dask": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/deepak-chopra-ai-7b63b6ef.png"
+    ]
+  },
+  "Databricks": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/databricks-be8df856.png",
+      "/icons/dark/databricks-eb9a69b8.png"
+    ]
+  },
+  "Databricks DBRX LLM": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/dark/databricks-dbrx-llm-83be754f.png"
+    ]
+  },
+  "Databricks Genie API": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/databricks-genie-api-be8df856.png",
+      "/icons/dark/databricks-genie-api-83be754f.png"
+    ]
+  },
+  "Databricks Notebook": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/databricks-notebook-be8df856.png",
+      "/icons/dark/databricks-notebook-83be754f.png"
+    ]
+  },
+  "Databricks ODBC Drivers": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/databricks-odbc-drivers-be8df856.png",
+      "/icons/dark/databricks-odbc-drivers-83be754f.png"
+    ]
+  },
+  "Databricks SQL Statement Execution API": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/databricks-sql-statement-execution-api-be8df856.png",
+      "/icons/dark/databricks-sql-statement-execution-api-83be754f.png"
+    ]
+  },
+  "Databricks Token Management": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/databricks-token-management-be8df856.png",
+      "/icons/dark/databricks-token-management-83be754f.png"
+    ]
+  },
+  "Databricks Unity Catalog": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/databricks-unity-catalog-be8df856.png",
+      "/icons/dark/databricks-unity-catalog-83be754f.png"
+    ]
+  },
+  "Databricks Vector Database": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/databricks-vector-database-be8df856.png",
+      "/icons/dark/databricks-vector-database-83be754f.png"
+    ]
+  },
+  "Databricks Vector Search Indexes": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/databricks-vector-search-indexes-be8df856.png",
+      "/icons/dark/databricks-vector-search-indexes-83be754f.png"
+    ]
+  },
+  "Databricks Workflow": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/confidential-computing-be8df856.png",
+      "/icons/dark/confidential-computing-83be754f.png"
+    ]
+  },
+  "Dataiku": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/dark/dataiku-47ba8aec.png"
+    ]
+  },
+  "date-fns": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/date-fns-106b6db6.png",
+      "/icons/dark/date-fns-9ed2a2c7.png"
+    ]
+  },
+  "DatoCMS": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/datocms-09fb65d5.png",
+      "/icons/dark/datocms-09fb65d5.png"
+    ]
+  },
+  "Deepgram": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/deepgram-0b9455cf.png",
+      "/icons/dark/deepgram-7850ef81.png"
+    ]
+  },
+  "DeepL": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/deepl-79d99609.png",
+      "/icons/dark/deepl-f232e19f.png"
+    ]
+  },
   "DeepSeek": {
     "description": "Family of large language models and their API.",
     "website": "https://deepseek.com/"
+  },
+  "DevExpress": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/devexpress-4cd1795f.png",
+      "/icons/dark/devexpress-b508709e.png"
+    ]
   },
   "Dex": {
     "description": "OpenID Connect identity provider that federates other identity sources.",
     "website": "https://dexidp.io/"
   },
+  "Directus": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/directus-b04062f2.png",
+      "/icons/dark/directus-be8c028b.png"
+    ]
+  },
+  "Django Project": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/django-project-011ac8ef.png",
+      "/icons/dark/django-project-f895f0dc.png"
+    ]
+  },
+  "Elastic Agent": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/elastic-agent-cf3d48ae.png",
+      "/icons/dark/elastic-agent-25d3d0ce.png"
+    ]
+  },
+  "Elastic Cloud": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/elastic-cloud-1385ce1e.png",
+      "/icons/dark/elastic-cloud-1fb4ce78.png"
+    ]
+  },
+  "Elastic Cloud on Kubernetes": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/elastic-cloud-on-kubernetes-1385ce1e.png",
+      "/icons/dark/elastic-cloud-on-kubernetes-25d3d0ce.png"
+    ]
+  },
+  "Elastic Integration": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/elastic-integration-1385ce1e.png",
+      "/icons/dark/elastic-integration-25d3d0ce.png"
+    ]
+  },
+  "Element": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/element-e8fb301b.png"
+    ]
+  },
+  "Eleven Labs": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/eleven-labs-e3a1c7b3.png",
+      "/icons/dark/eleven-labs-47a1109f.png"
+    ]
+  },
+  "ElevenLabs Text-to-Speech": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/elevenlabs-text-to-speech-e3a1c7b3.png",
+      "/icons/dark/elevenlabs-text-to-speech-47a1109f.png"
+    ]
+  },
   "EMQX": {
     "description": "Scalable MQTT broker for IoT and real-time messaging.",
     "website": "https://www.emqx.com/en"
+  },
+  "etcd": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/etcd-ad264c3e.png",
+      "/icons/dark/etcd-eafe8f77.png"
+    ]
   },
   "External Secrets Operator": {
     "description": "Kubernetes operator that syncs secrets from external secret managers.",
@@ -69,20 +546,174 @@
     "description": "Runtime security tool that detects threats in containers, Kubernetes and hosts.",
     "website": "https://falco.org/"
   },
+  "Fastly": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/fastly-871cf2b3.png",
+      "/icons/dark/fastly-871cf2b3.png"
+    ]
+  },
+  "FFmpeg": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/ffmpeg-c132e204.png",
+      "/icons/dark/ffmpeg-f469d05f.png"
+    ]
+  },
+  "Firebase Realtime Database": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/firebase-realtime-database-3ce0de63.png",
+      "/icons/dark/firebase-realtime-database-665482bc.png"
+    ]
+  },
+  "Firecrawl": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/firecrawl-343b9152.png",
+      "/icons/dark/firecrawl-d51e651e.png"
+    ]
+  },
+  "FluentD": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/fluentd-53991ac4.png",
+      "/icons/dark/fluentd-9bdf1d3b.png"
+    ]
+  },
+  "Fly.io": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/fly-io-992fb718.png",
+      "/icons/dark/fly-io-7ed9ad9f.png"
+    ]
+  },
   "Forgejo": {
     "description": "Self-hosted software forge: Git hosting, issues, CI."
+  },
+  "Fortinet": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/fortinet-c6c0e2eb.png",
+      "/icons/dark/fortinet-5d759508.png"
+    ]
+  },
+  "Frontify": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/frontify-b68cf6d8.png",
+      "/icons/dark/frontify-f04da452.png"
+    ]
+  },
+  "Gemini": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/gemini-d8c58ceb.png",
+      "/icons/dark/gemini-d8c58ceb.png"
+    ]
+  },
+  "GitLab Runner": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/vpn-gateway-48d7bb1e.png",
+      "/icons/dark/vpn-gateway-a0aedc16.png"
+    ]
+  },
+  "GitLab Secret Detection": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/gitlab-secret-detection-48d7bb1e.png",
+      "/icons/dark/gitlab-secret-detection-a0aedc16.png"
+    ]
   },
   "Gleam": {
     "description": "Type-safe functional language for the Erlang VM and JavaScript.",
     "website": "https://gleam.run/"
   },
+  "Google Developers": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/google-developers-e378d8be.png",
+      "/icons/dark/google-developers-d6873b93.png"
+    ]
+  },
+  "Google Play Console": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/google-play-console-5f7a4fd0.png",
+      "/icons/dark/google-play-console-ac7774a7.png"
+    ]
+  },
+  "Grafana Agent": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/grafana-agent-815413e6.png",
+      "/icons/dark/grafana-agent-547cb2b6.png"
+    ]
+  },
+  "Graylog": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/graylog-f755ebe6.png",
+      "/icons/dark/graylog-f755ebe6.png"
+    ]
+  },
+  "Greenhouse": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/greenhouse-e9c72f24.png",
+      "/icons/dark/greenhouse-1dfc5c10.png"
+    ]
+  },
   "Groq": {
     "description": "Low-latency LLM inference API running on Groq LPUs.",
     "website": "https://groq.com/"
   },
+  "Handlebars": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/handlebars-7b84ed1c.png",
+      "/icons/dark/handlebars-8ec8dc9e.png"
+    ]
+  },
+  "Haystack": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/haystack-338280a1.png",
+      "/icons/dark/haystack-db42a01e.png"
+    ]
+  },
   "Headlamp": {
     "description": "Extensible web UI for Kubernetes.",
     "website": "https://headlamp.dev"
+  },
+  "Heroku Connect": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/heroku-connect-da0b178b.png",
+      "/icons/dark/heroku-connect-29a58ab7.png"
+    ]
+  },
+  "Hetzner Online": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/hetzner-online-d11e328e.png",
+      "/icons/dark/hetzner-online-0875338d.png"
+    ]
+  },
+  "HiBob": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/hibob-c19c0e55.png",
+      "/icons/dark/hibob-130c0085.png"
+    ]
+  },
+  "Honeybadger": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/honeybadger-7981710b.png",
+      "/icons/dark/honeybadger-e1d37e4d.png"
+    ]
   },
   "Hono": {
     "description": "Small web framework built on Web Standards, for any JavaScript runtime.",
@@ -91,6 +722,13 @@
   "Hoppscotch": {
     "description": "Open-source API development and testing platform.",
     "website": "https://hoppscotch.com"
+  },
+  "Inertia.js": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/inertia-js-bfaab0a3.png",
+      "/icons/dark/inertia-js-67c9969d.png"
+    ]
   },
   "Java Database Connectivity (JDBC)": {
     "description": "Java API for connecting to relational databases, maintained by Oracle.",
@@ -104,6 +742,13 @@
   "Jetpack Compose": {
     "description": "Android's declarative UI toolkit."
   },
+  "Jinja": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/jinja-0fb789ae.png",
+      "/icons/dark/jinja-a319a706.png"
+    ]
+  },
   "k0s": {
     "description": "Single-binary Kubernetes distribution.",
     "website": "https://k0sproject.io/"
@@ -116,6 +761,13 @@
     "description": "AI-assisted diagnostics for Kubernetes clusters.",
     "website": "https://www.k8sgpt.ai"
   },
+  "Kafka Connect": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/kafka-connect-d2cff639.png",
+      "/icons/dark/kafka-connect-e3888785.png"
+    ]
+  },
   "Karpenter": {
     "description": "Just-in-time node provisioning and autoscaling for Kubernetes.",
     "website": "https://karpenter.sh"
@@ -123,6 +775,13 @@
   "KEDA": {
     "description": "Kubernetes event-driven autoscaler.",
     "website": "https://keda.sh/"
+  },
+  "Klarna": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/klarna-739b8beb.png",
+      "/icons/dark/klarna-739b8beb.png"
+    ]
   },
   "Knative": {
     "description": "Serverless and event-driven application platform on Kubernetes.",
@@ -156,29 +815,176 @@
     "description": "Policy engine for Kubernetes, with policies written as Kubernetes resources.",
     "website": "https://kyverno.io/"
   },
+  "Laravel": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/azure-health-data-services-3f572d2b.png",
+      "/icons/dark/azure-health-data-services-85617888.png"
+    ]
+  },
+  "LaTeX": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/latex-edf3460a.png",
+      "/icons/dark/latex-1a76a133.png"
+    ]
+  },
   "Linkerd": {
     "description": "Lightweight service mesh for Kubernetes.",
     "website": "https://linkerd.io/"
+  },
+  "LiveKit": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/livekit-d39682d0.png",
+      "/icons/dark/livekit-e936f834.png"
+    ]
+  },
+  "Make": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/make-72649817.png",
+      "/icons/dark/make-6c9f96ef.png"
+    ]
+  },
+  "Mantine": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/mantine-f72a4550.png",
+      "/icons/dark/mantine-fc239f56.png"
+    ]
   },
   "Mattermost": {
     "description": "Self-hostable team collaboration and messaging platform.",
     "website": "https://mattermost.com/"
   },
+  "MeiliSearch": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/meilisearch-42480592.png",
+      "/icons/dark/meilisearch-f278ae3a.png"
+    ]
+  },
+  "Microsoft Advertising": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/microsoft-advertising-4d123368.png",
+      "/icons/dark/microsoft-advertising-9e08782b.png"
+    ]
+  },
+  "Microsoft Component Services": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/microsoft-component-services-4d123368.png",
+      "/icons/dark/microsoft-component-services-9e08782b.png"
+    ]
+  },
+  "Microsoft IIS": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/microsoft-iis-b2b22bbc.png",
+      "/icons/dark/microsoft-iis-68de9562.png"
+    ]
+  },
+  "MLFlow": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/mlflow-735240bf.png",
+      "/icons/dark/mlflow-e051abe9.png"
+    ]
+  },
+  "Model Context Protocol": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/model-context-protocol-0dec2465.png",
+      "/icons/dark/model-context-protocol-e55f3db4.png"
+    ]
+  },
+  "MongoDB in Materialized Views ": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/mongodb-in-materialized-views-5640d74f.png",
+      "/icons/dark/mongodb-in-materialized-views-0f282f77.png"
+    ]
+  },
+  "Mongoose.js": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/mongoose-js-75e4f8bb.png",
+      "/icons/dark/mongoose-js-89658385.png"
+    ]
+  },
   "n8n": {
     "description": "Workflow automation platform with a visual editor and code steps.",
     "website": "https://n8n.io/"
+  },
+  "NATS": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/nats-0e77b870.png",
+      "/icons/dark/nats-25a5bc07.png"
+    ]
+  },
+  "NetApp": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/netapp-3b06c726.png",
+      "/icons/dark/netapp-a4d8a1ff.png"
+    ]
+  },
+  "Nextflow": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/nextflow-9609d160.png",
+      "/icons/dark/nextflow-d2b541a8.png"
+    ]
   },
   "Notary Project": {
     "description": "Standards and tools for signing and verifying container artifacts.",
     "website": "https://notaryproject.dev/"
   },
+  "NPM": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/npm-a9044419.png",
+      "/icons/dark/npm-a9044419.png"
+    ]
+  },
   "Nx": {
     "description": "Build system and tooling for monorepos.",
     "website": "https://nx.dev"
   },
+  "Ollama": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/ollama-e4e21b4d.png",
+      "/icons/dark/ollama-506bb8a1.png"
+    ]
+  },
+  "ONNX": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/onnx-5dff953b.png",
+      "/icons/dark/onnx-012d82d2.png"
+    ]
+  },
+  "OpenAPI Spec": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/openapi-spec-fcb154e3.png",
+      "/icons/dark/openapi-spec-d7c4c20f.png"
+    ]
+  },
   "OpenCost": {
     "description": "Cost monitoring for Kubernetes and cloud workloads.",
     "website": "https://www.opencost.io/"
+  },
+  "OpenID": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/openid-79229fd2.png",
+      "/icons/dark/openid-66d64db4.png"
+    ]
   },
   "OpenTofu": {
     "description": "Open-source infrastructure-as-code tool, the community fork of Terraform.",
@@ -251,9 +1057,44 @@
       "/icons/dark/oracle-reports-ff9ae607.png"
     ]
   },
+  "Palantir": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/palantir-0792eebe.png",
+      "/icons/dark/palantir-23f29786.png"
+    ]
+  },
+  "Palo Alto Networks": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/palo-alto-networks-24d23e45.png",
+      "/icons/dark/palo-alto-networks-53ac3a34.png"
+    ]
+  },
+  "Payload CMS": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/payload-cms-79adcd4e.png",
+      "/icons/dark/payload-cms-8d342074.png"
+    ]
+  },
+  "PaySafe": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/paysafe-09691e6b.png",
+      "/icons/dark/paysafe-0e57f545.png"
+    ]
+  },
   "PlanetScale": {
     "description": "Managed MySQL (Vitess) and PostgreSQL database platform.",
     "website": "https://planetscale.com"
+  },
+  "PlayCanvas": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/playcanvas-a5aaaef5.png",
+      "/icons/dark/playcanvas-8c4d95e6.png"
+    ]
   },
   "PM2": {
     "description": "Production process manager for Node.js applications.",
@@ -267,9 +1108,114 @@
     "description": "Fast DataFrame library for Rust and Python.",
     "website": "https://pola.rs/"
   },
+  "Preact": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/preact-61608710.png",
+      "/icons/dark/preact-331f5f7d.png"
+    ]
+  },
+  "PrimeNG": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/primeng-41472207.png",
+      "/icons/dark/primeng-fa65cae7.png"
+    ]
+  },
+  "Prisma ORM": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/prisma-orm-bbd37496.png",
+      "/icons/dark/prisma-orm-d29634b6.png"
+    ]
+  },
+  "Pydantic": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/pydantic-38cfb6a1.png",
+      "/icons/dark/pydantic-dd6b901f.png"
+    ]
+  },
+  "Pydantic AI": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/pydantic-ai-6be24c25.png",
+      "/icons/dark/pydantic-ai-f852abbb.png"
+    ]
+  },
+  "Pydantic LogFire": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/pydantic-logfire-1c5983aa.png",
+      "/icons/dark/pydantic-logfire-2c3f555c.png"
+    ]
+  },
+  "QGIS": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/qgis-1eb64237.png",
+      "/icons/dark/qgis-7bcbd685.png"
+    ]
+  },
+  "Qlik": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/qlik-8f933ce9.png",
+      "/icons/dark/qlik-063c6f0a.png"
+    ]
+  },
+  "Qlik Sense": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/qlik-sense-8f933ce9.png",
+      "/icons/dark/qlik-sense-063c6f0a.png"
+    ]
+  },
   "Railway": {
     "description": "Deployment platform for applications and databases.",
     "website": "https://railway.app/"
+  },
+  "React Router": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/react-router-4b09baf9.png",
+      "/icons/dark/react-router-775bc918.png"
+    ]
+  },
+  "Redis Cloud": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/redis-cloud-92f42b66.png",
+      "/icons/dark/redis-cloud-92f42b66.png"
+    ]
+  },
+  "Redis Serialization Protocol": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/redis-serialization-protocol-92f42b66.png",
+      "/icons/dark/redis-serialization-protocol-92f42b66.png"
+    ]
+  },
+  "Redis Streams": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/redis-streams-92f42b66.png",
+      "/icons/dark/redis-streams-92f42b66.png"
+    ]
+  },
+  "Redux Toolkit": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/redux-toolkit-5136fec0.png",
+      "/icons/dark/redux-toolkit-b2892b0a.png"
+    ]
+  },
+  "Refine": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/refine-d007ea81.png",
+      "/icons/dark/refine-f3f523aa.png"
+    ]
   },
   "Reflex": {
     "description": "Framework for full-stack web apps in pure Python.",
@@ -283,6 +1229,13 @@
     "description": "Cloud-native storage orchestrator for Kubernetes, built on Ceph.",
     "website": "https://rook.io/"
   },
+  "Rsbuild": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/rsbuild-2b6ce4b0.png",
+      "/icons/dark/rsbuild-34b7278e.png"
+    ]
+  },
   "Rspack": {
     "description": "Rust-based web bundler compatible with the webpack ecosystem.",
     "website": "https://rspack.rs/"
@@ -290,6 +1243,20 @@
   "RxJS": {
     "description": "Reactive programming library for JavaScript using Observables.",
     "website": "https://rxjs.dev/"
+  },
+  "Sage": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/sage-f298c7a0.png",
+      "/icons/dark/sage-f298c7a0.png"
+    ]
+  },
+  "Sails": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/sails-ae2d5af1.png",
+      "/icons/dark/sails-73ba2b6f.png"
+    ]
   },
   "SOPS": {
     "description": "Editor and format for encrypted secrets files (YAML, JSON, ENV).",
@@ -303,6 +1270,27 @@
     "description": "Production-ready implementation of the SPIFFE workload identity APIs.",
     "website": "https://spiffe.io/spire/"
   },
+  "Spring Batch": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/spring-batch-22c878be.png",
+      "/icons/dark/spring-batch-7ff5e75a.png"
+    ]
+  },
+  "Spring Cloud Gateway": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/cloud-sdk-ced5d9fb.png",
+      "/icons/dark/cloud-sdk-7ff5e75a.png"
+    ]
+  },
+  "Spring Framework": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/spring-framework-22c878be.png",
+      "/icons/dark/spring-framework-7ff5e75a.png"
+    ]
+  },
   "SST": {
     "description": "Framework for building full-stack applications on your own cloud.",
     "website": "https://sst.dev/"
@@ -315,32 +1303,241 @@
     "description": "Identity-based access platform for servers, Kubernetes, databases and apps.",
     "website": "https://goteleport.com"
   },
+  "Teradata": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/teradata-fc7ab0bc.png",
+      "/icons/dark/teradata-7e80578c.png"
+    ]
+  },
+  "Teradata ClearScape Analytics": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/teradata-clearscape-analytics-fc7ab0bc.png",
+      "/icons/dark/teradata-clearscape-analytics-7e80578c.png"
+    ]
+  },
   "TiDB": {
     "description": "Distributed, MySQL-compatible SQL database.",
     "website": "https://en.pingcap.com"
+  },
+  "TikTok": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/tiktok-887ef4fc.png",
+      "/icons/dark/tiktok-a0763e26.png"
+    ]
+  },
+  "TikTok for Business": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/tiktok-for-business-d6a6f487.png",
+      "/icons/dark/tiktok-for-business-a49870e0.png"
+    ]
+  },
+  "Trivy": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/trivy-6b3b6c9d.png",
+      "/icons/dark/trivy-8b99dbb3.png"
+    ]
+  },
+  "tRPC": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/trpc-efc9e5bf.png",
+      "/icons/dark/trpc-dacce47a.png"
+    ]
+  },
+  "Trustpilot": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/google-distributed-cloud-b65c268a.png",
+      "/icons/dark/google-distributed-cloud-12760299.png"
+    ]
   },
   "Turbopack": {
     "description": "Rust-based incremental bundler for Next.js.",
     "website": "https://nextjs.org/docs/app/api-reference/turbopack"
   },
+  "Turborepo": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/turborepo-f12db59f.png",
+      "/icons/dark/turborepo-cf266aef.png"
+    ]
+  },
   "Turso": {
     "description": "SQLite-compatible database (libSQL) for edge and embedded replicas.",
     "website": "https://turso.tech"
+  },
+  "TypeORM": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/typeorm-891121c3.png",
+      "/icons/dark/typeorm-585d5a25.png"
+    ]
+  },
+  "Umami": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/umami-913d90f1.png",
+      "/icons/dark/umami-8e0cee1a.png"
+    ]
   },
   "uv": {
     "description": "Fast Python package and project manager written in Rust.",
     "website": "https://docs.astral.sh/uv/"
   },
+  "Vimeo": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/dark/vimeo-e0eac1cb.png"
+    ]
+  },
+  "Vitess": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/vitess-21b9c883.png",
+      "/icons/dark/vitess-a991b183.png"
+    ]
+  },
+  "vLLM": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/vllm-595e04dc.png",
+      "/icons/dark/vllm-98e17e7d.png"
+    ]
+  },
   "Volcano": {
     "description": "Batch scheduling system for Kubernetes (AI, big data, HPC).",
     "website": "https://volcano.sh/"
+  },
+  "Vonage": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/vonage-7f6f6bc4.png",
+      "/icons/dark/vonage-04c4219c.png"
+    ]
+  },
+  "Vonage API Developer Platform": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/vonage-api-developer-platform-69381083.png",
+      "/icons/dark/vonage-api-developer-platform-04c4219c.png"
+    ]
+  },
+  "Vonage Communications APIs": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/vonage-communications-apis-69381083.png",
+      "/icons/dark/vonage-communications-apis-04c4219c.png"
+    ]
+  },
+  "VTEX": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/vtex-396345cd.png",
+      "/icons/dark/vtex-396345cd.png"
+    ]
+  },
+  "wagmi": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/wagmi-774d56cb.png",
+      "/icons/dark/wagmi-a5f4bcbb.png"
+    ]
   },
   "wasmCloud": {
     "description": "Platform for running distributed WebAssembly applications.",
     "website": "https://wasmcloud.com"
   },
+  "Watchtower": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/watchtower-add6ec03.png",
+      "/icons/dark/watchtower-8d0e45ad.png"
+    ]
+  },
+  "Wechat": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/wechat-4d3ebdfb.png",
+      "/icons/dark/wechat-f8ba8e33.png"
+    ]
+  },
+  "Windows Server": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/windows-server-0569a678.png",
+      "/icons/dark/windows-server-6ec85785.png"
+    ]
+  },
+  "Windows Server 2019": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/windows-server-2019-0569a678.png",
+      "/icons/dark/windows-server-2019-6ec85785.png"
+    ]
+  },
+  "Windows Server 2022": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/windows-server-2022-0569a678.png",
+      "/icons/dark/windows-server-2022-6ec85785.png"
+    ]
+  },
+  "Windows Server 2025": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/windows-server-2025-0569a678.png",
+      "/icons/dark/windows-server-2025-6ec85785.png"
+    ]
+  },
+  "Windsurf": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/windsurf-1c560bcd.png",
+      "/icons/dark/windsurf-c7d5fe91.png"
+    ]
+  },
+  "WireGuard": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/wireguard-1ffffff6.png",
+      "/icons/dark/wireguard-adc45197.png"
+    ]
+  },
+  "WorkOS": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/workos-a0a95185.png",
+      "/icons/dark/workos-6bacd4a6.png"
+    ]
+  },
+  "Xendit": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/xendit-0f91641e.png",
+      "/icons/dark/xendit-53c12ab2.png"
+    ]
+  },
+  "YouTube": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/youtube-bf7fd42c.png",
+      "/icons/dark/youtube-4f417bbe.png"
+    ]
+  },
   "YugabyteDB": {
     "description": "Distributed, PostgreSQL-compatible SQL database.",
     "website": "https://www.yugabyte.com/yugabytedb/"
+  },
+  "Zoom": {
+    "revision": 4,
+    "retiredIcons": [
+      "/icons/light/zoom-bda6f746.png",
+      "/icons/dark/zoom-0c1f3373.png"
+    ]
   }
 }

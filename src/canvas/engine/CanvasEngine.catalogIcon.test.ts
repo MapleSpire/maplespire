@@ -80,14 +80,16 @@ class FakeImage {
   crossOrigin = ''
   complete = false
   naturalWidth = 0
+  naturalHeight = 0
   onload: (() => void) | null = null
   onerror: (() => void) | null = null
   constructor() {
     FakeImage.created.push(this)
   }
-  load() {
+  load(width = 64, height = 64) {
     this.complete = true
-    this.naturalWidth = 64
+    this.naturalWidth = width
+    this.naturalHeight = height
     this.onload?.()
   }
 }
@@ -150,6 +152,36 @@ describe('2D technology icon: catalog artwork for a bare icon name', () => {
     drawImage.mockClear()
     render()
     expect(drawImage).toHaveBeenCalledWith(image, expect.any(Number), expect.any(Number), 20, 20)
+    engine.destroy()
+  })
+
+  // Regression, defect 2026-10-18: drawImage(img, x, y, 20, 20) stretched a
+  // non-square logo into the square. It must be aspect-fit and centred.
+  it('draws a non-square logo aspect-fit and centred in the 20 px box, never stretched', async () => {
+    await loadIconCatalog()
+    const { engine, render } = engineWith([object('web', { icon: 'React' })])
+    render()
+    const image = FakeImage.created.find((img) => img.src === REACT_LIGHT)!
+    image.load(200, 50) // 4:1, as a wide wordmark upload
+    drawImage.mockClear()
+    render()
+    expect(drawImage).toHaveBeenCalledTimes(1)
+    const [drawn, x, y, width, height] = drawImage.mock.calls[0] as [unknown, number, number, number, number]
+    expect(drawn).toBe(image)
+    expect(width).toBe(20)
+    expect(height).toBe(5)
+
+    image.load(50, 200) // 1:4, tall
+    drawImage.mockClear()
+    render()
+    const [, tx, ty, tw, th] = drawImage.mock.calls[0] as [unknown, number, number, number, number]
+    expect([tw, th]).toEqual([5, 20])
+    // Both fits share the box centre: the wide one is centred vertically, the
+    // tall one horizontally.
+    expect(x + width / 2).toBeCloseTo(tx + tw / 2)
+    expect(y + height / 2).toBeCloseTo(ty + th / 2)
+    expect(tx - x).toBeCloseTo(7.5)
+    expect(y - ty).toBeCloseTo(7.5)
     engine.destroy()
   })
 

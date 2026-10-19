@@ -654,6 +654,16 @@ describe('icons, groups, domains, audit', () => {
     }
     expect(forApps.icons.some((i) => i.name === 'PostgreSQL')).toBe(false)
 
+    // A wordmark (illegible at shape size, defect 2026-10-18) is labelled for the model.
+    const wide = (await executeAiTool(ctx, 'search_icons', { q: 'ServiceNow' })) as {
+      icons: { name: string; wordmark?: boolean }[]
+      note?: string
+    }
+    expect(wide.icons.find((i) => i.name === 'ServiceNow')?.wordmark).toBe(true)
+    expect(wide.icons.find((i) => i.name === 'PostgreSQL')).toBeUndefined()
+    expect(wide.note).toMatch(/wordmark/)
+    expect(hits.icons.find((i) => i.name === 'PostgreSQL')).not.toHaveProperty('wordmark')
+
     const packs = (await executeAiTool(ctx, 'search_icons', {})) as {
       totalIcons: number
       packs: { name: string; iconCount: number }[]

@@ -693,7 +693,11 @@ export const readTools: AiToolDef[] = [
           name: e.name,
           ...(e.packs?.length ? { packs: e.packs } : {}),
           compatibleWith: e.compatibleWith,
+          ...(e.wordmark ? { wordmark: true } : {}),
         })),
+        ...(icons.some((e) => e.wordmark)
+          ? { note: 'wordmark: true marks wide text logos that are illegible at shape size; prefer another result when one fits.' }
+          : {}),
       }
     },
   }),

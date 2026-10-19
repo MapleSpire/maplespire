@@ -20,8 +20,10 @@ import {
   parseCatalog, quote, rasterizeIcon, replaceEntryIcons, slugify, visibility, DARK_BG, LIGHT_BG,
 } from './lib.mjs'
 import { planBatch, readSeedFacts } from './add.mjs'
-import { flagsFor, measure } from './audit.mjs'
+import { WIDE_ICONS_PATH, flagsFor, measure, measureWideIcons } from './audit.mjs'
 import { parseLandscape, rankCandidates } from './discover.mjs'
+import { indexRecords, matchRecords } from './marks.mjs'
+import { readCatalog as readIconCatalog } from './lib.mjs'
 
 const svg = (body, w = 100, h = 100) => ({
   kind: 'svg',
@@ -280,4 +282,44 @@ test('candidates exclude catalog names, flag near-misses and rank technology sig
   assert.equal(ranked.find((c) => c.name === 'Gleam').sources.length, 2, 'devicon slug merged with the svgl title')
   assert.deepEqual(ranked.find((c) => c.name === 'Jaeger').possibleMatches, ['Jaeger Tracing'])
   assert.equal(names.at(-1), 'Uber', 'no technology signal ranks last')
+})
+
+// Gate, defect 2026-10-18: a wordmark drawn in the 20 px shape-icon box is a
+// grey line. The catalog's wide entries are measured from the PNGs; the
+// committed list may shrink (a square mark found) but never silently grow.
+test('no catalog icon is wider than 2.2:1 unless listed in wideIconNames.json — and every listed one still is', async () => {
+  const measured = await measureWideIcons(parseCatalog(await readIconCatalog()))
+  const listed = JSON.parse(await readFile(WIDE_ICONS_PATH, 'utf8'))
+  assert.ok(measured.length > 0 && listed.length > 0, 'the measurement saw no wide icon at all: is docker/icons there?')
+  const unlisted = measured.filter((name) => !listed.includes(name))
+  assert.deepEqual(unlisted, [], 'new wordmark artwork: find a square mark (node scripts/tech-icons/marks.mjs --name "<name>"), '
+    + 'or, if the brand has none, add the name with node scripts/tech-icons/audit.mjs --write-wide')
+  const stale = listed.filter((name) => !measured.includes(name))
+  assert.deepEqual(stale, [], 'listed as wide but the artwork is square now: run node scripts/tech-icons/audit.mjs --write-wide')
+})
+
+test('the server icon catalog marks exactly the listed wide entries as wordmarks', async () => {
+  const listed = JSON.parse(await readFile(WIDE_ICONS_PATH, 'utf8'))
+  const gen = await readFile(new URL('../../server/src/ai/core/tools/iconCatalog.gen.ts', import.meta.url), 'utf8')
+  const flagged = gen.split('\n')
+    .filter((line) => line.startsWith('  {"name":'))
+    .map((line) => JSON.parse(line.trim().replace(/,$/, '')))
+    .filter((entry) => entry.wordmark)
+    .map((entry) => entry.name.toLowerCase())
+  assert.deepEqual([...new Set(flagged)].sort(), [...new Set(listed.map((n) => n.toLowerCase()))].sort(),
+    'regenerate: cd server && npx tsx scripts/gen-icon-catalog.ts')
+})
+
+test('a wordmark entry matches a registry record by name, else by its leading words, never by a short prefix', () => {
+  const byKey = indexRecords([
+    { source: 'svgl', name: 'Spring', aliases: [], light: 'spring.svg' },
+    { source: 'simple-icons', name: 'Teradata', aliases: [], light: 'teradata.svg' },
+    { source: 'simple-icons', name: 'Go', aliases: [], light: 'go.svg' },
+  ])
+  assert.equal(matchRecords('Teradata', byKey).match, 'exact')
+  const prefix = matchRecords('Spring Cloud Gateway', byKey)
+  assert.equal(prefix.match, 'prefix')
+  assert.equal(prefix.via, 'Spring')
+  assert.equal(matchRecords('Go Developers Portal', byKey), null, '"Go" is too short to claim a prefix')
+  assert.equal(matchRecords('Springfield', byKey), null, 'whole words only')
 })

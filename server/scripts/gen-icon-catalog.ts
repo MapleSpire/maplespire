@@ -24,7 +24,8 @@
  * (`iconLight` / `iconDark`), framework/protocol keywords.
  * Merged in: description, website, revision and retired artwork paths from
  * src/lib/technologies/techIconDetails.json, which the technology seed
- * (server/src/technologies/seed.ts) and icon validation (normalize.ts) use.
+ * (server/src/technologies/seed.ts) and icon validation (normalize.ts) use;
+ * `wordmark` from src/lib/technologies/wideIconNames.json.
  * Dropped: colors, abbreviations — visual-only.
  */
 import { writeFileSync } from 'node:fs'
@@ -32,6 +33,7 @@ import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 import { ICONS, getTechMetadata } from '../../src/lib/techIcons'
 import { TECH_ICON_DETAILS } from '../../src/lib/technologies/techIconDetails'
+import wideIconNames from '../../src/lib/technologies/wideIconNames.json'
 
 interface Entry {
   name: string
@@ -44,6 +46,7 @@ interface Entry {
   description?: string
   website?: string
   revision?: number
+  wordmark?: true
 }
 
 const byName = new Map<string, Entry>()
@@ -82,6 +85,14 @@ for (const [name, details] of Object.entries(TECH_ICON_DETAILS)) {
   if (details.description) entry.description = details.description
   if (details.website) entry.website = details.website
   if (details.revision) entry.revision = details.revision
+}
+
+// Measured by scripts/tech-icons/audit.mjs --write-wide (light artwork wider
+// than 2.2:1); search ranks these below a square mark.
+for (const name of wideIconNames as string[]) {
+  const entry = byName.get(name.toLowerCase())
+  if (!entry) throw new Error(`wideIconNames.json names "${name}", which is not in the icon catalog`)
+  entry.wordmark = true
 }
 
 const entries = [...byName.values()].sort((a, b) => a.name.localeCompare(b.name))
@@ -132,6 +143,8 @@ export interface IconCatalogEntry {
   website?: string
   /** Seeded revision when above SEEDED_TECHNOLOGY_CATALOG_REVISION (artwork or description changed). */
   revision?: number
+  /** The artwork is wider than 2.2:1 (a wordmark): illegible at shape size, so search ranks it below square marks. */
+  wordmark?: true
 }
 
 export const ICON_CATALOG: IconCatalogEntry[] = [
