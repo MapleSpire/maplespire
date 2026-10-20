@@ -199,6 +199,9 @@ organisation** on GitHub.
   the decision.
 - **Contributions.** Pull requests are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
   Every change goes through review and the automated checks before it is merged.
+  Commits must be signed off under the [Developer Certificate of Origin](https://developercertificate.org/)
+  (`git commit -s`) so that we are sure to have the right to distribute the code
+  submitted; a GitHub check (**DCO**) verifies it on every pull request.
 - **Security.** Please do not open public issues for vulnerabilities — see [SECURITY.md](SECURITY.md).
 - **Website.** The marketing site lives in its own repository,
   [MapleSpire/maplespire-website](https://github.com/MapleSpire/maplespire-website),
@@ -213,10 +216,6 @@ You may use, study, modify and redistribute it — including commercially and as
 a hosted service — provided that you publish your modifications under the same
 license and offer the corresponding source code to the users who interact with
 a modified version over a network.
-
-A **commercial license** is also available from the copyright holder for
-organisations that want to embed MapleSpire in a proprietary product without
-the obligations of the AGPL. Contact us through [maplespire.ca](https://maplespire.ca).
 
 ---
 
@@ -233,6 +232,6 @@ anglais.
 
 - Démarrer : [docs/getting-started.md](docs/getting-started.md)
 - Site web : [maplespire.ca](https://maplespire.ca)
-- Licence : AGPL-3.0-or-later, avec une licence commerciale disponible sur demande.
+- Licence : AGPL-3.0-or-later.
 
 </details>

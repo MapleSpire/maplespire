@@ -57,3 +57,27 @@ MapleSpire is licensed under AGPL-3.0-or-later and is also offered under a
 commercial license. By submitting a contribution, you agree that it is licensed
 under AGPL-3.0-or-later and that the project maintainers may also distribute it
 under the project's commercial license.
+
+## Developer Certificate of Origin (DCO)
+
+To make sure we have the right to distribute the code you submit, every commit
+must be signed off under the [Developer Certificate of Origin](https://developercertificate.org/):
+by signing off, you certify that you wrote the contribution or otherwise have
+the right to submit it under the project's license.
+
+Add the sign-off with `git commit -s`, which appends this line using your
+`user.name` and `user.email`:
+
+```
+Signed-off-by: Jane Doe <jane@example.com>
+```
+
+The **DCO** GitHub check fails on a pull request if any commit lacks a valid
+sign-off. To fix it:
+
+```bash
+git rebase --signoff origin/main   # sign off every commit of your branch
+git push --force-with-lease
+```
+
+For the last commit only: `git commit --amend --signoff --no-edit`.
