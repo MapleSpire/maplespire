@@ -128,6 +128,10 @@ export async function startColdServer(options: {
       AUTH: 'off',
       AUTH_DEV_LOGIN: 'off',
       ORG_SEED: 'off',
+      // A restore whose automerge_meta has no root_url would otherwise get the
+      // demo written into its default workspace (server/src/demoSeed.ts) and
+      // projected into the very read model the drill inspects.
+      DEMO_SEED: 'off',
       // Empty, and REQUIRED explicitly off: the runtime treats an absent URL as
       // "no distributed runtime", which is right for a throwaway process, but
       // only if it is also told not to insist on one.

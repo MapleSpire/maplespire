@@ -86,8 +86,8 @@ export const DECLARED_BARE_ENV_PARSES = [
   { file: 'server/src/syncCells/ownerAwareWsRouter.ts', knob: 'SYNC_WS_OWNER_RECHECK_MS', blank: 'safe', why: 'THROWS at construction outside [50, 60000] — the best-behaved knob in the tree' },
   { file: 'server/src/tags/operations.ts', knob: '*', blank: 'safe', why: 'computed access; `positiveEnvironmentLimit`\'s `> 0` refuses the 0 a blank produces' },
   { file: 'server/src/technologies/assets.ts', knob: '*', blank: 'safe', why: 'computed access; `positiveEnvironmentLimit`\'s `> 0` refuses the 0 a blank produces' },
-  { file: 'src/lib/automerge/bridge.ts', knob: 'VITE_MODEL_SHARD_SIZE', blank: 'safe', why: '`import.meta.env.X ? Number(X) : 512` — a blank is falsy, so it takes the default' },
-  { file: 'src/lib/automerge/bridge.ts', knob: 'VITE_SHARD_SIZE', blank: 'safe', why: '`import.meta.env.X ? Number(X) : 200` — a blank is falsy, so it takes the default' },
+  { file: 'src/lib/automerge/shardSizes.ts', knob: 'VITE_MODEL_SHARD_SIZE', blank: 'safe', why: '`import.meta.env.X ? Number(X) : 512` — a blank is falsy, so it takes the default' },
+  { file: 'src/lib/automerge/shardSizes.ts', knob: 'VITE_SHARD_SIZE', blank: 'safe', why: '`import.meta.env.X ? Number(X) : 200` — a blank is falsy, so it takes the default' },
   // ── disables ──
   { file: 'server/scripts/repair-static-registry-references.ts', knob: 'STATIC_REGISTRY_AUDIT_LIMIT', blank: 'disables', why: 'guarded with `=== undefined`, which a blank is not, so the limit becomes 0 and the repair sweeps NOTHING while reporting a completed pass' },
   { file: 'server/src/auth/sessionEpoch.ts', knob: 'WS_AUTH_EPOCH_BURST_CACHE_MS', blank: 'disables', why: '`Math.max(0, …)` accepts 0; burst cache off' },

@@ -18,7 +18,6 @@ import { getHeads } from '@automerge/automerge'
 import { useModelStore } from '../../stores/modelStore'
 import { undoHistory } from '../history/undoHistory'
 import { useAutomergeStatus } from '../../stores/automergeStatusStore'
-import { createDemoData } from '../demoData'
 import {
   repo,
   getRootHandle,
@@ -31,6 +30,9 @@ import {
   createObjectShardHandle,
   createConnectionShardHandle,
   getModelShardHandles,
+  findHeldModelShardHandle,
+  findHeldRegistryShardHandle,
+  isMintedDocumentId,
   forgetWorkspace,
   forgetWorkspaceHandles,
   routeWorkspaceNetwork,
@@ -77,6 +79,13 @@ import { fetchDiagramMeta, type DiagramBootstrap } from '../modelQuery/diagramMe
 import { fetchDiagramListPage } from '../modelQuery/diagrams'
 import { buildLocalDiagramRender } from '../modelQuery/diagramRenderLocal'
 import { publishAfterDurableFlush } from './durableReferences'
+import { MODEL_SHARD_SIZE, SHARD_SIZE } from './shardSizes'
+import {
+  DeferredReferenceQueue,
+  ServerDurabilityWaiters,
+  isModelShardReferenceField,
+  type DeferredReference,
+} from './deferredReferences'
 import { subscribeCurrentWorkspaceInvalidations } from '../modelQuery/workspaceInvalidation'
 import { workspaceKvStore } from '../modelQuery/kvStore'
 import { withWorkspaceParams } from '../modelQuery/workspaceParams'
@@ -234,22 +243,8 @@ import type {
  * invalidation is lost. Normal live refresh is driven by workspace push. */
 const LIVE_SYNC_FALLBACK_MS = 60_000
 
-/**
- * Max diagrams per registry shard. Override via VITE_SHARD_SIZE env var (client).
- * The server uses AM_SHARD_SIZE (see server/src/automergeServer.ts).
- */
-const SHARD_SIZE = import.meta.env.VITE_SHARD_SIZE
-  ? Number(import.meta.env.VITE_SHARD_SIZE)
-  : 200
-
-/**
- * Max objects/connections per MODEL shard. Balances per-edit reconcile
- * cost (linear in shard) against handle count (100k/512 ≈ 200 shards). Override via
- * VITE_MODEL_SHARD_SIZE. Only used when model sharding is enabled.
- */
-const MODEL_SHARD_SIZE = import.meta.env.VITE_MODEL_SHARD_SIZE
-  ? Number(import.meta.env.VITE_MODEL_SHARD_SIZE)
-  : 512
+// Registry / model shard capacities: shardSizes.ts (shared with the import's
+// minted-id budget).
 
 /** Bound each offline edits document. A segment rotates after this many unique
  * entities or local write batches; compaction folds all segments oldest→newest. */
@@ -298,6 +293,11 @@ let netCleanups: Array<() => void> = []
 let serverProjectionRequestSequence = 0
 let lastAppliedServerProjectionRequest = 0
 const durableHeads = new DurableHeadLedger()
+/** Pointers held back until the server acknowledges the document they name
+ *  (deferredReferences.ts). The waiters live for one session, like the ledger
+ *  that feeds them; the queue is persisted per workspace and resumed at boot. */
+const serverDurability = new ServerDurabilityWaiters()
+const deferredReferences = new DeferredReferenceQueue(() => workspaceKvStore())
 /** Re-presents documents the sync gate refused. Bookkeeping lives beside the
  *  ledger because the ledger IS the "authored and not yet durable" set — the
  *  only population this may ever touch. See deniedDocumentRecovery.ts. */
@@ -487,6 +487,13 @@ async function runDurableAcknowledgement(): Promise<void> {
     const acknowledged = await acknowledgeDurableDocumentHeads(sent)
     if (epoch !== durableAckEpoch) return
     durableHeads.acknowledge(sent, acknowledged)
+    // Any `durable` answer means the server holds the document (heads are
+    // causal, so the frontier sent contains its creation) — which is all a held
+    // pointer waits for, even if newer edits are still on their way.
+    const sentIds = new Set(sent.map(({ documentId }) => documentId))
+    serverDurability.noteDurable(acknowledged
+      .filter((item) => item.durable && sentIds.has(item.documentId as DocumentId))
+      .map((item) => item.documentId as DocumentId))
     const stillPending = new Set(durableHeads.snapshot().map(({ documentId }) => documentId))
     for (const { documentId } of sent) {
       if (!stillPending.has(documentId)) {
@@ -1252,7 +1259,7 @@ async function syncShardHandles(): Promise<void> {
   const root = rootHandle.doc()
   if (!root) return
   const currentUrls = new Set<string>(shardHandles.map((h) => h.url))
-  const newUrls = root.shardUrls.filter((u) => !currentUrls.has(u))
+  const newUrls = uniqueUrls(root.shardUrls).filter((u) => !currentUrls.has(u))
   if (newUrls.length === 0) return
   for (const url of newUrls) {
     if (!isValidAutomergeUrl(url)) continue
@@ -1431,8 +1438,20 @@ async function ensureModelSharded(): Promise<boolean> {
       // a journaled-but-unwritten delete at the next boot; see
       // `bridgeSummaryDelete.test.ts`.
     } else {
-      objectShardHandles = await getModelShardHandles<ObjectShard>(meta.objectShardUrls)
-      connectionShardHandles = await getModelShardHandles<ConnectionShard>(meta.connectionShardUrls)
+      objectShardHandles = await getModelShardHandles<ObjectShard>(uniqueUrls(meta.objectShardUrls))
+      connectionShardHandles = await getModelShardHandles<ConnectionShard>(uniqueUrls(meta.connectionShardUrls))
+    }
+    // Shards this browser created whose pointer is still held back. Resumed on
+    // both paths so they get published; only the resident path writes model
+    // shards, so only it keeps the handles (appended after the published ones,
+    // in the order they were created).
+    const held = await resumeDeferredModelShardReferences(
+      modelMetaHandle,
+      new Set([...(meta.objectShardUrls ?? []), ...(meta.connectionShardUrls ?? [])]),
+    )
+    if (!bfsActive) {
+      objectShardHandles.push(...held.objects)
+      connectionShardHandles.push(...held.connections)
     }
   } else {
     // Do NOT split the monolith here, in the browser. A client-created
@@ -1556,6 +1575,242 @@ function reconcileModelShardBucket(
   })
 }
 
+/** Write a new model shard's url into ModelMeta — at once for a random-id
+ *  shard, after the server's acknowledgement for a minted one (see
+ *  writeModelShards and deferredReferences.ts). */
+function publishModelShardReference(field: 'objectShardUrls' | 'connectionShardUrls', handle: DocHandle<unknown>): void {
+  if (!modelMetaHandle) return
+  if (!isMintedDocumentId(handle.documentId)) {
+    changeAndTrack(modelMetaHandle, (m) => {
+      m[field].push(handle.url)
+    })
+    return
+  }
+  const reference: DeferredReference = {
+    holderDocumentId: modelMetaHandle.documentId,
+    field,
+    url: handle.url,
+  }
+  const epoch = durableAckEpoch
+  const persisted = deferredReferences.add(reference).catch((error) => {
+    // Unqueued, a held pointer would not survive this session, and a reload
+    // would hide the shard's objects from their own author. Write it now: a
+    // possible dangling pointer (the old behaviour) beats certain loss.
+    console.warn('deferred model-shard reference could not be persisted; writing it now', error)
+    writeHeldReference(reference, epoch)
+  })
+  holdReference(reference, handle.documentId, persisted)
+}
+
+/** Write a held pointer into the session's holder document — the ModelMeta for
+ *  a model shard, the root for a registry shard — once. False when the session
+ *  or the holder it was held for is gone. */
+function writeHeldReference(reference: DeferredReference, epoch: number): boolean {
+  if (epoch !== durableAckEpoch) return false
+  const field = reference.field
+  if (!isModelShardReferenceField(field)) {
+    // No holder comparison: `rootHandle` is assigned once per session (after
+    // the epoch bump in startBridge), so the epoch test above already rules
+    // out another root, and a resumed entry for another root is given up
+    // before it is held (resumeHeldReferences).
+    const root = rootHandle
+    if (!root) return false
+    changeAndTrack(root, (draft) => {
+      if (!draft.shardUrls.includes(reference.url)) draft.shardUrls.push(reference.url)
+      if (reference.writeHead) draft.registryWriteUrl = reference.url
+    })
+    return true
+  }
+  const meta = modelMetaHandle
+  if (!meta || meta.documentId !== reference.holderDocumentId) return false
+  changeAndTrack(meta, (m) => {
+    if (!m[field].includes(reference.url)) m[field].push(reference.url)
+  })
+  return true
+}
+
+/** Boots after which a held shard this browser cannot load is given up. */
+const HELD_SHARD_RESUME_LIMIT = 3
+
+/** Write `reference` once the server acknowledges `documentId`, in THIS session
+ *  only: a later session resumes it from the persisted queue instead. */
+function holdReference(
+  reference: DeferredReference,
+  documentId: DocumentId,
+  persisted: Promise<unknown>,
+): void {
+  const epoch = durableAckEpoch
+  void serverDurability.wait(documentId).then(async () => {
+    // Ordered after the add: a remove that overtook it would leave the entry
+    // queued for ever (harmless at the next boot, which finds it published).
+    await persisted
+    if (!writeHeldReference(reference, epoch)) return
+    await deferredReferences.remove(reference).catch((error) => {
+      console.warn(`published ${reference.field} reference could not be dequeued`, error)
+    })
+  })
+}
+
+/**
+ * The shared boot half of every held pointer kind. Takes the queue entries
+ * `accepts` selects (the queue is one per workspace and carries ModelMeta and
+ * root entries side by side — a resume must never count a failure against an
+ * entry of the other kind), drops those already published, and loads the rest
+ * from this browser's storage IN PARALLEL: each find is bounded
+ * (HELD_SHARD_RESOLUTION), so the whole resume costs the boot at most one
+ * budget however many entries are held.
+ */
+async function resumeHeldReferences<T>(options: {
+  queued: readonly DeferredReference[]
+  accepts: (reference: DeferredReference) => boolean
+  holderDocumentId: string
+  holderName: string
+  lost: string
+  isPublished: (reference: DeferredReference) => boolean
+  find: (url: string) => Promise<DocHandle<T>>
+  onResumed: (reference: DeferredReference, handle: DocHandle<T>) => void
+}): Promise<void> {
+  // The session this resume belongs to, read BEFORE any await: a find can take
+  // seconds, and a workspace switch in the meantime (stopBridge → startBridge)
+  // must not get this workspace's shard in its ledger or its hold (found in
+  // review, 2026-10-19). `holdReference` reads the epoch only when it is called.
+  const epoch = durableAckEpoch
+  const giveUp = async (reference: DeferredReference, why: string, error?: unknown) => {
+    const failures = await deferredReferences.noteResumeFailure(reference, HELD_SHARD_RESUME_LIMIT).catch(() => 0)
+    const verdict = failures >= HELD_SHARD_RESUME_LIMIT
+      ? `given up after ${failures} boots: ${options.lost}`
+      : `retrying next boot (${failures}/${HELD_SHARD_RESUME_LIMIT})`
+    console.warn(`held ${reference.field} entry ${reference.url} ${why}; ${verdict}`, error ?? '')
+  }
+  await Promise.all(options.queued.filter(options.accepts).map(async (reference) => {
+    if (reference.holderDocumentId !== options.holderDocumentId) {
+      // Held for a holder this workspace no longer uses: nowhere to publish.
+      await giveUp(reference, `was held for ${options.holderName} ${reference.holderDocumentId}, not ${options.holderDocumentId}`)
+      return
+    }
+    if (options.isPublished(reference)) {
+      await deferredReferences.remove(reference).catch(() => undefined)
+      return
+    }
+    let handle: DocHandle<T>
+    try {
+      handle = await options.find(reference.url)
+    } catch (error) {
+      await giveUp(reference, 'could not be loaded from this browser', error)
+      return
+    }
+    // The entry stays queued for that workspace's next boot.
+    if (epoch !== durableAckEpoch) return
+    options.onResumed(reference, handle)
+    trackDurableHandle(handle)
+    holdReference(reference, handle.documentId, Promise.resolve())
+  }))
+}
+
+/**
+ * Boot half of the held model-shard pointers: shards this browser created
+ * whose url the ModelMeta does not carry yet. They are loaded locally (their
+ * content is in this browser's storage) so the author keeps seeing their
+ * objects, re-entered in the durability ledger so the acknowledgement round
+ * asks about them again, and published once acknowledged. An entry the meta
+ * already carries was published by an earlier session or another tab whose
+ * dequeue was lost; it is just dropped.
+ *
+ * Runs on EVERY boot of a sharded workspace, boot-from-server included (the
+ * caller only keeps the handles on the resident path): a session that boots
+ * the other way must still publish what an earlier one held, or the shard's
+ * objects stay invisible to everyone, the author included.
+ */
+async function resumeDeferredModelShardReferences(
+  meta: DocHandle<ModelMeta>,
+  loaded: ReadonlySet<string>,
+): Promise<{ objects: DocHandle<ObjectShard>[]; connections: DocHandle<ConnectionShard>[] }> {
+  const resumed = { objects: [] as DocHandle<ObjectShard>[], connections: [] as DocHandle<ConnectionShard>[] }
+  let queued: DeferredReference[]
+  try {
+    queued = await deferredReferences.list()
+  } catch (error) {
+    console.warn('deferred model-shard references could not be read', error)
+    return resumed
+  }
+  const doc = meta.doc()
+  // Creation order: the handles are appended after the published ones, and the
+  // parallel resume completes in any order.
+  const order = new Map(queued.map((reference, index) => [reference, index]))
+  const objects: Array<[number, DocHandle<ObjectShard>]> = []
+  const connections: Array<[number, DocHandle<ConnectionShard>]> = []
+  await resumeHeldReferences<unknown>({
+    queued,
+    accepts: (reference) => isModelShardReferenceField(reference.field),
+    holderDocumentId: meta.documentId,
+    holderName: 'ModelMeta',
+    lost: 'its objects are lost to this workspace',
+    isPublished: (reference) => {
+      const field = reference.field as 'objectShardUrls' | 'connectionShardUrls'
+      return Boolean(doc?.[field]?.includes(reference.url)) || loaded.has(reference.url)
+    },
+    find: (url) => findHeldModelShardHandle<unknown>(url),
+    onResumed: (reference, handle) => {
+      const index = order.get(reference) ?? 0
+      if (reference.field === 'objectShardUrls') objects.push([index, handle as DocHandle<ObjectShard>])
+      else connections.push([index, handle as DocHandle<ConnectionShard>])
+    },
+  })
+  const byOrder = (a: [number, unknown], b: [number, unknown]) => a[0] - b[0]
+  resumed.objects = objects.sort(byOrder).map(([, handle]) => handle)
+  resumed.connections = connections.sort(byOrder).map(([, handle]) => handle)
+  return resumed
+}
+
+/**
+ * Boot half of the held REGISTRY-shard pointers: shards this browser created
+ * (overflow, or a summary workspace's write head) whose url the root does not
+ * carry yet. Same contract as the model resume above — and the same reason it
+ * runs on every boot path: a dangling registry shard breaks every client's
+ * registry boot and sets the GC census incomplete fleet-wide (server/src/gc.ts),
+ * which is why the pointer is held at all; an un-resumed one would instead hide
+ * the shard's diagrams from everyone, the author included.
+ *
+ * The handles join `shardHandles` (so the author's diagrams are projected and
+ * the flush keeps writing into them). While one is held, the classic absence
+ * sweep abstains: its witnesses no longer equal root.shardUrls
+ * (`observeRegistryAbsence`), which is the safe direction.
+ */
+async function resumeDeferredRegistryShardReferences(root: DocHandle<RootDoc>): Promise<void> {
+  let queued: DeferredReference[]
+  try {
+    queued = await deferredReferences.list()
+  } catch (error) {
+    console.warn('deferred registry-shard references could not be read', error)
+    return
+  }
+  if (!queued.some((reference) => reference.field === 'shardUrls')) return
+  const doc = root.doc()
+  await resumeHeldReferences<RegistryShard>({
+    queued,
+    accepts: (reference) => reference.field === 'shardUrls',
+    holderDocumentId: root.documentId,
+    holderName: 'root',
+    lost: 'its diagrams are lost to this workspace',
+    isPublished: (reference) => Boolean(doc?.shardUrls.includes(reference.url)),
+    find: (url) => findHeldRegistryShardHandle(url),
+    onResumed: (reference, handle) => {
+      if (!shardHandles.some((loaded) => loaded.url === handle.url)) shardHandles.push(handle)
+      attachShardListener(handle)
+      // This browser chose it as the write head; its own metas live there.
+      if (reference.writeHead && registrySummaryOnly) summaryRegistryWriteUrl = handle.url
+    },
+  })
+}
+
+/** One handle per url: two tabs publishing the same held shard can leave a
+ *  url twice in ModelMeta (concurrent list inserts both survive the merge),
+ *  and a duplicate index would split one shard's routing across two buckets
+ *  that then overwrite each other. */
+function uniqueUrls(urls: readonly string[] | undefined): string[] {
+  return [...new Set(urls ?? [])]
+}
+
 /**
  * Per-shard model write (Slice 3) — replaces the monolithic
  * `modelHandle.change(reconcile(wholeModel))`. Routes objects/connections to shards
@@ -1565,15 +1820,14 @@ function reconcileModelShardBucket(
  * Small collections (groups/domains/tags/decisionRecords) stay inline on the meta
  * and are reconciled only when one of them changed.
  *
- * KNOWN GAP against the create→flush→publish rule: on overflow this creates a
- * shard and publishes its url into ModelMeta in the same synchronous turn — a
- * browser cannot order the two documents' arrival at the server, so a client
- * dying between the meta sync and the shard sync leaves a dangling pointer
- * (`fsck document-present` is the detector; the walk + retry queue the
- * repair). Fixing it means an async publish (`publishAfterDurableFlush`, as
- * the registry shards do) with the write buffered meanwhile — tracked in the
- * plan, out of scope for the resident-replay cycle that made this path more
- * frequented.
+ * On overflow this creates a shard. A browser cannot order two documents'
+ * arrival at the server, so writing the new shard's url into ModelMeta in the
+ * same turn lets a client dying in between leave a dangling pointer (`fsck
+ * document-present` detects it). So the url goes through
+ * `publishModelShardReference`: a MINTED shard is used locally at once and its
+ * pointer is written only after the server acknowledges the shard; a shard on
+ * a random fallback id keeps the old same-turn write, because the server can
+ * only claim it through that pointer (deferredReferences.ts).
  */
 function writeModelShards(
   objects: readonly C4Object[],
@@ -1593,9 +1847,7 @@ function writeModelShards(
     const h = trackCreatedHandle(createObjectShardHandle({ objects: {} }))
     objectShardHandles.push(h)
     attachModelShardListener(h as DocHandle<unknown>)
-    changeAndTrack(modelMetaHandle, (m) => {
-      m.objectShardUrls.push(h.url)
-    })
+    publishModelShardReference('objectShardUrls', h)
   }
   const objBuckets = partitionByShard(objects, objPlan.route, objectShardHandles.length)
   for (let i = 0; i < objBuckets.length; i++) {
@@ -1618,9 +1870,7 @@ function writeModelShards(
     const h = trackCreatedHandle(createConnectionShardHandle({ connections: {} }))
     connectionShardHandles.push(h)
     attachModelShardListener(h as DocHandle<unknown>)
-    changeAndTrack(modelMetaHandle, (m) => {
-      m.connectionShardUrls.push(h.url)
-    })
+    publishModelShardReference('connectionShardUrls', h)
   }
   const connBuckets = partitionByShard(connections, connPlan.route, connectionShardHandles.length)
   for (let i = 0; i < connBuckets.length; i++) {
@@ -1663,8 +1913,9 @@ function writeModelShards(
  * reused across sessions and recorded in the singular ModelMeta pointer; ordered
  * plural arrays retain all last-wins segments until acknowledged compaction. On a
  * fresh session we `repo.find` those URLs (the server holds them, so it serves on
- * request — no fetch race); the very first edit creates the initial segments and
- * appends them last to ModelMeta.{object,connection}ShardUrls so the read model
+ * request — no fetch race). The browser never creates or appends a segment: the
+ * server mints the write heads with the ModelMeta (`buildModelMeta`) and owns
+ * rotation, kept last in ModelMeta.{object,connection}ShardUrls so the read model
  * overlays them. Done after the first paint (or lazily on first edit), never in
  * the critical boot path. After it resolves we re-schedule a flush to write the edits
  * accumulated meanwhile (they sit durably in editsObjects/Connections until then).
@@ -4703,12 +4954,52 @@ function findOrCreateSummaryWriteShard(): RegistryShardSelection {
   return { handle, created: true }
 }
 
-/** Publish a newly populated registry shard only after its child document is
- * locally durable. Capturing the root prevents an asynchronous flush from an
- * old workspace from appending into the next workspace's root. */
+/**
+ * Publish a newly populated registry shard into the root (`shardUrls`, and
+ * `registryWriteUrl` for a summary write head).
+ *
+ * A MINTED shard's pointer is written only after the server acknowledges the
+ * shard (deferredReferences.ts, same machinery as `publishModelShardReference`):
+ * a root naming a shard the server never received breaks every other client's
+ * registry boot, and the GC census reads every registry shard, so one dangling
+ * pointer makes it incomplete and aborts GC fleet-wide. The shard is used
+ * locally at once — it is already in `shardHandles` — and the pending pointer
+ * is persisted so a reload resumes it (`resumeDeferredRegistryShardReferences`).
+ *
+ * A shard on a random fallback id keeps the local-flush ordering: the server
+ * claims such a document only through the walk from the root, i.e. through
+ * this very pointer, so holding it would wait for ever.
+ *
+ * Capturing the root prevents an asynchronous publish from an old workspace
+ * from appending into the next workspace's root (`writeHeldReference` checks
+ * the holder and the session epoch).
+ */
 function publishNewRegistryShard(handle: DocHandle<RegistryShard>, summaryWriteHead = false): void {
   const targetRoot = rootHandle
   if (!targetRoot) return
+  if (isMintedDocumentId(handle.documentId)) {
+    const reference: DeferredReference = {
+      holderDocumentId: targetRoot.documentId,
+      field: 'shardUrls',
+      url: handle.url,
+      ...(summaryWriteHead ? { writeHead: true } : {}),
+    }
+    const epoch = durableAckEpoch
+    const persisted = deferredReferences.add(reference).catch((error) => {
+      // Unqueued, a held pointer would not survive this session and a reload
+      // would hide the shard's diagrams from their own author. Fall back to the
+      // pre-hold ordering (after the LOCAL flush): a possible dangling pointer
+      // beats certain loss.
+      console.warn('deferred registry-shard reference could not be persisted; writing it after the local flush', error)
+      void publishAfterDurableFlush(repo, () => {
+        writeHeldReference(reference, epoch)
+      }).catch((flushError) => {
+        console.warn('registry shard durability flush failed', flushError)
+      })
+    })
+    holdReference(reference, handle.documentId, persisted)
+    return
+  }
   void publishAfterDurableFlush(repo, () => {
     if (rootHandle !== targetRoot) return
     const root = targetRoot.doc()
@@ -5473,7 +5764,11 @@ function observeRegistryForAbsence(
       const doc = handle.doc()
       return { url: handle.url, diagramIds: doc ? Object.keys(doc.diagrams) : null }
     }),
-    rootShardUrls: registrySummaryOnly ? null : (rootHandle?.doc()?.shardUrls ?? null),
+    // Deduped like the handles it is compared with (getRegistryShardHandles):
+    // a url listed twice would otherwise make the sweep abstain for ever.
+    rootShardUrls: registrySummaryOnly
+      ? null
+      : (rootHandle?.doc()?.shardUrls ? uniqueUrls(rootHandle.doc()?.shardUrls) : null),
     writeHeadUrl: registrySummaryOnly
       ? (summaryRegistryWriteUrl ?? rootHandle?.doc()?.registryWriteUrl ?? null)
       : null,
@@ -5937,48 +6232,6 @@ function onStoreChange(state: ModelStoreSnapshot, previous: ModelStoreSnapshot):
   if (placementChanged) scheduleOffActivePlacementDrain()
 }
 
-// ── demo seeding (fresh install, empty root) ──────────────────────────────────
-
-function seedDemoIntoDocs(): void {
-  if (!rootHandle || !modelHandle) return
-  const demo = createDemoData()
-  for (const dg of demo.diagrams) {
-    // createDemoData() carries no comments; kept explicit for clarity.
-    const comments: Comment[] = []
-    const flows = demo.flows.filter((f) => f.diagramId === dg.id)
-    const handle = trackCreatedHandle(createDiagramHandle(diagramToDiagramDoc(dg, comments, flows, [])))
-    docUrlById.set(dg.id, handle.url)
-  }
-  changeAndTrack(modelHandle, (model) => {
-    reconcile(
-      model,
-      sliceToRootModel({
-        objects: demo.objects,
-        connections: demo.connections,
-        groups: demo.groups,
-        domains: demo.domains,
-        tagSnapshots: demo.tags,
-        decisionRecords: demo.decisionRecords,
-      })
-    )
-  })
-  // Place demo diagrams into shards (include composition for accurate stubs).
-  for (const dg of demo.diagrams) {
-    const selection = findOrCreateShardForNew()
-    const targetShard = selection.handle
-    const meta = buildMeta(
-      dg,
-      { objectIds: dg.objectIds, connectionIds: dg.connectionIds, groupIds: dg.groupIds },
-      docUrlById.get(dg.id)!,
-    )
-    changeAndTrack(targetShard, (s) => {
-      s.diagrams[dg.id] = meta
-    })
-    shardByDiagramId.set(dg.id, targetShard.url)
-    if (selection.created) publishNewRegistryShard(targetShard)
-  }
-}
-
 // ── live connection status ────────────────────────────────────────────────────
 
 /** Coalesce workspace invalidations into one generation-consistent render. A
@@ -6405,6 +6658,7 @@ export async function startBridge(ref: WorkspaceRef = DEFAULT_WORKSPACE_REF): Pr
   bootFallbackReentryPending = false
   durableAckEpoch += 1
   durableHeads.clear()
+  serverDurability.clear()
   serverUnreachable = false
   // Same lifetime as the ledger it shadows. A new session gets a fresh budget:
   // the per-session cap must not carry a previous workspace's refusals into one
@@ -6634,6 +6888,10 @@ export async function startBridge(ref: WorkspaceRef = DEFAULT_WORKSPACE_REF): Pr
       }
       for (const handle of shardHandles) attachShardListener(handle)
     }
+    // Registry shards this browser created whose root pointer is still held
+    // back — on BOTH registry paths (full and summary), before the first
+    // projection so the author's own diagrams are in it.
+    await resumeDeferredRegistryShardReferences(rootHandle)
 
     // Yield one macrotask so React paints the loading gate BEFORE the first
     // projection. The handle awaits above resolve as microtasks (no paint), so
@@ -6641,22 +6899,14 @@ export async function startBridge(ref: WorkspaceRef = DEFAULT_WORKSPACE_REF): Pr
     // before any frame is drawn and the user would stare at a blank screen.
     await new Promise((resolve) => setTimeout(resolve, 0))
 
-    // Fresh install: empty shards and no model entities → seed demo content. Needs the
-    // monolith, so skip under boot-from-server (the workspace already exists remotely).
-    // Only the ORIGINAL default workspace gets demo content. User-created landscapes
-    // and new versions start BLANK (a fork is how you start from a copy) — otherwise
-    // every new empty workspace would surprise the user with the MapleSpire demo.
-    if (!skipMonolith && modelHandle && isDefaultWorkspaceRef(currentRef)) {
-      const modelDoc = modelHandle.doc()
-      const totalDiagrams = mergeShards(shardHandles.map((h) => h.doc() ?? { diagrams: {} })).length
-      const empty =
-        modelDoc ? totalDiagrams === 0 && Object.keys(modelDoc.objects).length === 0 : true
-      if (empty) seedDemoIntoDocs()
-    }
+    // The demo of a fresh install is written by the SERVER into the default
+    // workspace before it publishes the root (server/src/demoSeed.ts). A browser
+    // seed reached the server one document at a time, and a tab closed mid-way
+    // left every other client a partial demo.
 
     // When model sharding is enabled, resolve the sharded model — loading
-    // existing shards, or splitting the (possibly just-seeded) monolith on first run
-    // and recording root.modelMetaUrl. Falls back to the monolith on any failure.
+    // existing shards. An unsharded monolith stays one: splitting it is server
+    // maintenance (see ensureModelSharded). Falls back to the monolith on any failure.
     // An ALREADY-sharded workspace is self-describing (root.modelMetaUrl): load its
     // shards regardless of the local flag — it may have no monolith to fall back to
     // (forks), and the flag only governs whether an UNsharded workspace gets split.
@@ -7167,6 +7417,7 @@ export function stopBridge(): void {
   durableAckInFlight = false
   durableAckFollowUp = false
   durableHeads.clear()
+  serverDurability.clear()
   // Same lifetime as the ledger it shadows. A new session gets a fresh budget:
   // the per-session cap must not carry a previous workspace's refusals into one
   // that may be perfectly healthy.

@@ -24,6 +24,7 @@ import { cachedHandles, drainEntries, syncedHandle } from './automergeRepoCompat
 import { pool } from './db.js'
 import { envNumber } from './envNumber.js'
 import { migrateEntitiesIntoRoot } from './automergeMigrate.js'
+import { seedDemoIntoUnpublishedRoot } from './demoSeed.js'
 import { buildModelMeta } from './modelMeta.js'
 import { buildEmptyRootShape } from './rootShape.js'
 import type { BootstrapScope } from './bootstrapScope.js'
@@ -505,8 +506,30 @@ async function findBootDocument(repo: Repo, url: string, what: string): Promise<
  * On first boot the server also creates the ModelDoc (the sharded C4 model) and
  * stores its URL inside the root so clients can find it.
  */
-async function ensureRootDoc(repo: Repo): Promise<string> {
-  const existing = await getMeta('root_url')
+export interface RootBootstrapDeps {
+  getMeta(key: string): Promise<string | null>
+  setMeta(key: string, value: string): Promise<void>
+  /** Folds legacy `entities` rows into the root; true when it wrote anything. */
+  migrate(
+    repo: Repo,
+    rootHandle: DocHandle<Record<string, unknown>>,
+    modelHandle: DocHandle<Record<string, unknown>>,
+  ): Promise<boolean>
+  /** Seed the demo into a fresh root. Off for a process that must not write
+   *  content into the database it boots against (the backup drill's cold server). */
+  seedDemo: boolean
+}
+
+const rootBootstrapDeps: RootBootstrapDeps = {
+  getMeta,
+  setMeta,
+  migrate: migrateEntitiesIntoRoot,
+  seedDemo: process.env.DEMO_SEED !== 'off',
+}
+
+/** Exported for demoSeed.ensureRootDoc.test.ts; production passes no `deps`. */
+export async function ensureRootDoc(repo: Repo, deps: RootBootstrapDeps = rootBootstrapDeps): Promise<string> {
+  const existing = await deps.getMeta('root_url')
   if (existing) return existing
 
   // Create the root doc first (just shard list + model pointer).
@@ -532,14 +555,19 @@ async function ensureRootDoc(repo: Repo): Promise<string> {
   // diagram docs, before anyone connects, so existing workspaces carry over.
   // Pass the repo + rootHandle so migration can create additional shards when
   // the diagram count exceeds AM_SHARD_SIZE.
-  await migrateEntitiesIntoRoot(repo, rootHandle, modelHandle)
+  const migrated = await deps.migrate(repo, rootHandle, modelHandle)
+  // A fresh install gets the demo HERE, inside the unpublished root, never
+  // from a browser (see demoSeed.ts for the partial seeds that caused). Not
+  // after a migration: `writeWorkspaceContent` replaces whole collections, so
+  // seeding over migrated groups/domains/ADRs would erase them.
+  const seeded = deps.seedDemo && !migrated && await seedDemoIntoUnpublishedRoot(repo, rootHandle, modelHandle)
 
   // Publish the root URL only after its model and registry documents are
   // durable. See the matching flush in createEmptyRoot().
   await repo.flush()
 
-  await setMeta('root_url', rootHandle.url)
-  console.log('Created shared Automerge root document', rootHandle.url, '+ model doc', modelHandle.url)
+  await deps.setMeta('root_url', rootHandle.url)
+  console.log('Created shared Automerge root document', rootHandle.url, '+ model doc', modelHandle.url, seeded ? '(demo seeded)' : '')
   return rootHandle.url
 }
 
