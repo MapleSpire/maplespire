@@ -53,10 +53,8 @@ See [docs/ci.md](docs/ci.md).
 
 ## License of contributions
 
-MapleSpire is licensed under AGPL-3.0-or-later and is also offered under a
-commercial license. By submitting a contribution, you agree that it is licensed
-under AGPL-3.0-or-later and that the project maintainers may also distribute it
-under the project's commercial license.
+MapleSpire is licensed under AGPL-3.0-or-later. By submitting a contribution,
+you agree that it is licensed under AGPL-3.0-or-later.
 
 ## Developer Certificate of Origin (DCO)
 
