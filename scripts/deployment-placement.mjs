@@ -31,7 +31,7 @@ export const COMPOSE_RECIPES = Object.freeze([
 ])
 const BENCH = 'infra/compose/maplespire-bench.override.yml'
 const NON_DEPLOYMENT_YAML = new Set([
-  '.github/FUNDING.yml', '.github/workflows/ci.yml', '.github/workflows/sync-cells.yml',
+  '.github/FUNDING.yml', '.github/workflows/ci.yml', '.github/workflows/dco.yml', '.github/workflows/sync-cells.yml',
   'infra/monitoring/alerts.test.yml', 'infra/monitoring/alerts.yml',
   'infra/monitoring/grafana/provisioning/dashboards/maplespire.yml',
   'infra/monitoring/grafana/provisioning/datasources/prometheus.yml', 'infra/monitoring/prometheus.yml',

@@ -7,6 +7,10 @@ name: DCO
 on:
   pull_request:
 
+concurrency:
+  group: dco-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
