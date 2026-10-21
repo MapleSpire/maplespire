@@ -28,6 +28,7 @@ import { CameraControls } from './CameraControls'
 import { WebglFallback } from './WebglFallback'
 import { measureCanvasSafeInsets } from './canvasSafeArea'
 import type { Scene3D } from '../../canvas3d'
+import { undoHistory } from '../../lib/history/undoHistory'
 import type { C4Object, Connection, Group } from '../../types'
 
 /** The 2D↔3D morph choreography, as overlay phases:
@@ -219,6 +220,9 @@ export function Canvas3DView({
           onConnectionLabelMove: (connId, position, offset) => {
             updateConnection(connId, { labelPosition: position, labelOffset: offset })
           },
+          // The board writes a drag on every pointermove; its end closes the
+          // undo entry, so one drag is one Ctrl+Z.
+          onDragEnd: () => undoHistory.seal(),
         })
         sceneRef.current = scene
         if (sharedSceneRef) sharedSceneRef.current = scene

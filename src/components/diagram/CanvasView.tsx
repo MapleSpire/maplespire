@@ -52,6 +52,13 @@ import { collectRelatedDiagramObjectIds } from '../../canvas/relatedDiagramAffor
 import { resolveParentNavigation } from '../../lib/diagrams/parentNavigation'
 import { editorCanvasInsets, fitActiveCanvas, zoomActiveCanvas } from './canvasViewportControls'
 import { usesMultiSelectMenu } from './contextMenuTarget'
+import { useCanvasCommands } from './useCanvasCommands'
+import { undoHistory } from '../../lib/history/undoHistory'
+import { rememberedClipboard } from './canvasCommands'
+import { ClipboardCommandRows, type ClipboardMenuProps } from './ClipboardCommandRows'
+import { CanvasBackgroundContextMenu } from './CanvasBackgroundContextMenu'
+import { useClampedMenuPosition } from './useClampedMenuPosition'
+import type { CanvasCommand } from './canvasShortcuts'
 import { DeleteCommandRows } from './DeleteCommandRows'
 import { InlineTextEditor } from './InlineTextEditor'
 import { resolveInlineEditSubject, type InlineEditSubject } from './groupInlineTextEdit'
@@ -1038,10 +1045,13 @@ export function CanvasView() {
       if (!drawn) continue
       // The engine's box is in the VIEW frame (displaced by an open expansion).
       const bounds = unshiftBox(viewCutsRef.current, drawn)
-      store.updateGroup(group.id, {
+      // Not an undo step of its own: undoing it would only re-create the
+      // invalid state this effect heals, and it would heal again — Ctrl+Z
+      // could never get past it.
+      undoHistory.suppress(() => store.updateGroup(group.id, {
         position: { x: bounds.x, y: bounds.y },
         size: { width: bounds.width, height: bounds.height },
-      })
+      }))
     }
   }, [groups, isReadonly])
 
@@ -1306,6 +1316,34 @@ export function CanvasView() {
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
   }, [currentFlowId, flowEditMode, commentMode, openCommentId, isReadonly, nextFlowStep, prevFlowStep, setFlowEditMode, setFlowStepIndex, toggleCommentMode, setOpenCommentId])
+
+  // Undo/redo, cut/copy/paste, duplicate, select all, remove — for the 2D
+  // canvas AND the 3D board, which this component hosts. Off while a flow plays.
+  const { run: runCanvasCommand, mac: macShortcuts } = useCanvasCommands({
+    engineRef,
+    canvasRef,
+    isReadonly,
+    disabled: Boolean(currentFlowId && !flowEditMode),
+  })
+  // Rows for the shape, group and multi-select menus. Read at render, which the
+  // menu opening triggers; paste is offered only once something was copied here.
+  const menuClipboard: ClipboardMenuProps = {
+    mac: macShortcuts,
+    canPaste: rememberedClipboard() !== null,
+    run: (command) => { void runCanvasCommand(command) },
+  }
+  // "Paste here": the click, mapped into the model frame (an open inline
+  // expansion displaces the canvas past a cut — same mapping as a drop).
+  const runBackgroundCommand = (command: CanvasCommand, clientX: number, clientY: number) => {
+    const canvas = canvasRef.current
+    const engine = engineRef.current
+    if (command === 'paste' && canvas && engine) {
+      const rect = canvas.getBoundingClientRect()
+      void runCanvasCommand(command, toModel(engine.screenToWorld(clientX - rect.left, clientY - rect.top)))
+      return
+    }
+    void runCanvasCommand(command)
+  }
 
   // Comment mode: click on canvas to place comment
   const handleCanvasClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -1675,6 +1713,7 @@ export function CanvasView() {
             removeObjectsFromDiagram(objectIds)
           }}
           onDeleteFromModel={() => deleteSelectedItems()}
+          clipboard={menuClipboard}
           onCopySize={() => {
             // Engine, not `objects` — see the single-shape menu below.
             const bounds = engineRef.current?.getObjectSizeById(contextMenu.objectId!)
@@ -1710,6 +1749,7 @@ export function CanvasView() {
           onRemoveFromGroup={(groupId) => removeObjectFromGroup(contextMenu.objectId!, groupId)}
           onRemoveFromDiagram={() => removeObjectFromDiagram(contextMenu.objectId!)}
           onDeleteFromModel={() => deleteObject(contextMenu.objectId!)}
+          clipboard={menuClipboard}
           onCopySize={() => {
             // `objects` is the STORE's list, whose `size` is the create-time
             // value: a resize on this diagram goes to `diagram.layouts[id]` and
@@ -1740,6 +1780,7 @@ export function CanvasView() {
           onClose={() => setContextMenu(null)}
           onRemoveFromDiagram={() => removeGroupFromDiagram(contextMenu.groupId!)}
           onDeleteFromModel={() => deleteGroup(contextMenu.groupId!)}
+          clipboard={menuClipboard}
           onCopySize={() => {
             // Always the ENGINE's bounds: `groups` here is the store's list,
             // whose `size` is the create-time value, while the diagram's layout
@@ -1759,6 +1800,17 @@ export function CanvasView() {
             }
             setContextMenu(null)
           }}
+        />
+      )}
+
+      {contextMenu && !isReadonly
+        && !contextMenu.objectId && !contextMenu.groupId && !contextMenu.connectionId && (
+        <CanvasBackgroundContextMenu
+          x={contextMenu.x}
+          y={contextMenu.y}
+          mac={macShortcuts}
+          onClose={() => setContextMenu(null)}
+          run={(command) => runBackgroundCommand(command, contextMenu.x, contextMenu.y)}
         />
       )}
 
@@ -1892,33 +1944,6 @@ export function CanvasView() {
   )
 }
 
-/**
- * Keeps a context menu inside the viewport. The menu is measured after mount
- * and its position is nudged so it never overflows the right/bottom (or top/left)
- * edges of the window. Returns a ref to attach to the menu element and the
- * clamped left/top to apply.
- */
-function useClampedMenuPosition(x: number, y: number) {
-  const ref = useRef<HTMLDivElement>(null)
-  const [pos, setPos] = useState<{ left: number; top: number }>({ left: x, top: y })
-
-  useLayoutEffect(() => {
-    const el = ref.current
-    if (!el) return
-    const margin = 8
-    const { width, height } = el.getBoundingClientRect()
-    const vw = window.innerWidth
-    const vh = window.innerHeight
-    let left = x
-    let top = y
-    if (left + width > vw - margin) left = Math.max(margin, vw - width - margin)
-    if (top + height > vh - margin) top = Math.max(margin, vh - height - margin)
-    setPos({ left, top })
-  }, [x, y])
-
-  return { ref, pos }
-}
-
 export function ConnectionContextMenu({
   x,
   y,
@@ -1991,6 +2016,7 @@ export function CanvasContextMenu({
   onDeleteFromModel,
   onCopySize,
   onCopyStyle,
+  clipboard,
 }: {
   x: number
   y: number
@@ -2004,6 +2030,7 @@ export function CanvasContextMenu({
   onDeleteFromModel: () => void
   onCopySize: () => void
   onCopyStyle: () => void
+  clipboard?: ClipboardMenuProps
 }) {
   const { t } = useTranslation()
   const objects = useModelStore((s) => s.objects)
@@ -2027,6 +2054,18 @@ export function CanvasContextMenu({
       }}
       onClick={(e) => e.stopPropagation()}
     >
+      {clipboard && (
+        <ClipboardCommandRows
+          {...clipboard}
+          // A right-click outside the selection opens THIS menu for the shape
+          // under the pointer: select it first so cut/copy/duplicate act on it.
+          run={(command) => {
+            if (command !== 'paste') useModelStore.getState().selectObjects([objectId])
+            clipboard.run(command)
+          }}
+          onClose={onClose}
+        />
+      )}
       <button
         onClick={() => {
           onCopySize()
@@ -2130,6 +2169,7 @@ export function GroupContextMenu({
   onDeleteFromModel,
   onCopySize,
   onCopyStyle,
+  clipboard,
 }: {
   x: number
   y: number
@@ -2140,6 +2180,7 @@ export function GroupContextMenu({
   onDeleteFromModel: () => void
   onCopySize: () => void
   onCopyStyle: () => void
+  clipboard?: ClipboardMenuProps
 }) {
   const { t } = useTranslation()
   const groups = useModelStore((s) => s.groups)
@@ -2161,6 +2202,18 @@ export function GroupContextMenu({
       <div className="px-3 py-1.5 text-[11px] font-semibold text-fg-subtle uppercase tracking-wide border-b border-line">
         {group.name}
       </div>
+      {clipboard && (
+        <ClipboardCommandRows
+          {...clipboard}
+          // Right-click does not select: make the group the selection first so
+          // the command acts on what the user pointed at.
+          run={(command) => {
+            if (command !== 'paste') useModelStore.getState().selectGroup(groupId)
+            clipboard.run(command)
+          }}
+          onClose={onClose}
+        />
+      )}
       <button
         onClick={() => {
           onCopySize()
@@ -2217,6 +2270,7 @@ export function MultiSelectContextMenu({
   onDeleteFromModel,
   onCopySize,
   onCopyStyle,
+  clipboard,
 }: {
   x: number
   y: number
@@ -2227,6 +2281,7 @@ export function MultiSelectContextMenu({
   onDeleteFromModel: () => void
   onCopySize: () => void
   onCopyStyle: () => void
+  clipboard?: ClipboardMenuProps
 }) {
   const { t } = useTranslation()
   const objectCount = selectedItems.filter((s) => s.type === 'object').length
@@ -2248,6 +2303,9 @@ export function MultiSelectContextMenu({
       <div className="px-3 py-1.5 text-[11px] font-semibold text-fg-subtle uppercase tracking-wide border-b border-line">
         {t('canvasViewChrome.contextMenu.shapesSelected', { count: objectCount })}
       </div>
+      {/* The menu only opens over a member of the selection, so the store's
+          selection IS what the user pointed at: no re-selecting needed. */}
+      {clipboard && <ClipboardCommandRows {...clipboard} onClose={onClose} />}
       {/* Copy FROM the shape the menu is anchored on — the one right-clicked —
           then click any shape in the selection to apply to all of it. This is
           the "make these all look like this one" direction; the other

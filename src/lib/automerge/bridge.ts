@@ -16,6 +16,7 @@ import type { AutomergeUrl, DocHandle, DocumentId } from '@automerge/automerge-r
 import { isValidAutomergeUrl } from '@automerge/automerge-repo'
 import { getHeads } from '@automerge/automerge'
 import { useModelStore } from '../../stores/modelStore'
+import { undoHistory } from '../history/undoHistory'
 import { useAutomergeStatus } from '../../stores/automergeStatusStore'
 import { createDemoData } from '../demoData'
 import {
@@ -1200,11 +1201,17 @@ function notifyActiveDiagramHandle(): void {
 }
 
 function withRemote(fn: () => void): void {
+  // A remote write can land synchronously INSIDE a recorded canvas action (a
+  // store subscriber re-entering under this flag, e.g. the hydration of a
+  // selected off-window entity). Report it, so undo never replays it as the
+  // user's own change.
+  const recordedBefore = undoHistory.recording ? useModelStore.getState() : null
   applyingRemote = true
   try {
     fn()
   } finally {
     applyingRemote = false
+    if (recordedBefore) undoHistory.noteRemote(recordedBefore, useModelStore.getState())
   }
 }
 
@@ -2826,9 +2833,12 @@ async function maybeReplayEntityIntentsResident(): Promise<void> {
     // map-surgery variant would durably write dangling references (incident
     // connections, diagram compositions, layouts, group memberships
     // all cascade in deleteObject/deleteConnection and nowhere else).
+    // Suppressed: a crash replay is not something the user can undo.
     const actions = useModelStore.getState()
-    for (const id of plan.replayDeleteObjectIds) actions.deleteObject(id)
-    for (const id of plan.replayDeleteConnectionIds) actions.deleteConnection(id)
+    undoHistory.suppress(() => {
+      for (const id of plan.replayDeleteObjectIds) actions.deleteObject(id)
+      for (const id of plan.replayDeleteConnectionIds) actions.deleteConnection(id)
+    })
     writeScheduler.flushNow()
     const carriers = residentCarrierDocumentIds()
     if (!carriers) return

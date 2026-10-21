@@ -33,6 +33,10 @@ import {
 } from '../lib/automerge/placementIntents'
 import { currentWorkspaceRef, subscribeWorkspaceRef, workspaceRefKey } from '../lib/automerge/workspace'
 import { workspaceKvStore } from '../lib/modelQuery/kvStore'
+import { executePlan, planApply, selectionOnDiagram, type Direction } from '../lib/history/applyDiff'
+import type { ModelDiff } from '../lib/history/modelDiff'
+import { undoHistory, type ApplyOutcome } from '../lib/history/undoHistory'
+import type { PastePlan } from '../lib/clipboard/pastePlan'
 
 export interface ObjectPlacementUpdate {
   id: string
@@ -994,6 +998,12 @@ interface ModelState {
 
   // Actions
   setWorkspaceReadOnly: (readOnly: boolean) => void
+  /** Undo/redo: apply a recorded diff backwards or forwards as ONE local edit
+   *  and restore `selection`. Only `src/lib/history` calls it. */
+  applyHistoryDiff: (diff: ModelDiff, direction: Direction, selection: readonly SelectedItem[]) => ApplyOutcome
+  /** Clipboard paste / duplicate onto the current diagram, ONE transaction;
+   *  the pasted shapes become the selection. See `lib/clipboard/pastePlan`. */
+  pasteEntities: (plan: PastePlan) => void
   addObject: (obj: Omit<C4Object, 'id' | 'tagAssignments' | 'tagOrder'> & Partial<Pick<C4Object, 'tagAssignments' | 'tagOrder'>>) => string
   updateObject: (id: string, data: Partial<C4Object>) => void
   /** Many entity updates, ONE store notification. See the implementation. */
@@ -1540,6 +1550,95 @@ export const useModelStore = create<ModelState>()(
       set((state) => {
         state.workspaceReadOnly = readOnly
       })
+    },
+
+    applyHistoryDiff: (diff, direction, selection) => {
+      const before = get()
+      const plan = planApply(diff, direction, before)
+      if (plan.applied.size === 0) return { applied: plan.applied, skipped: plan.skipped }
+      // Journal every placement the commit writes, per (diagram, layer), BEFORE
+      // the commit — the same contract as a drag (`updatePlacementsBatch`).
+      const batches = new Map<string, { diagramId: string; space: LayoutSpace; objects: PendingObjectPlacement[]; groups: PendingGroupPlacement[] }>()
+      for (const write of plan.placementWrites) {
+        const key = `${write.space}:${write.diagramId}`
+        let batch = batches.get(key)
+        if (!batch) {
+          batch = { diagramId: write.diagramId, space: write.space, objects: [], groups: [] }
+          batches.set(key, batch)
+        }
+        const entry = { id: write.id, position: write.value.position, size: write.value.size }
+        if (write.isGroup) batch.groups.push(entry)
+        else batch.objects.push(entry)
+      }
+      let placementRevision: number | undefined
+      for (const batch of batches.values()) {
+        placementRevision = recordPlacementIntent(batch.diagramId, batch.space, { objects: batch.objects, groups: batch.groups })
+      }
+      // Bump the placement revision only for a placement-only step: the bridge
+      // schedules a 'placement' write for it, which does NOT arm the full model
+      // write an entity restore or delete needs (same rule as `updateGroup`).
+      const placementOnly = plan.restore.length === 0 && plan.remove.length === 0 && plan.update.length === 0
+        && plan.membership.length === 0 && plan.groupMember.length === 0 && plan.diagramField.length === 0
+      set((state) => {
+        executePlan(state, plan)
+        const diagram = state.diagrams.find((candidate) => candidate.id === state.currentDiagramId)
+        state.selectedItems = selectionOnDiagram(selection, diagram)
+        if (placementRevision !== undefined && placementOnly) state.placementRevision = placementRevision
+      })
+      if (plan.endpoints.size > 0) get().syncAllLowerConnections()
+      return { applied: plan.applied, skipped: plan.skipped }
+    },
+
+    pasteEntities: (plan) => {
+      const diagramId = get().currentDiagramId
+      if (!diagramId) return
+      const use3d = activeLayoutSpace() === '3d'
+      set((state) => {
+        const diagram = state.diagrams.find((d) => d.id === diagramId)
+        if (!diagram) return
+        const addUnique = (list: string[], id: string): void => {
+          if (!list.includes(id)) list.push(id)
+        }
+        for (const object of plan.newObjects) state.objects.push({ ...object })
+        for (const group of plan.newGroups) state.groups.push({ ...group, autoSize: group.autoSize ?? true })
+        for (const connection of plan.newConnections) {
+          // Same stamp as addConnection: a later change of the diagram default
+          // must not reshape the pasted connections.
+          state.connections.push({ ...connection, shape: connection.shape ?? diagram.defaultConnectionShape ?? 'curved' })
+        }
+        for (const object of plan.newObjects) addUnique(diagram.objectIds, object.id)
+        for (const id of plan.addObjectIds) addUnique(diagram.objectIds, id)
+        for (const group of plan.newGroups) addUnique(diagram.groupIds, group.id)
+        for (const id of plan.addGroupIds) addUnique(diagram.groupIds, id)
+        for (const connection of plan.newConnections) addUnique(diagram.connectionIds, connection.id)
+        for (const id of plan.addConnectionIds) addUnique(diagram.connectionIds, id)
+        const layouts = (diagram.layouts ??= {})
+        for (const [id, placement] of Object.entries(plan.placements)) {
+          const value = { position: { ...placement.position }, size: { ...placement.size } }
+          // Pasted on a forked 3D board: shown where it was dropped in 3D, and
+          // given a 2D home too (only if it has none — a referenced element
+          // keeps the 2D place it already had on this diagram).
+          if (use3d && diagram.layouts3d) {
+            diagram.layouts3d[id] = value
+            if (!layouts[id]) layouts[id] = { position: { ...value.position }, size: { ...value.size } }
+          } else {
+            layouts[id] = value
+          }
+        }
+        // `addObject`'s rule: a new element on a child diagram joins its wrapper.
+        if (diagram.parentObjectId && plan.newObjects.length > 0) {
+          const wrapper = state.groups.find((g) => g.parentObjectId === diagram.parentObjectId)
+          if (wrapper) for (const object of plan.newObjects) addUnique(wrapper.objectIds, object.id)
+        }
+        state.selectedItems = plan.selection.map((item) => ({ ...item }))
+      })
+      const endpoints = [
+        ...plan.newObjects.map((o) => o.id),
+        ...plan.addObjectIds,
+        ...plan.newGroups.map((g) => g.id),
+        ...plan.addGroupIds,
+      ]
+      if (endpoints.length > 0) get().syncAllLowerConnections(endpoints)
     },
 
     addObject: (obj) => {
@@ -3148,6 +3247,80 @@ export const useModelStore = create<ModelState>()(
     },
   }))
 )
+
+// ---------------------------------------------------------------------------
+// Canvas undo/redo (src/lib/history). The actions below are the user's canvas
+// edits; each OUTERMOST call becomes (part of) one history entry. Everything
+// else is deliberately absent:
+// - diagram create/delete/duplicate/rename — the bridge refuses to lift a
+//   diagram tombstone it did not create this session, so an undo could hide or
+//   resurrect a colleague's diagram;
+// - flows, comments, ADRs, domains, imports — their own editors and capture;
+// - `reconcileTags`, `rememberTagSnapshots`, `syncLowerConnections` — derived
+//   bookkeeping, not something the user did.
+// ---------------------------------------------------------------------------
+export const UNDOABLE_ACTIONS = [
+  'addObject', 'addObjectToModel', 'updateObject', 'updateEntitiesBatch', 'deleteObject',
+  'moveObject', 'moveObjectsBatch', 'resizeObjectsBatch', 'updatePlacementsBatch',
+  'addConnection', 'updateConnection', 'updateConnectionsBatch', 'deleteConnection',
+  'toggleConnectionLock', 'toggleConnectionHiddenSource', 'toggleConnectionHiddenTarget',
+  'toggleConnectionShowOnFocus', 'hideGroupOutgoingConnections', 'hideGroupIncomingConnections',
+  'hideGroupAllConnections', 'hideMemberConnections', 'showGroupConnections', 'showMemberConnections',
+  'addGroup', 'updateGroup', 'deleteGroup', 'addObjectToGroup', 'removeObjectFromGroup',
+  'addTagToObject', 'removeTagFromObject', 'addTagToConnection', 'removeTagFromConnection',
+  'addTagToGroup', 'removeTagFromGroup',
+  'deleteSelectedItems', 'moveSelectedItems', 'addSelectedToGroup', 'removeSelectedFromGroup',
+  'setScopeForSelected',
+  'removeObjectFromDiagram', 'removeObjectsFromDiagram', 'removeConnectionFromDiagram',
+  'removeGroupFromDiagram', 'removeGroupsFromDiagram', 'addGroupToDiagram', 'addObjectToDiagram',
+  'applyDiagramLayout', 'resetDiagram3dLayout', 'pasteEntities',
+] as const satisfies ReadonlyArray<keyof ModelState>
+
+;(function installUndoHistory() {
+  const state = useModelStore.getState()
+  const wrapped: Partial<ModelState> = {}
+  for (const name of UNDOABLE_ACTIONS) {
+    const action = state[name] as (...args: unknown[]) => unknown
+    ;(wrapped as Record<string, unknown>)[name] = undoHistory.wrap(action, useModelStore.getState)
+  }
+  useModelStore.setState(wrapped)
+
+  undoHistory.configure({
+    // Recorded only while the diagram canvas is the active view and the user may
+    // edit: the Model Objects table and the AI page are not "the canvas", and a
+    // read-only grant cannot produce an edit worth undoing.
+    scope: () => {
+      const model = useModelStore.getState()
+      if (!model.currentDiagramId || model.workspaceReadOnly) return null
+      if (model.diagrams.find((d) => d.id === model.currentDiagramId)?.readonly) return null
+      const ui = useUIStore.getState()
+      if (ui.currentView !== 'diagram') return null
+      // A playing flow is a presentation: nothing to record, nothing to undo.
+      if (ui.currentFlowId && !ui.flowEditMode) return null
+      return `${currentWorkspaceKey()}::${model.currentDiagramId}`
+    },
+    apply: (diff, direction, selection) => useModelStore.getState().applyHistoryDiff(diff, direction, selection),
+  })
+
+  if (import.meta.env?.DEV && typeof window !== 'undefined') {
+    ;(window as unknown as { __undoHistory?: typeof undoHistory }).__undoHistory = undoHistory
+  }
+
+  // Another workspace, version or draft is another document: its ids may even
+  // coincide, so nothing recorded here may be applied there.
+  subscribeWorkspaceRef(() => undoHistory.clear())
+  useModelStore.subscribe((next, previous) => {
+    if (next.currentDiagramId !== previous.currentDiagramId) {
+      undoHistory.seal()
+      undoHistory.notify()
+    }
+  })
+  useUIStore.subscribe((next, previous) => {
+    if (next.currentView !== previous.currentView
+      || next.currentFlowId !== previous.currentFlowId
+      || next.flowEditMode !== previous.flowEditMode) undoHistory.notify()
+  })
+})()
 
 // ---------------------------------------------------------------------------
 // Wire up the DiagramIndex subscriber.

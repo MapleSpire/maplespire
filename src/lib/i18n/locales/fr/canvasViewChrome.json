@@ -62,7 +62,19 @@
       "removeShapesFromDiagram": "Retirer {{count}} forme de ce diagramme",
       "removeShapesFromDiagram_other": "Retirer {{count}} formes de ce diagramme",
       "deleteShapesFromModel": "Supprimer {{count}} forme du modèle",
-      "deleteShapesFromModel_other": "Supprimer {{count}} formes du modèle"
+      "deleteShapesFromModel_other": "Supprimer {{count}} formes du modèle",
+      "cut": "Couper",
+      "copy": "Copier",
+      "paste": "Coller",
+      "pasteHere": "Coller ici",
+      "pasteAsCopy": "Coller comme copie",
+      "duplicate": "Dupliquer",
+      "selectAll": "Tout sélectionner",
+      "undo": "Annuler",
+      "redo": "Rétablir"
+    },
+    "clipboard": {
+      "copyName": "{{name}} (copie)"
     },
     "inlineEdit": {
       "object": {
