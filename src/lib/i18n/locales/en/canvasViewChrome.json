@@ -62,7 +62,19 @@
       "removeShapesFromDiagram": "Remove {{count}} shape from this diagram",
       "removeShapesFromDiagram_other": "Remove {{count}} shapes from this diagram",
       "deleteShapesFromModel": "Delete {{count}} shape from the model",
-      "deleteShapesFromModel_other": "Delete {{count}} shapes from the model"
+      "deleteShapesFromModel_other": "Delete {{count}} shapes from the model",
+      "cut": "Cut",
+      "copy": "Copy",
+      "paste": "Paste",
+      "pasteHere": "Paste here",
+      "pasteAsCopy": "Paste as copy",
+      "duplicate": "Duplicate",
+      "selectAll": "Select all",
+      "undo": "Undo",
+      "redo": "Redo"
+    },
+    "clipboard": {
+      "copyName": "{{name}} (copy)"
     },
     "inlineEdit": {
       "object": {

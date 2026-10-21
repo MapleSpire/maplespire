@@ -71,8 +71,8 @@
         "connection": "Connection (C)",
         "pan": "Pan (Space)"
       },
-      "undo": "Undo (history / time-travel)",
-      "redo": "Redo (history / time-travel)",
+      "undo": "Undo ({{shortcut}})",
+      "redo": "Redo ({{shortcut}})",
       "search": "Search (Ctrl+K)",
       "draftLabel": "Draft: {{label}}",
       "exitDraft": "Exit draft (back to the live model)",

@@ -12,7 +12,7 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU Affero General Public License for more details.
 
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import { useTranslation } from 'react-i18next'
 import {
   MousePointer2,
@@ -42,6 +42,8 @@ import { useAuthStore } from '../../stores/authStore'
 import { ChangesDropdown } from '../drafts/ChangesDropdown'
 import { ImportModal } from '../modals/ImportModal'
 import { cn } from '../../lib/utils'
+import { undoHistory } from '../../lib/history/undoHistory'
+import { isMacPlatform, shortcutLabel } from './canvasShortcuts'
 
 /**
  * The single floating, centered editor pill (the design's tool surface, with the
@@ -69,7 +71,8 @@ export function EditorToolPill({ editReady = true }: EditorToolPillProps) {
   const addDiagram = useModelStore((s) => s.addDiagram)
   const setCurrentDiagram = useModelStore((s) => s.setCurrentDiagram)
   const clearSelection = useModelStore((s) => s.clearSelection)
-  const setHistoryOpen = useUIStore((s) => s.setHistoryOpen)
+  const undoAvailability = useSyncExternalStore(undoHistory.subscribe, undoHistory.getSnapshot)
+  const mac = useMemo(() => isMacPlatform(), [])
   const setSearchOpen = useUIStore((s) => s.setSearchOpen)
   const setSettingsOpen = useUIStore((s) => s.setSettingsOpen)
   const setShopOpen = useUIStore((s) => s.setShopOpen)
@@ -219,21 +222,25 @@ export function EditorToolPill({ editReady = true }: EditorToolPillProps) {
       ))}
 
       {divider}
-      {/* The app has no command-level undo/redo — its revert mechanism is the
-          time-travel History panel, so both route there (design keeps the pair). */}
+      {/* Canvas undo/redo (src/lib/history): the same stack as Ctrl+Z /
+          Ctrl+Shift+Z. The time-travel History panel stays on the canvas toolbar. */}
       <button
-        disabled={!editReady}
-        onClick={() => setHistoryOpen(true)}
-        title={t('diagramChrome.toolPill.undo')}
-        className={cn(ghost, editControlDisabled)}
+        data-testid="toolpill-undo"
+        disabled={!editReady || workspaceReadOnly || !undoAvailability.canUndo}
+        onClick={() => undoHistory.undo()}
+        title={t('diagramChrome.toolPill.undo', { shortcut: shortcutLabel('undo', mac) })}
+        aria-label={t('diagramChrome.toolPill.undo', { shortcut: shortcutLabel('undo', mac) })}
+        className={cn(ghost, 'disabled:cursor-default disabled:opacity-40 disabled:hover:bg-transparent')}
       >
         <Undo2 className="h-[17px] w-[17px]" />
       </button>
       <button
-        disabled={!editReady}
-        onClick={() => setHistoryOpen(true)}
-        title={t('diagramChrome.toolPill.redo')}
-        className={cn(ghost, editControlDisabled)}
+        data-testid="toolpill-redo"
+        disabled={!editReady || workspaceReadOnly || !undoAvailability.canRedo}
+        onClick={() => undoHistory.redo()}
+        title={t('diagramChrome.toolPill.redo', { shortcut: shortcutLabel('redo', mac) })}
+        aria-label={t('diagramChrome.toolPill.redo', { shortcut: shortcutLabel('redo', mac) })}
+        className={cn(ghost, 'disabled:cursor-default disabled:opacity-40 disabled:hover:bg-transparent')}
       >
         <Redo2 className="h-[17px] w-[17px]" />
       </button>

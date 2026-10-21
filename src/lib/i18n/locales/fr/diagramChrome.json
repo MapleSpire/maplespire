@@ -71,8 +71,8 @@
         "connection": "Connexion (C)",
         "pan": "Déplacement (Espace)"
       },
-      "undo": "Annuler (historique / retour dans le temps)",
-      "redo": "Rétablir (historique / retour dans le temps)",
+      "undo": "Annuler ({{shortcut}})",
+      "redo": "Rétablir ({{shortcut}})",
       "search": "Rechercher (Ctrl+K)",
       "draftLabel": "Brouillon : {{label}}",
       "exitDraft": "Quitter le brouillon (revenir au modèle actif)",

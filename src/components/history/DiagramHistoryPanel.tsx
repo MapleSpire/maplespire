@@ -29,6 +29,7 @@ import {
   type HistoryEntry,
 } from '../../lib/automerge/history'
 import type { Checkpoint, DiagramDoc } from '../../lib/automerge/types'
+import { undoHistory } from '../../lib/history/undoHistory'
 
 function relativeTime(ms: number, t: TFunction): string {
   if (!ms) return ''
@@ -114,6 +115,9 @@ export function DiagramHistoryPanel() {
   const doRestore = (heads: string[]) => {
     if (!handle) return
     restoreTo(handle, heads)
+    // A time-travel restore rewrites the diagram under every recorded entry;
+    // replaying those afterwards would mix two timelines.
+    undoHistory.clear()
     setPreviewHash(null)
     setPreview(null)
     setOpen(false)

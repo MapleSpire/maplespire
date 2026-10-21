@@ -66,7 +66,9 @@ const TECHNOLOGY_SHAPE_TYPES = new Set<TechnologyShapeType>([
   'system', 'app', 'store', 'component', 'group',
 ])
 
-function validatedTechnologyUsages(
+/** Also the clipboard's gate (`lib/clipboard/canvasClipboard`): a usage that
+ * fails it would be written to the model and crash every renderer reading it. */
+export function validatedTechnologyUsages(
   value: unknown,
   entityKind: 'Object' | 'Group',
   entityId: string,
