@@ -70,6 +70,8 @@ const RESULT: ImportResult = {
   },
 }
 
+let currentResult: ImportResult = RESULT
+
 /** A source with NO target picker — the default path. `run` never touches the
  *  real parser. */
 const source: ImportSource = {
@@ -77,7 +79,7 @@ const source: ImportSource = {
   label: 'Structurizr',
   description: 'test source',
   status: 'available',
-  run: async () => RESULT,
+  run: async () => currentResult,
 }
 
 vi.mock('../../lib/import', () => ({
@@ -135,8 +137,48 @@ describe('ImportModal — a short minted-id pre-provision is stated, not swallow
   beforeEach(() => {
     mocks.ensureMintedIdCapacity.mockReset()
     mocks.importModel.mockReset()
+    currentResult = RESULT
   })
   afterEach(cleanup)
+
+  it('asks for the model and registry shards the import can create, not only its diagrams', async () => {
+    // One object and one connection: each can overflow into a new model shard,
+    // and a shard short of a minted id is one whose pointer cannot be held
+    // until the server has it. 2 diagrams + 1 registry + 1 object + 1
+    // connection shard = 5.
+    currentResult = {
+      ...RESULT,
+      objects: [{
+        id: 'o1', type: 'system', name: 'O', position: { x: 0, y: 0 }, size: { width: 1, height: 1 },
+        tagAssignments: {}, tagOrder: [], scope: 'internal', status: 'live', properties: {},
+      }],
+      connections: [{ id: 'c1', fromId: 'o1', toId: 'o1', type: 'solid' }],
+    }
+    mocks.ensureMintedIdCapacity.mockResolvedValue(5)
+    const onClose = vi.fn()
+    await importTwoDiagrams(onClose)
+
+    await waitFor(() => { expect(onClose).toHaveBeenCalledTimes(1) })
+    expect(mocks.ensureMintedIdCapacity).toHaveBeenCalledWith(5)
+  })
+
+  it('budgets objects and connections separately', async () => {
+    // 1 object, 0 connections: 2 diagrams + 1 registry + 1 object shard = 4.
+    currentResult = {
+      ...RESULT,
+      objects: [{
+        id: 'o1', type: 'system', name: 'O', position: { x: 0, y: 0 }, size: { width: 1, height: 1 },
+        tagAssignments: {}, tagOrder: [], scope: 'internal', status: 'live', properties: {},
+      }],
+      connections: [],
+    }
+    mocks.ensureMintedIdCapacity.mockResolvedValue(4)
+    const onClose = vi.fn()
+    await importTwoDiagrams(onClose)
+
+    await waitFor(() => { expect(onClose).toHaveBeenCalledTimes(1) })
+    expect(mocks.ensureMintedIdCapacity).toHaveBeenCalledWith(4)
+  })
 
   it('names the shortfall and HOLDS the modal open', async () => {
     // 2 diagrams + 1 registry shard = 3 asked for; 1 granted.

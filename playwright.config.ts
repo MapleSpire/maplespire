@@ -38,11 +38,25 @@ export default defineConfig({
     actionTimeout: 15_000,
   },
   projects: [
+    // Checks ONCE, before any test, that the demo the server seeded is durable
+    // and boots in a fresh context; see e2e/chromium.setup.ts for the measured
+    // poisoning this guards against. No retry: a second attempt on a partially
+    // seeded database cannot succeed, and its failure message says so.
+    {
+      name: 'chromium-seed',
+      testMatch: '**/chromium.setup.ts',
+      retries: 0,
+      use: { ...devices['Desktop Chrome'], locale: 'en-US' },
+    },
     // Default-mode sync tests (demo seed) against `npm run dev:local` on :5174.
+    // `locale` is pinned because the specs select English labels and headless
+    // Chromium otherwise takes the OS language (French on a French machine:
+    // every spec then failed at the landing page's first button).
     {
       name: 'chromium',
+      dependencies: ['chromium-seed'],
       testIgnore: ['**/boot/**', '**/view3d*.spec.ts', '**/model-read-cache-scale.spec.ts'],
-      use: { ...devices['Desktop Chrome'] },
+      use: { ...devices['Desktop Chrome'], locale: 'en-US' },
     },
     // 3D board suite against the isolated 3D stack (scripts/dev3d-*.mjs) on :5191.
     // SwiftShader args keep WebGL deterministic on GPU-less runners; the frontend

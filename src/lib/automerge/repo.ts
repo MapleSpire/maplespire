@@ -17,6 +17,7 @@ import {
   isValidAutomergeUrl,
   parseAutomergeUrl,
   interpretAsDocumentId,
+  documentIdToBinary,
   type BinaryDocumentId,
   type DocHandle,
   type AutomergeUrl,
@@ -601,6 +602,23 @@ export function importDocumentNamed<T>(target: Repo, initial: T, bytes: Uint8Arr
   return target.import<T>(automergeSave(automergeFrom(initial as Record<string, unknown>)), { docId })
 }
 
+/** Mirrors `MINT_VERSION` / `MINTED_ID_BYTES` in server/src/rbac/documentIdMint.ts;
+ *  repoMintedIdFormat.test.ts checks this against ids the server really mints. */
+const MINT_VERSION = 1
+const MINTED_ID_BYTES = 24
+
+/**
+ * Format-only, like the server's `isMintedDocumentId`: a version-1 minted id is
+ * 24 bytes, a random browser id 16. The server can claim a minted document
+ * before anything references it, so it is the only kind whose pointer may wait
+ * for the server's durability acknowledgement (deferredReferences.ts); a random
+ * id is claimed only through that pointer.
+ */
+export function isMintedDocumentId(documentId: DocumentId): boolean {
+  const raw = documentIdToBinary(documentId)
+  return raw !== undefined && raw.length === MINTED_ID_BYTES && raw[0] === MINT_VERSION
+}
+
 /**
  * Create a document, named with a minted id when one is available. The
  * fallback is always safe — an unminted random id is a normal browser
@@ -653,8 +671,11 @@ export async function getRegistryShardHandles(
   if (!shardUrls || shardUrls.length === 0) {
     throw new Error('Root doc has no shardUrls after waiting')
   }
+  // One handle per url: two tabs publishing the same held registry shard leave
+  // its url twice in the root (concurrent list inserts both survive the merge),
+  // and a duplicate handle projects every diagram in that shard twice.
   return resolveInBatches(
-    shardUrls,
+    [...new Set(shardUrls)],
     async (url) => {
       if (!isValidAutomergeUrl(url)) throw new Error(`Invalid shard url: ${url}`)
       prepareDocumentRequest(url, 'registry-shard')
@@ -718,6 +739,29 @@ export function createConnectionShardHandle(initial: ConnectionShard): DocHandle
  * pinned in `handleRetry.test.ts` ('names what an UNBUDGETED caller is really
  * asking for').
  */
+/**
+ * A model shard whose pointer this browser is still holding back
+ * (deferredReferences.ts): the server may never have received it, so only this
+ * browser's storage can answer, and it answers in milliseconds. The tight
+ * budget keeps a shard missing from storage too from costing every boot the
+ * full resolution schedule (or, with the server down, a `find` that never
+ * settles).
+ */
+const HELD_SHARD_RESOLUTION = { budgetMs: 3_000, tries: 2, delayMs: 200, findTimeoutMs: 1_500 }
+
+export async function findHeldModelShardHandle<T>(url: string): Promise<DocHandle<T>> {
+  if (!isValidAutomergeUrl(url)) throw new Error(`Invalid model shard url: ${url}`)
+  prepareDocumentRequest(url, 'model-shard')
+  return resolveReadyHandleWithRetry<T>(repo, url, HELD_SHARD_RESOLUTION)
+}
+
+/** A registry shard whose root pointer is still held: same bound as above. */
+export async function findHeldRegistryShardHandle(url: string): Promise<DocHandle<RegistryShard>> {
+  if (!isValidAutomergeUrl(url)) throw new Error(`Invalid registry shard url: ${url}`)
+  prepareDocumentRequest(url, 'registry-shard')
+  return resolveReadyHandleWithRetry<RegistryShard>(repo, url, HELD_SHARD_RESOLUTION)
+}
+
 export async function getModelShardHandles<T>(urls: readonly string[]): Promise<DocHandle<T>[]> {
   return resolveInBatches(urls, async (url) => {
     if (!isValidAutomergeUrl(url)) throw new Error(`Invalid model shard url: ${url}`)

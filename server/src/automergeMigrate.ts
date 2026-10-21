@@ -50,83 +50,59 @@ function mapById(items: Entity[]): Record<string, Entity> {
   return out
 }
 
-export async function migrateEntitiesIntoRoot(
-  repo: Repo,
-  rootHandle: DocHandle<Record<string, unknown>>,
-  modelHandle: DocHandle<Record<string, unknown>>
-): Promise<void> {
-  const { rows } = await pool.query<EntityRow>('SELECT id, type, data FROM entities')
-  if (rows.length === 0) return
-
-  const of = (type: string): Entity[] =>
-    rows.filter((r) => r.type === type).map((r) => ({ id: r.id, ...r.data }))
-
-  const objects = of('object')
-  const connections = of('connection')
-  const groups = of('group')
-  const domains = of('domain')
-  const decisionRecords = of('decisionRecord')
-  const diagrams = of('diagram')
-  const comments = of('comment')
-  const flows = of('flow')
-
-  // Collect diagram registry entries (id → meta), creating DiagramDocs.
-  const allMetas: Array<{
+/** A diagram to place: its DiagramDoc, and its registry entry minus `docUrl`. */
+export interface WorkspaceDiagram {
+  meta: {
     id: string
     name: unknown
     type: unknown
-    docUrl: string
     parentObjectId?: string
     objectIds: string[]
     connectionIds: string[]
     groupIds: string[]
-  }> = []
-  for (const dg of diagrams) {
-    const { id, layouts, ...fields } = dg
-    const dgComments = comments.filter((c) => c.diagramId === id)
-    const dgFlows = flows.filter((f) => f.diagramId === id)
-    const diagramDoc = {
-      ...fields,
-      layouts: layouts ?? {},
-      comments: mapById(dgComments),
-      flows: mapById(dgFlows),
-      checkpoints: [],
-    }
-    const handle = repo.create(diagramDoc)
+  }
+  doc: Record<string, unknown>
+}
+
+/**
+ * Write a model and its diagrams into a root that is NOT YET PUBLISHED: one
+ * DiagramDoc per diagram, the ModelDoc's collections, then the registry entries
+ * (filling the root's last shard to SHARD_SIZE, appending shards beyond it).
+ *
+ * Content before pointers, but the order is not what makes this safe: the
+ * caller publishes the root only after `repo.flush()`, so no client can reach
+ * any of these documents until all of them are durable. Never call this on a
+ * root a client may already hold.
+ */
+export async function writeWorkspaceContent(
+  repo: Repo,
+  rootHandle: DocHandle<Record<string, unknown>>,
+  modelHandle: DocHandle<Record<string, unknown>>,
+  model: Record<string, Record<string, unknown>>,
+  diagrams: readonly WorkspaceDiagram[],
+): Promise<void> {
+  const placed: Array<WorkspaceDiagram['meta'] & { docUrl: string }> = []
+  for (const diagram of diagrams) {
+    const handle = repo.create(diagram.doc)
     await handle.whenReady()
-    // Carry composition into the shard meta so stubs are accurate without
-    // loading the full DiagramDoc. The diagram entity rows store these as arrays.
-    const objectIds = Array.isArray(dg.objectIds) ? (dg.objectIds as string[]) : []
-    const connectionIds = Array.isArray(dg.connectionIds) ? (dg.connectionIds as string[]) : []
-    const groupIds = Array.isArray(dg.groupIds) ? (dg.groupIds as string[]) : []
-    const parentObjectId = typeof dg.parentObjectId === 'string' ? dg.parentObjectId : undefined
-    allMetas.push({ id, name: dg.name, type: dg.type, docUrl: handle.url, parentObjectId, objectIds, connectionIds, groupIds })
+    placed.push({ ...diagram.meta, docUrl: handle.url })
   }
 
-  // Write the C4 model collections into the separate ModelDoc.
   modelHandle.change((m) => {
-    const model = m as Record<string, Record<string, Entity>>
-    model.objects = mapById(objects)
-    model.connections = mapById(connections)
-    model.groups = mapById(groups)
-    model.domains = mapById(domains)
-    model.tagSnapshots = {}
-    model.decisionRecords = mapById(decisionRecords)
+    const target = m as Record<string, Record<string, unknown>>
+    for (const [collection, entries] of Object.entries(model)) target[collection] = entries
   })
 
-  // Distribute diagram metas into registry shards, filling each to SHARD_SIZE.
-  // The root already has one empty shard at shardUrls[0]; we fill that first,
-  // then create additional shards as needed.
   const root = rootHandle.doc() as { shardUrls: string[] } | undefined
-  if (!root) throw new Error('Root doc not ready during migration')
+  if (!root) throw new Error('Root doc not ready while writing workspace content')
 
-  // Find the current last shard handle (already created in ensureRootDoc).
+  // Find the current last shard handle (already created by the caller).
   const existingShardUrl = root.shardUrls[root.shardUrls.length - 1]
   type ShardShape = { diagrams: Record<string, unknown> }
   let currentShardHandle = await findReadyDocument<ShardShape>(repo, existingShardUrl)
   let currentShardCount = Object.keys(currentShardHandle.doc()?.diagrams ?? {}).length
 
-  for (const meta of allMetas) {
+  for (const meta of placed) {
     if (currentShardCount >= SHARD_SIZE) {
       // Current shard full — create a new one and append to root.
       const newShard = repo.create<ShardShape>({ diagrams: {} })
@@ -154,6 +130,61 @@ export async function migrateEntitiesIntoRoot(
     })
     currentShardCount++
   }
+}
+
+export async function migrateEntitiesIntoRoot(
+  repo: Repo,
+  rootHandle: DocHandle<Record<string, unknown>>,
+  modelHandle: DocHandle<Record<string, unknown>>
+): Promise<boolean> {
+  const { rows } = await pool.query<EntityRow>('SELECT id, type, data FROM entities')
+  if (rows.length === 0) return false
+
+  const of = (type: string): Entity[] =>
+    rows.filter((r) => r.type === type).map((r) => ({ id: r.id, ...r.data }))
+
+  const objects = of('object')
+  const connections = of('connection')
+  const groups = of('group')
+  const domains = of('domain')
+  const decisionRecords = of('decisionRecord')
+  const diagrams = of('diagram')
+  const comments = of('comment')
+  const flows = of('flow')
+
+  const placed: WorkspaceDiagram[] = diagrams.map((dg) => {
+    const { id, layouts, ...fields } = dg
+    // Carry composition into the shard meta so stubs are accurate without
+    // loading the full DiagramDoc. The diagram entity rows store these as arrays.
+    const parentObjectId = typeof dg.parentObjectId === 'string' ? dg.parentObjectId : undefined
+    return {
+      meta: {
+        id,
+        name: dg.name,
+        type: dg.type,
+        ...(parentObjectId !== undefined ? { parentObjectId } : {}),
+        objectIds: Array.isArray(dg.objectIds) ? (dg.objectIds as string[]) : [],
+        connectionIds: Array.isArray(dg.connectionIds) ? (dg.connectionIds as string[]) : [],
+        groupIds: Array.isArray(dg.groupIds) ? (dg.groupIds as string[]) : [],
+      },
+      doc: {
+        ...fields,
+        layouts: layouts ?? {},
+        comments: mapById(comments.filter((c) => c.diagramId === id)),
+        flows: mapById(flows.filter((f) => f.diagramId === id)),
+        checkpoints: [],
+      },
+    }
+  })
+
+  await writeWorkspaceContent(repo, rootHandle, modelHandle, {
+    objects: mapById(objects),
+    connections: mapById(connections),
+    groups: mapById(groups),
+    domains: mapById(domains),
+    tagSnapshots: {},
+    decisionRecords: mapById(decisionRecords),
+  }, placed)
 
   console.log(
     `Migrated ${rows.length} legacy entities into Automerge: ` +
@@ -161,4 +192,5 @@ export async function migrateEntitiesIntoRoot(
       `${(rootHandle.doc() as { shardUrls: string[] }).shardUrls.length} shard(s) ` +
       `(SHARD_SIZE=${SHARD_SIZE}, model in separate doc)`
   )
+  return true
 }

@@ -16,7 +16,7 @@
     "so anything outside breaks `npm run build`. Hence a second, emit-less config",
     "with a wider root.",
     "",
-    "Two scripts are excluded, and the reason is structural rather than a waiver:",
+    "Three scripts are excluded, and the reason is structural rather than a waiver:",
     "they import CLIENT source across the package boundary (`../../src/lib/...`)",
     "with TypeScript extensions, which only `tsx` resolves. Checking them here",
     "would pull the browser module graph into a NodeNext program it was never",
@@ -55,6 +55,7 @@
   "exclude": [
     "src/**/*.test.ts",
     "scripts/seed-workspace.ts",
-    "scripts/gen-icon-catalog.ts"
+    "scripts/gen-icon-catalog.ts",
+    "scripts/gen-demo-seed.ts"
   ]
 }
