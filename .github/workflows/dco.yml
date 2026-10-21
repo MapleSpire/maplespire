@@ -3,9 +3,12 @@ name: DCO
 # Fails a pull request when one of its commits lacks a `Signed-off-by:` trailer
 # matching the commit author (https://developercertificate.org/). Merge commits
 # and bot commits are exempt. Mark this check as required in branch protection.
+# On `merge_group` (merge queue) the commits were already checked on the pull
+# request, so the job reports success without re-checking.
 
 on:
   pull_request:
+  merge_group:
 
 concurrency:
   group: dco-${{ github.ref }}
@@ -28,6 +31,10 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
+          if [ "${{ github.event_name }}" = "merge_group" ]; then
+            echo "Merge queue: commits were checked on the pull request."
+            exit 0
+          fi
           failed=0
           for sha in $(git rev-list --no-merges "$BASE_SHA..$HEAD_SHA"); do
             author_email=$(git log -1 --format='%ae' "$sha")
