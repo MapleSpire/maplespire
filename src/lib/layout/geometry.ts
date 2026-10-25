@@ -207,22 +207,24 @@ export function buildSegments(
   return segs
 }
 
-/** Resolve the two endpoints of an edge: anchored when locked, else raycast. */
+/** Resolve the two endpoints of an edge: anchored when locked, else raycast.
+ *
+ * An unlocked end raycasts toward the OTHER end's resolved point — its anchor when
+ * that end is locked, its centre otherwise — exactly as CanvasEngine's
+ * getConnectionGeometry does (getConnectionEndpoint returns the anchor point as the
+ * aim). Aiming at the centre here, as this function used to, scored a different
+ * endpoint than the canvas draws on every half-locked connection. */
 export function resolveEndpoints(
   fromBox: Box,
   toBox: Box,
   style: EdgeStyle,
 ): { fromEdge: { x: number; y: number; face: Face }; toEdge: { x: number; y: number; face: Face } } {
-  const fromC = center(fromBox)
-  const toC = center(toBox)
-  const fromEdge =
-    style.lockedToAnchors && style.fromAnchor !== undefined
-      ? anchorPoint(fromBox, style.fromAnchor)
-      : edgePoint(fromBox, toC)
-  const toEdge =
-    style.lockedToAnchors && style.toAnchor !== undefined
-      ? anchorPoint(toBox, style.toAnchor)
-      : edgePoint(toBox, fromC)
+  const fromAnchored =
+    style.lockedToAnchors && style.fromAnchor !== undefined ? anchorPoint(fromBox, style.fromAnchor) : null
+  const toAnchored =
+    style.lockedToAnchors && style.toAnchor !== undefined ? anchorPoint(toBox, style.toAnchor) : null
+  const fromEdge = fromAnchored ?? edgePoint(fromBox, toAnchored ?? center(toBox))
+  const toEdge = toAnchored ?? edgePoint(toBox, fromAnchored ?? center(fromBox))
   return { fromEdge, toEdge }
 }
 

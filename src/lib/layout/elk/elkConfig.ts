@@ -28,13 +28,68 @@ export interface Strategy {
   nodePlacement: 'NETWORK_SIMPLEX' | 'BRANDES_KOEPF'
   /** Connection shape to stamp on edges this strategy produces. */
   shape: LineShape
+  /** MULTI_EDGE row wrapping (default true). See {@link STRATEGIES}. */
+  wrapping?: boolean
+  /** Let crossing minimisation reorder nodes freely instead of keeping the
+   *  model order (default false). See {@link STRATEGIES}. */
+  freeOrder?: boolean
 }
 
-export const STRATEGIES: Strategy[] = [
+const WRAPPED: Strategy[] = [
   { id: 'ortho-ns-down', direction: 'DOWN', edgeRouting: 'ORTHOGONAL', nodePlacement: 'NETWORK_SIMPLEX', shape: 'straight' },
   { id: 'ortho-ns-right', direction: 'RIGHT', edgeRouting: 'ORTHOGONAL', nodePlacement: 'NETWORK_SIMPLEX', shape: 'straight' },
   { id: 'spline-bk-down', direction: 'DOWN', edgeRouting: 'SPLINES', nodePlacement: 'BRANDES_KOEPF', shape: 'curved' },
   { id: 'spline-bk-right', direction: 'RIGHT', edgeRouting: 'SPLINES', nodePlacement: 'BRANDES_KOEPF', shape: 'curved' },
+]
+
+/**
+ * The portfolio: every strategy with AND without row wrapping.
+ *
+ * Wrapping exists for long chains, which lay out as a one-row sliver without it.
+ * On a short graph it does harm: it cuts a three-layer context view (people →
+ * system → externals) into chunks and parks the last layer beside the first
+ * (measured on the SAOE `FSSystemContext` view: every DOWN candidate came out a
+ * 1110×288 strip, SharePoint Online and Agent parked in the top row beside the
+ * people). Since the
+ * score already penalises slivers, both variants compete and the metric keeps the
+ * wrapped one only where it reads better. The unwrapped variants come FIRST: the
+ * selection keeps the earlier candidate on a tied score, and a tie means the
+ * correction bought nothing (grouped.dsl `Landscape`: 7 vs 7, and only the unwrapped
+ * one put End User above the Cloud group).
+ *
+ * Only the ORTHOGONAL strategies keep a wrapped twin — one per direction, so a
+ * hinted `lr` chain still has a wrapped candidate. Measured 2026-10-22 over 48
+ * views (every DSL/JSON fixture view plus synthetic 12/20/30-node and branched
+ * chains) × {no hint, tb, lr}, replaying bestLayout's selection: dropping the two
+ * wrapped SPLINE strategies changed no result, while dropping every wrapped one
+ * lost four (saoe AzureObservabilityFlow 21→33, hierarchical System B 2→5, groups
+ * SystemLandscape 2→5, the 12-node chain 5→6 — wrapped ortho-ns-down won each).
+ * These per-view numbers came from throwaway probes on 2026-10-22, before the
+ * group-overlap term joined `groupStraddles`; the replay test named below
+ * reproduces the superset comparison, not each delta.
+ *
+ * Two FREE-ORDER strategies (`freeOrder`: crossing minimisation may reorder
+ * nodes instead of keeping the model order) help the dense container views,
+ * where the model order fights the sweep — against this same portfolio without
+ * them: SAOEPermitContainers 131→109 (4→3 crossings), FSContainers 128→85,
+ * big-bank JSON Containers 100→72. Free order
+ * is WORSE as the only setting (DataverseComponents 9→11 crossings), so it
+ * competes rather than replaces. They take the place of `ortho-ns-right-nowrap`,
+ * which never changed a selection. Same views × 3 hint modes: this 7-strategy
+ * portfolio picks a result as good as the 8-strategy superset (these 7 plus
+ * ortho-ns-right-nowrap) on every one. Against all 12 combinations (each base
+ * strategy wrapped, unwrapped and free-order) it loses 3 of 144 selections
+ * (total score 4672 vs 4620, 2026-10-22) — the price of 7 runs instead of 12.
+ * The portfolio was chosen ON these views; the claim bounds it there and nowhere
+ * else. Reproduce: LAYOUT_REPLAY=1 npx vitest run src/lib/layout/portfolioReplay.test.ts
+ */
+const UNWRAPPED: Strategy[] = WRAPPED.map((s) => ({ ...s, id: `${s.id}-nowrap`, wrapping: false }))
+const unwrapped = (id: string): Strategy => UNWRAPPED.find((s) => s.id === id)!
+export const STRATEGIES: Strategy[] = [
+  ...UNWRAPPED.filter((s) => s.id !== 'ortho-ns-right-nowrap'),
+  ...WRAPPED.filter((s) => s.edgeRouting === 'ORTHOGONAL'),
+  { ...unwrapped('spline-bk-right-nowrap'), id: 'spline-bk-right-nowrap-free', freeOrder: true },
+  { ...unwrapped('ortho-ns-down-nowrap'), id: 'ortho-ns-down-nowrap-free', freeOrder: true },
 ]
 
 /**
@@ -77,7 +132,7 @@ export function thoroughnessFor(complexity?: GraphComplexity): number {
 /** Root-level ELK layout options for a strategy, tuned to the graph's complexity
  * profile when one is provided (see {@link thoroughnessFor}). */
 export function rootOptions(s: Strategy, complexity?: GraphComplexity): Record<string, string> {
-  return {
+  const opts: Record<string, string> = {
     'elk.algorithm': 'layered',
     'elk.direction': s.direction,
     'elk.edgeRouting': s.edgeRouting,
@@ -127,4 +182,11 @@ export function rootOptions(s: Strategy, complexity?: GraphComplexity): Record<s
     // Determinism.
     'elk.randomSeed': '1',
   }
+  if (s.wrapping === false) {
+    delete opts['elk.layered.wrapping.strategy']
+    delete opts['elk.layered.wrapping.correctionFactor']
+    delete opts['elk.layered.wrapping.additionalEdgeSpacing']
+  }
+  if (s.freeOrder) opts['elk.layered.considerModelOrder.strategy'] = 'NONE'
+  return opts
 }

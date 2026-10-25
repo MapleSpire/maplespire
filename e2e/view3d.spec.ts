@@ -1286,8 +1286,10 @@ test.describe('3D board', () => {
     expect(afterMemberDrag.selectedVisual).toBe(true) // ring survives the rebuild
 
     // ── platform drag (USER BUG: members stayed behind): grabbing the plate
-    //    carries every member by the same delta, each snapping to the
-    //    half-grid on release (the 2D group-drag contract)
+    //    carries every member by ONE delta, snapped once on release so the
+    //    anchor member lands on the half-grid and the others keep their
+    //    offsets from it (the 2D group-drag contract; snapping each member on
+    //    its own moved them by different amounts — groupPlatform.ts)
     const starts: [string, { x: number; y: number }][] = []
     for (const id of memberIds) {
       const p = await page.evaluate((id) => window.__scene3d!.nodeWorldPos(id)!, id)
@@ -1299,27 +1301,23 @@ test.describe('3D board', () => {
     await page.mouse.down()
     for (let i = 1; i <= 8; i++) await page.mouse.move(pt2!.x - (120 * i) / 8, pt2!.y + (55 * i) / 8)
     await page.mouse.up()
-    // every member landed: displaced AND clipped to the dot lattice
+    // every member landed: displaced, all by the same delta, and the anchor
+    // clipped to the dot lattice
     await page.waitForFunction(
-      (starts) =>
-        starts.every(([id, s0]) => {
-          const p = window.__scene3d!.nodeWorldPos(id)
-          if (!p) return false
-          const on = (v: number) => Math.abs(v / 10 - Math.round(v / 10)) < 1e-6
-          return on(p.x) && on(p.y) && Math.hypot(p.x - s0.x, p.y - s0.y) > 30
-        }),
+      (starts) => {
+        const on = (v: number) => Math.abs(v / 10 - Math.round(v / 10)) < 1e-6
+        const now = starts.map(([id]) => window.__scene3d!.nodeWorldPos(id))
+        if (now.some((p) => !p)) return false
+        const d0 = { dx: now[0]!.x - starts[0][1].x, dy: now[0]!.y - starts[0][1].y }
+        return starts.every(([, s0], i) => {
+          const p = now[i]!
+          return Math.hypot(p.x - s0.x, p.y - s0.y) > 30
+            && Math.abs(p.x - s0.x - d0.dx) < 1e-6 && Math.abs(p.y - s0.y - d0.dy) < 1e-6
+        }) && now.some((p) => on(p!.x) && on(p!.y))
+      },
       starts,
       { timeout: 5000 },
     )
-    const deltas: { dx: number; dy: number }[] = []
-    for (const [id, s0] of starts) {
-      const p = await page.evaluate((id) => window.__scene3d!.nodeWorldPos(id)!, id)
-      deltas.push({ dx: p.x - s0.x, dy: p.y - s0.y })
-    }
-    for (const d of deltas.slice(1)) {
-      expect(Math.abs(d.dx - deltas[0].dx)).toBeLessThanOrEqual(10) // same ride,
-      expect(Math.abs(d.dy - deltas[0].dy)).toBeLessThanOrEqual(10) // per-member snap
-    }
     // and the platform followed its members
     const final = await page.evaluate((gid) => window.__scene3d!.groupInfo().find((g) => g.id === gid)!, groupId)
     expect(final.builtRect).toEqual(final.rect)

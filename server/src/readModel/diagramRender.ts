@@ -64,9 +64,10 @@ export interface DiagramComposition {
  *    or when the rolled-up endpoints coincide (self-loop); first connection to map to
  *    a given visible (from→to) pair wins (one lower per pair).
  *
- * Ids are deterministic (`lower:<from>→<to>`) — unlike the client's random ids, but
- * lower connections are never persisted (recomputed on load), so the id is internal
- * and only from/to/kind matter for rendering.
+ * Ids are deterministic (`lower:<from>→<to>`) — the same ids the client's roll-up
+ * mints (`lowerConnectionId`, src/lib/diagrams/lowerRouting.ts). Lower connections are
+ * never persisted (recomputed on load) and carry no routing here: a lower's routing
+ * is its diagram's `lowerRouting`, which the client merges when it draws.
  */
 export function computeLowerConnections(
   diagram: DiagramComposition,

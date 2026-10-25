@@ -12,8 +12,9 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU Affero General Public License for more details.
 
-import type { Connection, Diagram, Group, Position, Size } from '../../types'
+import type { Connection, Diagram, Group, LowerConnectionRouting, Position, Size } from '../../types'
 import type { KvStore } from '../modelQuery/kvStore'
+import { cleanLowerRouting, lowerRoutingFields, withLowerRoutingForSpace } from '../diagrams/lowerRouting'
 import { deepEqualPlain, entityIntentTabId } from './entityIntents'
 import { adoptSingleKeyLegacyJournal, adoptTabJournalNamespace } from './tabJournalAdoption'
 import type { DiagramDoc } from './types'
@@ -38,10 +39,25 @@ export interface PendingConnectionPlacement {
   data: Partial<Connection>
 }
 
+/**
+ * The routing of one derived (lower) connection ON THIS DIAGRAM. Unlike a
+ * connection record — which targets the model documents — this is
+ * diagram-scoped, like an object placement: it is written into the DiagramDoc's
+ * `lowerRouting[pair]`, and only the DiagramDoc carries it.
+ */
+export interface PendingLowerRoutePlacement {
+  /** `${fromId}→${toId}`, the key of `Diagram.lowerRouting`. */
+  pair: string
+  /** ABSOLUTE for the record's space: a field of that space absent here is
+   * cleared when the record is applied, so a replay is idempotent. */
+  routing: LowerConnectionRouting
+}
+
 export interface PlacementIntentBatch {
   objects?: PendingObjectPlacement[]
   groups?: PendingGroupPlacement[]
   connections?: PendingConnectionPlacement[]
+  lowerRoutes?: PendingLowerRoutePlacement[]
 }
 
 interface PendingRecordBase {
@@ -69,16 +85,46 @@ interface PendingConnectionRecord extends PendingRecordBase, PendingConnectionPl
   kind: 'connection'
 }
 
+/** `id` is the pair (the record key needs one); `routing` as in the batch. */
+interface PendingLowerRouteRecord extends PendingRecordBase {
+  kind: 'lowerRoute'
+  routing: LowerConnectionRouting
+}
+
 export type SerializedPlacementIntent =
   | PendingObjectRecord
   | PendingGroupRecord
   | PendingConnectionRecord
+  | PendingLowerRouteRecord
 
 export interface PlacementIntentSnapshot {
   throughRevision: number
   objects: Array<PendingObjectPlacement & { space: PlacementLayoutSpace }>
   groups: Array<PendingGroupPlacement & { space: PlacementLayoutSpace }>
   connections: Array<PendingConnectionPlacement & { space: PlacementLayoutSpace }>
+  lowerRoutes: Array<PendingLowerRoutePlacement & { space: PlacementLayoutSpace }>
+}
+
+/** Records whose only carrier is the DiagramDoc (no model document involved):
+ * shape placements, pure-geometry group placements and lower routes. */
+export function isDiagramDocPlacementRecord(record: SerializedPlacementIntent): boolean {
+  return record.kind === 'object'
+    || record.kind === 'lowerRoute'
+    || (record.kind === 'group' && record.autoSize === undefined)
+}
+
+/** A copy of a record, sharing no structure with it. */
+function cloneRecord(record: SerializedPlacementIntent): SerializedPlacementIntent {
+  if (record.kind === 'object') {
+    return { ...record, position: { ...record.position }, size: { ...record.size } }
+  }
+  if (record.kind === 'group') {
+    return { ...record, position: clonePosition(record.position), size: cloneSize(record.size) }
+  }
+  if (record.kind === 'lowerRoute') {
+    return { ...record, routing: cleanLowerRouting(record.routing) }
+  }
+  return { ...record, data: { ...record.data } }
 }
 
 export interface PlacementProjection {
@@ -117,6 +163,21 @@ export function applyPlacementSnapshotToDiagramDoc(
     layouts[group.id] = {
       position: { ...group.position },
       size: { ...group.size },
+    }
+  }
+  for (const route of snapshot.lowerRoutes) {
+    if (!doc.lowerRouting) doc.lowerRouting = {}
+    // Re-read after each initialization, for the same proxy reason as above.
+    const routes = doc.lowerRouting!
+    if (!routes[route.pair]) routes[route.pair] = {}
+    const entry = routes[route.pair] as Record<string, unknown>
+    const routing = cleanLowerRouting(route.routing) as Record<string, unknown>
+    for (const field of lowerRoutingFields(route.space)) {
+      if (routing[field] === undefined) {
+        if (field in entry) delete entry[field]
+      } else {
+        entry[field] = routing[field]
+      }
     }
   }
 }
@@ -230,6 +291,21 @@ export class PendingPlacementIntents {
       if (!records.has(key)) newKeys = true
       records.set(key, record)
     }
+    for (const route of batch.lowerRoutes ?? []) {
+      const record: PendingLowerRouteRecord = {
+        workspaceKey,
+        diagramId,
+        space,
+        revision,
+        recordedAt: now,
+        kind: 'lowerRoute',
+        id: route.pair,
+        routing: cleanLowerRouting(route.routing),
+      }
+      const key = recordKey(record)
+      if (!records.has(key)) newKeys = true
+      records.set(key, record)
+    }
     return { revision, newKeys }
   }
 
@@ -266,6 +342,7 @@ export class PendingPlacementIntents {
     const objects: Array<PendingObjectPlacement & { space: PlacementLayoutSpace }> = []
     const groups: Array<PendingGroupPlacement & { space: PlacementLayoutSpace }> = []
     const connections: Array<PendingConnectionPlacement & { space: PlacementLayoutSpace }> = []
+    const lowerRoutes: Array<PendingLowerRoutePlacement & { space: PlacementLayoutSpace }> = []
     let throughRevision = 0
     for (const record of records) {
       throughRevision = Math.max(throughRevision, record.revision)
@@ -279,11 +356,13 @@ export class PendingPlacementIntents {
           autoSize: record.autoSize,
           space: record.space,
         })
+      } else if (record.kind === 'lowerRoute') {
+        lowerRoutes.push({ pair: record.id, routing: cleanLowerRouting(record.routing), space: record.space })
       } else {
         connections.push({ id: record.id, data: { ...record.data }, space: record.space })
       }
     }
-    return { throughRevision, objects, groups, connections }
+    return { throughRevision, objects, groups, connections, lowerRoutes }
   }
 
   acknowledge(workspaceKey: string, diagramId: string, throughRevision: number): void {
@@ -325,7 +404,15 @@ export class PendingPlacementIntents {
       const nextDiagram: Diagram = { ...diagram }
       let layouts = diagram.layouts
       let layouts3d = diagram.layouts3d
+      let lowerRouting = diagram.lowerRouting
       for (const record of records) {
+        if (record.kind === 'lowerRoute') {
+          lowerRouting = {
+            ...(lowerRouting ?? {}),
+            [record.id]: withLowerRoutingForSpace(lowerRouting?.[record.id], record.routing, record.space),
+          }
+          continue
+        }
         if (record.kind !== 'object' && record.kind !== 'group') continue
         const source = record.space === '3d' ? layouts3d : layouts
         const existing = source?.[record.id]
@@ -338,6 +425,7 @@ export class PendingPlacementIntents {
       }
       nextDiagram.layouts = layouts
       if (layouts3d !== undefined) nextDiagram.layouts3d = layouts3d
+      if (lowerRouting !== undefined) nextDiagram.lowerRouting = lowerRouting
       diagrams = diagrams.map((candidate) => candidate.id === diagramId ? nextDiagram : candidate)
     }
 
@@ -366,15 +454,7 @@ export class PendingPlacementIntents {
   }
 
   serialize(workspaceKey: string): SerializedPlacementIntent[] {
-    return [...(this.byWorkspace.get(workspaceKey)?.values() ?? [])].map((record) => {
-      if (record.kind === 'object') {
-        return { ...record, position: { ...record.position }, size: { ...record.size } }
-      }
-      if (record.kind === 'group') {
-        return { ...record, position: clonePosition(record.position), size: cloneSize(record.size) }
-      }
-      return { ...record, data: { ...record.data } }
-    })
+    return [...(this.byWorkspace.get(workspaceKey)?.values() ?? [])].map(cloneRecord)
   }
 
   hydrate(workspaceKey: string, serialized: readonly SerializedPlacementIntent[] | undefined): void {
@@ -400,11 +480,7 @@ export class PendingPlacementIntents {
           : source.revision > existing.revision
         if (!newer) continue
       }
-      const record = source.kind === 'object'
-        ? { ...source, position: { ...source.position }, size: { ...source.size } }
-        : source.kind === 'group'
-          ? { ...source, position: clonePosition(source.position), size: cloneSize(source.size) }
-          : { ...source, data: { ...source.data } }
+      const record = cloneRecord(source)
       records.set(recordKey(record), record)
       this.revision = Math.max(this.revision, record.revision)
     }

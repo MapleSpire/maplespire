@@ -15,18 +15,34 @@
 import { create } from 'zustand'
 import { immer } from 'zustand/middleware/immer'
 import { isDraft, original } from 'immer'
-import type { C4Object, Connection, Diagram, Flow, FlowStep, Group, Tag, SelectedItem, Domain, Comment, DecisionRecord, Position, Size, ConnectionShape } from '../types'
+import type { C4Object, Connection, Diagram, Flow, FlowStep, Group, Tag, SelectedItem, Domain, Comment, DecisionRecord, Position, Size, ConnectionShape, LowerConnectionRouting } from '../types'
 import { generateId } from '../lib/utils'
 import { LEGACY_COMMENT_AUTHOR, type CommentAuthorship } from '../lib/comments/authorship'
 import { assertTechnologyUsageIdentityPreserved } from '../lib/technologyUsage'
 import { assignTag, unassignTag, orderedTagIds } from '../lib/tags/assignments'
 import { buildDuplicateDiagram, buildDuplicateFlows } from '../lib/diagrams/duplicate'
+import {
+  applyLayoutRoutingPatch,
+  cleanLowerRouting,
+  forkLowerRouting3d,
+  isLowerConnectionId,
+  lowerConnectionId,
+  lowerPairKey,
+  lowerPairsOf,
+  lowerRefsOf,
+  lowerRoutingForSpace,
+  mergeLowerRouting,
+  resolveLowerRouting,
+  splitRoutingPatch,
+  withoutLowerRouting3d,
+} from '../lib/diagrams/lowerRouting'
 import { useUIStore } from './uiStore'
 import {
   pendingPlacementIntents,
   persistPlacementIntentsNow,
   schedulePersistPlacementIntents,
   type PendingGroupPlacement,
+  type PendingLowerRoutePlacement,
   type PendingObjectPlacement,
   type PlacementIntentBatch,
   type PlacementLayoutSpace,
@@ -580,8 +596,6 @@ interface LowerSyncContext {
 
 type LowerSyncSource = Pick<ModelState, 'diagrams' | 'objects' | 'groups' | 'connections'>
 
-const lowerPairKey = (fromId: string, toId: string): string => `${fromId}→${toId}`
-
 function lowerSyncContextCurrent(ctx: LowerSyncContext, state: LowerSyncSource): boolean {
   return ctx.diagrams === state.diagrams
     && ctx.objects === state.objects
@@ -687,18 +701,26 @@ function deriveLowerConnections(ctx: LowerSyncContext, diagramId: string): boole
 
   // Lower connections currently attached to this diagram, and the diagram's
   // NON-lower connections (the needed lower ones are re-attached below,
-  // reusing the same objects, hence the same ids).
+  // reusing the same objects, hence the same ids). A `lower:` id whose object
+  // is not in the store is a lower too: a projection that replaces
+  // `connections` (bridge.ts projectAll, the server render) drops every lower
+  // object while a diagram it did not rebuild still lists them. Read as a
+  // direct connection it was kept for ever and persisted as a dangling id.
   const existingLowerIds: string[] = []
   const newConnectionIds: string[] = []
   for (const cid of currentIds) {
-    if (ctx.connectionMap.get(cid)?.kind === 'lower') existingLowerIds.push(cid)
+    const conn = ctx.connectionMap.get(cid)
+    if (conn ? conn.kind === 'lower' : isLowerConnectionId(cid)) existingLowerIds.push(cid)
     else newConnectionIds.push(cid)
   }
 
   // --- Re-derive the lower connections this diagram needs. An existing lower
   // with the same endpoint pair is reused, so a still-needed one keeps its id
   // across re-syncs (deleting + recreating it invalidated a live selection —
-  // the right sidebar flickered open/closed). ---
+  // the right sidebar flickered open/closed). A lower that has to be minted
+  // gets the pair's deterministic id, so a lower re-minted after a projection
+  // dropped it keeps its id too. Its routing is not on the object at all: it
+  // is the diagram's (`Diagram.lowerRouting`, merged when drawn). ---
   const newConnectionIdSet = new Set(newConnectionIds)
   const seenPairs = new Set<string>()
   const usedLowerIds = new Set<string>()
@@ -731,7 +753,7 @@ function deriveLowerConnections(ctx: LowerSyncContext, diagramId: string): boole
       usedLowerIds.add(existingLower.id)
     } else {
       const newConn: Connection = {
-        id: generateId(),
+        id: lowerConnectionId(visibleFrom, visibleTo),
         fromId: visibleFrom,
         toId: visibleTo,
         kind: 'lower',
@@ -805,7 +827,11 @@ function commitLowerSync(ctx: LowerSyncContext): number {
   let connections: Connection[] | null = null
   if (ctx.pruned.size > 0 || ctx.added.length > 0) {
     connections = ctx.pruned.size > 0 ? ctx.connections.filter((c) => !ctx.pruned.has(c.id)) : ctx.connections.slice()
-    for (const addition of ctx.added) if (!ctx.pruned.has(addition.id)) connections.push(addition)
+    // An addition is committed iff it is still the live object for its id. Not
+    // `!pruned.has(id)`: lower ids are per PAIR, so one diagram can prune
+    // `lower:A→B` and a later diagram of the same pass mint it again — the
+    // id is then pruned (the old object goes) AND added (the new one stays).
+    for (const addition of ctx.added) if (ctx.connectionMap.get(addition.id) === addition) connections.push(addition)
   }
   ctx.pendingConnectionIds.clear()
   ctx.pruned.clear()
@@ -1335,6 +1361,13 @@ function ensureFork3d(
     if (c.labelOffset !== undefined) c.labelOffset3d = c.labelOffset
     if (c.shape !== undefined) c.shape3d = c.shape
   }
+  // The same fork for the routing of the diagram's lowers, which lives on the
+  // diagram rather than on the lower object.
+  if (diagram.lowerRouting) {
+    const forked: Record<string, LowerConnectionRouting> = {}
+    for (const [pair, entry] of Object.entries(diagram.lowerRouting)) forked[pair] = forkLowerRouting3d(entry)
+    diagram.lowerRouting = forked
+  }
 }
 
 /**
@@ -1523,6 +1556,92 @@ function redirectConnPatchTo3d(data: Partial<Connection>): Partial<Connection> {
     }
   }
   return out
+}
+
+// ---------------------------------------------------------------------------
+// Lower-connection routing is per DIAGRAM (`Diagram.lowerRouting`, keyed by
+// endpoint pair): the lower object is re-derived on every projection and shared
+// by every diagram that rolls up onto the same pair, so routing written onto it
+// was lost within seconds. Every write path that can carry a lower's routing
+// splits it off here. See src/lib/diagrams/lowerRouting.ts.
+// ---------------------------------------------------------------------------
+
+/** Auto-layout patches split into the ones for lowers (id -> pair) and the rest. */
+function splitLowerPatches<T extends { id: string }>(
+  connections: readonly Connection[],
+  patches: readonly T[],
+): { lowerPairById: Map<string, string>; directPatches: T[] } {
+  const lowerPairById = lowerPairsOf(connections, patches.map((patch) => patch.id))
+  return { lowerPairById, directPatches: patches.filter((patch) => !lowerPairById.has(patch.id)) }
+}
+
+/**
+ * Plan connection edits against the PLAIN pre-commit state (the journal and the
+ * commit then see the same values): the routing half of an edit to a LOWER goes
+ * to `diagram.lowerRouting` (`entries`, pair -> new absolute entry); everything
+ * else stays an edit of the connection object (`objectUpdates`, unchanged
+ * semantics). In 3D the routing lands on the `*3d` twins, after the fork
+ * `ensureFork3d` is about to make, so planned entry and committed entry agree.
+ *
+ * A lower's ENDPOINTS are derived from the model and are not edited here. The
+ * canvas's anchor drag always names the shape the end is on (`fromId`/`toId`
+ * equal to the current endpoint): that is a routing edit, and the endpoint
+ * fields are dropped. Dropping the end on ANOTHER shape is a re-point, and it is
+ * refused: on the parent commit the next roll-up (≈100 ms later) undid it, and
+ * with per-pair ids it would now leave two objects under one id.
+ */
+function planLowerRoutingEdits(
+  connections: readonly Connection[],
+  diagram: Diagram | undefined,
+  updates: readonly ConnectionBatchUpdate[],
+  space: LayoutSpace,
+): { entries: Map<string, LowerConnectionRouting>; objectUpdates: ConnectionBatchUpdate[] } {
+  const entries = new Map<string, LowerConnectionRouting>()
+  if (!diagram) return { entries, objectUpdates: [...updates] }
+  const lowers = lowerRefsOf(connections, updates.map((update) => update.id))
+  if (lowers.size === 0) return { entries, objectUpdates: [...updates] }
+  const objectUpdates: ConnectionBatchUpdate[] = []
+  for (const update of updates) {
+    const lower = lowers.get(update.id)
+    if (!lower) {
+      objectUpdates.push(update)
+      continue
+    }
+    const { fromId, toId, ...data } = update.data
+    if ((fromId !== undefined && fromId !== lower.fromId) || (toId !== undefined && toId !== lower.toId)) continue
+    const { routing, rest, hasRouting } = splitRoutingPatch(data)
+    if (hasRouting) {
+      // A first entry starts from what is DRAWN (a lower without an entry is
+      // drawn with its object's own fields), so one edited field does not
+      // reset the others.
+      let base = entries.get(lower.pair)
+        ?? diagram.lowerRouting?.[lower.pair]
+        ?? (lower.connection ? cleanLowerRouting(lower.connection as unknown as Record<string, unknown>) : undefined)
+      if (space === '3d' && !diagram.layouts3d && base) base = forkLowerRouting3d(base)
+      const patch = space === '3d' ? redirectConnPatchTo3d(routing as Partial<Connection>) : routing
+      entries.set(lower.pair, mergeLowerRouting(base, patch as Record<string, unknown>))
+    }
+    if (Object.keys(rest).length > 0) objectUpdates.push({ id: update.id, data: rest })
+  }
+  return { entries, objectUpdates }
+}
+
+/** Journal records for planned lower-routing entries: each the ABSOLUTE routing
+ * of `space` for its pair, so a replay is idempotent. */
+function lowerRouteRecords(
+  entries: ReadonlyMap<string, LowerConnectionRouting>,
+  space: LayoutSpace,
+): PendingLowerRoutePlacement[] {
+  return [...entries].map(([pair, entry]) => ({ pair, routing: lowerRoutingForSpace(entry, space) }))
+}
+
+/** Commit planned entries onto the diagram DRAFT. */
+function commitLowerRoutingEntries(
+  diagram: Diagram,
+  entries: ReadonlyMap<string, LowerConnectionRouting>,
+): void {
+  if (entries.size === 0) return
+  diagram.lowerRouting = { ...(diagram.lowerRouting ?? {}), ...Object.fromEntries(entries) }
 }
 
 export const useModelStore = create<ModelState>()(
@@ -1795,6 +1914,7 @@ export const useModelStore = create<ModelState>()(
       const before = get()
       const diagram = before.diagrams.find((candidate) => candidate.id === before.currentDiagramId)
       const space = activeLayoutSpace()
+      const lowerEdits = planLowerRoutingEdits(before.connections, diagram, connections, space)
       let placementRevision: number | undefined
       if (diagram) {
         const objectById = new Map(before.objects.map((object) => [object.id, object]))
@@ -1817,7 +1937,7 @@ export const useModelStore = create<ModelState>()(
             autoSize: update.autoSize,
           }]
         })
-        const resolvedConnections = connections.map((update) => ({
+        const resolvedConnections = lowerEdits.objectUpdates.map((update) => ({
           id: update.id,
           data: space === '3d' ? redirectConnPatchTo3d(update.data) : update.data,
         }))
@@ -1825,6 +1945,7 @@ export const useModelStore = create<ModelState>()(
           objects: resolvedObjects,
           groups: resolvedGroups,
           connections: resolvedConnections,
+          lowerRoutes: lowerRouteRecords(lowerEdits.entries, space),
         })
       }
       set((state) => {
@@ -1868,7 +1989,11 @@ export const useModelStore = create<ModelState>()(
           }
         }
 
-        for (const update of connections) {
+        if (diagram && lowerEdits.entries.size > 0) {
+          if (space === '3d') ensureFork3d(state, diagram)
+          commitLowerRoutingEntries(diagram, lowerEdits.entries)
+        }
+        for (const update of lowerEdits.objectUpdates) {
           const connection = connectionById.get(update.id)
           if (!connection) continue
           let patch = update.data
@@ -1917,9 +2042,33 @@ export const useModelStore = create<ModelState>()(
       // Read before the commit: the scoped roll-up needs the OLD endpoints too.
       // (null = could not be computed: the roll-up falls back to a full pass)
       const lowerScope = tryLowerScope(() => connectionUpdateScope(updates))
+      const before = get()
+      const currentDiagram = before.diagrams.find((d) => d.id === before.currentDiagramId)
+      const space = activeLayoutSpace()
+      const lowerEdits = planLowerRoutingEdits(before.connections, currentDiagram, updates, space)
+      // Journaled like a placement (crash-safe, and overlaid on any projection
+      // that lands before the flush). `placementRevision` — which selects the
+      // targeted DiagramDoc write, and wakes the off-active drain — is bumped
+      // only when the batch is NOTHING but lower routing: the targeted write
+      // writes only the journal, so it would skip any other edit of the batch,
+      // which the ordinary write then persists (with the DiagramDoc, acknowledging
+      // the record against it).
+      let placementRevision: number | undefined
+      if (currentDiagram && lowerEdits.entries.size > 0) {
+        const revision = recordPlacementIntent(currentDiagram.id, space, { lowerRoutes: lowerRouteRecords(lowerEdits.entries, space) })
+        if (lowerEdits.objectUpdates.length === 0) placementRevision = revision
+      }
       set((state) => {
+        if (placementRevision !== undefined) state.placementRevision = placementRevision
+        if (lowerEdits.entries.size > 0) {
+          const diagram = state.diagrams.find((d) => d.id === state.currentDiagramId)
+          if (diagram) {
+            if (space === '3d') ensureFork3d(state, diagram)
+            commitLowerRoutingEntries(diagram, lowerEdits.entries)
+          }
+        }
         const byId = new Map(state.connections.map((connection, index) => [connection.id, index]))
-        for (const { id, data } of updates) {
+        for (const { id, data } of lowerEdits.objectUpdates) {
           const idx = byId.get(id)
           if (idx !== undefined) {
             // Routing/label/shape edits made on the 3D board land on the *3d twins
@@ -1939,7 +2088,8 @@ export const useModelStore = create<ModelState>()(
       // anchors/waypoints/hidden/…). So only re-roll-up when an endpoint actually changes
       // (a reconnect); a curved↔straight / solid↔dashed / label edit skips the whole
       // O(diagrams×connections) recompute it used to trigger on every keystroke.
-      if (updates.some(({ data }) => data.fromId !== undefined || data.toId !== undefined)) {
+      // (A lower's anchor drag names its own endpoint; the plan drops that.)
+      if (lowerEdits.objectUpdates.some(({ data }) => data.fromId !== undefined || data.toId !== undefined)) {
         get().syncAllLowerConnections(lowerScope?.endpointIds, lowerScope?.reachedDiagramIds)
       }
     },
@@ -1949,6 +2099,22 @@ export const useModelStore = create<ModelState>()(
     },
 
     toggleConnectionLock: (id) => {
+      const before = get()
+      const currentDiagram = before.diagrams.find((d) => d.id === before.currentDiagramId)
+      const pair = currentDiagram ? lowerPairsOf(before.connections, [id]).get(id) : undefined
+      if (currentDiagram && pair !== undefined) {
+        // A lower's lock is the diagram's routing: toggle the value it is DRAWN
+        // with, through the one door that writes lower routing.
+        const connection = before.connections.find((c) => c.id === id)
+        const drawn: LowerConnectionRouting = connection
+          ? resolveLowerRouting(connection, currentDiagram.lowerRouting)
+          : currentDiagram.lowerRouting?.[pair] ?? {}
+        const locked = activeLayoutSpace() === '3d'
+          ? (drawn.lockedToAnchors3d ?? drawn.lockedToAnchors)
+          : drawn.lockedToAnchors
+        get().updateConnectionsBatch([{ id, data: { lockedToAnchors: !locked } }])
+        return
+      }
       set((state) => {
         const idx = state.connections.findIndex((c) => c.id === id)
         if (idx !== -1) {
@@ -2217,8 +2383,23 @@ export const useModelStore = create<ModelState>()(
 
     applyDiagramLayout: (diagramId, layouts, connectionPatches, space) => {
       const use3d = (space ?? activeLayoutSpace()) === '3d'
+      const layoutSpace: LayoutSpace = use3d ? '3d' : '2d'
       const before = get()
       const target = before.diagrams.find((diagram) => diagram.id === diagramId)
+      // A patch for a derived (lower) connection is routing of THIS diagram:
+      // it goes to `diagram.lowerRouting`, never onto the shared lower object,
+      // which the next projection replaces (see src/lib/diagrams/lowerRouting.ts).
+      const { lowerPairById, directPatches } = splitLowerPatches(before.connections, connectionPatches)
+      const lowerEntries = new Map<string, LowerConnectionRouting>()
+      if (target) {
+        for (const patch of connectionPatches) {
+          const pair = lowerPairById.get(patch.id)
+          if (pair === undefined) continue
+          const entry = cleanLowerRouting(lowerEntries.get(pair) ?? target.lowerRouting?.[pair])
+          applyLayoutRoutingPatch(entry, patch, use3d)
+          lowerEntries.set(pair, entry)
+        }
+      }
       let placementRevision: number | undefined
       // Journal for ANY target diagram (phase B): a layout applied to a
       // non-current diagram used to mutate the store without a journal record
@@ -2231,14 +2412,15 @@ export const useModelStore = create<ModelState>()(
           objectIds.has(id) ? [{ id, position: layout.position, size: layout.size }] : [])
         const groups = Object.entries(layouts).flatMap(([id, layout]) =>
           groupIds.has(id) ? [{ id, position: layout.position, size: layout.size }] : [])
-        const connections = connectionPatches.map(({ id, ...data }) => ({
+        const connections = directPatches.map(({ id, ...data }) => ({
           id,
           data: use3d ? redirectConnPatchTo3d(data) : data,
         }))
-        placementRevision = recordPlacementIntent(diagramId, use3d ? '3d' : '2d', {
+        placementRevision = recordPlacementIntent(diagramId, layoutSpace, {
           objects,
           groups,
           connections,
+          lowerRoutes: lowerRouteRecords(lowerEntries, layoutSpace),
         })
       }
       set((state) => {
@@ -2249,52 +2431,13 @@ export const useModelStore = create<ModelState>()(
           // result is not an intentional deletion of an existing placement.
           if (use3d) diagram.layouts3d = { ...(diagram.layouts3d ?? {}), ...layouts }
           else diagram.layouts = { ...(diagram.layouts ?? {}), ...layouts }
+          commitLowerRoutingEntries(diagram, lowerEntries)
         }
-        const patchById = new Map(connectionPatches.map((p) => [p.id, p]))
+        const patchById = new Map(directPatches.map((p) => [p.id, p]))
         for (const c of state.connections) {
           const p = patchById.get(c.id)
           if (!p) continue
-          if (use3d) {
-            // 3D layout results land on the *3d twins; clears use explicit
-            // sentinels ([] / false) so they don't fall back to the 2D values.
-            c.waypoints3d = p.waypoints && p.waypoints.length ? p.waypoints : []
-            if (p.lockedToAnchors && (p.fromAnchor !== undefined || p.toAnchor !== undefined)) {
-              c.lockedToAnchors3d = true
-              if (p.fromAnchor !== undefined) c.fromAnchor3d = p.fromAnchor
-              else delete c.fromAnchor3d
-              if (p.toAnchor !== undefined) c.toAnchor3d = p.toAnchor
-              else delete c.toAnchor3d
-            } else {
-              c.lockedToAnchors3d = false
-              delete c.fromAnchor3d
-              delete c.toAnchor3d
-            }
-            if (p.shape) c.shape3d = p.shape
-            if (p.labelPosition !== undefined) c.labelPosition3d = p.labelPosition
-            if (p.labelOffset !== undefined) c.labelOffset3d = p.labelOffset
-            continue
-          }
-          if (p.waypoints && p.waypoints.length) c.waypoints = p.waypoints
-          else delete c.waypoints
-          // The layout owns the anchor state it scored — an end the patch leaves
-          // undefined is CLEARED (back to raycast), never kept: a stale anchor
-          // surviving a re-layout gets re-locked onto the wrong port and the canvas
-          // draws a worse line than the one the layout picked. Mirrors applyPatch
-          // in src/lib/layout/index.ts — keep the two in lockstep.
-          if (p.lockedToAnchors && (p.fromAnchor !== undefined || p.toAnchor !== undefined)) {
-            c.lockedToAnchors = true
-            if (p.fromAnchor !== undefined) c.fromAnchor = p.fromAnchor
-            else delete c.fromAnchor
-            if (p.toAnchor !== undefined) c.toAnchor = p.toAnchor
-            else delete c.toAnchor
-          } else {
-            c.lockedToAnchors = false
-            delete c.fromAnchor
-            delete c.toAnchor
-          }
-          if (p.shape) c.shape = p.shape
-          if (p.labelPosition !== undefined) c.labelPosition = p.labelPosition
-          if (p.labelOffset !== undefined) c.labelOffset = p.labelOffset
+          applyLayoutRoutingPatch(c, p, use3d)
         }
         if (placementRevision !== undefined) state.placementRevision = placementRevision
       })
@@ -2319,6 +2462,11 @@ export const useModelStore = create<ModelState>()(
           delete c.labelPosition3d
           delete c.labelOffset3d
           delete c.shape3d
+        }
+        if (diagram.lowerRouting) {
+          const flat: Record<string, LowerConnectionRouting> = {}
+          for (const [pair, entry] of Object.entries(diagram.lowerRouting)) flat[pair] = withoutLowerRouting3d(entry)
+          diagram.lowerRouting = flat
         }
       })
     },

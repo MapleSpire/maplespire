@@ -72,7 +72,14 @@ export const structurizrJsonSource: ImportSource = {
     const mapped = mapWorkspace(workspace)
 
     const preserved = new Set(mapped.preservedDiagramIds)
-    const ctx = { objects: mapped.objects, connections: mapped.connections, groups: mapped.groups }
+    // The depths tell the layout which of two groups with the same members is the
+    // outer one (a deployment node whose only child is another node).
+    const ctx = {
+      objects: mapped.objects,
+      connections: mapped.connections,
+      groups: mapped.groups,
+      groupDepths: mapped.groupDepths,
+    }
     const { diagrams: laidOut, connections: routed } = await applyAutoLayout(
       mapped.diagrams.filter((d) => !preserved.has(d.id)),
       ctx,
@@ -95,10 +102,13 @@ export const structurizrJsonSource: ImportSource = {
     const laidOutById = new Map(laidOut.map((d) => [d.id, d]))
     const diagrams = mapped.diagrams.map((diagram) => {
       const resolved = laidOutById.get(diagram.id) ?? diagram
-      // The layout engine sizes every group from its own members alone, so a
-      // deployment node and the node inside it come back sharing one border.
-      // Expanding (never rewriting) the boxes it produced restores the nesting
-      // without handing the canvas a layout no candidate was ever scored on.
+      // The layout nests group boxes by membership (graph.ts nestGroups), with
+      // these depths deciding equal-member ties, so this normally finds nothing
+      // to grow (measured 2026-10-22: 0 of the 40 auto-laid-out group boxes across
+      // the seven JSON fixtures). It stays as the guarantee: expanding (never rewriting) the boxes
+      // the layout produced restores any nesting it missed — a group that only
+      // partly overlaps another is boxed around its own members — without handing
+      // the canvas a layout no candidate was ever scored on.
       const groups = mapped.groups.filter((g) => resolved.groupIds.includes(g.id))
       if (groups.length === 0 || !resolved.layouts) return resolved
       return { ...resolved, layouts: sizeGroupBoxes(groups, resolved.layouts, 'expand', mapped.groupDepths) }

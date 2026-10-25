@@ -176,6 +176,27 @@ describe('RightSidebar descriptions and connection metadata', () => {
     expect(useUIStore.getState().currentView).toBe('decision-records')
   })
 
+  it('shows and toggles a derived (lower) connection\'s anchor lock as its DIAGRAM routes it', () => {
+    // A lower's routing is the diagram's `lowerRouting` (src/lib/diagrams/lowerRouting.ts);
+    // reading the shared object, the button would show "unlocked" and re-lock on click.
+    const lower: Connection = { id: 'lower:shape-a→shape-b', fromId: 'shape-a', toId: 'shape-b', type: 'dashed', kind: 'lower', label: '' }
+    useModelStore.setState({
+      connections: [connection, lower],
+      diagrams: [{
+        ...diagram,
+        connectionIds: ['connection-a-b', lower.id],
+        lowerRouting: { 'shape-a→shape-b': { fromAnchor: 4, lockedToAnchors: true } },
+      }],
+      selectedItems: [{ id: lower.id, type: 'connection' }],
+    })
+    render(<RightSidebar />)
+
+    fireEvent.click(screen.getByTestId('connection-anchor-lock'))
+
+    const entry = useModelStore.getState().diagrams[0].lowerRouting?.['shape-a→shape-b']
+    expect(entry?.lockedToAnchors).toBe(false)
+  })
+
   it('exposes and persists description, tags, owners and technologies for a connection', () => {
     useModelStore.setState({ selectedItems: [{ id: connection.id, type: 'connection' }] })
     render(<RightSidebar />)

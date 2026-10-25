@@ -306,3 +306,31 @@ describe('CanvasView ↔ inline expansion wires', () => {
     expect(useUIStore.getState().inlineExpansions).toEqual({ peer: 'C' })
   })
 })
+
+// Not an inline-expansion wire, but the same harness: what the 2D engine is
+// FED. A derived (lower) connection's routing is its diagram's `lowerRouting`
+// (src/lib/diagrams/lowerRouting.ts); CanvasView once merged through a private
+// copy of `filterAndMergeDiagramData` that no test exercised, so dropping the
+// merge there left every test green (architect lens, 2026-10-22).
+describe('CanvasView ↔ lower routing wire', () => {
+  it('feeds the engine a lower with the routing its diagram holds, not the bare shared object', () => {
+    useModelStore.setState({
+      objects: [obj('S'), obj('P', 400), { ...obj('s1'), parentId: 'S' } as C4Object, { ...obj('p1'), parentId: 'P' } as C4Object],
+      connections: [
+        { id: 'c1', fromId: 's1', toId: 'p1', type: 'solid', kind: 'direct' },
+        { id: 'lower:S→P', fromId: 'S', toId: 'P', type: 'dashed', kind: 'lower', label: '' },
+      ],
+      diagrams: [{
+        ...diagram('A', ['S', 'P']),
+        connectionIds: ['lower:S→P'],
+        lowerRouting: { 'S→P': { fromAnchor: 4, toAnchor: 10, lockedToAnchors: true } },
+      } as Diagram],
+      currentDiagramId: 'A',
+    })
+    render(<CanvasView />)
+    const last = engine.setData.at(-1)
+    const fed = (last?.[1] as Array<{ id: string; fromAnchor?: number; toAnchor?: number; lockedToAnchors?: boolean }>)
+      .find((c) => c.id === 'lower:S→P')
+    expect(fed).toMatchObject({ fromAnchor: 4, toAnchor: 10, lockedToAnchors: true })
+  })
+})

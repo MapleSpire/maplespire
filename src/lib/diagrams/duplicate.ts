@@ -13,6 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import type { Diagram, Flow, Position, Size } from '../../types'
+import { cloneLowerRoutingMap } from './lowerRouting'
 
 /**
  * Duplicating a diagram copies the VIEW, never the model.
@@ -67,6 +68,7 @@ export function buildDuplicateDiagram(source: Diagram, name: string): Omit<Diagr
     groupIds,
     layouts,
     layouts3d,
+    lowerRouting,
     ...view
   } = source
   const copy: Omit<Diagram, 'id'> = {
@@ -83,6 +85,10 @@ export function buildDuplicateDiagram(source: Diagram, name: string): Omit<Diagr
   // layer would fork the copy's 3D placement away from its 2D one on creation.
   const cloned3d = cloneLayouts(layouts3d)
   if (cloned3d) copy.layouts3d = cloned3d
+  // Same objects at the same positions, so the same derived lowers routed the
+  // same way — and, like the layouts, never aliased into the copy's document.
+  const clonedLowerRouting = cloneLowerRoutingMap(lowerRouting)
+  if (clonedLowerRouting) copy.lowerRouting = clonedLowerRouting
   return copy
 }
 

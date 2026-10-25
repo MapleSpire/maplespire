@@ -90,6 +90,7 @@ export const FSCK_CHECKS = {
   'overlay-segment-bounded': 'No LISTED overlay segment has grown past the size the fold bounds it to.',
   'overlay-segment-retained': 'Every overlay segment still inside its retention window exists in storage.',
   'write-head-writable': 'The registry write head is listed with a WRITABLE kind, never a baseline kind.',
+  'diagram-doc-url': 'Every diagram in a registry shard names a valid DiagramDoc url.',
 } as const
 
 /** PARK-level checks — they look ACROSS workspaces, so they can never appear
@@ -328,6 +329,22 @@ export function collectReferencedUrls(
   return [...out]
 }
 
+/** Every diagram entry of the given registry shards, with its RAW `docUrl` —
+ * unlike {@link collectReferencedUrls}, an invalid or empty url is kept. */
+export function registryDiagramEntries(
+  registries: readonly PlainDoc[],
+): { diagramId: string; docUrl: unknown }[] {
+  const out: { diagramId: string; docUrl: unknown }[] = []
+  for (const registry of registries) {
+    const diagrams = registry?.diagrams
+    if (!diagrams || typeof diagrams !== 'object' || Array.isArray(diagrams)) continue
+    for (const [diagramId, entry] of Object.entries(diagrams as Record<string, { docUrl?: unknown }>)) {
+      out.push({ diagramId, docUrl: entry?.docUrl })
+    }
+  }
+  return out
+}
+
 /**
  * KNOWN LIMIT: the "required, not defaulted" discipline on `staticSource`,
  * `claimCoverage` and the other required fields below holds by convention, not
@@ -344,6 +361,19 @@ export interface StructureCheckInput {
   modelMetaUnresolved?: boolean
   /** Registry shards that failed to resolve, so their diagrams are unknown. */
   unresolvedRegistries?: readonly string[]
+  /**
+   * Every diagram entry of the resolved registry shards, with its raw `docUrl`.
+   *
+   * `referenced` cannot carry this: `collectReferencedUrls` keeps only VALID
+   * urls, so a meta published with `docUrl: ''` simply vanished from every
+   * check and the workspace reported `clean`. That is what a client defect
+   * fixed 2026-10-21 left behind — a Structurizr import on a classic workspace
+   * published 14 such metas (bridge.ts / unpublishedDiagramDocs.ts).
+   *
+   * Optional ONLY so the existing partial test inputs keep compiling; a caller
+   * that omits it gets the skip, never a silent pass.
+   */
+  registryDiagramDocUrls?: readonly { diagramId: string; docUrl: unknown }[]
   referenced: readonly string[]
   /** Document IDs (not URLs) found in `automerge_storage`. */
   presentIds: ReadonlySet<string>
@@ -1017,6 +1047,32 @@ export function checkWorkspaceStructure(input: StructureCheckInput): {
           documentUrl: `automerge:${id}`,
         })
       }
+    }
+  }
+
+  // ── diagram-doc-url ───────────────────────────────────────────────────────
+  // A registry meta whose docUrl names no document. Every reachability check
+  // above is blind to it — `collectReferencedUrls` drops an invalid url — so
+  // it needs its own row. Same completeness rule as above: an unresolved
+  // registry could hold one, so a partial walk skips instead of passing.
+  if (!input.root || unresolvedRegistries.length > 0) {
+    skip('diagram-doc-url', !input.root
+      ? 'the root document did not resolve'
+      : `${unresolvedRegistries.length} registry shard(s) did not resolve, so the diagram set is partial`)
+  } else if (input.registryDiagramDocUrls === undefined) {
+    skip('diagram-doc-url', 'the registry entries were not gathered')
+  } else {
+    ran('diagram-doc-url')
+    for (const entry of input.registryDiagramDocUrls) {
+      if (url(entry.docUrl)) continue
+      findings.push({
+        check: 'diagram-doc-url',
+        severity: 'degraded',
+        detail: `diagram ${entry.diagramId} names no DiagramDoc (docUrl ${JSON.stringify(entry.docUrl ?? null)}): `
+          + 'no client can open its document. On a classic workspace the next client write repoints it '
+          + 'at a fresh EMPTY document (its positions are not recoverable from the registry — re-run '
+          + 'Auto-layout on it); a summary-only workspace has no client repair path and shows it read-only',
+      })
     }
   }
 
@@ -2061,6 +2117,7 @@ export async function fsckWorkspace(
     modelMeta,
     modelMetaUnresolved,
     unresolvedRegistries,
+    registryDiagramDocUrls: registryDiagramEntries(registries),
     referenced,
     presentIds: present,
     admittedIds: admitted,

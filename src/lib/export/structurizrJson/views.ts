@@ -48,6 +48,7 @@
 
 import type { C4Object, Connection, Diagram, Flow, Group, MessageStep, Position, Size } from '../../../types'
 import { scaleFactorFor } from '../../structurizr/json/layoutPolicy'
+import { resolveLowerRouting } from '../../diagrams/lowerRouting'
 import { ENVIRONMENT_PROPERTY, SOURCE_ID_PROPERTY, SOURCE_INSTANCE_OF_PROPERTY } from '../../structurizr/json/provenance'
 import {
   DEFAULT_LAYOUT_SCALE,
@@ -292,9 +293,12 @@ function elementRows(
  */
 function edgeGeometry(
   diagram: Diagram,
-  connection: Connection,
+  stored: Connection,
   transform: ViewTransform,
 ): Pick<WireRelationshipView, 'vertices' | 'routing' | 'position'> {
+  // A derived (lower) edge is routed by THIS diagram (`lowerRouting`), not by
+  // the shared lower object.
+  const connection = resolveLowerRouting(stored, diagram.lowerRouting)
   const waypoints = connection.waypoints ?? []
   const shape = connection.shape ?? diagram.defaultConnectionShape ?? 'curved'
   return {

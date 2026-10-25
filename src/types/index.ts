@@ -230,6 +230,18 @@ export interface Connection {
   shape3d?: ConnectionShape
 }
 
+/**
+ * How ONE diagram routes a derived (`kind: 'lower'`) connection — the same
+ * routing fields a Connection carries, 2D and 3D. Held in
+ * `Diagram.lowerRouting`, keyed by the lower's endpoint pair; see
+ * `src/lib/diagrams/lowerRouting.ts` for why it is not on the lower itself.
+ */
+export type LowerConnectionRouting = Pick<
+  Connection,
+  | 'waypoints' | 'fromAnchor' | 'toAnchor' | 'lockedToAnchors' | 'labelPosition' | 'labelOffset' | 'shape'
+  | 'waypoints3d' | 'fromAnchor3d' | 'toAnchor3d' | 'lockedToAnchors3d' | 'labelPosition3d' | 'labelOffset3d' | 'shape3d'
+>
+
 export interface Diagram {
   id: string
   name: string
@@ -260,6 +272,14 @@ export interface Diagram {
    * per-element (3D ?? 2D) until adjusted in 3D. "Align 3D with 2D" deletes it.
    */
   layouts3d?: Record<string, { position: Position; size: Size }>
+  /**
+   * Routing of this diagram's derived (`kind: 'lower'`) connections, keyed by
+   * endpoint pair `${fromId}→${toId}`. A lower is re-derived (and its object
+   * replaced) on every projection and is never persisted, so its routing lives
+   * here, beside `layouts`, and is merged onto it when the diagram is drawn
+   * (`resolveLowerRouting`). An entry is ABSOLUTE: a field it lacks is cleared.
+   */
+  lowerRouting?: Record<string, LowerConnectionRouting>
   /**
    * Scene decoration (3D board): curated prop pack + density + board style,
    * placed deterministically from the seed — shared with the team exactly

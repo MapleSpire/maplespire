@@ -261,6 +261,7 @@ import { disposeCityFacadeTextures } from './decor/cityFacade'
 import { toCreasedNormals } from 'three/examples/jsm/utils/BufferGeometryUtils.js'
 import { disposeThemeAssets, getLoadedAsset, loadThemeAsset } from './assets'
 import { getActiveScene3D, setActiveScene3D } from './activeScene'
+import { groupDragMoves, groupPlatformRect, startGroupDrag, type GroupDragStart } from './groupPlatform'
 
 // ── DS card anatomy (design-system C4 node card / editor-3d kit) ─────────────
 const CARD_RADIUS = 14
@@ -545,6 +546,8 @@ export class Scene3D {
   private raycaster = new THREE.Raycaster()
 
   private data: SceneData = { objects: [], connections: [], groups: [], tags: [] }
+  /** The object ids of `data.objects`, rebuilt when that array is replaced (groupRect). */
+  private objectIdsOf: { objects: SceneData['objects']; ids: Set<string> } | null = null
   private skin: SkinConfig | null = null
   private resolvedTheme: 'light' | 'dark' = 'light'
   private palette: Palette3d | null = null
@@ -898,11 +901,7 @@ export class Scene3D {
     /** Last world position a node/group drag dispatched (drop-snap input). */
     lastPos: { x: number; y: number } | null
     /** Group-drag capture (2D parity: members ride along by the drag delta). */
-    groupDrag: {
-      rect: { x: number; y: number; w: number; h: number }
-      groupPos: { x: number; y: number } | null
-      members: Map<string, { x: number; y: number }>
-    } | null
+    groupDrag: GroupDragStart | null
   } = { mode: 'idle', id: null, lastX: 0, lastY: 0, grabDX: 0, grabDZ: 0, moved: false, button: 0, lastPos: null, groupDrag: null }
 
   private detachFns: (() => void)[] = []
@@ -3814,37 +3813,17 @@ export class Scene3D {
     return { cx: (minX + maxX) / 2, cz: (minY + maxY) / 2, width: maxX - minX, height: maxY - minY }
   }
 
+  /** The object ids of `data.objects`, cached per array. */
+  private objectIdsOnScene(): Set<string> {
+    if (this.objectIdsOf?.objects !== this.data.objects) {
+      this.objectIdsOf = { objects: this.data.objects, ids: new Set(this.data.objects.map((o) => o.id)) }
+    }
+    return this.objectIdsOf.ids
+  }
+
+  /** The group's platform: groupPlatform.ts, the 2D computeGroupBounds contract. */
   private groupRect(g: Group): Rect {
-    // 2D computeGroupBounds contract: a parent wrapper always hugs its members;
-    // a standalone group honors stored geometry only when autoSize is OFF. Any
-    // other group derives its box from member positions, so moving a member
-    // re-hugs the platform live ("autolayout").
-    const isParentWrapper = !!g.parentObjectId
-    const stored =
-      g.position && g.size
-        ? { x: g.position.x, y: g.position.y, w: g.size.width, h: g.size.height }
-        : null
-    if (g.autoSize === false && stored && !isParentWrapper) return stored
-    let minX = Infinity
-    let minY = Infinity
-    let maxX = -Infinity
-    let maxY = -Infinity
-    for (const id of g.objectIds) {
-      const o = this.data.objects.find((x) => x.id === id)
-      if (!o) continue
-      minX = Math.min(minX, o.position.x)
-      minY = Math.min(minY, o.position.y)
-      maxX = Math.max(maxX, o.position.x + o.size.width)
-      maxY = Math.max(maxY, o.position.y + o.size.height)
-    }
-    if (!isFinite(minX)) {
-      // no members on this diagram: stored geometry, else the 2D default
-      // 240x160 drop-target box at the group's position (or the origin)
-      if (stored) return stored
-      const pos = g.position ?? { x: 0, y: 0 }
-      return { x: pos.x, y: pos.y, w: g.size?.width ?? 240, h: g.size?.height ?? 160 }
-    }
-    return { x: minX - 30, y: minY - 46, w: maxX - minX + 60, h: maxY - minY + 76 }
+    return groupPlatformRect(g, this.data.groups, this.data.objects, this.objectIdsOnScene())
   }
 
   private objectRect(o: C4Object): Rect {
@@ -10263,16 +10242,7 @@ export class Scene3D {
           // capture start positions: dragging a platform carries its members
           // by the same delta (the 2D group-drag contract)
           const grp = this.data.groups.find((g) => g.id === hit.target.id)
-          p.groupDrag = {
-            rect: { x: rect.x, y: rect.y, w: rect.w, h: rect.h },
-            groupPos: grp?.position ? { x: grp.position.x, y: grp.position.y } : null,
-            members: new Map(
-              (grp?.objectIds ?? []).flatMap((id) => {
-                const o = this.data.objects.find((x) => x.id === id)
-                return o ? [[id, { x: o.position.x, y: o.position.y }] as const] : []
-              }),
-            ),
-          }
+          p.groupDrag = startGroupDrag(grp, rect, this.data.groups, this.data.objects, this.objectIdsOnScene())
           this.captureSmartGuideCandidates(new Set(grp?.objectIds ?? []), new Set([hit.target.id]))
         }
       } else if (hit && this.readonly_ && hit.target.kind !== 'connection') {
@@ -10375,15 +10345,11 @@ export class Scene3D {
           p.lastPos = pos
           if (p.mode === 'dragNode') this.callbacks.onObjectMove(p.id, pos)
           else if (p.groupDrag) {
-            // 2D contract: every member rides along by the drag delta; the
-            // stored group position (when set) shifts by the same delta
-            const gd = p.groupDrag
-            const dx = pos.x - gd.rect.x
-            const dy = pos.y - gd.rect.y
-            for (const [id, start] of gd.members)
-              this.callbacks.onObjectMove(id, { x: start.x + dx, y: start.y + dy })
-            if (gd.groupPos) this.callbacks.onGroupMove(p.id, { x: gd.groupPos.x + dx, y: gd.groupPos.y + dy })
-            else if (gd.members.size === 0) this.callbacks.onGroupMove(p.id, pos)
+            // 2D contract: members and nested stored groups ride along by the
+            // drag delta, and so does the stored group position (groupPlatform.ts)
+            const moves = groupDragMoves(p.id, p.groupDrag, pos)
+            for (const [id, at] of moves.objects) this.callbacks.onObjectMove(id, at)
+            for (const [id, at] of moves.groups) this.callbacks.onGroupMove(id, at)
           } else this.callbacks.onGroupMove(p.id, pos)
           break
         }
@@ -10505,15 +10471,10 @@ export class Scene3D {
           })
           if (wasNode) this.callbacks.onObjectMove(dragId, snapTo(p.lastPos))
           else if (p.groupDrag) {
-            // 2D drag-end: each member snaps where it landed; so does the
-            // stored group position
-            const gd = p.groupDrag
-            const dx = p.lastPos.x - gd.rect.x
-            const dy = p.lastPos.y - gd.rect.y
-            for (const [id, start] of gd.members)
-              this.callbacks.onObjectMove(id, snapTo({ x: start.x + dx, y: start.y + dy }))
-            if (gd.groupPos) this.callbacks.onGroupMove(dragId, snapTo({ x: gd.groupPos.x + dx, y: gd.groupPos.y + dy }))
-            else if (gd.members.size === 0) this.callbacks.onGroupMove(dragId, snapTo(p.lastPos))
+            // 2D drag-end: everything the drag moved snaps where it landed
+            const moves = groupDragMoves(dragId, p.groupDrag, p.lastPos, snapTo)
+            for (const [id, at] of moves.objects) this.callbacks.onObjectMove(id, at)
+            for (const [id, at] of moves.groups) this.callbacks.onGroupMove(id, at)
           } else this.callbacks.onGroupMove(dragId, snapTo(p.lastPos))
         }
         this.callbacks.onDragEnd?.()

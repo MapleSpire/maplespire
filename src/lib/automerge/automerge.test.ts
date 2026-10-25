@@ -131,6 +131,7 @@ describe('projection round-trips', () => {
       connectionIds: ['c1'],
       groupIds: [],
       layouts: { o1: { position: { x: 10, y: 20 }, size: { width: 160, height: 100 } } },
+      lowerRouting: { 'o1→o2': { fromAnchor: 3, lockedToAnchors: true } },
       readonly: false,
     }
     const comments: Comment[] = [
@@ -475,6 +476,7 @@ describe('reconcile on real Automerge drafts', () => {
       connectionIds: [],
       groupIds: [],
       layouts: { o1: { position: { x: 5, y: 6 }, size: { width: 160, height: 100 } } },
+      lowerRouting: { 'o1→o2': { waypoints: [{ x: 1, y: 2 }], shape: 'straight', lockedToAnchors3d: false } },
       readonly: true,
       skinId: 'skin-x',
       defaultConnectionShape: 'straight',

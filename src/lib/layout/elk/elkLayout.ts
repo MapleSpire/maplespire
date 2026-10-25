@@ -25,8 +25,13 @@ import {
   boundaryGroupsOf,
   buildLayoutGraph,
   contentBounds,
+  deriveGroupBoxes,
+  groupPadding,
   groupTextBands,
+  layeringEdges,
   measureLaidOut,
+  modelGroupBoundaries,
+  nestGroups,
   packIsolatedBelow,
   repairRoute,
   snapAlignBoxes,
@@ -38,13 +43,12 @@ import {
 } from '../graph'
 import { assignAnchors } from '../ports'
 import type { Box } from '../geometry'
-import { groupHeaderBandHeight, headerTextWidth, GROUP_FOOTER_PAD, GROUP_STD_PAD_TOP, type Rect } from '../metrics'
+import { groupHeaderBandHeight, headerTextWidth, GROUP_STD_PAD_TOP, type BoundaryBox, type Rect } from '../metrics'
 
-const GROUP_PAD = 30
-// Standard (non-parent) model-level groups reserve GROUP_STD_PAD_TOP on top for the icon +
-// title row (shared via metrics.ts with the canvas + custom layout + preview). Parent-wrapper
-// boundaries instead reserve a per-group centered-header band on top (groupHeaderBandHeight) +
-// GROUP_FOOTER_PAD below, matching the identity stack the canvas renders.
+// Group padding comes from graph.ts `groupPadding`, shared with the custom engine:
+// standard (non-parent) groups reserve GROUP_STD_PAD_TOP on top for the icon + title
+// row; parent-wrapper boundaries a per-group centred-header band
+// (groupHeaderBandHeight) + GROUP_FOOTER_PAD below, matching what the canvas renders.
 
 // Interior spacing for boundary compounds. ELK applies its DEFAULT nodeNode (20)
 // *inside* compounds — the generous root spacing in elkConfig does NOT propagate
@@ -67,16 +71,20 @@ const GROUP_PAD = 30
 const GROUP_SPACING_NODE = 40
 const GROUP_SPACING_LAYERS = 40
 
-// Rough px width of a group title at a given font size (Segoe UI ≈ 0.55em/char).
-// Used to give the boundary compound a minimum width so the top-left title (drawn
-// with no clipping by the canvas) fits inside the box instead of overflowing.
-const titleMinWidth = (name: string, fontSize = 13) =>
-  Math.ceil((name?.length ?? 0) * fontSize * 0.55) + 40
-
+/**
+ * `placements`, shared across one portfolio run, maps a placement (every shape and
+ * group box) to the solution already routed and scored for it. Two strategies often
+ * place identically — a graph short enough never triggers row wrapping, so a
+ * strategy and its `-nowrap` twin agree — and routing + scoring is most of a
+ * candidate's cost; the twin reuses the result under its own strategy id. Only on
+ * the calling thread: layout workers run one candidate each and pass none, so a
+ * twin is routed again there (same result, in parallel).
+ */
 export async function layoutDiagramElk(
   diagram: Diagram,
   ctx: LayoutContext,
   strategy: Strategy,
+  placements?: Map<string, LayoutSolution>,
 ): Promise<LayoutSolution | null> {
   const objectById = new Map(ctx.objects.map((o) => [o.id, o]))
   const { nodes, edges } = buildLayoutGraph(diagram, objectById, ctx.groups, ctx.connections)
@@ -84,8 +92,7 @@ export async function layoutDiagramElk(
 
   const nodeSet = new Set(nodes.map((n) => n.id))
   const boundaries = boundaryGroupsOf(diagram, ctx.groups, nodeSet)
-  const boundaryOf = new Map<string, string>()
-  for (const b of boundaries) for (const m of b.memberIds) if (!boundaryOf.has(m)) boundaryOf.set(m, b.id)
+  const nesting = nestGroups(diagram, ctx.groups, nodeSet, ctx.groupDepths)
 
   // Degree-0 nodes leave the ELK graph and get grid-packed below the wired content
   // instead (ELK strings them into an ~8:1 one-row sliver; its component packing
@@ -100,24 +107,43 @@ export async function layoutDiagramElk(
   const { connected, isolated } = splitIsolatedNodes(nodes, edges, groupedIds)
 
   // Build the ELK graph.
-  const groupName = new Map(ctx.groups.map((g) => [g.id, g.name]))
   // Per-group header geometry, mirroring the canvas exactly: the reserved top-band
   // height (centered identity stack) and the widest header line (for the masking band).
   const groupHeaderH = new Map(ctx.groups.map((g) => [g.id, groupHeaderBandHeight(g)]))
   const groupHeaderW = new Map(ctx.groups.map((g) => [g.id, headerTextWidth(g.name, g.type, g.description)]))
+  const groupById = new Map(ctx.groups.map((g) => [g.id, g]))
+  // Every group is a compound — boundaries, model-level groups ("Cloud", "Big Bank
+  // plc") and the nodes of a deployment view — NESTED the way their membership nests,
+  // so ELK keeps each group's members together and everyone else outside, at every
+  // level. Before, only the first group to claim a member became a compound: a
+  // non-member was placed inside the others (grouped.dsl's Legacy ERP inside
+  // "Cloud"; big-bank DevelopmentDeployment's Mainframe inside "Developer Laptop").
+  // A model group that only partly overlaps another cannot be one (a node has one
+  // parent) and is laid out as loose nodes, as before. Every box is derived from
+  // the members below, not taken from ELK.
+  //
+  // The title floor and its centring are written in ELK's INTERNAL frame. Layered
+  // lays out left-to-right and rotates for DOWN, and a compound's minimum size and
+  // content alignment are not rotated back (measured, elk.bundled 0.11.1: under
+  // DOWN a minimum of (500,0) returned a 210×500 box, (0,500) a 500×172 one; only
+  // V_CENTER centred the child horizontally). Written plainly, the floor reserved
+  // HEIGHT, and deriveGroupBoxes then widened the box over its neighbours.
+  const down = strategy.direction === 'DOWN'
   const compoundNodes = new Map<string, ElkNode>()
-  for (const b of boundaries) {
-    // top reserves the per-group centered-header band so the lowest member can't sit on
-    // it; bottom is the slim footer (no text there now). nodeSize.minimum floors the
-    // compound width to the title width so the header fits inside the box.
-    const minW = titleMinWidth(groupName.get(b.id) ?? '')
-    const topPad = groupHeaderH.get(b.id) ?? GROUP_STD_PAD_TOP
-    compoundNodes.set(b.id, {
-      id: b.id,
+  for (const gid of nesting.ids) {
+    if (nesting.loose.has(gid)) continue
+    const pad = groupPadding(groupById.get(gid)!)
+    compoundNodes.set(gid, {
+      id: gid,
       layoutOptions: {
-        'elk.padding': `[top=${topPad},left=${GROUP_PAD},bottom=${GROUP_FOOTER_PAD},right=${GROUP_PAD}]`,
+        // top reserves the header (a boundary's centred band, a group's title row) so
+        // the highest member — or nested group — can't sit on it; nodeSize.minimum
+        // floors the width to the title, centred on the content as deriveGroupBoxes
+        // centres it, so the header fits inside a box ELK actually reserved.
+        'elk.padding': `[top=${pad.top},left=${pad.side},bottom=${pad.bottom},right=${pad.side}]`,
         'elk.nodeSize.constraints': 'MINIMUM_SIZE',
-        'elk.nodeSize.minimum': `(${minW},0)`,
+        'elk.nodeSize.minimum': down ? `(0,${pad.titleFloor})` : `(${pad.titleFloor},0)`,
+        'elk.contentAlignment': down ? '[V_CENTER, H_LEFT]' : '[H_CENTER, V_TOP]',
         // Interior breathing room (members default to nodeNode=20 otherwise).
         'elk.spacing.nodeNode': `${GROUP_SPACING_NODE}`,
         'elk.layered.spacing.nodeNodeBetweenLayers': `${GROUP_SPACING_LAYERS}`,
@@ -126,13 +152,12 @@ export async function layoutDiagramElk(
     })
   }
   const rootChildren: ElkNode[] = []
+  const parentChildren = (parentId: string | undefined) =>
+    (parentId && compoundNodes.get(parentId)?.children) || rootChildren
   for (const n of connected) {
-    const elkNode: ElkNode = { id: n.id, width: n.width, height: n.height }
-    const bId = boundaryOf.get(n.id)
-    if (bId && compoundNodes.has(bId)) compoundNodes.get(bId)!.children!.push(elkNode)
-    else rootChildren.push(elkNode)
+    parentChildren(nesting.compoundOf.get(n.id)).push({ id: n.id, width: n.width, height: n.height })
   }
-  for (const c of compoundNodes.values()) rootChildren.push(c)
+  for (const [gid, c] of compoundNodes) parentChildren(nesting.compoundParent.get(gid)).push(c)
 
   // ── map node positions to world coordinates ─────────────────────────────────
   const objectBoxes = new Map<string, Box>()
@@ -142,7 +167,10 @@ export async function layoutDiagramElk(
       id: 'root',
       layoutOptions: rootOptions(strategy, complexity),
       children: rootChildren,
-      edges: edges.map((e) => ({ id: e.id, sources: [e.fromId], targets: [e.toId] })),
+      // ELK only PLACES the nodes (edges are re-routed below), so it ranks on the
+      // C4 layering edges: people first, reciprocal pairs counted once.
+      edges: layeringEdges(edges, (id) => objectById.get(id)?.type === 'actor')
+        .map((e) => ({ id: e.id, sources: [e.fromId], targets: [e.toId] })),
     }
 
     let res: ElkNode
@@ -153,24 +181,38 @@ export async function layoutDiagramElk(
       return null
     }
 
+    // ELK PLACES the compounds (which keeps non-members out of them); their boxes
+    // are derived from the members below, not taken from ELK.
     const collect = (node: ElkNode, ox: number, oy: number) => {
       for (const child of node.children ?? []) {
         const x = ox + (child.x ?? 0)
         const y = oy + (child.y ?? 0)
-        if (compoundNodes.has(child.id)) {
-          groupBoxes.set(child.id, { x, y, width: child.width ?? 0, height: child.height ?? 0 })
-          collect(child, x, y)
-        } else {
-          objectBoxes.set(child.id, { x, y, width: child.width ?? 0, height: child.height ?? 0 })
-        }
+        if (compoundNodes.has(child.id)) collect(child, x, y)
+        else objectBoxes.set(child.id, { x, y, width: child.width ?? 0, height: child.height ?? 0 })
       }
     }
     collect(res, 0, 0)
 
     // Snap near-miss rows/columns onto shared axes (guarded, same-zone only) before
     // anything derives from the positions — group bboxes, routing, metrics.
-    snapAlignBoxes(objectBoxes, (id) => boundaryOf.get(id) ?? '__root')
+    snapAlignBoxes(objectBoxes, (id) => nesting.compoundOf.get(id) ?? '__root')
   }
+
+  // Whole pixels, then every group box from its members, by the rules the canvas
+  // draws it with (graph.ts deriveGroupBoxes), shared with the custom engine.
+  // ELK's own compound box is fractional (members 30.5px in, width 245.5) and,
+  // rounded apart from its members, came back a pixel off on re-import whenever a
+  // strategy with fractional offsets won (roundTrip.test: no-views Containers-2
+  // -54,-95 vs -55,-95; big-bank SystemLandscape -54,-23 vs -54,-24).
+  for (const b of objectBoxes.values()) {
+    b.x = Math.round(b.x)
+    b.y = Math.round(b.y)
+  }
+  // Every group with a member on the diagram gets a box — a one-member model group
+  // too. The legacy two-member rule left it out of the result, so the canvas kept
+  // drawing its PRE-layout box (imported groups are autoSize:false) around a member
+  // that had moved: 12 of 13 deployment nodes on big-bank LiveDeployment.
+  for (const [gid, box] of deriveGroupBoxes(nesting, ctx.groups, objectBoxes)) groupBoxes.set(gid, box)
 
   // The isolated field: a uniform grid below the wired content, sized so the whole
   // page approaches the 1.6 target aspect. Grid boxes join objectBoxes so routing
@@ -180,30 +222,14 @@ export async function layoutDiagramElk(
   }
   if (objectBoxes.size === 0) return null
 
-  // Model-level groups (no parentObjectId): bbox of members + padding.
-  for (const gid of diagram.groupIds) {
-    if (groupBoxes.has(gid)) continue
-    const g = ctx.groups.find((x) => x.id === gid)
-    if (!g || g.parentObjectId) continue
-    const members = g.objectIds.map((id) => objectBoxes.get(id)).filter(Boolean) as Box[]
-    if (members.length < 2) continue
-    const minX = Math.min(...members.map((m) => m.x))
-    const minY = Math.min(...members.map((m) => m.y))
-    const maxX = Math.max(...members.map((m) => m.x + m.width))
-    const maxY = Math.max(...members.map((m) => m.y + m.height))
-    // Floor the width to the title (font 11) so the top-left label fits; widen
-    // symmetrically around the member bbox so the box stays centred on its content.
-    // These are standard (non-parent) groups — legacy symmetric reservation, unchanged.
-    const bboxW = maxX - minX + GROUP_PAD * 2
-    const width = Math.max(bboxW, titleMinWidth(g.name, 11))
-    const x = minX - GROUP_PAD - (width - bboxW) / 2
-    groupBoxes.set(gid, {
-      x,
-      y: minY - GROUP_STD_PAD_TOP,
-      width,
-      height: maxY - minY + GROUP_STD_PAD_TOP + GROUP_PAD,
-    })
-  }
+  const placementKey = placements
+    ? [...objectBoxes, ...groupBoxes]
+        .map(([id, b]) => `${id}:${b.x},${b.y},${b.width},${b.height}`)
+        .sort()
+        .join('|')
+    : ''
+  const routed = placements?.get(placementKey)
+  if (routed) return { ...routed, source: strategy.id }
 
   // ── edges: curved, with faithful obstacle-avoidance routing ─────────────────
   // ELK gives the (excellent) node placement + boundaries; we draw curved edges
@@ -227,8 +253,11 @@ export async function layoutDiagramElk(
 
   // Boundary descriptors (with their reserved top header bands) — computed BEFORE
   // routing so the soft zones can steer detours clear of the group's centered header,
-  // exactly as `measureDiagram` does on the persisted state.
-  const boundaryDescs = boundaries
+  // as `measureDiagram` does on the persisted state. Deliberately NOT identical to
+  // it: candidates are also scored on the MODEL-level groups (modelGroupBoundaries),
+  // which measureDiagram leaves out because imported deployment views overlap by
+  // design — see that function's note.
+  const boundaryDescs: BoundaryBox[] = boundaries
     .map((b) => {
       const box = groupBoxes.get(b.id)
       return box
@@ -241,6 +270,7 @@ export async function layoutDiagramElk(
         : null
     })
     .filter((b): b is NonNullable<typeof b> => b !== null)
+  boundaryDescs.push(...modelGroupBoundaries(diagram, ctx.groups, (id) => groupBoxes.get(id)))
   const softZones = groupTextBands(boundaryDescs)
 
   const laid: LaidEdge[] = []
@@ -284,5 +314,7 @@ export async function layoutDiagramElk(
     }
   }
 
-  return { source: strategy.id, layouts, connPatches, edgeGeoms, metrics }
+  const solution: LayoutSolution = { source: strategy.id, layouts, connPatches, edgeGeoms, metrics }
+  placements?.set(placementKey, solution)
+  return solution
 }

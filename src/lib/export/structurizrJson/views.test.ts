@@ -446,6 +446,25 @@ describe('Structurizr JSON views — drawn edges', () => {
     expect(routed.routing).toBe('Direct')
   })
 
+  it('routes a derived (lower) edge as its diagram draws it — from `lowerRouting`, not the shared object', () => {
+    const mapped = importWorkspace(routedJson)
+    const diagram = mapped.diagrams.find((d) => d.sourceViewKey === 'Containers')!
+    const plain = mapped.connections.find((c) => c.properties?.[SOURCE_ID_PROPERTY] === '22')!
+    const bundle = bundleOf(mapped)
+    const asLower = { ...plain, kind: 'lower' as const, waypoints: undefined, labelPosition: 0.2 }
+    bundle.connections = bundle.connections.map((c) => (c.id === plain.id ? asLower : c))
+    const bends: Position[] = [{ x: 300, y: 300 }, { x: 400, y: 300 }]
+    bundle.diagrams = bundle.diagrams.map((d) => d.id === diagram.id
+      ? { ...d, lowerRouting: { [`${plain.fromId}→${plain.toId}`]: { waypoints: bends, labelPosition: 0.8, shape: 'straight' } } }
+      : d)
+
+    const row = buildWireViewSet(buildExportContext(bundle)).containerViews?.[0]?.relationships?.find((r) => r.id === '22')
+
+    expect(row?.vertices).toHaveLength(2)
+    expect(row?.position).toBe(80)
+    expect(row?.routing).toBe('Direct')
+  })
+
   it('leaves an edge off a view that does not draw both of its ends', () => {
     const mapped = importWorkspace(routedJson)
     const diagram = mapped.diagrams.find((d) => d.sourceViewKey === 'Containers')!

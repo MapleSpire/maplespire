@@ -12,10 +12,12 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU Affero General Public License for more details.
 
-// Lazy ELK instance. We use the bundled build (`elkjs/lib/elk.bundled.js`) which
-// runs the layout on the calling thread inside a promise — fine for the one-shot
-// import / "Auto-layout" actions, and works identically in the browser and in
-// Node/vitest. The dynamic import keeps elkjs out of the main bundle (code-split).
+// Lazy ELK instance: the bundled build (`elkjs/lib/elk.bundled.js`), which lays out
+// on the calling thread. In a browser that thread is a LAYOUT WORKER — the
+// auto-layout runs whole candidates (ELK, routing, scoring) in a pool of them
+// (layoutRunner.ts) — and in Node/vitest, or when those workers are unavailable,
+// it is the calling thread itself. The dynamic import keeps elkjs out of the main
+// bundle (code-split).
 
 export interface ElkPoint {
   x: number
@@ -50,10 +52,36 @@ let elkPromise: Promise<ElkInstance> | null = null
 
 export function getElk(): Promise<ElkInstance> {
   if (!elkPromise) {
-    elkPromise = import('elkjs/lib/elk.bundled.js').then((mod) => {
-      const ELK = (mod as unknown as { default: new () => ElkInstance }).default
-      return new ELK()
+    elkPromise = loadElk().catch((error: unknown) => {
+      // Without ELK every portfolio candidate is dropped and auto-layout falls back
+      // to the custom engine, which nothing else reports (an elkjs missing from
+      // node_modules once did exactly that, silently). Not cached: a chunk that failed to
+      // load offline loads once the network is back.
+      console.warn('[layout] elkjs failed to load; auto-layout uses the custom engine only', error)
+      elkPromise = null
+      throw error
     })
   }
   return elkPromise
+}
+
+async function loadElk(): Promise<ElkInstance> {
+  const mod = await import('elkjs/lib/elk.bundled.js')
+  const ELK = (mod as unknown as { default: new () => ElkInstance }).default
+  // The first `new ELK()` requires elk.bundled.js's GWT module
+  // (`require('./elk-worker.min.js')` in the ELKNode constructor), which decides
+  // there whether it runs inside a worker — a `self` and no `document` — and
+  // inside one becomes a worker of its own: it sets `self.onmessage` to its
+  // dispatcher and exports no in-thread ELK. In a layout worker that took the
+  // worker's messages: the first ELK job got no ELK, every job after it no answer
+  // (layoutWorker.test.ts). A `document` present for that one synchronous call
+  // sends it down its in-thread branch, the one Node takes.
+  const inWorker = typeof document === 'undefined' && typeof self !== 'undefined'
+  const scope = globalThis as { document?: unknown }
+  if (inWorker) scope.document = {}
+  try {
+    return new ELK()
+  } finally {
+    if (inWorker) delete scope.document
+  }
 }

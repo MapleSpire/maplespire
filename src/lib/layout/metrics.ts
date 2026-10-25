@@ -149,10 +149,15 @@ export interface LayoutMetrics {
   bendiness: number
   /** Non-adjacent edge pairs running near-parallel and close (clutter/bundling). */
   nearParallelPairs: number
-  /** Max number of node centers within a local window (excessive proximity). */
+  /** Max number of boxes closer than CROWD_GAP to any one node (excessive proximity). */
   localDensity: number
-  /** Non-member object nodes that fall inside a boundary (system/container) box. */
+  /** Non-member object nodes whose centre falls inside a boundary (system/container)
+   * box — or, in the auto-layout's own candidate scoring, a model-level group box. */
   boundaryViolations: number
+  /** Non-member object nodes overlapping such a box by at least STRADDLE_MIN on both
+   * axes without their centre inside it (half in, half out), plus pairs of such
+   * boxes that share no member yet overlap by as much. Soft. */
+  groupStraddles: number
   /** Edges or edge-labels routed across a boundary's reserved TOP header band (the
    * centered identity stack — icon/title/type/description — would be masked by the
    * connection). */
@@ -171,7 +176,12 @@ export const METRIC_CONST = {
   PARALLEL_DEG: 12,
   BUNDLE_DIST: 24,
   REF_EDGE_LEN: 300,
-  LOCAL_R: 220,
+  /** Border gap below which two shapes crowd each other. Under every spacing the
+   * engines use on purpose (ELK root 60, boundary interiors 40, isolated grid 40,
+   * custom 70), so only a genuinely cramped placement counts. */
+  CROWD_GAP: 30,
+  /** Overlap (px, on both axes) at which a non-member shape straddles a group box. */
+  STRADDLE_MIN: 8,
 }
 const WEIGHTS = {
   nodeOverlap: 1000,
@@ -200,6 +210,10 @@ const WEIGHTS = {
   // (2× a crossing) keeps header masking a real, meaningful penalty without distorting
   // selection away from the crossing/bend axes.
   headerBand: 40,
+  // straddle: a third of a hard boundary violation — enough that any candidate
+  // keeping non-members clear of group boxes wins over one that does not, without
+  // ranking a straddle above an edge cut through a shape (200).
+  straddle: 100,
 }
 
 export function rectCenter(r: Rect): Point {
@@ -489,27 +503,56 @@ export function computeMetrics(rects: Rect[], edges: EdgeGeom[], gap = 0, bounda
     }
   }
 
-  // Local density: max node centers within LOCAL_R of any node center.
-  const centers = rects.map((r) => ({ x: r.x + r.width / 2, y: r.y + r.height / 2 }))
+  // Local density: the most boxes crowding any one node — border-to-border gap under
+  // CROWD_GAP. Measured on GAPS, not centres: a centre radius (220px, until
+  // 2026-10-21) counted ELK's ordinary 60px spacing between 150px-wide shapes
+  // (centres ~210px apart) as crowding while the custom engine's 70px spacing
+  // (~220px) escaped it, so a normally spaced ELK candidate paid 8–12 points the
+  // custom engine never did — enough to hand the SAOE `FSSystemContext` view to the
+  // custom engine's off-centre hub and long diagonals (score 11 vs 17).
   let localDensity = 0
-  for (let i = 0; i < centers.length; i++) {
+  for (let i = 0; i < rects.length; i++) {
     let count = 0
-    for (let j = 0; j < centers.length; j++) {
-      if (i === j) continue
-      if (Math.hypot(centers[i].x - centers[j].x, centers[i].y - centers[j].y) < METRIC_CONST.LOCAL_R) count++
+    for (let j = 0; j < rects.length; j++) {
+      if (i !== j && rectGap(rects[i], rects[j]) < METRIC_CONST.CROWD_GAP) count++
     }
     localDensity = Math.max(localDensity, count)
   }
 
   // Boundary violations: a non-member object node whose centre falls inside a
-  // system/container boundary box (it should sit OUTSIDE the box).
+  // boundary/group box (it should sit OUTSIDE the box). A non-member that only
+  // STRADDLES the box edge is counted separately (groupStraddles, soft): it reads as
+  // half a member — grouped.dsl's Legacy ERP sat half inside "Cloud" — but a few
+  // pixels of overlap in a hand-placed layout is not worth failing the hard gate.
   let boundaryViolations = 0
+  let groupStraddles = 0
   for (const b of boundaries) {
     for (const r of rects) {
       if (b.memberIds.has(r.id)) continue
       const cx = r.x + r.width / 2
       const cy = r.y + r.height / 2
-      if (cx > b.x && cx < b.x + b.width && cy > b.y && cy < b.y + b.height) boundaryViolations++
+      if (cx > b.x && cx < b.x + b.width && cy > b.y && cy < b.y + b.height) {
+        boundaryViolations++
+        continue
+      }
+      const ox = Math.min(r.x + r.width, b.x + b.width) - Math.max(r.x, b.x)
+      const oy = Math.min(r.y + r.height, b.y + b.height) - Math.max(r.y, b.y)
+      if (ox >= METRIC_CONST.STRADDLE_MIN && oy >= METRIC_CONST.STRADDLE_MIN) groupStraddles++
+    }
+  }
+  // Two group boxes that share no member must not overlap either: each box then
+  // draws over the other's title and members. Object rects alone cannot see it —
+  // a box widened to its title can cover a neighbouring group's empty margin.
+  for (let i = 0; i < boundaries.length; i++) {
+    for (let j = i + 1; j < boundaries.length; j++) {
+      const a = boundaries[i]
+      const b = boundaries[j]
+      let shared = false
+      for (const m of a.memberIds) if (b.memberIds.has(m)) { shared = true; break }
+      if (shared) continue
+      const ox = Math.min(a.x + a.width, b.x + b.width) - Math.max(a.x, b.x)
+      const oy = Math.min(a.y + a.height, b.y + b.height) - Math.max(a.y, b.y)
+      if (ox >= METRIC_CONST.STRADDLE_MIN && oy >= METRIC_CONST.STRADDLE_MIN) groupStraddles++
     }
   }
 
@@ -549,7 +592,8 @@ export function computeMetrics(rects: Rect[], edges: EdgeGeom[], gap = 0, bounda
       localDensity * WEIGHTS.density +
       aspectPenalty * WEIGHTS.aspect +
       bendiness * WEIGHTS.bend +
-      headerBandHits * WEIGHTS.headerBand,
+      headerBandHits * WEIGHTS.headerBand +
+      groupStraddles * WEIGHTS.straddle,
   )
 
   return {
@@ -567,6 +611,7 @@ export function computeMetrics(rects: Rect[], edges: EdgeGeom[], gap = 0, bounda
     nearParallelPairs,
     localDensity,
     boundaryViolations,
+    groupStraddles,
     headerBandHits,
     width: Math.round(width),
     height: Math.round(height),

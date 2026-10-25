@@ -90,6 +90,7 @@ import { isRetryableDocumentResolutionError } from './documentResolution'
 import { shouldFallBackToCachedRoot } from './rootFetchPolicy'
 import { GroupEditOverlay } from './groupEditOverlay'
 import { LocalDiagramHold } from './localDiagramHold'
+import { UnpublishedDiagramDocs } from './unpublishedDiagramDocs'
 import { mergeOverlaySegments, updateOverlaySegment } from './overlayPrecedence'
 import {
   planBfsWriteMode,
@@ -122,10 +123,12 @@ import {
   applyPlacementSnapshotToDiagramDoc,
   flushPlacementIntentPersistence,
   hydratePlacementIntents,
+  isDiagramDocPlacementRecord,
   pendingPlacementIntents,
   persistPlacementIntents,
   type PlacementIntentSnapshot,
 } from './placementIntents'
+import { isLowerConnectionId } from '../diagrams/lowerRouting'
 import { DiagramCollectionCapture, planDiagramCollectionAck } from './diagramCollectionCapture'
 import {
   DiagramStubCapture,
@@ -635,6 +638,11 @@ const summaryLocalDiagramIds = new Set<string>()
 
 /** Diagrams the user just created, held until a registry shard carries them. */
 const localDiagramHold = new LocalDiagramHold()
+/** Their DiagramDocs, kept resolvable across `docUrlById` rebuilds until a meta
+ * names them (see unpublishedDiagramDocs.ts). */
+const unpublishedDiagramDocs = new UnpublishedDiagramDocs()
+/** Diagrams whose meta flushWrite withheld for naming no document — warned once each. */
+const withheldMetaWarned = new Set<string>()
 
 // ── sharded model state (only when isModelShardingEnabled()) ───────────────────
 /** True once the model has been sharded (ModelMeta + object/connection shards
@@ -3435,6 +3443,7 @@ function writeDiagramTombstones(): void {
     serverRegistryDiagrams = serverRegistryDiagrams.filter((candidate) => candidate.id !== id)
     serverDiagramBootstraps.delete(id)
     docUrlById.delete(id)
+    unpublishedDiagramDocs.forget(id)
   }
   publishDiagramTombstones()
   acknowledgeDeleteIntents()
@@ -3919,15 +3928,16 @@ function rebuildRegistryIndex(): void {
     // what a stale route or a re-fetched page would use to re-open it.
     for (const meta of serverRegistryDiagrams) {
       if (tombstoneDiagrams.has(meta.id)) continue
-      docUrlById.set(meta.id, meta.docUrl)
+      docUrlById.set(meta.id, unpublishedDiagramDocs.resolve(meta.id, meta.docUrl))
     }
     for (const handle of shardHandles) {
       for (const meta of Object.values(handle.doc()?.diagrams ?? {})) {
         if (tombstoneDiagrams.has(meta.id)) continue
-        docUrlById.set(meta.id, meta.docUrl)
+        docUrlById.set(meta.id, unpublishedDiagramDocs.resolve(meta.id, meta.docUrl))
         shardByDiagramId.set(meta.id, handle.url)
       }
     }
+    unpublishedDiagramDocs.readmit(docUrlById)
     return
   }
   const shardDocs = shardHandles.map((h) => h.doc())
@@ -3935,10 +3945,11 @@ function rebuildRegistryIndex(): void {
     const shard = shardDocs[i]
     if (!shard) continue
     for (const meta of Object.values(shard.diagrams)) {
-      docUrlById.set(meta.id, meta.docUrl)
+      docUrlById.set(meta.id, unpublishedDiagramDocs.resolve(meta.id, meta.docUrl))
       shardByDiagramId.set(meta.id, shardHandles[i].url)
     }
   }
+  unpublishedDiagramDocs.readmit(docUrlById)
 }
 
 /** Project the active diagram into the store from the server render — objects +
@@ -4277,7 +4288,9 @@ function projectAll(): void {
   const shardsChanged = !sameRefs(shardDocs, lastShardDocs)
 
   // Rebuild the id → doc-url / id → shard-url maps only when a shard changed
-  // (the write path keeps them current in between).
+  // (the write path keeps them current in between). This runs synchronously on
+  // the echo of flushWrite's own writes, so a document still waiting on the
+  // create→flush→publish gate is in no shard yet: the rebuild must keep it.
   if (shardsChanged) {
     docUrlById.clear()
     shardByDiagramId.clear()
@@ -4285,10 +4298,11 @@ function projectAll(): void {
       const shard = shardDocs[i]
       if (!shard) continue
       for (const meta of Object.values(shard.diagrams)) {
-        docUrlById.set(meta.id, meta.docUrl)
+        docUrlById.set(meta.id, unpublishedDiagramDocs.resolve(meta.id, meta.docUrl))
         shardByDiagramId.set(meta.id, shardHandles[i].url)
       }
     }
+    unpublishedDiagramDocs.readmit(docUrlById)
     lastShardDocs = shardDocs
   }
 
@@ -4405,8 +4419,15 @@ function projectAll(): void {
   // load until the next mutation re-runs the sync (and they'd all appear at
   // once). Re-derive them for the active diagram. syncLowerConnections always
   // runs inside withRemote(), so its store mutation is skipped by onStoreChange
-  // and cannot echo back to the docs or loop; it reuses existing lower-connection
-  // objects by endpoint pair, so it does not create churn.
+  // and cannot echo back to the docs or loop.
+  //
+  // It DOES churn the lower objects whenever this projection replaced
+  // `connections` (any model-doc change, our own flush's included): the shard /
+  // model merge holds no lowers, so every one is minted again. That costs no
+  // identity — a lower's id is its pair (`lower:<from>→<to>`) — and no routing,
+  // which lives on the diagram (`Diagram.lowerRouting`, from the DiagramDoc) and
+  // not on the lower. Measured 2026-10-21 before that split: Auto-layout's
+  // routing of FSSystemContext's lowers was gone ~2 s later, by this path.
   const currentId = useModelStore.getState().currentDiagramId
 
   // Keep the paged IndexedDB index fresh (no-op unless paging is enabled). Runs
@@ -4762,6 +4783,20 @@ function upsertSummaryRegistryWindow(meta: DiagramMeta, diagram: Diagram): void 
  * setCurrentDiagram triggers an asynchronous server projection. Without this
  * bounded local bootstrap, the server's expected 404 for a brand-new id replaces
  * the store with an empty registry and the create button appears to do nothing. */
+/** `ids` minus every derived (lower) connection: by kind in the store, and by the
+ * `lower:` prefix for one whose object a projection dropped. The same rule as
+ * flushWrite's `withoutLower`, for the paths that write a new document or meta
+ * outside it. Returns `ids` itself when nothing is removed. */
+function withoutDerivedConnectionIds(ids: string[]): string[] {
+  if (ids.length === 0) return ids
+  const lowerIds = new Set<string>()
+  for (const connection of useModelStore.getState().connections) {
+    if (connection.kind === 'lower') lowerIds.add(connection.id)
+  }
+  const derived = (id: string) => lowerIds.has(id) || isLowerConnectionId(id)
+  return ids.some(derived) ? ids.filter((id) => !derived(id)) : ids
+}
+
 function captureSummaryLocalDiagram(diagram: Diagram): void {
   if (!registrySummaryOnly || docUrlById.has(diagram.id)) return
   summaryLocalDiagramIds.add(diagram.id)
@@ -4771,9 +4806,7 @@ function captureSummaryLocalDiagram(diagram: Diagram): void {
       diagram,
       {
         objectIds: diagram.objectIds,
-        connectionIds: diagram.connectionIds.filter((id) =>
-          useModelStore.getState().connections.find((connection) => connection.id === id)?.kind !== 'lower'
-        ),
+        connectionIds: withoutDerivedConnectionIds(diagram.connectionIds),
         groupIds: diagram.groupIds,
       },
       docUrl,
@@ -4836,6 +4869,7 @@ function writeSummaryLocalRegistry(
       serverRegistryDiagrams = serverRegistryDiagrams.filter((candidate) => candidate.id !== id)
       serverDiagramBootstraps.delete(id)
       docUrlById.delete(id)
+      unpublishedDiagramDocs.forget(id)
       shardByDiagramId.delete(id)
       continue
     }
@@ -4855,6 +4889,8 @@ function writeSummaryLocalRegistry(
       docUrl,
     )
     upsertSummaryRegistryWindow(meta, diagram)
+    // Both branches below place the meta in the write head.
+    unpublishedDiagramDocs.forget(id)
 
     if (existingHandle) {
       changeAndTrack(existingHandle, (shard) => {
@@ -4871,10 +4907,29 @@ function writeSummaryLocalRegistry(
   }
 }
 
+/** The document a loaded registry meta names for `diagramId`, if any. */
+function publishedDocUrl(diagramId: string): string | undefined {
+  if (tombstoneDiagrams.has(diagramId)) return undefined
+  for (const handle of shardHandles) {
+    const docUrl = handle.doc()?.diagrams?.[diagramId]?.docUrl
+    if (docUrl) return docUrl
+  }
+  return serverRegistryDiagrams.find((meta) => meta.id === diagramId)?.docUrl || undefined
+}
+
 /** Create a DiagramDoc for a diagram that doesn't have one yet, record its url. */
 function ensureDiagramDoc(diagram: Diagram): string {
   const existing = docUrlById.get(diagram.id)
   if (existing) return existing
+  // The index can lag the loaded registry — under boot-from-server it is rebuilt
+  // only at boot, so a diagram a colleague added since has a meta and no entry.
+  // A meta that names a document IS this diagram's document: minting another
+  // would hand this client an empty copy of it.
+  const published = publishedDocUrl(diagram.id)
+  if (published) {
+    docUrlById.set(diagram.id, published)
+    return published
+  }
   const isActive = diagram.id === activeDiagramId
   // Flows are taken for ANY new diagram, not just the active one: store.flows is
   // normally windowed to the active diagram (so this matches the old behavior),
@@ -4883,13 +4938,14 @@ function ensureDiagramDoc(diagram: Diagram): string {
   const revisionBeforeCreate = pendingEntityIntents.revisionNow
   const handle = trackCreatedHandle(createDiagramHandle(
     diagramToDiagramDoc(
-      diagram,
+      { ...diagram, connectionIds: withoutDerivedConnectionIds(diagram.connectionIds) },
       isActive ? commentsFor(diagram.id) : [],
       flowsFor(diagram.id),
       []
     )
   ))
   docUrlById.set(diagram.id, handle.url)
+  unpublishedDiagramDocs.record(diagram.id, handle.url)
   // Create→flush→publish: hold the registry meta back until this
   // doc's local flush confirms — a meta pointing at a doc that died with the
   // tab is a permanently unopenable zombie stub. The flush resolving kicks
@@ -4902,7 +4958,11 @@ function ensureDiagramDoc(diagram: Diagram): string {
   const confirmDocDurable = (attempt: number): void => {
     void repo.flush([handle.documentId]).then(() => {
       if (gateEpoch !== durableAckEpoch) return
-      pendingDurableDiagramDocs.delete(diagram.id)
+      // The gate is keyed by diagram: if a newer document replaced this one (the
+      // diagram deleted and re-created by undo), only THAT one confirming may
+      // lift it. A diagram gone from the index altogether has nothing to hold.
+      const current = docUrlById.get(diagram.id)
+      if (!current || current === handle.url) pendingDurableDiagramDocs.delete(diagram.id)
       if (started) scheduleWrite('normal')
     }).catch((error) => {
       console.warn('diagram doc durability flush failed', error)
@@ -5022,6 +5082,7 @@ function flushWrite(): void {
         mode: 'targeted',
         objects: placementSnapshot.objects.length,
         groups: placementSnapshot.groups.length,
+        lowerRoutes: placementSnapshot.lowerRoutes.length,
         coalescedRevision: placementSnapshot.throughRevision,
       })
     }
@@ -5035,20 +5096,38 @@ function flushWrite(): void {
   // resident summary and then accidentally make them discoverable.
   if (!registrySummaryOnly && !contractFrozen) {
     for (const dg of state.diagrams) ensureDiagramDoc(dg)
+    // A diagram deleted before its meta was placed is in no shard, so no
+    // registry removal retires its record; without this, every later rebuild
+    // would readmit its url — the deleted diagram stays resolvable, and a
+    // same-id re-creation (an undo) reuses the dead document. (With no rebuild
+    // in between, docUrlById itself still holds that url, as it always did.)
+    // Summary sessions hold a window, not every diagram — their records retire
+    // on placement in the write head.
+    unpublishedDiagramDocs.retainOnly(new Set(state.diagrams.map((dg) => dg.id)))
   }
 
   // Derived "lower" roll-up connections are NEVER persisted — syncLowerConnections
-  // recomputes them on load. Excluding them means a diagram switch (which only
+  // recomputes them on load (their per-diagram routing is persisted, on the
+  // DiagramDoc's `lowerRouting`). Excluding them means a diagram switch (which only
   // adds/removes lower connections) leaves the PERSISTED model unchanged, so the
   // guard below skips the O(model) Automerge reconcile that otherwise froze every
   // nested-diagram switch (~7.3s at 15k). They're filtered from the model doc AND
-  // from each diagram's connectionIds (doc + shard meta) to avoid dangling refs.
+  // from each diagram's connectionIds (doc + shard meta) to avoid dangling refs —
+  // by kind, AND by id for a `lower:` id whose object a projection dropped
+  // before the roll-up re-minted it (by kind alone that id was persisted).
   const lowerIds = new Set<string>()
   for (const c of state.connections) if (c.kind === 'lower') lowerIds.add(c.id)
   const persistedConnections = lowerIds.size
     ? state.connections.filter((c) => c.kind !== 'lower')
     : state.connections
-  const withoutLower = (cids: string[]) => (lowerIds.size ? cids.filter((cid) => !lowerIds.has(cid)) : cids)
+  const withoutLower = (cids: string[]) => {
+    for (const cid of cids) {
+      if (lowerIds.has(cid) || isLowerConnectionId(cid)) {
+        return cids.filter((id) => !lowerIds.has(id) && !isLowerConnectionId(id))
+      }
+    }
+    return cids
+  }
 
   // 1) Model doc: shared C4 model. Reconciling walks all objects/connections through
   // the Automerge change proxy — ~seconds at 15k/10k. When sharded, write per-shard
@@ -5211,7 +5290,16 @@ function flushWrite(): void {
           tombstoneConnections,
           tombstoneGroups
         )
-    return buildMeta(dg, composition, docUrlById.get(dg.id) ?? existing?.docUrl ?? '')
+    // A meta that names a document keeps it: nothing in this client may repoint
+    // a published diagram (a colleague's diagram this client's index has not
+    // learned would otherwise be repointed at a stub minted for it). Only a meta
+    // published with an EMPTY docUrl is repointed, at the fresh document
+    // ensureDiagramDoc made for it, and only once that document is durable —
+    // the create→flush→publish gate, for an existing meta.
+    const docUrl = existing?.docUrl
+      || (pendingDurableDiagramDocs.has(dg.id) ? '' : docUrlById.get(dg.id))
+      || ''
+    return buildMeta(dg, composition, docUrl)
   }
   for (const shardPlan of registryPlan.reconcile) {
     const handle = shardHandles[shardPlan.shardIndex]
@@ -5239,6 +5327,7 @@ function flushWrite(): void {
         delete s.diagrams[id]
         shardByDiagramId.delete(id)
         docUrlById.delete(id)
+        unpublishedDiagramDocs.forget(id)
       }
       for (const id of toUpdate) {
         const dg = storeDiagramById.get(id)
@@ -5281,13 +5370,25 @@ function flushWrite(): void {
     // flush's completion schedules another pass; localDiagramHold keeps the
     // diagram visible meanwhile, and the stub intent keeps it recoverable.
     if (pendingDurableDiagramDocs.has(id)) continue
+    const meta = desiredMetaFor(dg)
+    // Never publish a meta that names no document: nobody can open it, and
+    // ensureDiagramDoc reads an empty url as "no document", so every later
+    // flush minted another one for it. The ensureDiagramDoc pass above created
+    // this diagram's doc; an empty url here means that bookkeeping broke.
+    if (!meta.docUrl) {
+      if (!withheldMetaWarned.has(dg.id)) {
+        withheldMetaWarned.add(dg.id)
+        console.warn('[bridge] diagram meta withheld: it names no DiagramDoc', dg.id)
+      }
+      continue
+    }
     const selection = findOrCreateShardForNew()
     const targetShard = selection.handle
-    const meta = desiredMetaFor(dg)
     changeAndTrack(targetShard, (s) => {
       s.diagrams[dg.id] = meta
     })
     shardByDiagramId.set(dg.id, targetShard.url)
+    unpublishedDiagramDocs.forget(dg.id)
     if (selection.created) publishNewRegistryShard(targetShard)
   }
 
@@ -5560,6 +5661,7 @@ async function sweepAbsentDiagramIntents(): Promise<void> {
         serverRegistryDiagrams = serverRegistryDiagrams.filter((candidate) => candidate.id !== entry.diagramId)
         serverDiagramBootstraps.delete(entry.diagramId)
         docUrlById.delete(entry.diagramId)
+        unpublishedDiagramDocs.forget(entry.diagramId)
         shardByDiagramId.delete(entry.diagramId)
       }
     }
@@ -5742,6 +5844,7 @@ async function drainOffActivePlacementIntents(): Promise<void> {
     if (diagramId === activeDiagramId) continue
     const snapshot = pendingPlacementIntents.snapshot(workspaceKey, diagramId)
     const drainable = snapshot !== undefined && (snapshot.objects.length > 0
+      || snapshot.lowerRoutes.length > 0
       || snapshot.groups.some((g) => g.position !== undefined || g.size !== undefined))
     if (!snapshot || !drainable) continue
     const url = docUrlById.get(diagramId)
@@ -5769,6 +5872,7 @@ async function drainOffActivePlacementIntents(): Promise<void> {
       if (diagramId === activeDiagramId) continue
       const fresh = pendingPlacementIntents.snapshot(workspaceKey, diagramId)
       const freshDrainable = fresh !== undefined && (fresh.objects.length > 0
+        || fresh.lowerRoutes.length > 0
         || fresh.groups.some((g) => g.position !== undefined || g.size !== undefined))
       if (!fresh || !freshDrainable) continue
       changeAndTrack(handle, (doc) => {
@@ -5776,21 +5880,22 @@ async function drainOffActivePlacementIntents(): Promise<void> {
       })
       await repo.flush([handle.documentId])
       if (epoch !== durableAckEpoch) return
-      // Only what THIS doc write expressed: object records and pure-geometry
-      // group records. Connection records and autoSize-carrying group records
-      // target the MODEL documents, which only the active-diagram flush
-      // writes — they survive for the activation path. Revision-scoped to
-      // the FRESH snapshot: anything re-recorded after it survives.
+      // Only what THIS doc write expressed: object records, pure-geometry
+      // group records and lower routes. Connection records and
+      // autoSize-carrying group records target the MODEL documents, which only
+      // the active-diagram flush writes — they survive for the activation
+      // path. Revision-scoped to the FRESH snapshot: anything re-recorded after
+      // it survives.
       pendingPlacementIntents.acknowledgeWhere(
         workspaceKey, diagramId, fresh.throughRevision,
-        (record) => record.kind === 'object'
-          || (record.kind === 'group' && record.autoSize === undefined),
+        isDiagramDocPlacementRecord,
       )
       await persistPlacementIntents(store, workspaceKey)
       markClientTimeline('placement.offactive.drained', {
         diagramId,
         objects: fresh.objects.length,
         groups: fresh.groups.length,
+        lowerRoutes: fresh.lowerRoutes.length,
       })
       scheduleDurableAcknowledgement(0)
     } catch (error) {
@@ -5942,12 +6047,17 @@ function onStoreChange(state: ModelStoreSnapshot, previous: ModelStoreSnapshot):
 function seedDemoIntoDocs(): void {
   if (!rootHandle || !modelHandle) return
   const demo = createDemoData()
+  // Read back from this map, not docUrlById: each placement below echoes a
+  // synchronous projectAll that rebuilds docUrlById from the shards, which do
+  // not name the diagrams placed after it yet.
+  const seededDocUrls = new Map<string, string>()
   for (const dg of demo.diagrams) {
     // createDemoData() carries no comments; kept explicit for clarity.
     const comments: Comment[] = []
     const flows = demo.flows.filter((f) => f.diagramId === dg.id)
     const handle = trackCreatedHandle(createDiagramHandle(diagramToDiagramDoc(dg, comments, flows, [])))
     docUrlById.set(dg.id, handle.url)
+    seededDocUrls.set(dg.id, handle.url)
   }
   changeAndTrack(modelHandle, (model) => {
     reconcile(
@@ -5969,7 +6079,7 @@ function seedDemoIntoDocs(): void {
     const meta = buildMeta(
       dg,
       { objectIds: dg.objectIds, connectionIds: dg.connectionIds, groupIds: dg.groupIds },
-      docUrlById.get(dg.id)!,
+      seededDocUrls.get(dg.id)!,
     )
     changeAndTrack(targetShard, (s) => {
       s.diagrams[dg.id] = meta
@@ -7294,6 +7404,8 @@ export function stopBridge(): void {
   lastAppliedServerProjectionRequest = 0
   activeDiagramId = null
   docUrlById.clear()
+  unpublishedDiagramDocs.clear()
+  withheldMetaWarned.clear()
   activeDocumentShare.endSession()
   started = false
 }
