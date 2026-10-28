@@ -75,6 +75,8 @@ export interface ModelCacheDependencyPage {
 
 export interface ModelCacheViewerLevel {
   ancestors: CachedModelEntityRecord[]
+  /** `childCount` here is an expand flag (0 or 1: has C4 children), not a
+   * count — the server's is capped at 1 000 for the same reason. */
   objects: CachedModelEntityRecord[]
   connections: CachedConnectionRecord[]
   nextCursor: string | null

@@ -120,6 +120,42 @@ async function openModelViewer(page: Page) {
 const tile = (page: Page, name: string) =>
   page.locator('[data-testid="mv-tile"]').filter({ has: page.getByText(name, { exact: true }) })
 
+/** Read-only probe: sample the tile count of each drill zoom layer on every
+ * animation frame until stopped. Returns the per-layer min/max over the frames
+ * that carried both layers (frames = 0 means the zoom never ran). */
+async function startZoomLayerRecorder(page: Page) {
+  await page.evaluate(() => {
+    const rec = { frames: 0, out: [] as number[], in: [] as number[], run: true }
+    ;(window as unknown as { __mvZoomRec: typeof rec }).__mvZoomRec = rec
+    const tick = () => {
+      const layers = document.querySelectorAll<HTMLElement>('[data-testid="mv-zoom-layer"]')
+      if (layers.length === 2) {
+        rec.frames += 1
+        for (const layer of layers) {
+          rec[layer.dataset.layer as 'out' | 'in'].push(layer.querySelectorAll('[data-testid="mv-tile"]').length)
+        }
+      }
+      if (rec.run) requestAnimationFrame(tick)
+    }
+    requestAnimationFrame(tick)
+  })
+}
+
+async function stopZoomLayerRecorder(page: Page) {
+  const rec = await page.evaluate(() => {
+    const r = (window as unknown as { __mvZoomRec: { frames: number; out: number[]; in: number[]; run: boolean } }).__mvZoomRec
+    r.run = false
+    return { frames: r.frames, out: r.out, in: r.in }
+  })
+  expect(rec.frames, 'the drill zoom never showed its two layers').toBeGreaterThan(0)
+  return {
+    outMin: Math.min(...rec.out),
+    outMax: Math.max(...rec.out),
+    inMin: Math.min(...rec.in),
+    inMax: Math.max(...rec.in),
+  }
+}
+
 // The isolated stack is a shared stateful backend — keep tests sequential.
 test.describe.configure({ mode: 'serial' })
 
@@ -152,19 +188,25 @@ test.describe('Model viewer', () => {
     if (box) await page.mouse.click(box.x + 2, box.y + box.height / 2) // ≈ 0.5× speed → ~1.1s zoom
     await page.locator('[data-testid="mv-view-options"]').click()
 
+    // Every animation frame of the zoom must show BOTH levels populated: the
+    // level window is fetched per level, and clearing it on the path change
+    // once zoomed two EMPTY layers and popped the tiles in afterwards — while
+    // a "two layers exist" check stayed green (2026-10-19).
+    await startZoomLayerRecorder(page)
     await tile(page, 'Storefront').locator('[data-testid="mv-expand"]').click()
-    // mid-transition: the viewport carries BOTH zoom layers (out + in)
-    await expect(page.locator('[data-testid="mv-viewport"] > div')).toHaveCount(2)
     // landed: boundary chrome + container level
     await expect(page.locator('[data-testid="mv-back"]')).toBeVisible({ timeout: 10000 })
     await expect(page.locator('[data-testid="mv-level"]')).toHaveText(/container|conteneur/i)
     await expect(page.locator('[data-testid="mv-tile"]')).toHaveCount(2) // web, bff
     await expect(page.locator('[data-testid="mv-crumb-current"]')).toContainText('Storefront')
+    expect(await stopZoomLayerRecorder(page)).toMatchObject({ outMin: 4, outMax: 4, inMin: 2, inMax: 2 })
 
     // ── Boundary Back ascends to the context level ────────────────────────────
+    await startZoomLayerRecorder(page)
     await page.locator('[data-testid="mv-back"]').click()
     await expect(page.locator('[data-testid="mv-level"]')).toHaveText(/context|contexte/i, { timeout: 10000 })
     await expect(page.locator('[data-testid="mv-tile"]')).toHaveCount(4)
+    expect(await stopZoomLayerRecorder(page)).toMatchObject({ outMin: 2, outMax: 2, inMin: 4, inMax: 4 })
 
     // ── Connection panel: the context edge rolls up the deeper connections ───
     await page.locator('[data-testid="mv-edge"]').click()
@@ -177,6 +219,140 @@ test.describe('Model viewer', () => {
     await expect(connPanel).toContainText('Submits order')
     // the direct edge lives in the generated System Context diagram
     await expect(connPanel.locator('[data-testid="mv-conn-diagram"]')).toHaveCount(2)
+  })
+
+  test('2D: level warm-up follows intent — a sweep is free, a dwell warms one level, the drill needs no request', async ({ page }) => {
+    await loginIfNeeded(page)
+    await createFreshLandscape(page)
+    await importNorthwind(page)
+    await openModelViewer(page)
+    await expect(page.locator('[data-testid="mv-tile"]')).toHaveCount(4)
+    await page.waitForTimeout(1500) // let the level fetch / change feed settle before counting
+
+    const levelRequests: string[] = []
+    page.on('request', (req) => {
+      if (req.url().includes('/api/model/viewer/level')) levelRequests.push(req.url())
+    })
+
+    // A pointer crossing the grid must not become a request per tile: the dwell
+    // timer dies with each exit. (The model can hold hundreds of thousands of
+    // objects — a sweep over 200 tiles would otherwise be 200 requests.)
+    const centres: Array<{ x: number; y: number }> = []
+    for (const t of await page.locator('[data-testid="mv-tile"]').all()) {
+      const b = await t.boundingBox()
+      if (b) centres.push({ x: b.x + b.width / 2, y: b.y + b.height / 2 })
+    }
+    for (const c of centres) await page.mouse.move(c.x, c.y)
+    await page.mouse.move(2, 2)
+    await page.waitForTimeout(500)
+    expect(levelRequests, 'a sweep over every tile requested levels').toHaveLength(0)
+
+    // Dwelling on a decomposable tile warms exactly that level, once.
+    const box = await tile(page, 'Order management').boundingBox()
+    await page.mouse.move(box!.x + box!.width / 2, box!.y + box!.height / 2)
+    await expect.poll(() => levelRequests.length, { timeout: 5000 }).toBe(1)
+    await page.waitForTimeout(400)
+    expect(levelRequests).toHaveLength(1)
+
+    // The drill and the way back then need no request at all.
+    await startZoomLayerRecorder(page)
+    await tile(page, 'Order management').locator('[data-testid="mv-expand"]').click()
+    await expect(page.locator('[data-testid="mv-back"]')).toBeVisible({ timeout: 10000 })
+    await expect(page.locator('[data-testid="mv-tile"]')).toHaveCount(2) // api, db
+    expect(await stopZoomLayerRecorder(page)).toMatchObject({ outMin: 4, outMax: 4, inMin: 2, inMax: 2 })
+    await page.locator('[data-testid="mv-back"]').click()
+    await expect(page.locator('[data-testid="mv-tile"]')).toHaveCount(4, { timeout: 10000 })
+    await expect(page.locator('[data-testid="mv-level"]')).toHaveText(/context|contexte/i)
+    expect(levelRequests, 'the drill or the way back fetched a level that was warm').toHaveLength(1)
+  })
+
+  test('2D: the drill zooms about the opened tile — the pivot never slides across the screen', async ({ page }) => {
+    await loginIfNeeded(page)
+    await createFreshLandscape(page)
+    await importNorthwind(page)
+    await openModelViewer(page)
+    await expect(page.locator('[data-testid="mv-tile"]')).toHaveCount(4)
+
+    // Slow the zoom through the REAL speed control so sampling has room.
+    await page.locator('[data-testid="mv-view-options"]').click()
+    const range = page.locator('input[type="range"]')
+    const rangeBox = await range.boundingBox()
+    if (rangeBox) await page.mouse.click(rangeBox.x + 2, rangeBox.y + rangeBox.height / 2)
+    await page.locator('[data-testid="mv-view-options"]').click()
+
+    const viewport = await page.locator('[data-testid="mv-viewport"]').boundingBox()
+    const tileBox = await tile(page, 'Order management').boundingBox()
+    const focal = {
+      x: tileBox!.x + tileBox!.width / 2 - viewport!.x,
+      y: tileBox!.y + tileBox!.height / 2 - viewport!.y,
+    }
+
+    // Freeze the app's own animations at fixed fractions of their duration and
+    // find, for each layer, the point the zoom is centred on: the fixed point of
+    // x → s·x + e. The sampler is ARMED BEFORE the click and fires from a
+    // MutationObserver the moment both zoom layers exist, sampling
+    // synchronously (getComputedStyle recomputes a paused animation's current
+    // time on read). Sampling after the click returned raced the zoom itself:
+    // under load the zoom had already landed (2026-10-25, 0 samples).
+    type PivotRow = { layer: string; frac: number; s: number; cx: number | null; cy: number | null }
+    const armPivotSampler = () =>
+      page.evaluate(() => {
+        const w = window as unknown as { __mvPivots?: PivotRow[] }
+        w.__mvPivots = undefined
+        const sample = (): boolean => {
+          const layers = [...document.querySelectorAll<HTMLElement>('[data-testid="mv-zoom-layer"]')]
+          const animations = document.getAnimations()
+          if (layers.length !== 2 || animations.length < 2) return false
+          animations.forEach((a) => a.pause())
+          const rows: PivotRow[] = []
+          for (const frac of [0.02, 0.05, 0.1, 0.2, 0.4, 0.6]) {
+            animations.forEach((a) => {
+              a.currentTime = frac * Number(a.effect?.getComputedTiming().duration ?? 0)
+            })
+            for (const layer of layers) {
+              const m = new DOMMatrix(getComputedStyle(layer).transform)
+              const scaling = Math.abs(1 - m.a) > 0.02
+              rows.push({
+                layer: layer.dataset.layer ?? '?',
+                frac,
+                s: m.a,
+                cx: scaling ? m.e / (1 - m.a) : null,
+                cy: scaling ? m.f / (1 - m.d) : null,
+              })
+            }
+          }
+          animations.forEach((a) => a.finish()) // let the zoom land
+          w.__mvPivots = rows
+          return true
+        }
+        const observer = new MutationObserver(() => { if (sample()) observer.disconnect() })
+        observer.observe(document.querySelector('[data-testid="mv-viewport"]')!, { childList: true })
+      })
+    const collectPivots = async (): Promise<PivotRow[]> => {
+      await page.waitForFunction(() => (window as unknown as { __mvPivots?: unknown }).__mvPivots !== undefined, null, { timeout: 10_000 })
+      return page.evaluate(() => (window as unknown as { __mvPivots: PivotRow[] }).__mvPivots)
+    }
+    const expectPivotOnTile = (rows: PivotRow[], what: string) => {
+      const scaling = rows.filter((r) => r.cx !== null)
+      expect(scaling.length, `${what}: no sample was scaling`).toBeGreaterThan(6)
+      for (const r of scaling) {
+        const drift = Math.hypot(r.cx! - focal.x, r.cy! - focal.y)
+        // Before the fix the pivot started at the viewport's top-left corner and
+        // slid to the tile: ~1000 px away at the first frame.
+        expect(drift, `${what}: the ${r.layer} layer zooms about (${r.cx!.toFixed(0)}, ${r.cy!.toFixed(0)}) at ${r.frac}, not the tile`).toBeLessThan(3)
+      }
+    }
+
+    await armPivotSampler()
+    await tile(page, 'Order management').locator('[data-testid="mv-expand"]').click()
+    expectPivotOnTile(await collectPivots(), 'dive')
+    await expect(page.locator('[data-testid="mv-back"]')).toBeVisible({ timeout: 10000 })
+
+    // The way back shrinks into the same tile of the parent layout.
+    await armPivotSampler()
+    await page.locator('[data-testid="mv-back"]').click()
+    expectPivotOnTile(await collectPivots(), 'ascent')
+    await expect(page.locator('[data-testid="mv-tile"]')).toHaveCount(4, { timeout: 10000 })
   })
 
   test('3D: board renders the level; dblclick dives into the lower level and the breadcrumb ascends', async ({ page }) => {

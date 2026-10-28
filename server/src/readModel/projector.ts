@@ -56,6 +56,7 @@ export interface ObjectRowValues {
   domain_id: string | null
   parent_id: string | null
   effective_parent_id: string | null
+  c4_parent_id: string | null
   scope: string | null
   status: string | null
   data: ObjectInput
@@ -281,6 +282,7 @@ export function objectToRow(key: WorkspaceKey, orgId: string | null, o: ObjectIn
     domain_id: o.domainId ?? null,
     parent_id: o.parentId ?? null,
     effective_parent_id: o.parentId ?? null,
+    c4_parent_id: o.parentId ?? null,
     scope: o.scope ?? null,
     status: o.status ?? null,
     data: o,
@@ -339,12 +341,12 @@ export function diagramToRow(key: WorkspaceKey, orgId: string | null, d: Diagram
 // ── bulk writes (chunked, parameterized, idempotent) ───────────────────────────
 
 /** Max rows per INSERT — keeps the bound-parameter count well under Postgres's
- * 65535 limit (objects = 14 cols/row → 1000 rows = 14k params). */
+ * 65535 limit (objects = 15 cols/row → 1000 rows = 15k params). */
 const CHUNK = 1000
 
 const OBJ_COLS = [
   'landscape_id', 'version_id', 'org_id', 'id', 'type', 'name', 'description', 'technology',
-  'domain_id', 'parent_id', 'effective_parent_id', 'scope', 'status', 'data',
+  'domain_id', 'parent_id', 'effective_parent_id', 'c4_parent_id', 'scope', 'status', 'data',
 ] as const
 const CONN_COLS = ['landscape_id', 'version_id', 'org_id', 'id', 'from_id', 'to_id', 'label', 'kind', 'data'] as const
 const GROUP_COLS = ['landscape_id', 'version_id', 'org_id', 'id', 'name', 'data'] as const
@@ -354,7 +356,7 @@ function objValues(key: WorkspaceKey, orgId: string | null, o: ObjectInput): unk
   const r = objectToRow(key, orgId, o)
   return [
     r.landscape_id, r.version_id, r.org_id, r.id, r.type, r.name, r.description, r.technology,
-    r.domain_id, r.parent_id, r.effective_parent_id, r.scope, r.status, JSON.stringify(r.data),
+    r.domain_id, r.parent_id, r.effective_parent_id, r.c4_parent_id, r.scope, r.status, JSON.stringify(r.data),
   ]
 }
 function connValues(key: WorkspaceKey, orgId: string | null, c: ConnectionInput): unknown[] {
@@ -401,13 +403,28 @@ async function bulkUpsert(db: Queryable, table: string, cols: readonly string[],
   }
 }
 
-/** Maintain the indexed navigation parent separately from the source parent.
- * Group membership takes precedence; dangling parents become roots. Touched
- * parents also refresh their children so create/delete/reparent remains correct
- * without scanning the workspace. */
+/** Maintain the two indexed parents derived from the source `parent_id`:
+ *  - `effective_parent_id`, the explorer's navigation parent: Group membership
+ *    takes precedence, a dangling parent becomes a root;
+ *  - `c4_parent_id`, the Model Viewer's level: the parent when that row exists,
+ *    else NULL (a root). Groups play no part.
+ * Touched parents also refresh their children so create/delete/reparent remains
+ * correct without scanning the workspace — which is what keeps a child right
+ * when its parent is deleted or re-created: its `parent_id` names a touched id.
+ *
+ * `changed` has no default ON PURPOSE: `'objects'` (rows inserted, updated or
+ * deleted) refreshes both; `'membership'` (only `ro_group_objects` moved)
+ * refreshes `effective_parent_id` alone, because `c4_parent_id` does not read
+ * groups. That saves the c4 arm's parent EXISTS, which runs for EVERY bounded
+ * row; the effective arm's own EXISTS still runs for each bounded row that is
+ * in no group (the children pulled in by `parent_id = ANY`, for instance). A
+ * new call site must say which it is; a membership caller passing `'objects'`
+ * is merely slower, an objects caller passing `'membership'` leaves a stale
+ * level. */
 async function refreshEffectiveParents(
   db: Queryable,
   key: WorkspaceKey,
+  changed: 'objects' | 'membership',
   touchedIds?: string[],
 ): Promise<void> {
   const ids = [...new Set(touchedIds?.filter(Boolean) ?? [])]
@@ -417,6 +434,14 @@ async function refreshEffectiveParents(
     ? `AND (object.id = ANY($3::text[]) OR object.parent_id = ANY($3::text[]))`
     : ''
   if (ids.length) params.push(ids)
+  const c4Parent = changed === 'objects'
+    ? `,
+     c4_parent_id = CASE WHEN EXISTS (
+       SELECT 1 FROM ro_objects parent
+       WHERE parent.landscape_id = object.landscape_id
+         AND parent.version_id = object.version_id AND parent.id = object.parent_id
+     ) THEN object.parent_id END`
+    : ''
   await db.query(
     `UPDATE ro_objects object
      SET effective_parent_id = COALESCE(
@@ -429,7 +454,7 @@ async function refreshEffectiveParents(
          WHERE parent.landscape_id = object.landscape_id
            AND parent.version_id = object.version_id AND parent.id = object.parent_id
        ) THEN object.parent_id END
-     )
+     )${c4Parent}
      WHERE object.landscape_id = $1 AND object.version_id = $2 ${bounded}`,
     params,
   )
@@ -602,7 +627,7 @@ export async function upsertObjects(
     const diagramIds = await diagramIdsForObjects(tx, key, ids)
     await bulkUpsert(tx, 'ro_objects', OBJ_COLS, objects.map((o) => objValues(key, orgId, o)))
     if (options.analyzeBeforeReparent) await analyzeObjectsForReparent(tx, key)
-    await refreshEffectiveParents(tx, key, ids)
+    await refreshEffectiveParents(tx, key, 'objects', ids)
     await replaceObjectTechnologyPostingsInTransaction(tx, key, orgId, objects)
     await replaceObjectTagPostingsInTransaction(tx, key, orgId, objects)
     await replaceObjectTeamPostingsInTransaction(tx, key, orgId, objects)
@@ -845,7 +870,7 @@ export async function deleteObjects(db: Queryable, key: WorkspaceKey, ids: strin
         `DELETE FROM ro_objects WHERE landscape_id = $1 AND version_id = $2 AND id = ANY($3::text[])`,
         [key.landscapeId, key.versionId, ids]
       )
-      await refreshEffectiveParents(tx, key, ids)
+      await refreshEffectiveParents(tx, key, 'objects', ids)
       const newParentIds = await effectiveParentIdsForTouched(tx, key, ids)
       const newRootCount = await rootCountForTouched(tx, key, ids)
       await refreshObjectChildStats(tx, key, [...ids, ...oldParentIds, ...newParentIds])
@@ -951,7 +976,7 @@ export async function deleteGroups(db: Queryable, key: WorkspaceKey, ids: string
         `DELETE FROM ro_groups WHERE landscape_id = $1 AND version_id = $2 AND id = ANY($3::text[])`,
         [key.landscapeId, key.versionId, ids]
       )
-      await refreshEffectiveParents(tx, key, objectIds)
+      await refreshEffectiveParents(tx, key, 'membership', objectIds)
       const newParentIds = await effectiveParentIdsForTouched(tx, key, objectIds)
       const newRootCount = await rootCountForTouched(tx, key, objectIds)
       await refreshObjectChildStats(tx, key, [...ids, ...newParentIds])
@@ -1139,7 +1164,7 @@ async function replaceGroupMembership(
       params,
     )
   }
-  await refreshEffectiveParents(db, key, [
+  await refreshEffectiveParents(db, key, 'membership', [
     ...previous.rows.map((row) => row.object_id),
     ...rows.map(([, objectId]) => objectId),
   ])

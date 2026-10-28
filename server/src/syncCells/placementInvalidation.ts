@@ -32,6 +32,10 @@ export class PlacementInvalidationListener {
   private readonly released = new WeakSet<PoolClient>()
   private readonly channel: string
   private readonly invalidateOnConnect: boolean
+  private readonly schemaScoped: boolean
+  /** The schema whose placement table this listener serves, resolved on the
+   * LISTEN connection before subscribing; null = unknown (accept everything). */
+  private ownSchema: string | null = null
 
   constructor(
     private readonly pool: Pool,
@@ -45,10 +49,22 @@ export class PlacementInvalidationListener {
        * follows the LISTEN, so there is no blind interval, and the extra pass
        * would only shift every pass-counting assertion by one. */
       invalidateOnConnect?: boolean
+      /** Ignore a notification whose payload names ANOTHER schema. NOTIFY is
+       * database-wide while placement is per schema: the placement trigger
+       * sends `TG_TABLE_SCHEMA` so each schema's cells can tell their own
+       * events apart. Unfiltered, a placement change in any other schema of
+       * the same database woke this one's cells — an extra pass that, among
+       * other things, retried a pending Redis authority release early
+       * (measured 2026-10-22: ownership.placementRecovery went red 2 runs in 5
+       * under foreign notifications, never without). Defaults to on for the
+       * placement channel only; the version-created channel's payload is a
+       * landscape id, not a schema. */
+      schemaScoped?: boolean
     } = {},
   ) {
     this.channel = options.channel ?? WORKSPACE_PLACEMENT_CHANNEL
     this.invalidateOnConnect = options.invalidateOnConnect ?? true
+    this.schemaScoped = options.schemaScoped ?? this.channel === WORKSPACE_PLACEMENT_CHANNEL
     // LISTEN keeps one checkout until stop. Leave capacity for the SELECT
     // that consumes its invalidation; pg normalizes max on a real Pool.
     const maximum = pool.options?.max
@@ -97,7 +113,13 @@ export class PlacementInvalidationListener {
     this.client = client
     // Install error/notification handlers before the first LISTEN await.
     client.on('notification', (message: Notification) => {
-      if (this.client === client && message.channel === this.channel) this.invalidate()
+      if (this.client !== client || message.channel !== this.channel) return
+      // Drop only a notification that positively names another schema. An
+      // empty payload or an unknown own schema falls OPEN: a spurious pass
+      // costs one SELECT, a dropped invalidation costs a stale placement map
+      // until the next timer tick.
+      if (this.schemaScoped && this.ownSchema && message.payload && message.payload !== this.ownSchema) return
+      this.invalidate()
     })
     client.on('error', (error: Error) => {
       this.destroy(client, error)
@@ -110,6 +132,26 @@ export class PlacementInvalidationListener {
       if (!this.stopping) this.report(error)
     })
     try {
+      if (this.schemaScoped) {
+        // Resolved BEFORE subscribing (no notification can arrive earlier), on
+        // this very connection: the schema the trigger will name is the one
+        // where `workspace_placement` resolves under this session's search_path
+        // — the same unqualified table `readWorkspacePlacement` reads on this
+        // pool, so a notification about any other schema cannot change what
+        // this process reads. If the table does not exist yet (production
+        // creates it in db/schemaMigrations.ts before any cell starts) the
+        // filter stays OPEN for this connection's lifetime.
+        this.ownSchema = await client.query<{ schema: string | null }>(
+          `SELECT n.nspname AS schema FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE c.oid = to_regclass('workspace_placement')`,
+        ).then((result) => result.rows?.[0]?.schema ?? null, (error) => {
+          // A stop() or a lost connection already destroyed this client (and the
+          // error/end handler reported it): this rejection is that, not news.
+          if (!this.stopping && this.client === client) this.report(error)
+          return null
+        })
+        if (this.stopping || this.client !== client) return
+      }
       await client.query(`LISTEN ${this.channel}`)
       if (this.stopping || this.client !== client) return
       // Also invalidate after reconnect: commits during the disconnected

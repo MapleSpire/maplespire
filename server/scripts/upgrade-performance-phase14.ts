@@ -171,7 +171,7 @@ async function updateGovernedObjectBatch(
       `WITH input AS (
          SELECT * FROM jsonb_to_recordset($3::jsonb) AS row(
            id text, type text, name text, description text, technology text,
-           domain_id text, parent_id text, effective_parent_id text,
+           domain_id text, parent_id text, effective_parent_id text, c4_parent_id text,
            scope text, status text, data jsonb
          )
        )
@@ -179,6 +179,7 @@ async function updateGovernedObjectBatch(
          type = input.type, name = input.name, description = input.description,
          technology = input.technology, domain_id = input.domain_id,
          parent_id = input.parent_id, effective_parent_id = input.effective_parent_id,
+         c4_parent_id = input.c4_parent_id,
          scope = input.scope, status = input.status, data = input.data
        FROM input
        WHERE object.landscape_id = $1 AND object.version_id = $2

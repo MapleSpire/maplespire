@@ -17,6 +17,7 @@ import { performance } from 'node:perf_hooks'
 import type { AutomergeUrl, DocHandle, Repo } from '@automerge/automerge-repo'
 import type { Pool, PoolClient } from 'pg'
 import {
+  advanceReadModelGenerationWithinTransaction,
   beginReadModelProjection,
   completeReadModelProjection,
   failReadModelProjection,
@@ -30,7 +31,9 @@ import { OVERLAY_WRITE_HEAD_VERSION } from '../modelMeta.js'
 import { claimWorkspaceDocuments } from '../rbac/documentClaims.js'
 import { invalidateWorkspaceCoverage } from '../rbac/claimCoverage.js'
 import { appendReadModelChange, type ReadModelChangePayload } from './changeFeed.js'
+import { objectChangeWithCacheNeighbours } from './objectExplorer.js'
 import { withReadModelProjectionTransaction } from './projectionTransaction.js'
+import { repairWorkspaceC4ParentIds } from './schema.js'
 import {
   assertReadModelPlane, isProjectionMutexTimeout, isReadModelAuthorityLoss,
   STATIC_PLANE_LOCK_WAIT_MS,
@@ -545,6 +548,17 @@ export class StaticDeltaProjector {
     firstQueuedAt?: number
   }>()
   private readonly attachedWorkspaces = new Map<string, StaticDocumentDescriptor>()
+  /** The ATTACH descriptors (the values of `attachedWorkspaces`) whose
+   * `c4_parent_id` repair has run. Keyed by object identity, not workspace: a
+   * release deletes the map entry and a later re-attach stores a NEW
+   * descriptor, so every attach repairs once without a release-side clear. */
+  private readonly c4ParentsRepaired = new WeakSet<StaticDocumentDescriptor>()
+  /** Attach descriptors whose repair is queued and not yet settled, so a tick
+   * that fires while one waits behind a long projection does not queue a
+   * second. */
+  private readonly c4ParentRepairsInFlight = new WeakSet<StaticDocumentDescriptor>()
+  /** Serializes the repairs — see `scheduleC4ParentRepairs`. Drained by `stop()`. */
+  private c4RepairChain: Promise<void> = Promise.resolve()
   private readonly overlayState = new Map<string, StaticOverlayState>()
   private readonly metaSemanticFingerprints = new Map<string, string>()
   private readonly currentOverlayDocumentIds = new Map<string, {
@@ -645,12 +659,149 @@ export class StaticDeltaProjector {
         // a blocking wait there would stall `start()` itself.
         this.scheduleOverlayChainFolds()
         this.scanResidentHandles()
+        // Also SCHEDULES, on each workspace's own tail: a repair queued behind
+        // a long projection must not hold up the next descriptor reload.
+        this.scheduleC4ParentRepairs()
       }).catch((error) => {
         console.error('[read-model] static descriptor reload failed', error)
       })
     }, this.descriptorReloadMs)
     this.scanTimer.unref()
     this.reloadTimer.unref()
+  }
+
+  /**
+   * Repair `ro_objects.c4_parent_id` once for every workspace this cell has
+   * ATTACHED since its last repair (`c4ParentsRepaired`).
+   *
+   * WHY ON ATTACH. The `0005-ro-objects-c4-parent` migration fixes rows once,
+   * at the first new-code boot. An OLD-code cell still serving during a
+   * rolling deploy then keeps writing `ro_objects` without the column: a new
+   * object reads as a root, a reparent keeps its old level, the children of a
+   * deleted parent appear at no level. WITH `SYNC_CELL_OWNERSHIP=on` those are
+   * rows of workspaces it owns: every static write asserts the ownership
+   * fencing token under the projection mutex (`assertPlaneAndOwnership`, also
+   * in the old code), so once this cell holds the lease an old cell's next
+   * write is refused, and one that took the mutex first commits before this
+   * repair, queued behind the same mutex, runs. So the moment those rows
+   * become this cell's problem is the moment it takes the workspace over.
+   * WITHOUT ownership (`ownsWorkspace` is `() => true`, no fence) two
+   * overlapping processes both project every static workspace, and an old one
+   * still running after this repair writes drift nothing repairs before the
+   * next restart; the shipped deploys do not overlap (k8s `Recreate` with one
+   * replica, ownership on elsewhere). An ordinary workspace heals at takeover
+   * anyway (every projector start is a cold build); a static one has no cold
+   * build, hence this.
+   *
+   * Through `transactionOnly`: queued on the workspace's tail behind its
+   * projections, under the projection mutex, plane and ownership fence
+   * asserted on both sides. `repairWorkspaceC4ParentIds` writes only wrong rows, so on
+   * a consistent workspace it is a read-only pass — the price every attach
+   * pays once the fleet is homogeneous (~1.2 s at 200 000 objects, measured with
+   * server/scripts/measure-viewer-level-c4.ts).
+   *
+   * ONE AT A TIME, on `c4RepairChain`: a takeover attaches many workspaces in
+   * one reload, and firing every repair at once would hold that many projection
+   * mutexes and read-model connections (the pool is small) next to the cold
+   * builds the same takeover starts.
+   *
+   * Not run by `start()`'s own first reload, on purpose: that would add one
+   * pass per static workspace to boot. The first tick is `descriptorReloadMs`
+   * later, and the drift it repairs was written before this process existed.
+   */
+  private scheduleC4ParentRepairs(): void {
+    for (const attached of this.attachedWorkspaces.values()) {
+      if (this.stopped) return
+      if (this.c4ParentsRepaired.has(attached) || this.c4ParentRepairsInFlight.has(attached)) continue
+      this.c4ParentRepairsInFlight.add(attached)
+      const run = this.c4RepairChain.then(async () => {
+        // Saves opening a transaction after a shutdown that landed while this
+        // waited behind earlier repairs. Not the guard: the action re-checks
+        // `stopped`, and a RELEASED attach is refused by `transactionOnly`'s
+        // ownership and plane asserts (which is why no release check is here —
+        // a QA mutant removing one survived as equivalent).
+        if (this.stopped) return
+        await this.repairC4ParentsOnAttach(attached)
+      })
+      // `repairC4ParentsOnAttach` never rejects, so neither does the chain.
+      this.c4RepairChain = run.finally(() => {
+        this.c4ParentRepairsInFlight.delete(attached)
+      })
+    }
+  }
+
+  /** One workspace's repair. NEVER rejects — it is scheduled, not awaited. It
+   * counts as done only if the action RAN *and* its transaction COMMITTED:
+   * `transactionOnly` refuses quietly when the cell no longer owns the
+   * workspace, the mutex wait expired, or authority was lost — including a
+   * fencing-token rotation AFTER the action ran, which rolls it back while the
+   * same attach stays in place. Each of those leaves it due for the next tick. */
+  private async repairC4ParentsOnAttach(attached: StaticDocumentDescriptor): Promise<void> {
+    let ran = false
+    let committed: boolean
+    try {
+      committed = await this.transactionOnly(attached, async (tx) => {
+        // A repair can wait on the workspace's tail behind projections; a
+        // SIGTERM in that wait must not then start a pass `stop()` has to
+        // drain inside the 30 s forced-exit window. `ran` stays false.
+        if (this.stopped) return
+        const repaired = await repairWorkspaceC4ParentIds(tx, attached)
+        if (repaired.length) await this.publishC4ParentRepair(tx, attached, repaired)
+        ran = true
+      })
+    } catch (error) {
+      console.error(
+        `[read-model] c4_parent_id repair failed for ${attached.landscapeId}/${attached.versionId}; `
+        + 'the next descriptor reload retries it',
+        error,
+      )
+      return
+    }
+    if (ran && committed) this.c4ParentsRepaired.add(attached)
+  }
+
+  /**
+   * Tell the browser caches what the repair rewrote: one `objects` change
+   * naming exactly the repaired ids, under a generation allocated and appended
+   * INSIDE the repair's transaction. Only called when a row changed — a
+   * consistent workspace (every attach, once the fleet is homogeneous)
+   * allocates no generation and appends nothing.
+   *
+   * NOT `publish()`, for two reasons. `publish()` stamps
+   * `read_model_static_document_state` for the descriptor's document up to that
+   * document's newest storage write, which would mark a pending registry shard
+   * as projected when nothing projected it. And it takes its token on the POOL
+   * before the transaction, so a pass that then finds nothing to repair would
+   * still have bumped `observed_generation` (that bump survives the rollback).
+   * Here the generation commits or rolls back with the rows it describes: a
+   * refused or failed repair leaves none behind, so there is no
+   * `failReadModelProjection` to record and no ordinary-plane health row to
+   * forge — `transactionOnly`'s asserts on both sides of the action gate the
+   * write, under the projection mutex.
+   *
+   * NOT `beginReadModelProjection` / `completeReadModelProjection` either: they
+   * stamp `last_projected_at`, `source_changed_at` and clear the error columns,
+   * workspace freshness this pass did not earn — it projects no document, and
+   * it runs at takeover, when the former owner's backlog is most likely
+   * pending. `advanceReadModelGenerationWithinTransaction` moves the two
+   * generation counters only (health.ts says how).
+   *
+   * Not widened with `objectCacheNeighbourIds`: the repair moves only the
+   * repaired rows' own `c4_parent_id`. No other row served to a cache reads it
+   * — the cache rows' `child_count` and explorer parent follow
+   * `effective_parent_id` (objectExplorer.ts), which the repair does not
+   * touch. The viewer level's own `child_count` does read `c4_parent_id`
+   * (viewerLevel.ts), but online it is a live query and offline the worker
+   * probes its own index of the refreshed rows (modelReadCache.worker.ts
+   * `queryViewerLevel`), so the parent's chevron follows the repaired child.
+   */
+  private async publishC4ParentRepair(
+    tx: Queryable,
+    attached: StaticDocumentDescriptor,
+    repaired: string[],
+  ): Promise<void> {
+    const token = await advanceReadModelGenerationWithinTransaction(tx, attached, attached.orgId)
+    await appendReadModelChange(tx, attached, token, { kind: 'objects', upsertIds: repaired, deleteIds: [] })
   }
 
   async stop(): Promise<void> {
@@ -688,6 +839,9 @@ export class StaticDeltaProjector {
     // A descriptor refresh may already be inside a PostgreSQL query when the
     // interval is cleared. Drain it before the caller closes the shared pool.
     await this.reloadTail
+    // Before the tails: a queued repair re-checks `stopped` and returns, and
+    // the one in progress is inside a `transactionOnly` the tails then cover.
+    await this.c4RepairChain
     await Promise.allSettled([...this.workspaceTails.values()])
     // The detach writes `release()` starts are DURABILITY-adjacent, and
     // reconciliation can fire `release()` from every reload tick, so `stop()`
@@ -1923,10 +2077,12 @@ export class StaticDeltaProjector {
       selected: (entityId) => selected[entityId] as ObjectInput | ConnectionInput | undefined,
       // The ledger a user resolves from: same-field conflicts found INSIDE the
       // `$` branches of the entities this heal writes.
-      recordConflicts: (recorded) => this.transactionOnly(descriptor, (tx) => recordOverlayConflicts(
-        tx, descriptor, kind, descriptor.documentId, descriptor.documentId,
-        overlayBatchIds(snapshot), recorded,
-      )),
+      recordConflicts: async (recorded) => {
+        await this.transactionOnly(descriptor, (tx) => recordOverlayConflicts(
+          tx, descriptor, kind, descriptor.documentId, descriptor.documentId,
+          overlayBatchIds(snapshot), recorded,
+        ))
+      },
     })
     return outcome !== 'none'
   }
@@ -3711,8 +3867,16 @@ export class StaticDeltaProjector {
       try {
         await withReadModelProjectionTransaction(this.db, descriptor, 'static', async (tx) => {
           await this.assertPlaneAndOwnership(tx, descriptor, expectedFence)
+          // Every `objects` change this projector publishes names the ids it
+          // wrote; the rows that write moves without naming them (children
+          // whose c4ParentId/parentId follows a deleted or re-created parent)
+          // are read here, under the mutex, BEFORE the write — the one place,
+          // so no publish site can forget them (objectExplorer.ts).
+          const published = change.kind === 'objects'
+            ? await objectChangeWithCacheNeighbours(tx, descriptor, change)
+            : change
           await action(tx, token.generation)
-          await appendReadModelChange(tx, descriptor, token, change)
+          await appendReadModelChange(tx, descriptor, token, published)
           await tx.query(
             `INSERT INTO read_model_static_document_state (
                landscape_id, version_id, document_id, source_updated_at,
@@ -3838,21 +4002,25 @@ export class StaticDeltaProjector {
          WHERE landscape_id = $1 AND version_id = $2 AND document_id = $3`,
         [descriptor.landscapeId, descriptor.versionId, descriptor.documentId, sourceRevision],
       )
-    })
+    }).then(() => undefined)
   }
 
+  /** Resolves `true` only when the transaction COMMITTED; `false` for each
+   * quiet refusal (not owned, no fencing token, mutex yielded, authority lost —
+   * the last one after the action may already have run and been rolled back).
+   * A caller that records "done" must read the result, not its own flag. */
   private transactionOnly(
     descriptor: StaticDocumentDescriptor,
     action: (tx: Queryable) => Promise<void>,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const workspace = keyOf(descriptor)
     const previous = this.workspaceTails.get(workspace) ?? Promise.resolve()
     const task = previous.then(async () => {
-      if (!this.ownsWorkspace(descriptor)) return
+      if (!this.ownsWorkspace(descriptor)) return false
       const expectedFence = this.ownership?.enabled
         ? this.ownership.fencingToken(descriptor)
         : null
-      if (this.ownership?.enabled && !expectedFence) return
+      if (this.ownership?.enabled && !expectedFence) return false
       // No pre-check here: this path takes no projection token, so there is no
       // pool-side `observed_generation` bump to keep off a workspace it has
       // lost. The in-transaction assert under the mutex is the gate, and it is
@@ -3863,16 +4031,18 @@ export class StaticDeltaProjector {
           await action(tx)
           await this.assertPlaneAndOwnership(tx, descriptor, expectedFence)
         })
+        return true
       } catch (error) {
         if (isProjectionMutexTimeout(error)) {
           console.warn(
             `[read-model] static acknowledgement yielded the mutex for `
             + `${descriptor.landscapeId}/${descriptor.versionId}`,
           )
-          return
+          return false
         }
         if (!isReadModelAuthorityLoss(error)) throw error
         this.notePlaneLost(descriptor)
+        return false
       }
     })
     this.workspaceTails.set(workspace, task.then(() => undefined, () => undefined))

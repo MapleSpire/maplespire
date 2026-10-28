@@ -212,8 +212,10 @@ function fakePool(
       const client = new EventEmitter()
       return Object.assign(client, {
         async query(text: string) {
-          // Placed mode listens for placement changes; hash mode for version
-          // creation (a workspace created on another cell).
+          // Placed mode listens for placement changes (after resolving its own
+          // schema); hash mode for version creation (a workspace created on
+          // another cell).
+          if (text.includes("to_regclass('workspace_placement')")) return { rows: [], rowCount: 0 }
           expect(['LISTEN workspace_placement_changed', 'LISTEN workspace_version_created']).toContain(text)
           return { rows: [], rowCount: 0 }
         },

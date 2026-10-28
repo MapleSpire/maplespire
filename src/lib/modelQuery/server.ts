@@ -148,6 +148,10 @@ function cacheExplorerWorkingSet(workspaceKey: string, page: ObjectExplorerPage)
         name: row.name,
         type: row.type,
         parentId: row.parentId,
+        // The payload below carries the EXPLORER parent (a group, for a
+        // grouped object): without this the worker would file the row under
+        // the group and drop it from its Model Viewer level.
+        ...(row.c4ParentId !== undefined ? { c4ParentId: row.c4ParentId } : {}),
         childCount: row.childCount,
         appCount: row.appCount,
         storeCount: row.storeCount,

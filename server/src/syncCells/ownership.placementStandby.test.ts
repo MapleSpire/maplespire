@@ -65,6 +65,8 @@ function fixture() {
   })
   const listenerClient = Object.assign(new EventEmitter(), {
     query: vi.fn(async (sql: string) => {
+      // The listener resolves its own schema before subscribing.
+      if (sql.includes("to_regclass('workspace_placement')")) return { rows: [], rowCount: 0 }
       expect(sql).toBe(`LISTEN ${WORKSPACE_PLACEMENT_CHANNEL}`)
       return { rows: [], rowCount: 0 }
     }),
@@ -164,7 +166,8 @@ describe('placed standby routing snapshot', () => {
       expect(() => f.coordinator.partitionFor(workspace)).toThrow('has not loaded')
       await f.coordinator.start()
       expect(f.connect).toHaveBeenCalledTimes(1)
-      expect(f.listenerClient.query).toHaveBeenCalledExactlyOnceWith(`LISTEN ${WORKSPACE_PLACEMENT_CHANNEL}`)
+      expect(f.listenerClient.query).toHaveBeenCalledTimes(2) // own-schema lookup, then LISTEN
+      expect(f.listenerClient.query).toHaveBeenLastCalledWith(`LISTEN ${WORKSPACE_PLACEMENT_CHANNEL}`)
       expect(new Set(f.send.mock.calls.filter(([args]) => args[0] === 'EVAL' && args[2] === '2').map(([args]) => args[3])))
         .toEqual(new Set([f.ownerKey(0), f.ownerKey(1)]))
       f.assertEmptyFence()
