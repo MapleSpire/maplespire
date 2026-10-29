@@ -701,6 +701,20 @@ export async function ensureReadModelSchema(db: Queryable): Promise<void> {
     )`)
   await db.query(`CREATE INDEX IF NOT EXISTS idx_ro_objects_search_trgm
     ON ro_objects USING gin (search_document public.gin_trgm_ops)`)
+  // The C4 parent with dangling links repaired to NULL: `parent_id` when that
+  // parent row exists, else NULL. The Model Viewer's levels follow it — unlike
+  // `effective_parent_id` it ignores Group membership, and unlike raw
+  // `parent_id` an object whose parent was deleted is a root instead of being
+  // reachable at no level. Maintained by `refreshEffectiveParents` in
+  // projector.ts; rows that predate the column are backfilled once by the
+  // `0005-ro-objects-c4-parent` migration (`backfillC4ParentIds` below).
+  await db.query(`ALTER TABLE ro_objects
+    ADD COLUMN IF NOT EXISTS c4_parent_id TEXT`)
+  await db.query(`CREATE INDEX IF NOT EXISTS idx_ro_objects_c4_name_c_page
+    ON ro_objects (
+      landscape_id, version_id, c4_parent_id,
+      normalized_name COLLATE "C", id COLLATE "C"
+    )`)
 
   // One row per governed technology usage. Deliberately no FK to the central
   // catalogue: shard delivery can precede catalogue metadata and historical
@@ -1142,6 +1156,81 @@ export async function ensureReadModelSchema(db: Queryable): Promise<void> {
       ['phase5-derived-read-model-v1'],
     )
   }
+}
+
+/** Every workspace's `c4_parent_id`, repaired in place. Run once by the
+ * `0005-ro-objects-c4-parent` migration (server/src/db/schemaMigrations.ts),
+ * which upgrades rows written before the column existed (all NULL — every
+ * object would read as a root).
+ *
+ * WRITES ONLY WRONG ROWS — both statements are guarded — so re-running it is
+ * safe, and on a consistent table it is a read-only pass. That is the remedy
+ * for the one writer the migration cannot fence: an OLD-code cell still
+ * serving during a rolling deploy writes `ro_objects` without this column,
+ * after the migration has been recorded. A workspace it served is repaired
+ * when a new-code cell takes it over — ordinary ones by the cold build every
+ * projector start runs, static ones by this function scoped to the workspace,
+ * once per attach (`StaticDeltaProjector.repairC4ParentsOnAttach`, through
+ * `repairWorkspaceC4ParentIds`). Costs measured with
+ * server/scripts/measure-viewer-level-c4.ts. */
+export async function backfillC4ParentIds(
+  db: Queryable,
+  workspace?: { landscapeId: string; versionId: string },
+): Promise<void> {
+  // Scoped to one workspace by the tests and the measurement script; every
+  // workspace for the migration, whose runner passes the client alone. Collects
+  // no ids: the migration rewrites up to every row of the table.
+  await repairC4ParentStatements(db, workspace, false)
+}
+
+/** `backfillC4ParentIds` scoped to ONE workspace, returning the ids of the
+ * rows it changed — the static projector publishes them on the change feed so
+ * a browser cache holding the drifted `c4ParentId` refetches them. Empty on a
+ * consistent workspace (both statements write only wrong rows). The two
+ * statements' row sets are disjoint (a parent that exists vs one that does
+ * not) as long as nothing deletes a parent between them — true under the
+ * projection mutex and ownership fence the caller holds; `appendReadModelChange`
+ * dedupes the list either way. */
+export function repairWorkspaceC4ParentIds(
+  db: Queryable,
+  workspace: { landscapeId: string; versionId: string },
+): Promise<string[]> {
+  return repairC4ParentStatements(db, workspace, true)
+}
+
+async function repairC4ParentStatements(
+  db: Queryable,
+  workspace: { landscapeId: string; versionId: string } | undefined,
+  collect: boolean,
+): Promise<string[]> {
+  const params = workspace ? [workspace.landscapeId, workspace.versionId] : []
+  const scoped = workspace ? 'AND object.landscape_id = $1 AND object.version_id = $2' : ''
+  const returning = collect ? 'RETURNING object.id' : ''
+  const attached = await db.query<{ id: string }>(`
+    UPDATE ro_objects object
+    SET c4_parent_id = parent.id
+    FROM ro_objects parent
+    WHERE parent.landscape_id = object.landscape_id
+      AND parent.version_id = object.version_id
+      AND parent.id = object.parent_id
+      AND object.c4_parent_id IS DISTINCT FROM parent.id
+      ${scoped}
+    ${returning}
+  `, params)
+  const dangling = await db.query<{ id: string }>(`
+    UPDATE ro_objects object
+    SET c4_parent_id = NULL
+    WHERE object.c4_parent_id IS NOT NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM ro_objects parent
+        WHERE parent.landscape_id = object.landscape_id
+          AND parent.version_id = object.version_id
+          AND parent.id = object.parent_id
+      )
+      ${scoped}
+    ${returning}
+  `, params)
+  return collect ? [...attached.rows, ...dangling.rows].map((row) => row.id) : []
 }
 
 async function backfillDerivedReadModel(db: Queryable): Promise<void> {

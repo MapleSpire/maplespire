@@ -185,12 +185,14 @@ suite('Phase-5 derived read model (isolated PostgreSQL)', () => {
     expect(groupDomainConnections.items).toEqual([
       expect.objectContaining({ fromName: 'Runtime group', toName: 'API' }),
     ])
+    // The viewer follows the C4 hierarchy (parent_id), not the explorer's
+    // group-first tree: B belongs to group G but is still a root object.
     const viewerRoot = await roViewerLevel(pool, key, { limit: 10 })
-    expect(viewerRoot.objects.map((item) => item.object.id)).toEqual(['A'])
+    expect(viewerRoot.objects.map((item) => item.object.id)).toEqual(['A', 'B'])
     expect(viewerRoot.objects[0]?.childCount).toBe(1)
-    const groupLevel = await roViewerLevel(pool, key, { parentId: 'G', limit: 10 })
-    expect(groupLevel.totalObjects).toBe(1)
-    expect(groupLevel.objects[0]?.object.id).toBe('B')
+    const componentLevel = await roViewerLevel(pool, key, { parentId: 'A', limit: 10 })
+    expect(componentLevel.totalObjects).toBe(1)
+    expect(componentLevel.objects[0]?.object.id).toBe('C')
 
     const decisions = await roDecisionRecordPage(pool, key, { limit: 1 })
     const olderDecisions = await roDecisionRecordPage(pool, key, {

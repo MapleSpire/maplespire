@@ -235,12 +235,18 @@ function entityRecord(
     && typeof (input.payload as { parentId?: unknown }).parentId === 'string'
     ? (input.payload as { parentId: string }).parentId
     : ROOT_PARENT_KEY
+  // The server resolved the C4 parent against every object (a dangling one is
+  // null: a root); prefer it. `undefined` means the row came from an older
+  // server or the explorer working set, which carry no such field.
+  const modelParentKey = input.kind === 'object' && input.c4ParentId !== undefined
+    ? input.c4ParentId ?? ROOT_PARENT_KEY
+    : payloadParentId
   const base = {
     ...input,
     workspaceKey,
     generation,
     parentKey: input.parentId ?? ROOT_PARENT_KEY,
-    modelParentKey: payloadParentId,
+    modelParentKey,
     normalizedName,
     normalizedSearchText,
     searchTrigramKeys: objectSearchTrigramKeys(workspaceKey, generation, normalizedName, normalizedSearchText),
@@ -1278,32 +1284,64 @@ async function queryViewerLevel(
   const connectionLimit = Math.min(2_000, Math.max(1, request.connectionLimit))
   const after = decodeCursor(request.after)
   if (request.after && !after) throw new Error('Invalid model-cache viewer cursor')
+  // The Model Viewer follows the C4 hierarchy — `modelParentKey`, the server's
+  // `c4_parent_id` (see entityRecord) — like the server (viewerLevel.ts) and
+  // resident implementations. NOT `parentKey`: that is the explorer's navigation
+  // tree, where Group membership outranks the parent, so an object inside a
+  // boundary group would vanish from its real level and its parent show no
+  // children.
   const parentKey = request.parentId ?? ROOT_PARENT_KEY
   const db = await openModelReadCache()
   const objectTx = db.transaction(MODEL_CACHE_STORES.objects, 'readonly')
-  const source = objectTx.objectStore(MODEL_CACHE_STORES.objects).index('byParent')
-  const range = IDBKeyRange.bound(
-    [request.workspaceKey, meta.activeGeneration, parentKey],
-    [request.workspaceKey, meta.activeGeneration, parentKey, []],
-  )
-  const objects: CachedModelEntityRecord[] = []
+  const objectStore = objectTx.objectStore(MODEL_CACHE_STORES.objects)
+  const levelRange = (index: 'byModelParentName' | 'byParent') => ({
+    source: objectStore.index(index),
+    range: IDBKeyRange.bound(
+      [request.workspaceKey, meta.activeGeneration, parentKey],
+      [request.workspaceKey, meta.activeGeneration, parentKey, []],
+    ),
+  })
+  // A dangling C4 parent reads as a root (parity with the server, resident.ts
+  // and levels.ts). Rows the cache feed sent carry the server's repair
+  // (`c4ParentId` null), so the first scan finds them, grouped or not; when
+  // the parent is deleted on the server the feed republishes its children
+  // (they are neighbours of the deleted id, objectExplorer.ts). The second,
+  // root-only scan is for rows WITHOUT that field (an older server, the
+  // explorer working set): there the explorer's `parentKey` is the server's
+  // repair — an object whose effective parent is the root while its C4 parent
+  // is not has a parent that does not exist. The two scans are disjoint: a
+  // repaired row never has a non-root modelParentKey under a root parentKey.
+  // Not covered for those legacy rows: a dangling object that is ALSO in a
+  // group (its effective parent is the group).
+  const scans = [{ ...levelRange('byModelParentName'), dangling: false }]
+  if (parentKey === ROOT_PARENT_KEY) scans.push({ ...levelRange('byParent'), dangling: true })
   let totalObjects = 0
   let rowsRead = 0
-  await new Promise<void>((resolve, reject) => {
+  // Two cursors share one transaction: the first to see the cancel aborts it,
+  // and the other must not abort it a second time (InvalidStateError, thrown
+  // from an event handler).
+  let aborted = false
+  const scanned = await Promise.all(scans.map(({ source, range, dangling }) => new Promise<CachedModelEntityRecord[]>((resolve, reject) => {
+    const objects: CachedModelEntityRecord[] = []
     const cursorRequest = source.openCursor(range)
     cursorRequest.onerror = () => reject(cursorRequest.error ?? new Error('IndexedDB viewer-level cursor failed'))
     cursorRequest.onsuccess = () => {
-      if (cancelled.has(request.id)) {
-        objectTx.abort()
+      if (aborted || cancelled.has(request.id)) {
+        if (!aborted) objectTx.abort()
+        aborted = true
         reject(new DOMException('Aborted', 'AbortError'))
         return
       }
       const cursor = cursorRequest.result
-      if (!cursor) { resolve(); return }
+      if (!cursor) { resolve(objects); return }
       rowsRead += 1
       const record = cursor.value as CachedModelEntityRecord
       const payload = record.payload as { domainId?: string }
-      const matches = (!query || record.normalizedName.includes(query))
+      // Groups are not levels (their modelParentKey is always the root).
+      const atLevel = record.kind === 'object'
+        && (!dangling || record.modelParentKey !== ROOT_PARENT_KEY)
+      const matches = atLevel
+        && (!query || record.normalizedName.includes(query))
         && (!domainIds.size || Boolean(payload.domainId && domainIds.has(payload.domainId)))
       if (matches) {
         totalObjects += 1
@@ -1314,11 +1352,36 @@ async function queryViewerLevel(
       }
       cursor.continue()
     }
-  })
+  })))
   await transactionDone(objectTx)
+  // Each scan is already in (normalizedName, id) index order; merge them.
+  const objects = scanned.flat().sort((a, b) => (
+    a.normalizedName < b.normalizedName ? -1
+      : a.normalizedName > b.normalizedName ? 1
+        : a.id < b.id ? -1 : a.id > b.id ? 1 : 0
+  ))
   const hasMore = objects.length > limit
   const pageObjects = objects.slice(0, limit)
   const visibleIds = new Set(pageObjects.map((record) => record.id))
+
+  // Whether a tile expands, from its C4 children. One indexed first-key probe
+  // per tile — the viewer only reads `childCount > 0` (levels.ts hasChildren);
+  // the stored `childCount` is the explorer's group-first count and is wrong
+  // here. A full count would walk every child of every hub tile.
+  const childTx = db.transaction(MODEL_CACHE_STORES.objects, 'readonly')
+  const childIndex = childTx.objectStore(MODEL_CACHE_STORES.objects).index('byModelParentName')
+  const firstChildKeys = await Promise.all(pageObjects.map((record) => requestResult(
+    childIndex.getKey(IDBKeyRange.bound(
+      [request.workspaceKey, meta.activeGeneration, record.id],
+      [request.workspaceKey, meta.activeGeneration, record.id, []],
+    )),
+  )))
+  await transactionDone(childTx)
+  rowsRead += pageObjects.length
+  const levelObjects = pageObjects.map((record, index) => ({
+    ...record,
+    childCount: firstChildKeys[index] !== undefined ? 1 : 0,
+  }))
 
   const connections = new Map<string, CachedConnectionRecord>()
   if (visibleIds.size) {
@@ -1354,16 +1417,18 @@ async function queryViewerLevel(
   for (let depth = 0; ancestorId && depth < 64; depth += 1) {
     const record = await readCachedEntity(db, request.workspaceKey, meta.activeGeneration, ancestorId)
     rowsRead += record ? 1 : 0
-    if (!record) break
+    // A group is not on the C4 chain; a missing parent ends it.
+    if (!record || record.kind !== 'object') break
     ancestors.unshift(record)
-    ancestorId = record.parentId ?? null
+    // The C4 parent, not `record.parentId` (the explorer's group-first parent).
+    ancestorId = record.modelParentKey === ROOT_PARENT_KEY ? null : record.modelParentKey
   }
   const connectionRows = [...connections.values()]
   const last = pageObjects.at(-1)
   return {
     result: {
       ancestors,
-      objects: pageObjects,
+      objects: levelObjects,
       connections: connectionRows.slice(0, connectionLimit),
       nextCursor: hasMore && last ? encodeCursor({ normalizedName: last.normalizedName, id: last.id }) : null,
       totalObjects,

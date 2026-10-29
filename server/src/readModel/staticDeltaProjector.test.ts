@@ -1284,6 +1284,9 @@ describe('StaticDeltaProjector — les tombstones de diagramme (T6)', () => {
      * body never executes, so any assertion about what it does — or refuses to
      * do — is vacuous. */
     admittedRotations?: Array<Record<string, string>>
+    /** Ids `objectCacheNeighbourIds` finds (children of a deleted parent, …).
+     * The default empty answer cannot show whether a publication lists them. */
+    cacheNeighbours?: string[]
   } = {}) {
     const repo = new Repo({})
     const calls: Array<{ sql: string; params: unknown[] }> = []
@@ -1340,6 +1343,10 @@ describe('StaticDeltaProjector — les tombstones de diagramme (T6)', () => {
       // removed could not detect a projector that replays the whole list.
       // The connections a deleted diagram carried, captured BEFORE the deletes
       // so their aggregate counters can be recomputed after.
+      if (text.includes('SELECT group_id FROM ro_group_objects') && text.includes('parent_id = ANY')) {
+        const rows = (options.cacheNeighbours ?? []).map((id) => ({ id }))
+        return { rows, rowCount: rows.length }
+      }
       if (text.includes('SELECT connection_id FROM ro_diagram_connections')) {
         return {
           rows: (options.affectedConnections ?? []).map((connectionId) => ({ connection_id: connectionId })),
@@ -1386,6 +1393,26 @@ describe('StaticDeltaProjector — les tombstones de diagramme (T6)', () => {
     deletedConnectionIds: [],
     deletedDiagramIds: [],
     ...overrides,
+  })
+
+  it('a parent tombstone also publishes the children whose cached c4ParentId it moves', async () => {
+    // The static projector publishes the ids it wrote. Deleting a parent
+    // rewrites its children's c4_parent_id (refreshEffectiveParents) without
+    // naming them, so an offline cache kept them on the deleted parent's
+    // level: the publication must list them, read BEFORE the delete.
+    const { internal, calls } = harness({ cacheNeighbours: ['child-a', 'child-b', 'parent'] })
+    await internal.projectMeta(descriptorOf('meta'), baseMeta({ deletedObjectIds: ['parent'] }), 7)
+
+    const neighbourRead = calls.findIndex((call) => call.sql.includes('SELECT group_id FROM ro_group_objects'))
+    const objectDelete = calls.findIndex((call) => call.sql.includes('DELETE FROM ro_objects'))
+    const event = calls.find((call) => call.sql.includes('INSERT INTO read_model_change_events'))
+    expect(neighbourRead).toBeGreaterThanOrEqual(0)
+    expect(objectDelete).toBeGreaterThan(neighbourRead)
+    expect(event?.params[3]).toBe('objects')
+    const payload = JSON.parse(String(event?.params[4])) as { upsertIds: string[]; deleteIds: string[] }
+    expect(payload.deleteIds).toEqual(['parent'])
+    // the children are listed; the deleted id is not "upserted" back
+    expect([...payload.upsertIds].sort()).toEqual(['child-a', 'child-b'])
   })
 
   describe('A8 — le plan ro_* n\'a qu\'un écrivain à la fois', () => {

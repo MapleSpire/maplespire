@@ -16,7 +16,7 @@ import type { C4Object, Connection, Group } from '../../types'
 import { accountDatabaseName } from '../auth/accountNamespace'
 
 export const MODEL_READ_CACHE_DB = 'maplespire-model-read-cache'
-export const MODEL_READ_CACHE_VERSION = 7
+export const MODEL_READ_CACHE_VERSION = 8
 export const ROOT_PARENT_KEY = '\u0000root'
 
 export const MODEL_CACHE_STORES = {
@@ -101,6 +101,10 @@ export interface CachedModelEntityInput {
   name: string
   type: string
   parentId?: string | null
+  /** The server's `c4_parent_id`: the C4 parent when that object exists, else
+   * null (a root); groups play no part. Absent from rows an older server or
+   * the explorer working set sent — those fall back to the payload's parent. */
+  c4ParentId?: string | null
   childCount: number
   appCount?: number
   storeCount?: number
@@ -118,7 +122,9 @@ export interface CachedModelEntityRecord extends CachedModelEntityInput {
   generation: number
   parentKey: string
   /** The real C4 parent, independent from the tree parent used by the sidebar
-   * (which may be a group). This keeps offline diagram roll-ups correct. */
+   * (which may be a group). This keeps offline diagram roll-ups correct, and
+   * it is the Model Viewer's level. The server's dangling-repaired
+   * `c4ParentId` when the row carried one, else the payload's `parentId`. */
   modelParentKey: string
   normalizedName: string
   normalizedSearchText: string
@@ -374,6 +380,17 @@ function createModelReadCacheSchema(database: IDBDatabase, transaction: IDBTrans
       // rebuild the reconstructable projection to reclaim them deterministically.
       clearDerived = true
     }
+    if (oldVersion < 8) {
+      const objects = transaction.objectStore(MODEL_CACHE_STORES.objects)
+      if (!objects.indexNames.contains('byModelParentName')) {
+        objects.createIndex('byModelParentName', [
+          'workspaceKey', 'generation', 'modelParentKey', 'normalizedName', 'id',
+        ])
+      }
+      // Every row written since version 4 carries `modelParentKey` and
+      // `normalizedName`, so `createIndex` populates the new index from the rows
+      // already stored: an offline cache survives this upgrade intact.
+    }
     if (clearDerived) {
       // Older derived records cannot populate the new compound indexes. Clear
       // only reconstructable projections; local mutations and sync checkpoints
@@ -398,6 +415,8 @@ function createModelReadCacheSchema(database: IDBDatabase, transaction: IDBTrans
   objects.createIndex('byName', ['workspaceKey', 'generation', 'normalizedName', 'id'])
   objects.createIndex('byType', ['workspaceKey', 'generation', 'type', 'normalizedName', 'id'])
   objects.createIndex('byModelParent', ['workspaceKey', 'generation', 'modelParentKey', 'id'])
+  // The Model Viewer's level: C4 children of one parent, in name order.
+  objects.createIndex('byModelParentName', ['workspaceKey', 'generation', 'modelParentKey', 'normalizedName', 'id'])
   objects.createIndex('bySearchTrigram', 'searchTrigramKeys', { multiEntry: true })
 
   const connections = database.createObjectStore(MODEL_CACHE_STORES.connections, {

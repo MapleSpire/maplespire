@@ -64,6 +64,9 @@ export function ModelViewerView() {
     model,
     connections,
     loaded,
+    levelParentId,
+    peekLevel,
+    prefetchLevel,
     totalObjects,
     connectionsTruncated,
     coverage,
@@ -81,11 +84,14 @@ export function ModelViewerView() {
 
   // Objects can be deleted/reparented while the viewer is open (or across
   // workspace switches) — always render a path the current model can serve,
-  // and write the truncation back so the URL/store never points nowhere.
-  const path = useMemo(() => (loaded ? validatePath(model, storePath) : storePath), [loaded, model, storePath])
+  // and write the truncation back so the URL/store never points nowhere. Only
+  // a window that answers the store's level may judge it: during a drill the
+  // previous level is still being served, and it does not carry the new path.
+  const levelReady = loaded && levelParentId === (storePath.at(-1) ?? null)
+  const path = useMemo(() => (levelReady ? validatePath(model, storePath) : storePath), [levelReady, model, storePath])
   useEffect(() => {
-    if (loaded && path.length !== storePath.length) setPath(path)
-  }, [loaded, path, storePath, setPath])
+    if (levelReady && path.length !== storePath.length) setPath(path)
+  }, [levelReady, path, storePath, setPath])
 
   const domainById = useMemo(() => new Map(domains.map((d) => [d.id, d])), [domains])
   const curParent: ParentId = path.length ? path[path.length - 1] : null
@@ -267,6 +273,9 @@ export function ModelViewerView() {
           <ViewerGrid
             model={model}
             connections={connections}
+            levelParentId={levelParentId}
+            peekLevel={peekLevel}
+            prefetchLevel={prefetchLevel}
             domainById={domainById}
             path={path}
             onPath={go}

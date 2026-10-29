@@ -177,6 +177,58 @@ export async function beginReadModelProjection(
   return { generation: Number(rows[0].observed_generation), startedAtMs: Date.now() }
 }
 
+/** A generation for a change that projects NO source document — a repair of a
+ * derived column (`StaticDeltaProjector.publishC4ParentRepair`) — allocated
+ * and advanced in ONE statement, on the caller's transaction, so it commits or
+ * rolls back with the rows and the change event it describes.
+ *
+ * Moves the two generation counters and nothing else. `begin`/`complete`
+ * would also stamp `last_projected_at`, `source_changed_at` and the error
+ * columns — freshness the caller did not earn: a pending durable write would
+ * stop reading `stale`, an attach-only workspace (`last_projected_at` NULL)
+ * would turn from `uninitialized` to `healthy`, a failed generation's error
+ * would be cleared, and `absenceProvable`'s timestamp fallback would cover a
+ * document nothing projected (`projectionStatusSql`,
+ * `getWorkspaceProjectionFreshness`).
+ *
+ * `projected_generation` follows only when the workspace was CAUGHT UP. Behind
+ * (a failed projection, or a former owner's pool-side token that never
+ * committed), it stays where it is, and the status keeps saying
+ * `catching_up` / `failed` rather than being advanced past a generation
+ * nothing projected. The event is then NOT served when the backlog completes
+ * — those tokens are all below it and `complete` takes their GREATEST — but
+ * once a projection allocated AFTER it completes (`roReadModelChanges` serves
+ * only `generation <= projected_generation`); a reader whose cursor sits
+ * below the hole gets `resetRequired` either way. On a quiet workspace that
+ * can be the next edit. Measured by "a workspace behind…" in
+ * staticDeltaProjector.c4ParentRepair.integration.test.ts. */
+export async function advanceReadModelGenerationWithinTransaction(
+  tx: Queryable,
+  key: WorkspaceKey,
+  orgId: string | null,
+): Promise<ProjectionToken> {
+  // Every right-hand side reads the row as it stood before this UPDATE
+  // (PostgreSQL SET semantics), so `projected_generation` compares the OLD
+  // counters.
+  const { rows } = await tx.query<{ observed_generation: string | number }>(
+    `INSERT INTO read_model_projection_state (
+       landscape_id, version_id, org_id, observed_generation, projected_generation, updated_at
+     ) VALUES ($1, $2, $3, 1, 1, now())
+     ON CONFLICT (landscape_id, version_id) DO UPDATE SET
+       org_id = COALESCE(EXCLUDED.org_id, read_model_projection_state.org_id),
+       observed_generation = read_model_projection_state.observed_generation + 1,
+       projected_generation = CASE
+         WHEN read_model_projection_state.projected_generation >= read_model_projection_state.observed_generation
+           THEN GREATEST(read_model_projection_state.projected_generation, read_model_projection_state.observed_generation + 1)
+         ELSE read_model_projection_state.projected_generation
+       END,
+       updated_at = now()
+     RETURNING observed_generation`,
+    [key.landscapeId, key.versionId, orgId],
+  )
+  return { generation: Number(rows[0].observed_generation), startedAtMs: Date.now() }
+}
+
 export async function completeReadModelProjection(
   db: Queryable,
   key: WorkspaceKey,

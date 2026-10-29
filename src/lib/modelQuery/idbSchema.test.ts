@@ -32,8 +32,8 @@ describe('model read cache search normalization', () => {
     expect(searchTrigrams('Node.js')).toEqual(['nod', 'ode', 'de.', 'e.j', '.js'])
   })
 
-  it('uses the schema that removes duplicated per-connection search tokens', () => {
-    expect(MODEL_READ_CACHE_VERSION).toBe(7)
+  it('uses the schema that indexes the Model Viewer level by C4 parent', () => {
+    expect(MODEL_READ_CACHE_VERSION).toBe(8)
   })
 
   it('embeds the normalized name in scoped multi-entry object trigram keys', () => {

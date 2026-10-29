@@ -68,6 +68,26 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)('transactional placement invalid
     await db?.teardown()
   })
 
+  // The probe that established the 2026-10-22 flake: NOTIFY is database-wide,
+  // so another suite's (or another tenant schema's) placement change reached
+  // this schema's cells. Foreign events must not wake them; their own must.
+  it('ignores placement notifications from another schema of the same database', async () => {
+    const before = refreshCount
+    for (let index = 0; index < 20; index += 1) {
+      await db.pool.query(`SELECT pg_notify($1, $2)`, [WORKSPACE_PLACEMENT_CHANNEL, `${db.schema}_foreign`])
+    }
+    await new Promise(resolve => setTimeout(resolve, 150))
+    await refresh
+    expect(refreshCount).toBe(before)
+    // ... while a notification naming this schema still refreshes it.
+    await db.pool.query(`SELECT pg_notify($1, $2)`, [WORKSPACE_PLACEMENT_CHANNEL, db.schema])
+    await vi.waitFor(() => expect(refreshCount).toBeGreaterThan(before), { timeout: 5000, interval: 20 })
+    expect(failures).toEqual([])
+    // Leave the shared audit log as the next test expects it: empty.
+    await vi.waitFor(() => expect(notifications.length).toBeGreaterThan(0), { timeout: 5000, interval: 20 })
+    notifications.length = 0
+  })
+
   it('wakes for committed insert/update/delete and cascades, never for rollback, then stops', async () => {
     const transaction = await db.pool.connect()
     try {

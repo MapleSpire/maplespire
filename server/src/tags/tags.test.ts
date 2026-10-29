@@ -301,7 +301,13 @@ describe.skipIf(!connectionString)('Tag catalog PostgreSQL invariants', () => {
   })
 
   it('deduplicates privacy-minimized outbox telemetry and isolates organization summaries', async () => {
-    const now = new Date().toISOString()
+    // A minute in the past, not "now": the window ends at the DATABASE's now()
+    // while this timestamp comes from the test process's clock, and the two are
+    // different clocks (under ci:local, Postgres runs in a container). Any lead
+    // of this process over the database puts the events in the database's
+    // future, out of the 24h window — the 2026-10-22 ci:local red, reproduced
+    // exactly by skewing this timestamp +2 s. (The real skew was not measured.)
+    const now = new Date(Date.now() - 60_000).toISOString()
     const events = [
       {
         id: `tagop_client_${'e'.repeat(32)}`,

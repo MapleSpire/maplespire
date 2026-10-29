@@ -12,7 +12,7 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU Affero General Public License for more details.
 
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { ChevronLeft, Expand, Link2, Minus, Plus } from 'lucide-react'
 import { cn } from '../../lib/utils'
@@ -30,6 +30,8 @@ import { TechIconBadge } from '../shared/TechIconBadge'
 import type { ModelViewerOptions } from '../../stores/uiStore'
 import type { C4Object, C4Type, Connection, Domain } from '../../types'
 import { orderedTechnologyUsages } from '../../lib/technologyUsage'
+import { zoomKeyframes } from '../../lib/modelViewer/zoomKeyframes'
+import type { ViewerLevelData } from './useViewerData'
 
 /** The drill-down zoom (design kit `mv-grid.jsx`): the outgoing level scales
  * INTO the opened tile while the new level blooms out of it — two WAAPI layers
@@ -37,11 +39,51 @@ import { orderedTechnologyUsages } from '../../lib/technologyUsage'
 const EASE = 'cubic-bezier(0.16, 1, 0.3, 1)'
 export const ZOOM_K = 3.4
 export const BASE_DUR = 560
+/** A hover warms its level only after dwelling this long on the tile. */
+const HOVER_DWELL_MS = 90
 
 const prefersReduced = () =>
   typeof matchMedia !== 'undefined' && matchMedia('(prefers-reduced-motion: reduce)').matches
 
 const samePath = (a: string[], b: string[]) => a.length === b.length && a.every((v, i) => v === b[i])
+
+/** Layouts memoized per model: the same inputs yield the SAME layout object, so
+ * the same tile objects — which is what keeps a memoized tile from re-rendering
+ * when its level changes role (resting → outgoing, incoming → resting). */
+const layoutCache = new WeakMap<ViewerModel, Map<string, ViewerLayout>>()
+
+function layoutLevel(
+  model: ViewerModel,
+  parentId: ParentId,
+  area: ViewerArea,
+  opts: Pick<ModelViewerOptions, 'density' | 'showEmpty'>
+): ViewerLayout {
+  const key = `${parentId ?? ''}|${area.x}|${area.y}|${area.w}|${area.h}|${opts.density}|${opts.showEmpty}`
+  let byKey = layoutCache.get(model)
+  if (!byKey) {
+    byKey = new Map()
+    layoutCache.set(model, byKey)
+  }
+  let layout = byKey.get(key)
+  if (!layout) {
+    if (byKey.size >= 6) byKey.clear() // a resize drag sweeps many areas
+    let kids = childrenOf(model, parentId)
+    if (!opts.showEmpty) {
+      const nonEmpty = kids.filter((o) => hasChildren(model, o.id))
+      if (nonEmpty.length) kids = nonEmpty
+    }
+    layout = computeViewerLayout(kids, parentId, area, { density: opts.density })
+    byKey.set(key, layout)
+  }
+  return layout
+}
+
+/** Level layers are keyed by their level, so a level keeps its DOM element — and
+ * its tiles — through the zoom instead of being remounted at its start and end. */
+// `:` + id for an object, a bare marker for the root: an object id can never equal it.
+const levelKey = (parentId: ParentId) => (parentId === null ? 'mv-level-root' : `mv-level:${parentId}`)
+/** SVG marker ids are interpolated into `url(#…)`: keep them to a safe charset. */
+const levelUid = (parentId: ParentId) => levelKey(parentId).replace(/[^A-Za-z0-9_-]/g, '_')
 
 export type ViewerSelection = { kind: 'object' | 'conn'; id: string } | null
 
@@ -53,6 +95,17 @@ export interface ViewerGridFilters {
 interface ViewerGridProps {
   model: ViewerModel
   connections: Connection[]
+  /** The level `model`/`connections` currently describe (useViewerData's
+   * `levelParentId`). The data is fetched per level, so after a path change it
+   * still describes the previous level until the new page lands; a zoom that
+   * could not start from memory waits for it. Undefined = nothing loaded yet. */
+  levelParentId: ParentId | undefined
+  /** A level already in memory (useViewerData's `peekLevel`): the zoom starts on
+   * the click from this, never after a round trip. */
+  peekLevel: (parentId: ParentId) => ViewerLevelData | undefined
+  /** Warm a level so a later drill into it is instant (`prefetchLevel`);
+   * `force` marks a press, which skips the hover rate budget. */
+  prefetchLevel: (parentId: ParentId, force?: boolean) => void
   domainById: Map<string, Domain>
   /** Drill path of object ids (empty = context level). */
   path: string[]
@@ -74,6 +127,8 @@ interface Highlight {
   hoverId: string | null
   selection: ViewerSelection
 }
+
+type LevelData = ViewerLevelData
 
 /* ── Connection overlay ──────────────────────────────────────────────────── */
 
@@ -188,7 +243,7 @@ function ConnLayer({
 
 /* ── One object tile ─────────────────────────────────────────────────────── */
 
-function Tile({
+const Tile = memo(function Tile({
   t: tile,
   className,
   minimal,
@@ -199,6 +254,7 @@ function Tile({
   onSelect,
   onOpen,
   onEnter,
+  onPress,
   onLeave,
 }: {
   t: ViewerTile
@@ -211,6 +267,7 @@ function Tile({
   onSelect: (id: string) => void
   onOpen: (id: string) => void
   onEnter: (id: string) => void
+  onPress: (id: string) => void
   onLeave: () => void
 }) {
   const { t } = useTranslation()
@@ -231,6 +288,9 @@ function Tile({
         onOpen(o.id)
       }}
       onMouseEnter={() => onEnter(o.id)}
+      // The press precedes the click: it is a stronger intent than a hover (and
+      // the only one a touch screen has), so it warms the level at once.
+      onPointerDown={() => onPress(o.id)}
       onMouseLeave={onLeave}
     >
       <div className={cn('flex items-center gap-2 px-3 pt-3', compact && 'pt-2')}>
@@ -295,7 +355,7 @@ function Tile({
       <div className="mt-auto h-[3px] w-full shrink-0" style={{ background: barColor }} />
     </div>
   )
-}
+})
 
 /* ── Boundary "group" — frames a drilled-in level with the parent's identity
  *    centred in the header band and a quiet Back link (top-left). ──────────── */
@@ -390,6 +450,7 @@ function World({
   onUp,
   onSelectConn,
   onEnter,
+  onPress,
   onLeave,
   levelUpLabel,
 }: {
@@ -409,6 +470,7 @@ function World({
   onUp: () => void
   onSelectConn: (id: string) => void
   onEnter: (id: string) => void
+  onPress: (id: string) => void
   onLeave: () => void
   levelUpLabel: string
 }) {
@@ -509,6 +571,7 @@ function World({
             onSelect={onSelect}
             onOpen={onOpen}
             onEnter={onEnter}
+            onPress={onPress}
             onLeave={onLeave}
           />
         ))}
@@ -522,6 +585,9 @@ function World({
 export function ViewerGrid({
   model,
   connections,
+  levelParentId,
+  peekLevel,
+  prefetchLevel,
   domainById,
   path,
   onPath,
@@ -536,9 +602,9 @@ export function ViewerGrid({
 }: ViewerGridProps) {
   const { t } = useTranslation()
   const vpRef = useRef<HTMLDivElement>(null)
-  const outRef = useRef<HTMLDivElement>(null)
-  const inRef = useRef<HTMLDivElement>(null)
-  const restRef = useRef<HTMLDivElement>(null)
+  // One element per level layer, by level key (see `levelKey`).
+  const layerEls = useRef(new Map<string, HTMLDivElement>())
+  const restKeyRef = useRef('')
   const [size, setSize] = useState({ w: 1280, h: 800 })
   const [renderPath, setRenderPath] = useState<string[]>(path)
   const [transition, setTransition] = useState<{
@@ -547,7 +613,16 @@ export function ViewerGrid({
     focal: { x: number; y: number }
     outParent: ParentId
     inParent: ParentId
+    /** Each layer is drawn from the data it had when the zoom started: the
+     * outgoing level is no longer in the fetched window once the incoming
+     * one has landed. */
+    outData: LevelData
+    inData: LevelData
   } | null>(null)
+  // The data the resting layer draws. It follows the props only while they
+  // describe the rendered level, so a drill that is waiting for its target
+  // level keeps showing the current one instead of an empty grid.
+  const [restData, setRestData] = useState<LevelData>({ model, connections })
   const [hoverId, setHoverId] = useState<string | null>(null)
   const [shakeId, setShakeId] = useState<string | null>(null)
 
@@ -572,20 +647,17 @@ export function ViewerGrid({
     [size, insets]
   )
 
-  const visibleKids = (parentId: ParentId): C4Object[] => {
-    let kids = childrenOf(model, parentId)
-    if (!opts.showEmpty) {
-      const nonEmpty = kids.filter((o) => hasChildren(model, o.id))
-      if (nonEmpty.length) kids = nonEmpty
-    }
-    return kids
-  }
-  const layoutOf = (parentId: ParentId): ViewerLayout =>
-    computeViewerLayout(visibleKids(parentId), parentId, area, { density: opts.density })
+  const layoutOf = (m: ViewerModel, parentId: ParentId): ViewerLayout => layoutLevel(m, parentId, area, opts)
 
   const curParent: ParentId = renderPath.length ? renderPath[renderPath.length - 1] : null
-  // eslint-disable-next-line react-hooks/exhaustive-deps -- layoutOf reads model/opts, listed via its inputs
-  const curLayout = useMemo(() => layoutOf(curParent), [model, connections, curParent, area, opts.density, opts.showEmpty])
+  if (
+    !transition &&
+    levelParentId === curParent &&
+    (restData.model !== model || restData.connections !== connections)
+  ) {
+    setRestData({ model, connections })
+  }
+  const curLayout = layoutOf(restData.model, curParent)
 
   /* ── User zoom & pan (large models render unreadably small at fit scale) ──
    * Applied imperatively to the resting layer's transform — a wheel burst or a
@@ -604,6 +676,7 @@ export function ViewerGrid({
   const maxZoomRef = useRef(4)
   useEffect(() => {
     transitionRef.current = transition
+    restKeyRef.current = levelKey(curParent)
     areaRef.current = area
     boundsRef.current = {
       x0: curLayout.ox,
@@ -614,15 +687,18 @@ export function ViewerGrid({
     maxZoomRef.current = Math.max(4, 1.4 / (curLayout.scale || 1))
   })
 
+  const writeReadout = () => {
+    const r = zoomReadoutRef.current
+    if (r) r.textContent = `${Math.round(zoomRef.current.k * 100)}%`
+  }
   const applyZoom = () => {
     const z = zoomRef.current
-    const el = restRef.current
+    const el = layerEls.current.get(restKeyRef.current)
     if (el) {
       el.style.transform =
         z.k === 1 && z.tx === 0 && z.ty === 0 ? '' : `translate(${z.tx}px, ${z.ty}px) scale(${z.k})`
     }
-    const r = zoomReadoutRef.current
-    if (r) r.textContent = `${Math.round(z.k * 100)}%`
+    writeReadout()
   }
   const setZoom = (k: number, tx: number, ty: number) => {
     const kk = Math.min(maxZoomRef.current, Math.max(0.5, k))
@@ -697,30 +773,42 @@ export function ViewerGrid({
     if (panRef.current && !panRef.current.panned) panRef.current = null
   }
 
-  // A path prop change queues a zoom transition (in = deeper, out = shallower).
-  useEffect(() => {
-    if (samePath(path, renderPath) || transition) return
-    setHoverId(null)
-    const deeper = path.length > renderPath.length
+  /** Queue the zoom to `toPath` (in = deeper, out = shallower) drawn from
+   * `inData`. A zoom animates two POPULATED levels: it only ever starts once the
+   * target level's data is in hand — from memory on the click itself, or from
+   * the effect below when it had to be fetched. */
+  const beginTransition = (toPath: string[], inData: LevelData) => {
+    const toParent: ParentId = toPath.length ? toPath[toPath.length - 1] : null
+    const deeper = toPath.length > renderPath.length
     const fallback = { x: area.x + area.w / 2, y: area.y + area.h / 2 }
-    let focal: { x: number; y: number }
-    if (deeper) {
-      focal = tileFocal(curLayout, path[path.length - 1]) ?? fallback
-    } else {
-      const toParent: ParentId = path.length ? path[path.length - 1] : null
-      focal = tileFocal(layoutOf(toParent), renderPath[path.length]) ?? fallback
-    }
+    const focal = deeper
+      ? (tileFocal(curLayout, toPath[toPath.length - 1]) ?? fallback)
+      : (tileFocal(layoutOf(inData.model, toParent), renderPath[toPath.length]) ?? fallback)
+    setHoverId(null)
     setTransition({
-      toPath: path,
+      toPath,
       dir: deeper ? 'in' : 'out',
       focal,
       outParent: curParent,
-      inParent: path.length ? path[path.length - 1] : null,
+      inParent: toParent,
+      outData: restData,
+      inData,
     })
+  }
+
+  // A path change that did not start from a click here (breadcrumb, browser
+  // Back, a deep link) queues its zoom once the target level is in hand.
+  useEffect(() => {
+    if (samePath(path, renderPath) || transition) return
+    const toParent: ParentId = path.length ? path[path.length - 1] : null
+    const inData = levelParentId === toParent ? { model, connections } : peekLevel(toParent)
+    if (!inData) return
+    beginTransition(path, inData)
     // renderPath is a dep so a path change that arrived MID-transition (guarded
-    // out above) is re-examined once the commit lands, instead of being lost.
+    // out above) is re-examined once the commit lands, instead of being lost;
+    // levelParentId so a drill waiting for its level starts when it lands.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [path, renderPath])
+  }, [path, renderPath, levelParentId, model, connections])
 
   // Run the WAAPI zoom whenever a transition is queued. A timer commits even if
   // the animation's finish event never lands, so a transition can never stick.
@@ -730,107 +818,138 @@ export function ViewerGrid({
   useLayoutEffect(() => {
     if (!transition) return
     let done = false
+    const outEl = layerEls.current.get(levelKey(transition.outParent))
+    const inEl = layerEls.current.get(levelKey(transition.inParent))
+    const landing: { anim?: Animation } = {}
     const commit = () => {
       if (done) return
       done = true
       zoomRef.current = { k: 1, tx: 0, ty: 0 } // the incoming layer landed at identity
-      applyZoom() // refresh the % readout (the rest layer remounts untransformed)
+      // The incoming layer keeps its element and becomes the resting layer: its
+      // keyframes (fill: both) would otherwise outrank the user pan/zoom
+      // transform forever.
+      if (landing.anim) {
+        landing.anim.onfinish = null
+        landing.anim.oncancel = null
+        landing.anim.cancel()
+      }
+      if (inEl) inEl.style.transform = ''
+      writeReadout()
+      // The landed level rests on the data it zoomed in with — the props may
+      // already describe a level queued after it.
+      setRestData(transition.inData)
       setRenderPath(transition.toPath)
       setTransition(null)
     }
-    const outEl = outRef.current
-    const inEl = inRef.current
     const dur = Math.round(BASE_DUR / (opts.speed || 1))
     if (prefersReduced() || !outEl || !inEl) {
       commit()
       return
     }
-    const z = zoomRef.current
-    const { x: fx, y: fy } = transition.focal
-    const userM = `translate(${z.tx}px, ${z.ty}px) scale(${z.k})`
-    const aboutF = (s: number) => `translate(${fx}px, ${fy}px) scale(${s}) translate(${-fx}px, ${-fy}px)`
+    // Pure scale about the opened tile: the keyframes pair up function by
+    // function so the pivot never slides (see zoomKeyframes).
+    const frames = zoomKeyframes(transition.dir, transition.focal, zoomRef.current, ZOOM_K)
     outEl.style.transformOrigin = '0 0'
     inEl.style.transformOrigin = '0 0'
-    const into = transition.dir === 'in'
-    outEl.animate(
-      into
-        ? [
-            { transform: userM, opacity: 1 },
-            // dive: the current level scales up INTO the opened tile, on top
-            // of whatever pan/zoom the user had
-            { transform: `${userM} ${aboutF(ZOOM_K)}`, opacity: 0 },
-          ]
-        : [
-            { transform: userM, opacity: 1 },
-            // ascend: the current level shrinks into its tile in the PARENT
-            // layout — the end state drops the user transform so it converges
-            // where the incoming (identity) layer draws that tile
-            { transform: aboutF(1 / ZOOM_K), opacity: 0 },
-          ],
-      { duration: dur, easing: EASE, fill: 'both' }
-    )
-    const anim = inEl.animate(
-      into
-        ? [
-            // bloom out of the dived tile's on-screen position (k·f + t)
-            {
-              transform: `translate(${z.k * fx + z.tx}px, ${z.k * fy + z.ty}px) scale(${1 / ZOOM_K}) translate(${-fx}px, ${-fy}px)`,
-              opacity: 0,
-            },
-            { transform: 'none', opacity: 1 },
-          ]
-        : [
-            { transform: aboutF(ZOOM_K), opacity: 0 },
-            { transform: 'none', opacity: 1 },
-          ],
-      { duration: dur, easing: EASE, fill: 'both' }
-    )
-    anim.onfinish = commit
-    anim.oncancel = commit
+    const timing = { duration: dur, easing: EASE, fill: 'both' } as const
+    outEl.animate(frames.out, timing)
+    const inAnim = inEl.animate(frames.in, timing)
+    landing.anim = inAnim
+    inAnim.onfinish = commit
+    inAnim.oncancel = commit
     const timer = window.setTimeout(commit, dur + 140)
     return () => window.clearTimeout(timer)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [transition])
 
   const hl: Highlight = { hoverId, selection }
+  // Start the zoom ON the click when the target level is already in memory (a
+  // warm hover, a visited level): the path change then only follows it. A level
+  // that is not there yet falls back to the effect above, which waits for it.
   const openObject = (id: string) => {
     if (transition) return
-    if (hasChildren(model, id)) {
-      onPath([...renderPath, id])
+    if (hasChildren(restData.model, id)) {
+      const toPath = [...renderPath, id]
+      const next = peekLevel(id)
+      if (next) beginTransition(toPath, next)
+      onPath(toPath)
     } else {
       setShakeId(id)
       window.setTimeout(() => setShakeId(null), 480)
     }
   }
   const goUp = () => {
-    if (transition) return
-    if (renderPath.length > 0) onPath(renderPath.slice(0, -1))
+    if (transition || renderPath.length === 0) return
+    const toPath = renderPath.slice(0, -1)
+    const next = peekLevel(toPath.length ? toPath[toPath.length - 1] : null)
+    if (next) beginTransition(toPath, next)
+    onPath(toPath)
   }
 
-  const levelUpLabelFor = (parentId: ParentId): string => {
+  /* ── Level warm-up: INTENT, never a sweep ────────────────────────────────
+   * The model can hold hundreds of thousands of objects and a level shows up to
+   * 200 tiles, so a mouse crossing the grid must not fire one request per tile.
+   * A hover only warms its level after it DWELLS on the tile (the timer dies
+   * with the pointer's exit); a press — the one signal a touch screen gives —
+   * warms at once. Concurrency, rate and cancellation are the level store's
+   * (lib/modelViewer/levelStore.ts); here we only decide what counts as intent. */
+  const dwellTimer = useRef<number | undefined>(undefined)
+  const clearDwell = () => {
+    window.clearTimeout(dwellTimer.current)
+    dwellTimer.current = undefined
+  }
+  useEffect(() => clearDwell, [])
+  const warmLevel = (id: string, immediate: boolean) => {
+    clearDwell()
+    if (transition || !hasChildren(restData.model, id)) return
+    if (immediate) prefetchLevel(id, true)
+    else dwellTimer.current = window.setTimeout(() => prefetchLevel(id), HOVER_DWELL_MS)
+  }
+
+  const levelUpLabelFor = (m: ViewerModel, parentId: ParentId): string => {
     if (parentId === null) return t('modelViewer.breadcrumb.root')
-    const parent = model.objectById.get(parentId)
-    const grand = parent?.parentId ? model.objectById.get(parent.parentId) : undefined
+    const parent = m.objectById.get(parentId)
+    const grand = parent?.parentId ? m.objectById.get(parent.parentId) : undefined
     return grand?.name ?? t('modelViewer.breadcrumb.root')
   }
 
-  const worldShared = {
-    model,
-    connections,
-    domainById,
-    hl,
-    opts,
-    filters,
-    shakeId,
-    onSelect: onSelectObject,
-    onOpen: openObject,
-    onUp: goUp,
-    onSelectConn,
-    onEnter: (id: string) => {
-      if (!transition) setHoverId(id)
-    },
-    onLeave: () => setHoverId(null),
-  }
+  // Tile handlers must keep their identity across renders or the memoized tiles
+  // re-render on every hover: they read the latest closures through a ref.
+  const latest = useRef({ onSelectObject, onSelectConn, openObject, goUp, warmLevel })
+  useEffect(() => {
+    latest.current = { onSelectObject, onSelectConn, openObject, goUp, warmLevel }
+  })
+  const handlers = useMemo(
+    () => ({
+      onSelect: (id: string) => latest.current.onSelectObject(id),
+      onOpen: (id: string) => latest.current.openObject(id),
+      onUp: () => latest.current.goUp(),
+      onSelectConn: (id: string) => latest.current.onSelectConn(id),
+      onEnter: (id: string) => {
+        if (!transitionRef.current) setHoverId(id)
+        latest.current.warmLevel(id, false)
+      },
+      onPress: (id: string) => latest.current.warmLevel(id, true),
+      onLeave: () => {
+        clearDwell()
+        setHoverId(null)
+      },
+    }),
+    // clearDwell only touches a ref; setHoverId is a state setter
+    []
+  )
+
+  const worldShared = { domainById, hl, opts, filters, shakeId, ...handlers }
+
+  // Level layers, keyed by level so a level keeps its element — and its tiles —
+  // when it changes role: resting → outgoing at the start of a zoom, incoming →
+  // resting at its end. Remounting them was most of the work of both moments.
+  const layers = transition
+    ? [
+        { role: 'out' as const, parentId: transition.outParent, data: transition.outData },
+        { role: 'in' as const, parentId: transition.inParent, data: transition.inData },
+      ]
+    : [{ role: 'rest' as const, parentId: curParent, data: restData }]
 
   return (
     <div
@@ -856,41 +975,33 @@ export function ViewerGrid({
         if (!transition) onClear()
       }}
     >
-      {transition ? (
-        <>
-          <div key="mv-zoom-out" ref={outRef} className="absolute inset-0 will-change-[transform,opacity]">
+      {layers.map(({ role, parentId, data }) => {
+        const key = levelKey(parentId)
+        return (
+          <div
+            key={key}
+            ref={(el) => {
+              if (el) layerEls.current.set(key, el)
+              else layerEls.current.delete(key)
+            }}
+            data-testid={role === 'rest' ? undefined : 'mv-zoom-layer'}
+            data-layer={role}
+            // will-change only while zooming: on the resting layer it would
+            // rasterize once and blur the user's own pan/zoom magnification.
+            className={cn('absolute inset-0 origin-top-left', role !== 'rest' && 'will-change-[transform,opacity]')}
+          >
             <World
               {...worldShared}
-              parentId={transition.outParent}
-              layout={layoutOf(transition.outParent)}
-              interactive={false}
-              uid="o"
-              levelUpLabel={levelUpLabelFor(transition.outParent)}
+              {...data}
+              parentId={parentId}
+              layout={role === 'rest' ? curLayout : layoutOf(data.model, parentId)}
+              interactive={role === 'rest'}
+              uid={levelUid(parentId)}
+              levelUpLabel={levelUpLabelFor(data.model, parentId)}
             />
           </div>
-          <div key="mv-zoom-in" ref={inRef} className="absolute inset-0 will-change-[transform,opacity]">
-            <World
-              {...worldShared}
-              parentId={transition.inParent}
-              layout={layoutOf(transition.inParent)}
-              interactive={false}
-              uid="i"
-              levelUpLabel={levelUpLabelFor(transition.inParent)}
-            />
-          </div>
-        </>
-      ) : (
-        <div key="mv-rest" ref={restRef} className="absolute inset-0 origin-top-left">
-          <World
-            {...worldShared}
-            parentId={curParent}
-            layout={curLayout}
-            interactive
-            uid="c"
-            levelUpLabel={levelUpLabelFor(curParent)}
-          />
-        </div>
-      )}
+        )
+      })}
       <div
         className="absolute bottom-4 z-30 flex items-center gap-2 transition-[right] duration-300"
         style={{ right: 'var(--pad-r)' }}

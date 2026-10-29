@@ -314,10 +314,13 @@ export async function ensureSyncCellOwnershipSchema(db: Pool): Promise<void> {
       PRIMARY KEY (landscape_id, version_id, topology_generation)
     )
   `)
-  // Every committed writer, including FK cascades, invalidates all cell
-  // and router snapshots. Payload is only a schema identity for diagnostic
-  // isolation, never trusted placement data. PostgreSQL coalesces identical
-  // notifications inside a transaction; a single refresh reads the full map.
+  // Every committed writer, including FK cascades, invalidates the cell and
+  // router snapshots of THIS schema. The payload is the schema identity, never
+  // placement data: NOTIFY is database-wide, so PlacementInvalidationListener
+  // drops a notification naming another schema (2026-10-22 — before that, any
+  // schema's write woke every cell in the database). PostgreSQL coalesces
+  // identical notifications inside a transaction; a single refresh reads the
+  // full map.
   await db.query(`
     CREATE OR REPLACE FUNCTION notify_workspace_placement_changed() RETURNS trigger AS $$
     BEGIN

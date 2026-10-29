@@ -460,9 +460,14 @@ describe.skipIf(!TEST_DATABASE_URL || !TEST_REDIS_URL)('superseded cell stand-do
       expect(await client.get(oldKey)).toBe(oldValue)
       expect(predecessor.owns(WORKSPACE)).toBe(true)
       permitNotification = true
-      // The production channel is a global invalidation hint: even a payload
-      // naming another schema can enter the same real stand-down predicate.
-      await db.pool.query('SELECT pg_notify($1, $2)', ['workspace_placement_changed', 'another-test-schema'])
+      // A real placement notification for THIS schema enters the real
+      // stand-down predicate. (Until 2026-10-22 this sent a payload naming
+      // ANOTHER schema and asserted that it, too, woke the cell: the channel was
+      // a database-wide hint. That is deliberately reversed — a foreign
+      // schema's placement change cannot alter what this cell reads, and the
+      // spurious passes it caused made placementRecovery flaky; see
+      // placementInvalidation.ts `schemaScoped`.)
+      await db.pool.query('SELECT pg_notify($1, $2)', ['workspace_placement_changed', db.schema])
       await expect.poll(() => delegated.length).toBeGreaterThan(0)
       await Promise.all(delegated)
       expect(predecessor.snapshot()).toMatchObject({ standDownActive: true, partitionIndex: null })

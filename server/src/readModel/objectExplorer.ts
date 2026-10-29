@@ -21,6 +21,7 @@ import {
   readModelQueryHash,
 } from './cursor.js'
 import { servedRowsChangedBy, type ServedRowChanges } from './servedRowDigest.js'
+import type { ReadModelChangePayload } from './changeFeed.js'
 
 const MAX_PAGE = 50
 const MAX_HIERARCHY_DEPTH = 64
@@ -42,7 +43,11 @@ export interface ObjectExplorerRow {
   name: string
   kind: 'object' | 'group'
   type: string
+  /** The explorer's navigation parent (`effective_parent_id`: group first). */
   parentId: string | null
+  /** The Model Viewer's level parent (`c4_parent_id`), so the browser cache
+   * can file a working-set row on its C4 level (see ObjectCacheInput). */
+  c4ParentId: string | null
   childCount: number
   hasChildren: boolean
   canAcceptChildren: boolean
@@ -74,6 +79,7 @@ interface ExplorerSqlRow extends Record<string, unknown> {
   kind: 'object' | 'group'
   type: string
   parent_id: string | null
+  c4_parent_id: string | null
   child_count: string | number
   scope: string | null
   status: string | null
@@ -191,7 +197,12 @@ export interface ObjectCacheInput {
   kind: 'object' | 'group'
   name: string
   type: string
+  /** The explorer's navigation parent (`effective_parent_id`: group first). */
   parentId: string | null
+  /** The Model Viewer's level parent (`c4_parent_id`): the C4 parent when that
+   * row exists, else null — groups play no part and a dangling parent reads as
+   * a root. The offline worker indexes its levels on it. */
+  c4ParentId: string | null
   childCount: number
   searchText: string
   payload: Record<string, unknown>
@@ -208,6 +219,7 @@ function mapObjectCacheRow(row: {
   name: string
   type: string
   parent_id: string | null
+  c4_parent_id: string | null
   child_count: string | number
   data: Record<string, unknown>
 }): ObjectCacheInput {
@@ -217,6 +229,7 @@ function mapObjectCacheRow(row: {
     name: row.name,
     type: row.type,
     parentId: row.parent_id,
+    c4ParentId: row.c4_parent_id,
     childCount: Number(row.child_count),
     // Governed facets have dedicated postings. Keeping this bounded to the
     // identity avoids a multiplicative trigram index at 100k objects.
@@ -231,7 +244,7 @@ function mapObjectCacheRow(row: {
  * omit an id whose served row changed and a cache would keep the stale one. */
 const OBJECT_CACHE_ROWS_BY_IDS_SQL = `
        SELECT g.id, 'group'::text AS kind, g.name, 'group'::text AS type,
-              NULL::text AS parent_id,
+              NULL::text AS parent_id, NULL::text AS c4_parent_id,
               (SELECT count(*) FROM ro_group_objects go
                WHERE go.landscape_id = g.landscape_id AND go.version_id = g.version_id
                  AND go.group_id = g.id)::int AS child_count,
@@ -240,7 +253,7 @@ const OBJECT_CACHE_ROWS_BY_IDS_SQL = `
        WHERE g.landscape_id = $1 AND g.version_id = $2 AND g.id = ANY($3::text[])
        UNION ALL
        SELECT o.id, 'object'::text AS kind, o.name, o.type,
-              o.effective_parent_id AS parent_id,
+              o.effective_parent_id AS parent_id, o.c4_parent_id,
               (SELECT count(*) FROM ro_objects child
                WHERE child.landscape_id = o.landscape_id AND child.version_id = o.version_id
                  AND child.effective_parent_id = o.id)::int AS child_count,
@@ -284,6 +297,27 @@ export async function objectCacheNeighbourIds(
   return rows.map((row) => row.id)
 }
 
+/** An `objects` change widened to the served cache rows its write can move
+ * WITHOUT naming them (`objectCacheNeighbourIds`), read through `tx` BEFORE the
+ * write. For a writer that publishes the ids it touched rather than a served-row
+ * diff — the static projector. Without it, deleting or re-creating a parent
+ * there moves its children's `c4ParentId` (and `parentId`) in `ro_objects`
+ * while the change feed never names them, and an offline cache keeps every
+ * child on its old level. Over-listing is harmless: the client refetches the
+ * listed rows by id. */
+export async function objectChangeWithCacheNeighbours(
+  tx: Queryable,
+  key: WorkspaceKey,
+  change: Extract<ReadModelChangePayload, { kind: 'objects' }>,
+): Promise<Extract<ReadModelChangePayload, { kind: 'objects' }>> {
+  const neighbours = await objectCacheNeighbourIds(tx, key, [...change.upsertIds, ...change.deleteIds])
+  const deleted = new Set(change.deleteIds)
+  return {
+    ...change,
+    upsertIds: [...new Set([...change.upsertIds, ...neighbours.filter((id) => !deleted.has(id))])],
+  }
+}
+
 /** Run `write` through `tx` and return what it did to the served object/group
  * cache rows of `seeds` (what the write names) and their neighbours. The ONE
  * place an object-feed event learns its ids, so the projection paths cannot
@@ -318,6 +352,7 @@ export async function roObjectCacheByIds(
       name: string
       type: string
       parent_id: string | null
+      c4_parent_id: string | null
       child_count: string | number
       data: Record<string, unknown>
     }>(
@@ -360,6 +395,7 @@ export async function roObjectCachePage(
     name: string
     type: string
     parent_id: string | null
+    c4_parent_id: string | null
     child_count: string | number
     search_text: string
     data: Record<string, unknown>
@@ -367,7 +403,7 @@ export async function roObjectCachePage(
   }>(
     `WITH candidates AS (
        SELECT g.id, 'group'::text AS kind, g.name, 'group'::text AS type,
-              NULL::text AS parent_id,
+              NULL::text AS parent_id, NULL::text AS c4_parent_id,
               (SELECT count(*) FROM ro_group_objects go
                WHERE go.landscape_id = g.landscape_id AND go.version_id = g.version_id
                  AND go.group_id = g.id)::int AS child_count,
@@ -376,7 +412,7 @@ export async function roObjectCachePage(
        WHERE g.landscape_id = $1 AND g.version_id = $2
        UNION ALL
        SELECT o.id, 'object'::text AS kind, o.name, o.type,
-              o.effective_parent_id AS parent_id,
+              o.effective_parent_id AS parent_id, o.c4_parent_id,
               (SELECT count(*) FROM ro_objects child
                WHERE child.landscape_id = o.landscape_id AND child.version_id = o.version_id
                  AND child.effective_parent_id = o.id)::int AS child_count,
@@ -384,7 +420,7 @@ export async function roObjectCachePage(
        FROM ro_objects o
        WHERE o.landscape_id = $1 AND o.version_id = $2
      )
-     SELECT id, kind, name, type, parent_id, child_count, search_text, data, sort_order
+     SELECT id, kind, name, type, parent_id, c4_parent_id, child_count, search_text, data, sort_order
      FROM candidates ${afterSql}
      ORDER BY sort_order, id
      LIMIT $${params.length}`,
@@ -449,6 +485,7 @@ function mapExplorerRow(row: ExplorerSqlRow, metrics: ExplorerMetrics = emptyMet
     kind: row.kind,
     type: row.type,
     parentId: row.parent_id,
+    c4ParentId: row.c4_parent_id,
     childCount,
     hasChildren: childCount > 0,
     canAcceptChildren: row.kind === 'group' || row.type === 'system' || row.type === 'app' || row.type === 'store',
@@ -493,7 +530,7 @@ export async function roObjectTreeChildren(
   if (!opts.parentId) {
     candidatesSql = `
       SELECT g.id, g.name, 'group'::text AS kind, 'group'::text AS type,
-             NULL::text AS parent_id,
+             NULL::text AS parent_id, NULL::text AS c4_parent_id,
              (SELECT count(*) FROM ro_group_objects go
               WHERE go.landscape_id = g.landscape_id AND go.version_id = g.version_id AND go.group_id = g.id)::int AS child_count,
              NULL::text AS scope, NULL::text AS status, g.data->>'domainId' AS domain_id,
@@ -508,7 +545,7 @@ export async function roObjectTreeChildren(
       FROM ro_groups g
       WHERE g.landscape_id = $1 AND g.version_id = $2
       UNION ALL
-      SELECT o.id, o.name, 'object'::text AS kind, o.type, o.effective_parent_id AS parent_id,
+      SELECT o.id, o.name, 'object'::text AS kind, o.type, o.effective_parent_id AS parent_id, o.c4_parent_id,
              (SELECT count(*) FROM ro_objects child
               WHERE child.landscape_id = o.landscape_id AND child.version_id = o.version_id AND child.effective_parent_id = o.id)::int AS child_count,
              o.scope, o.status, o.domain_id, o.data->>'icon' AS icon, o.data->'iconAssignment' AS icon_assignment,
@@ -525,7 +562,7 @@ export async function roObjectTreeChildren(
   } else {
     const parent = add(opts.parentId)
     candidatesSql = `
-      SELECT o.id, o.name, 'object'::text AS kind, o.type, o.effective_parent_id AS parent_id,
+      SELECT o.id, o.name, 'object'::text AS kind, o.type, o.effective_parent_id AS parent_id, o.c4_parent_id,
              (SELECT count(*) FROM ro_objects child
               WHERE child.landscape_id = o.landscape_id AND child.version_id = o.version_id AND child.effective_parent_id = o.id)::int AS child_count,
              o.scope, o.status, o.domain_id, o.data->>'icon' AS icon, o.data->'iconAssignment' AS icon_assignment,
@@ -548,7 +585,7 @@ export async function roObjectTreeChildren(
   params.push(limit + 1)
   const { rows } = await db.query<ExplorerSqlRow>(
     `WITH candidates AS (${candidatesSql})
-     SELECT id, name, kind, type, parent_id, child_count, scope, status, domain_id, icon,
+     SELECT id, name, kind, type, parent_id, c4_parent_id, child_count, scope, status, domain_id, icon,
             icon_assignment, in_diagram, sort_order, normalized_name
      FROM candidates ${afterSql}
      ORDER BY sort_order, normalized_name, id
@@ -756,7 +793,7 @@ export async function roObjectSearchPage(
   }
 
   const candidates = `
-    SELECT o.id, o.name, 'object'::text AS kind, o.type, o.effective_parent_id AS parent_id,
+    SELECT o.id, o.name, 'object'::text AS kind, o.type, o.effective_parent_id AS parent_id, o.c4_parent_id,
            (SELECT count(*) FROM ro_objects child
             WHERE child.landscape_id = o.landscape_id AND child.version_id = o.version_id AND child.effective_parent_id = o.id)::int AS child_count,
            o.scope, o.status, o.domain_id, o.data->>'icon' AS icon, o.data->'iconAssignment' AS icon_assignment,
@@ -768,7 +805,7 @@ export async function roObjectSearchPage(
            ${objectScore} AS score, o.normalized_name
     FROM ro_objects o WHERE ${objectWhere.join(' AND ')}
     UNION ALL
-    SELECT g.id, g.name, 'group'::text AS kind, 'group'::text AS type, NULL::text AS parent_id,
+    SELECT g.id, g.name, 'group'::text AS kind, 'group'::text AS type, NULL::text AS parent_id, NULL::text AS c4_parent_id,
            (SELECT count(*) FROM ro_group_objects go
             WHERE go.landscape_id = g.landscape_id AND go.version_id = g.version_id AND go.group_id = g.id)::int AS child_count,
            NULL::text AS scope, NULL::text AS status, g.data->>'domainId' AS domain_id, g.data->>'icon' AS icon, g.data->'iconAssignment' AS icon_assignment,
@@ -787,7 +824,7 @@ export async function roObjectSearchPage(
   params.push(limit + 1)
   const { rows } = await db.query<ExplorerSqlRow>(
     `WITH candidates AS (${candidates})
-     SELECT id, name, kind, type, parent_id, child_count, scope, status, domain_id, icon,
+     SELECT id, name, kind, type, parent_id, c4_parent_id, child_count, scope, status, domain_id, icon,
             icon_assignment, in_diagram, score, normalized_name
      FROM candidates ${afterSql}
      ORDER BY score DESC, normalized_name, id
