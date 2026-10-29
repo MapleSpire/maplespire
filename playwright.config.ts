@@ -14,6 +14,17 @@
 
 import { defineConfig, devices } from '@playwright/test'
 
+const SYNC_CELL_FAILOVER_SPECS = ['**/workspace-move-retryable.spec.ts', '**/sync-cell-offline-replay.spec.ts']
+// Specs that need AUTH=on + AUTH_DEV_LOGIN=on: they act as a dev-login user.
+// tag-perspective-new-group administers its own org: the Tag catalog is
+// org-scoped, so an AUTH=off stack has no org and offers no "New group"
+// (`canCreateGroup` needs an orgId) — by design, not a defect.
+// canvas-undo-clipboard signs each test in with a fresh dev-login email for
+// an empty personal workspace; at AUTH=off `/` is the landing page, no login
+// form appears and every test times out waiting for /app/landscape/… (6/6,
+// measured 2026-10-25 on an isolated AUTH-off stack).
+const AUTH_DEV_LOGIN_SPECS = ['**/tag-perspective-new-group.spec.ts', '**/canvas-undo-clipboard.spec.ts']
+
 // E2E tests drive the REAL app (two isolated browser contexts) against the
 // running dev stack (`npm run dev:local`). They are NOT run by `npm test`
 // (that's vitest) — run them with `npx playwright test`.
@@ -55,7 +66,30 @@ export default defineConfig({
     {
       name: 'chromium',
       dependencies: ['chromium-seed'],
-      testIgnore: ['**/boot/**', '**/view3d*.spec.ts', '**/model-read-cache-scale.spec.ts'],
+      testIgnore: [
+        '**/boot/**', '**/view3d*.spec.ts', '**/model-read-cache-scale.spec.ts',
+        ...SYNC_CELL_FAILOVER_SPECS, ...AUTH_DEV_LOGIN_SPECS,
+      ],
+      use: { ...devices['Desktop Chrome'], locale: 'en-US' },
+    },
+    // A dev:local stack started with AUTH=on AUTH_DEV_LOGIN=on AUTH_SECRET=…
+    // (see docs/auth-setup.md), on its own ports:
+    //   E2E_AUTH_BASE_URL=http://localhost:<port> npx playwright test --project=chromium-auth
+    {
+      name: 'chromium-auth',
+      testMatch: AUTH_DEV_LOGIN_SPECS,
+      use: { ...devices['Desktop Chrome'], locale: 'en-US', baseURL: process.env.E2E_AUTH_BASE_URL ?? 'http://localhost:5174' },
+    },
+    // Specs that need the two-partition bench `infra/compose/sync-cell-failover.yml`
+    // (dev login, two sync cells behind the WebSocket router), not dev:local.
+    // sync-cell-offline-replay drives `docker compose` on that project itself
+    // and signs in through the REQUIRED dev-login form; workspace-move-retryable
+    // also requires that form and fails at AUTH=off by design. Against
+    // dev:local both can only fail, so they are not part of `chromium`.
+    //   E2E_BASE_URL=http://127.0.0.1:<bench frontend port> npx playwright test --project=sync-cell-failover
+    {
+      name: 'sync-cell-failover',
+      testMatch: SYNC_CELL_FAILOVER_SPECS,
       use: { ...devices['Desktop Chrome'], locale: 'en-US' },
     },
     // 3D board suite against the isolated 3D stack (scripts/dev3d-*.mjs) on :5191.

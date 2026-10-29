@@ -37,7 +37,7 @@
 
 import { test, expect, type Page } from '@playwright/test'
 import { submitDevLogin } from './support/devLogin'
-import { waitForWorkspaceProjected } from './support/workspaceReady'
+import { syncBar, waitForWorkspaceProjected } from './support/workspaceReady'
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -126,9 +126,25 @@ function landscapeIdOf(socketUrl: string): string | null {
   }
 }
 
+/**
+ * Sockets the session opened while it was legitimately IN the landscape named
+ * `default`. At AUTH=on a fresh dev-login user's landscape has a generated id,
+ * so this stays 0 and every socket is checked. At AUTH=off (dev:local) the app
+ * boots into the legacy workspace, whose landscape id IS `default`: its first
+ * socket is the session's home, not a tear. Only sockets opened after that are
+ * witnesses, and the spec leaves `default` at its first step (the import
+ * creates a new landscape), so the assertion still has the whole run to fire.
+ */
+let homeDefaultSockets = 0
+
+async function exemptDefaultHomeSockets(page: Page): Promise<void> {
+  const sockets = await automergeSockets(page)
+  homeDefaultSockets = sockets.length > 0 && sockets.every((u) => landscapeIdOf(u) === 'default') ? sockets.length : 0
+}
+
 /** Assertion A, applied at every checkpoint. */
 async function expectNoDefaultWorkspaceSocket(page: Page, when: string): Promise<void> {
-  const sockets = await automergeSockets(page)
+  const sockets = (await automergeSockets(page)).slice(homeDefaultSockets)
   expect(
     sockets.filter((u) => landscapeIdOf(u) === 'default'),
     `${when}: no automerge socket may be routed at landscapeId=default — that is the live sync socket being torn off the active landscape`,
@@ -318,6 +334,7 @@ test('a landscape-scope export ships the whole model, not the deployment diagram
   cleanupApiUrl = trackApiOrigin(page)
   await signIn(page)
   await waitForAppReady(page)
+  await exemptDefaultHomeSockets(page)
   await expectNoDefaultWorkspaceSocket(page, 'after sign-in')
 
   const socketsBeforeImport = (await automergeSockets(page)).length
@@ -365,6 +382,19 @@ test('a landscape-scope export ships the whole model, not the deployment diagram
 
   // ── 2. Assertion B: survive a reload. Everything after this point reads a
   // landscape rehydrated from durable storage, not one held in memory. ───────
+  // A reload is a bet on durability, so wait for the claim first: the badge
+  // reporting `ready` for THIS workspace. Measured 2026-10-18 (AUTH=off,
+  // resident session): reloading ~0.1 s after the modal closed, while the badge
+  // read `saving`, came back with the model and none of the 7 imported
+  // diagrams — the registry write had not been persisted yet, and a resident
+  // session journals nothing (detectEdits is boot-from-server only). Waiting
+  // for `ready` took ~0.3 s once the import stopped creating duplicate,
+  // unclaimable DiagramDocs (bridge.ts `unpublishedDiagramDocUrls`); before
+  // that fix the badge never left `saving`.
+  await expect(syncBar(page)).toHaveAttribute('data-projected-workspace', `${ref!.landscapeId}/${ref!.versionId}`)
+  await expect(syncBar(page), 'the imported landscape never became durable').toHaveAttribute('data-status', 'ready', {
+    timeout: 60_000,
+  })
   await page.reload()
   await waitForEditorReady(page)
   // `waitForEditorReady` only proves the STORE EXISTS; it is satisfied while the
@@ -565,10 +595,16 @@ test('a landscape-scope export ships the whole model, not the deployment diagram
     `a workspace with no coordinates re-lays-out on open, discarding the arrangement (${placed.length}/${elementRows.length} placed)`,
   ).toBeGreaterThanOrEqual(35)
 
-  // No view may be empty: an emitted view whose elements were all filtered out
-  // by a missing model is exactly what the degraded bundle produced (6 of its 7
-  // views had `elements: []`).
-  for (const { collection, view } of views) {
+  // No IMPORTED view may be empty: an emitted view whose elements were all
+  // filtered out by a missing model is exactly what the degraded bundle
+  // produced (6 of its 7 views had `elements: []`). The starter diagram every
+  // new landscape is seeded with is empty by construction and exports as an
+  // empty view, so it is not a witness; the imported views are matched by key
+  // and must ALL be found, or this loop would check nothing.
+  const importedViews = views.filter(({ view }) => IMPORTED_VIEWS.includes(view.key))
+  expect(importedViews.map(({ view }) => view.key).sort(), 'every imported view must be emitted under its own key')
+    .toEqual([...IMPORTED_VIEWS].sort())
+  for (const { collection, view } of importedViews) {
     expect((view.elements ?? []).length, `${collection}/${view.key} must not be an empty view`).toBeGreaterThan(0)
   }
 
@@ -628,7 +664,7 @@ test('a landscape-scope export ships the whole model, not the deployment diagram
   // ── 6. Assertion A, final. Opening Share resolves root/meta/shard documents;
   // a bare-default getter on any of those re-routes the live socket. ─────────
   await expectNoDefaultWorkspaceSocket(page, 'after both landscape-scope exports')
-  const finalRoutes = [...new Set(await automergeSockets(page))].map(landscapeIdOf)
+  const finalRoutes = [...new Set((await automergeSockets(page)).slice(homeDefaultSockets))].map(landscapeIdOf)
   expect(
     [...new Set(finalRoutes)],
     'the session must never have been routed at more than the landscapes it actually visited',

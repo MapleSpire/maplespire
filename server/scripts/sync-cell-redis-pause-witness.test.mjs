@@ -14,7 +14,7 @@
 
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
-import { createServer } from 'node:net'
+import { createConnection, createServer } from 'node:net'
 import { performance } from 'node:perf_hooks'
 import { test } from 'node:test'
 import { startRedisFreezeWitness, analyzeRedisFreezeWitness, REDIS_FREEZE_WITNESS_LIMITS } from './sync-cell-redis-pause-witness.mjs'
@@ -33,6 +33,28 @@ const response = (command) => {
   assert.equal(parts[5], '')
   assert.equal(parts.length, 6)
   return Buffer.from(`$42\r\n${parts[4]}\r\n`)
+}
+
+// Admission refuses a reply older than 50 ms, correctly, and a starved loop
+// resumes a test's sleep before the poll phase can deliver the next reply, so
+// admitting right after a sleep measured the host (2026-10-25: red under load
+// with the witness truthfully reporting admission-stale). `next()` resolves when
+// the client has received a whole number of 49-byte replies; its continuation
+// runs after the entire 'data' emit, the witness's own listener included, so
+// the reply it waited for is matched and fresh at the admission call.
+function replyTap() {
+  let received = 0, waiter = null
+  return {
+    connect: (options) => {
+      const socket = createConnection(options)
+      socket.on('data', (chunk) => {
+        received += chunk.length
+        if (received % 49 === 0 && waiter) { const resolve = waiter; waiter = null; resolve() }
+      })
+      return socket
+    },
+    next: () => new Promise((resolve) => { waiter = resolve }),
+  }
 }
 
 function harness(options = {}) {
@@ -172,15 +194,17 @@ test('real TCP uses only complete PING nonces, filters target, and closes its so
   })
   const origin = performance.now()
   let ordinal = 0
+  const replies = replyTap()
   const witness = startRedisFreezeWitness({
     target: { ...target, port: server.address().port, Config: { Env: ['SECRET=never retain'] } },
     clock: () => { const monoAt = performance.now() - origin; return { at: Math.floor(monoAt), monoAt, ordinal: ++ordinal } },
     limits: REAL_TCP_LIMITS,
-  })
+  }, { connect: replies.connect })
   t.after(() => witness.stop())
   const deadline = performance.now() + 1500
   while (commands.length < 3 && performance.now() < deadline) await sleep(3)
   assert.ok(commands.length >= 3)
+  await replies.next()
   // Do not repeatedly call the admission gate while waiting for enough samples.
   const admission = witness.admissionBeforePause()
   assert.equal(admission.valid, true, JSON.stringify(admission))
@@ -223,12 +247,15 @@ test('real TCP stays healthy for the full two-second baseline and stops normally
   })
   const origin = performance.now()
   let ordinal = 0
+  const replies = replyTap()
   const witness = startRedisFreezeWitness({ target: { ...target, port: server.address().port },
     clock: () => { const monoAt = performance.now() - origin; return { at: Math.floor(monoAt), monoAt, ordinal: ++ordinal } },
-    limits: REAL_TCP_LIMITS })
+    limits: REAL_TCP_LIMITS },
+  { connect: replies.connect })
   t.after(() => witness.stop())
   await sleep(2000)
   assert.ok(count >= 2)
+  await replies.next()
   const admission = witness.admissionBeforePause()
   assert.equal(admission.valid, true, JSON.stringify(admission))
   witness.pauseAttempted()

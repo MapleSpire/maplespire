@@ -722,6 +722,14 @@ function deriveLowerConnections(ctx: LowerSyncContext, diagramId: string): boole
   // dropped it keeps its id too. Its routing is not on the object at all: it
   // is the diagram's (`Diagram.lowerRouting`, merged when drawn). ---
   const newConnectionIdSet = new Set(newConnectionIds)
+  // Pairs the diagram already joins with one of its own edges, in that
+  // direction: no roll-up beside them (Structurizr's default implied-
+  // relationship strategy; see computeLowerConnections, its render twin).
+  const directPairs = new Set<string>()
+  for (const cid of newConnectionIds) {
+    const own = ctx.connectionMap.get(cid)
+    if (own) directPairs.add(lowerPairKey(own.fromId, own.toId))
+  }
   const seenPairs = new Set<string>()
   const usedLowerIds = new Set<string>()
   const additions: Connection[] = []
@@ -740,6 +748,7 @@ function deriveLowerConnections(ctx: LowerSyncContext, diagramId: string): boole
     if (visibleFrom === visibleTo) continue
 
     const pairKey = lowerPairKey(visibleFrom, visibleTo)
+    if (directPairs.has(pairKey)) continue
     if (seenPairs.has(pairKey)) continue
     seenPairs.add(pairKey)
 
@@ -3064,6 +3073,8 @@ export const useModelStore = create<ModelState>()(
         if (!diagram) return
         diagram.connectionIds = diagram.connectionIds.filter((id) => id !== connectionId)
       })
+      // A direct edge suppresses the roll-up of its pair; without it the roll-up is owed.
+      get().syncLowerConnections(targetDiagramId)
     },
 
     isConnectionOnlyInDiagram: (connectionId, diagramId) => {

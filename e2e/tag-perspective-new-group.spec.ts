@@ -13,7 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import { test, expect } from '@playwright/test'
-import { submitDevLogin } from './support/devLogin'
+import { enterAppWorkspace } from './support/devLogin'
 import { waitForWorkspaceProjected } from './support/workspaceReady'
 
 /**
@@ -32,12 +32,7 @@ import { waitForWorkspaceProjected } from './support/workspaceReady'
 test.use({ channel: process.env.PW_BROWSER_CHANNEL || undefined })
 
 test('a Tag group created from the bottom bar is shown, active, and can take a value', async ({ page }) => {
-  await page.goto('/')
-  const devLogin = page.getByTestId('dev-login-email')
-  await devLogin.waitFor({ state: 'visible', timeout: 45_000 }).catch(() => null)
-  if (await devLogin.isVisible().catch(() => false)) {
-    await submitDevLogin(page, `e2e-tag-group-${Date.now()}@example.com`)
-  }
+  await enterAppWorkspace(page, `e2e-tag-group-${Date.now()}@example.com`)
   await page.waitForURL(/\/app\/landscape\/[^/]+\/version\/[^/]+\/diagram\//, { timeout: 90_000 })
   await waitForWorkspaceProjected(page)
 

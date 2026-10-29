@@ -62,13 +62,15 @@ function seed() {
       obj('B1', { parentId: 'S' }), obj('B2', { parentId: 'S2' }),
       obj('X', { type: 'system' }), obj('Y', { type: 'system' }),
     ],
-    connections: [conn('xy', 'X', 'Y')],
+    // Y→X, not X→Y: a direct edge suppresses the roll-up of its own pair, and
+    // the arms below want dOther to owe one (X1→Y1 rolls up to X→Y).
+    connections: [conn('yx', 'Y', 'X')],
     groups: [group('G', ['A1'])],
     diagrams: [
       diagram('dActive', { objectIds: ['A1', 'A2', 'B1', 'B2'] }),
       diagram('dSystems', { objectIds: ['S', 'S2'] }),
       diagram('dGroup', { objectIds: ['S2'], groupIds: ['G'] }),
-      diagram('dOther', { objectIds: ['X', 'Y'], connectionIds: ['xy'] }),
+      diagram('dOther', { objectIds: ['X', 'Y'], connectionIds: ['yx'] }),
     ],
     domains: [],
     currentDiagramId: 'dActive',
@@ -209,7 +211,7 @@ describe('syncLowerConnections commits nothing when nothing changes', () => {
   })
 
   it('a changed diagram still commits', () => {
-    useModelStore.setState({ connections: [conn('xy', 'X', 'Y'), conn('aa', 'A1', 'A2')] })
+    useModelStore.setState({ connections: [conn('yx', 'Y', 'X'), conn('aa', 'A1', 'A2')] })
     const listener = vi.fn()
     const unsubscribe = useModelStore.subscribe(listener)
     useModelStore.getState().syncLowerConnections('dSystems')

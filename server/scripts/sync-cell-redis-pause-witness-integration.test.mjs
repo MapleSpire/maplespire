@@ -16,6 +16,7 @@ import test from 'node:test'
 import { createServer, createConnection } from 'node:net'
 import { observationOptions, runStandaloneObservation, startObservation, refineRedisPauseClock } from './sync-cell-redis-pause-observe.mjs'
 import { startRedisFreezeWitness } from './sync-cell-redis-pause-witness.mjs'
+import { untilAdmitted } from './fixtures/real-time-void.mjs'
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 const target = {
@@ -41,6 +42,10 @@ async function echoServer(t, onRequest = (_nonce, reply) => reply()) {
   const sockets = new Set()
   const server = createServer(socket => {
     sockets.add(socket); socket.on('close', () => sockets.delete(socket))
+    // The witness resets its socket when an arm stops early. Without a
+    // listener that ECONNRESET was an uncaught exception that REPLACED the
+    // arm's own failure in the report.
+    socket.on('error', () => undefined)
     let bytes = Buffer.alloc(0)
     socket.on('data', chunk => {
       bytes = Buffer.concat([bytes, chunk])
@@ -72,6 +77,9 @@ async function bounded(promise) {
 
 test('real observer plus real TCP witness: a normal stop preserves a valid witness artifact', async t => {
   const tcpTarget = await echoServer(t)
+  // Void when the 260 ms window held fewer than two Engine reads, or the loop
+  // left the last sample or witness reply stale at admission.
+  await untilAdmitted(t, 'real TCP witness admission', async () => {
   const base = Date.now(), start = performance.now()
   const now = () => base + Math.floor(performance.now() - start)
   const observer = startObservation({ ...options(), redisWitnessTarget: tcpTarget,
@@ -82,7 +90,12 @@ test('real observer plus real TCP witness: a normal stop preserves a valid witne
   })
   try {
     await sleep(260)
-    observer.pauseStarted(); observer.pauseCompleted()
+    try { observer.pauseStarted() } catch (error) {
+      const { summary } = await observer.stop()
+      if (summary.pauseAdmission?.valid === false) return { void: summary.pauseAdmission.issues }
+      throw error
+    }
+    observer.pauseCompleted()
     await sleep(20)
     observer.sealBeforeUnpause(); observer.unpauseStarted(); observer.unpauseCompleted()
     const report = await observer.stop()
@@ -91,7 +104,9 @@ test('real observer plus real TCP witness: a normal stop preserves a valid witne
     assert.equal(report.freezeWitness.cleanup.cleanupConfirmed, true)
     assert.ok(report.freezeWitness.records.length >= 2)
     assert.equal(report.summary.freezeWitness.valid, false, 'no ownership loss was simulated, so this is not an outage qualification')
+    return { void: null }
   } finally { await observer.stop() }
+  })
 })
 
 test('real PING confirmed after ACK improves only the departure bound; the historical interval remains intact', async t => {
@@ -158,11 +173,15 @@ test('witness option requires calibration, an explicit network and a matching ve
   }
 })
 
-test('standalone: witness-only refusal keeps the clock admission true and acquires no pause or cleanup', async () => {
+test('standalone: witness-only refusal keeps the clock admission true and acquires no pause or cleanup', async t => {
   for (const mode of ['refused', 'constructor-throws', 'admission-throws']) {
   const opts = { ...options(), beforeMs: 300, pauseMs: 0, recoverMs: 0, out: 'memory' }
-  const commands = [], events = []
-  let written
+  let commands, events, written
+  // The witness refusal is the arm; the CLOCK admission must hold for it to
+  // mean anything, and a fixed 300 ms window on a starved loop can leave it
+  // with one Engine read or a stale sample. That attempt is void.
+  await untilAdmitted(t, `witness ${mode} with a valid clock`, async () => {
+  commands = []; events = []; written = undefined
   await assert.rejects(runStandaloneObservation(opts, {
     docker: async (command, _flag, format, name) => {
       commands.push(command)
@@ -186,6 +205,8 @@ test('standalone: witness-only refusal keeps the clock admission true and acquir
       } },
     }),
   }), /pause admission refused/)
+  return { void: written.summary.baseline?.valid === false ? written.summary.baseline.issues : null }
+  })
   assert.equal(written.summary.baseline.valid, true)
   assert.equal(written.summary.pauseAdmission.valid, false)
   assert.equal(written.summary.pauseAdmission.clockValid, true)

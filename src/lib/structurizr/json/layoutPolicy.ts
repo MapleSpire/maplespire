@@ -201,9 +201,9 @@ export function viewHasSavedLayout(
  * One uniform scale for a whole view: how far apart our boxes must sit to keep
  * the arrangement the customer had.
  *
- * Structurizr's renderer draws an unstyled element 450x300; ours is ~185x100
- * (`SIZE_BY_TYPE`, `../mapper.ts`). Copying x/y verbatim therefore leaves gaps
- * ~2.4x wider than the shapes and the diagram reads as scattered. A single
+ * Structurizr's renderer draws an unstyled element 450x300; ours is 160x100
+ * (`SIZE_BY_TYPE`, `../conventions.ts`). Copying x/y verbatim therefore leaves
+ * gaps ~2.8x wider than the shapes and the diagram reads as scattered. A single
  * factor — a similarity transform — is what preserves the arrangement exactly:
  * per-axis factors would keep rows and columns but shear every diagonal
  * alignment, and per-element factors would destroy alignment outright.

@@ -577,6 +577,12 @@ let shardHandles: DocHandle<RegistryShard>[] = []
 const shardChangeHandlers = new Map<string, () => void>()
 /** id → diagram doc url, mirrored from the merged registry. */
 const docUrlById = new Map<string, string>()
+/** Forget a diagram's doc url everywhere this module keeps one: the index and
+ * the session's record of a document whose meta is not placed yet. */
+function forgetDiagramDocUrl(id: string): void {
+  docUrlById.delete(id)
+  unpublishedDiagramDocs.forget(id)
+}
 /** id → shard url that holds this diagram's meta. */
 const shardByDiagramId = new Map<string, string>()
 /** Static performance baselines resolve diagram stubs from the read model and
@@ -3693,8 +3699,7 @@ function writeDiagramTombstones(): void {
     // re-publish a diagram the user just deleted.
     serverRegistryDiagrams = serverRegistryDiagrams.filter((candidate) => candidate.id !== id)
     serverDiagramBootstraps.delete(id)
-    docUrlById.delete(id)
-    unpublishedDiagramDocs.forget(id)
+    forgetDiagramDocUrl(id)
   }
   publishDiagramTombstones()
   acknowledgeDeleteIntents()
@@ -4188,7 +4193,7 @@ function rebuildRegistryIndex(): void {
         shardByDiagramId.set(meta.id, handle.url)
       }
     }
-    unpublishedDiagramDocs.readmit(docUrlById)
+    unpublishedDiagramDocs.readmit(docUrlById, (id) => tombstoneDiagrams.has(id))
     return
   }
   const shardDocs = shardHandles.map((h) => h.doc())
@@ -4200,7 +4205,7 @@ function rebuildRegistryIndex(): void {
       shardByDiagramId.set(meta.id, shardHandles[i].url)
     }
   }
-  unpublishedDiagramDocs.readmit(docUrlById)
+  unpublishedDiagramDocs.readmit(docUrlById, (id) => tombstoneDiagrams.has(id))
 }
 
 /** Project the active diagram into the store from the server render — objects +
@@ -4553,7 +4558,7 @@ function projectAll(): void {
         shardByDiagramId.set(meta.id, shardHandles[i].url)
       }
     }
-    unpublishedDiagramDocs.readmit(docUrlById)
+    unpublishedDiagramDocs.readmit(docUrlById, (id) => tombstoneDiagrams.has(id))
     lastShardDocs = shardDocs
   }
 
@@ -5159,8 +5164,7 @@ function writeSummaryLocalRegistry(
       summaryLocalDiagramIds.delete(id)
       serverRegistryDiagrams = serverRegistryDiagrams.filter((candidate) => candidate.id !== id)
       serverDiagramBootstraps.delete(id)
-      docUrlById.delete(id)
-      unpublishedDiagramDocs.forget(id)
+      forgetDiagramDocUrl(id)
       shardByDiagramId.delete(id)
       continue
     }
@@ -5617,8 +5621,7 @@ function flushWrite(): void {
       for (const id of toRemove) {
         delete s.diagrams[id]
         shardByDiagramId.delete(id)
-        docUrlById.delete(id)
-        unpublishedDiagramDocs.forget(id)
+        forgetDiagramDocUrl(id)
       }
       for (const id of toUpdate) {
         const dg = storeDiagramById.get(id)
@@ -5955,8 +5958,7 @@ async function sweepAbsentDiagramIntents(): Promise<void> {
         summaryLocalDiagramIds.delete(entry.diagramId)
         serverRegistryDiagrams = serverRegistryDiagrams.filter((candidate) => candidate.id !== entry.diagramId)
         serverDiagramBootstraps.delete(entry.diagramId)
-        docUrlById.delete(entry.diagramId)
-        unpublishedDiagramDocs.forget(entry.diagramId)
+        forgetDiagramDocUrl(entry.diagramId)
         shardByDiagramId.delete(entry.diagramId)
       }
     }
@@ -6311,6 +6313,12 @@ function onStoreChange(state: ModelStoreSnapshot, previous: ModelStoreSnapshot):
   } else if (explicitDeletesChanged) {
     // In whole-model mode the ordinary model write persists the removal; do not
     // retain transient intents that could be replayed if a runtime flag changes.
+    // A diagram deleted before its meta was published is in no shard, so the
+    // registry write never removes it and nothing tombstones it here: drop its
+    // unpublished url NOW, or every later rebuild would make it resolvable again
+    // (bridgeCreatedDocUrlLifecycle.test.ts, "a gated diagram deleted locally
+    // stays unresolvable across a rebuild").
+    for (const deletedId of state.pendingDeletedDiagramIds) unpublishedDiagramDocs.forget(deletedId)
     clearExplicitDeleteIntents()
   }
   const id = state.currentDiagramId

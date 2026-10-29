@@ -35,7 +35,7 @@ import {
   type ModelCacheSyncState,
   type ModelCacheWorkspaceMeta,
 } from '../lib/modelQuery/idbSchema'
-import { computeLowerConnections } from '../lib/modelQuery/diagramRenderLocal'
+import { computeLowerConnections, withOwnConnections } from '../lib/modelQuery/diagramRenderLocal'
 import { reconciledCachedChildCount } from '../lib/modelQuery/cachedHierarchy'
 import { modelCacheSearchMode } from '../lib/modelQuery/modelCacheSearchMode'
 import type {
@@ -1847,13 +1847,14 @@ async function buildDiagramRender(
     sourceIds,
     request.id,
   )
+  const nonLower = (rows: Iterable<CachedConnectionRecord>) => [...rows]
+    .filter((row) => row.connection.kind !== 'lower')
+    .map((row) => ({ id: row.id, fromId: row.fromId, toId: row.toId }))
   const lower = computeLowerConnections(
     manifest,
     hierarchy.parentOf,
     groupObjectIds,
-    candidateConnections.rows
-      .filter((row) => row.connection.kind !== 'lower')
-      .map((row) => ({ id: row.id, fromId: row.fromId, toId: row.toId })),
+    withOwnConnections(nonLower(candidateConnections.rows), nonLower(directConnectionRecords.values())),
   )
   const payload = {
     projectionGeneration: generation,

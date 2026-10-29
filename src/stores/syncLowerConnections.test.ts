@@ -82,6 +82,44 @@ describe('syncLowerConnections (immer-free refactor)', () => {
     expect(lowerEdges()).toHaveLength(0)
   })
 
+  // saoe.dsl IncidentFlow (2026-10-21): a roll-up beside the diagram's own
+  // edge between the same pair drew two lines.
+  it('adds no roll-up beside an edge the diagram already draws, and owes it once that edge leaves', () => {
+    useModelStore.setState({
+      connections: [conn('c1', 'A1', 'A2', { kind: 'direct' }), conn('own', 'S', 'S2', { kind: 'direct' })],
+      diagrams: [diagram({ objectIds: ['S', 'S2'], connectionIds: ['own'] })],
+    })
+    useModelStore.getState().syncLowerConnections('d1')
+    expect(lowerEdges()).toHaveLength(0)
+    expect(useModelStore.getState().diagrams[0].connectionIds).toEqual(['own'])
+
+    useModelStore.getState().removeConnectionFromDiagram('own', 'd1')
+    const lowers = lowerEdges()
+    expect(lowers).toEqual([expect.objectContaining({ fromId: 'S', toId: 'S2', kind: 'lower' })])
+    expect(useModelStore.getState().diagrams[0].connectionIds).toEqual([lowers[0].id])
+  })
+
+  it('an edge the other way round does not suppress the roll-up', () => {
+    useModelStore.setState({
+      connections: [conn('c1', 'A1', 'A2', { kind: 'direct' }), conn('back', 'S2', 'S', { kind: 'direct' })],
+      diagrams: [diagram({ objectIds: ['S', 'S2'], connectionIds: ['back'] })],
+    })
+    useModelStore.getState().syncLowerConnections('d1')
+    expect(lowerEdges()).toEqual([expect.objectContaining({ fromId: 'S', toId: 'S2' })])
+  })
+
+  it('drops an existing roll-up once the diagram draws the pair itself', () => {
+    useModelStore.getState().syncLowerConnections('d1')
+    const [lower] = lowerEdges()
+    useModelStore.setState((state) => ({
+      connections: [...state.connections, conn('own', 'S', 'S2', { kind: 'direct' })],
+      diagrams: [{ ...state.diagrams[0], connectionIds: [...state.diagrams[0].connectionIds, 'own'] }],
+    }))
+    useModelStore.getState().syncLowerConnections('d1')
+    expect(lowerEdges()).toHaveLength(0)
+    expect(useModelStore.getState().diagrams[0].connectionIds).not.toContain(lower.id)
+  })
+
   it('prunes a lower edge once the underlying direct edge is gone', () => {
     useModelStore.getState().syncLowerConnections('d1')
     expect(lowerEdges()).toHaveLength(1)

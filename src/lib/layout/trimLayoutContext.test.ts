@@ -38,9 +38,13 @@ describe('trimLayoutContext — the part of the model a layout worker is sent', 
   ]
 
   it('drops most of the model', () => {
-    // FSSystemContext keeps 29 of saoe's 101 objects: its 6 shapes plus the
-    // descendants whose connections roll up onto them.
-    const [, d, ctx] = cases.find(([name]) => name === 'saoe/FSSystemContext')!
+    // DiagramLevel2GAE keeps 20 of saoe's 101 objects and 21 of its 93
+    // connections: its 6 shapes plus the descendants whose connections roll up
+    // onto them (measured 2026-10-29). FSSystemContext used to be the example,
+    // but since view scoping follows C4 it shows SAOE Permis and the Azure
+    // infrastructure too, i.e. the two largest systems, and keeps 46/101 and
+    // 60/93 — no longer a view that "drops most of the model".
+    const [, d, ctx] = cases.find(([name]) => name === 'saoe/DiagramLevel2GAE')!
     const trimmed = trimLayoutContext(d, ctx)
     expect(trimmed.objects.length).toBeLessThan(ctx.objects.length / 2)
     expect(trimmed.connections.length).toBeLessThan(ctx.connections.length / 2)

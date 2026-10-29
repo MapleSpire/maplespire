@@ -47,7 +47,13 @@
 
 import type { C4Object, Connection } from '../../../types'
 import { STYLE_PREFIX } from '../../structurizr/json/provenance'
-import { resolveElementStyle, resolveRelationshipStyle } from '../../structurizr/json/styles'
+import {
+  resolveElementStyle,
+  resolveRelationshipStyle,
+  resolveStyleForElement,
+} from '../../structurizr/json/styles'
+import { structurizrSizeFor } from '../../structurizr/json/layoutPolicy'
+import type { SzElementKind, SzElementStyle } from '../../structurizr/json/types'
 import { importedTagColor } from '../../structurizr/mapper'
 import { absoluteIconUrl, artworkOf, isRelativeIconPath } from '../structurizrArtwork'
 import { RESERVED_WIRE_TAGS, WIRE_DEFAULT_TAGS, scopeTagsFor } from './types'
@@ -890,13 +896,40 @@ function buildRelationshipStyles(ctx: ExportContext): WireRelationshipStyle[] {
   return styles
 }
 
+/** One build per export, as a performance cache: the views emitter reads the
+ *  styles too — `upstreamSizeOf`, once per placed shape per view — and the
+ *  build walks every object and connection. It is NOT what keeps warnings from
+ *  repeating: `ctx.warn` already ignores a message it holds (QA lens,
+ *  2026-10-21, measured: removing the cache changes no warning). */
+const wireStylesByContext = new WeakMap<ExportContext, WireStyles>()
+
 export function buildWireStyles(ctx: ExportContext): WireStyles {
+  const cached = wireStylesByContext.get(ctx)
+  if (cached) return cached
   const elements = buildElementStyles(ctx)
   const relationships = buildRelationshipStyles(ctx)
-  return {
+  const styles: WireStyles = {
     ...(elements.length > 0 ? { elements } : {}),
     ...(relationships.length > 0 ? { relationships } : {}),
   }
+  wireStylesByContext.set(ctx, styles)
+  return styles
+}
+
+/**
+ * The box a reader of THIS file draws `object` at upstream — the importer's own
+ * resolution (`resolveStyleForElement` → `structurizrSizeFor`) run against the
+ * styles and tags this export writes. The view scale must be the exact inverse
+ * of the importer's, and the importer measures a `Person`-shaped element at
+ * 400×400 and a sized style at its size, not everything at 450×300.
+ */
+export function upstreamSizeOf(ctx: ExportContext, object: C4Object): { width: number; height: number } {
+  const styles = (buildWireStyles(ctx).elements ?? []) as unknown as SzElementStyle[]
+  const kind = (ctx.kindByObjectId.get(object.id) ?? 'container') as SzElementKind
+  const resolved = resolveStyleForElement({ kind, styleTags: wireTagsFor(ctx, object) }, undefined, styles, {
+    colorScheme: ctx.colorScheme,
+  })
+  return structurizrSizeFor(resolved)
 }
 
 // ── the rest of `views.configuration` ────────────────────────────────────────

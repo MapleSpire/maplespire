@@ -34,8 +34,9 @@ import { parseWorkspaceJson } from '../../structurizr/json/parse'
 import { mapWorkspace, SOURCE_ID_PROPERTY } from '../../structurizr/json/mapWorkspace'
 import type { ExportBundle } from '../types'
 import { buildExportContext } from './types'
-import type { WireDeploymentView, WireDynamicView, WireElementView, WireViewSet } from './types'
+import type { WireDeploymentView, WireDynamicView, WireElementView, WireStyles, WireViewSet } from './types'
 import { buildWireViewSet } from './views'
+import { buildWireStyles } from './styles'
 import bigBankJson from '../../structurizr/fixtures/json/big-bank-plc.json?raw'
 import positionedJson from '../../structurizr/fixtures/json/positioned-container-and-deployment.json?raw'
 import dynamicJson from '../../structurizr/fixtures/json/parallel-edges-and-dynamic.json?raw'
@@ -73,14 +74,23 @@ const bundleOf = (mapped: Mapped): ExportBundle => ({
 
 const viewsOf = (mapped: Mapped): WireViewSet => buildWireViewSet(buildExportContext(bundleOf(mapped)))
 
-/** The workspace a re-import sees: our views over the source file's own model. */
-const rebuild = (source: string, views: WireViewSet): string => {
-  const original = JSON.parse(source) as { model: unknown; views?: { configuration?: unknown } }
+/** The element styles the export writes for `mapped`. */
+const stylesOf = (mapped: Mapped): WireStyles => buildWireStyles(buildExportContext(bundleOf(mapped)))
+
+/**
+ * The workspace a re-import sees: our views over the source file's own model,
+ * WITH the styles our export writes. The styles decide the box a reader draws
+ * each element at (a `Person` shape is 400×400), and the view scale is computed
+ * from that box — so re-importing our views under the source's own stylesheet
+ * measured a file the export never writes.
+ */
+const rebuild = (source: string, views: WireViewSet, styles: WireStyles): string => {
+  const original = JSON.parse(source) as { model: unknown; views?: { configuration?: Record<string, unknown> } }
   return JSON.stringify({
     id: 1,
     name: 'Round trip',
     model: original.model,
-    views: { ...views, ...(original.views?.configuration ? { configuration: original.views.configuration } : {}) },
+    views: { ...views, configuration: { ...(original.views?.configuration ?? {}), styles } },
   })
 }
 
@@ -148,16 +158,21 @@ describe('Structurizr JSON views — coordinates', () => {
 
   it('scales each view by what that view will be divided by, not by one constant', () => {
     // The importer's factor is the MAXIMUM of (our box / their box) over a
-    // view's own leaves, so it differs per view: a landscape of software systems
-    // (200 wide) is scaled by 200/450, an ordinary container view (185) by
-    // 185/450. Exporting everything at the container view's 2.43x would spread
-    // this landscape by 8% on every round trip — a diagram that grows a little
-    // each time the customer moves their workspace between two tools.
-    const views = viewsOf(importWorkspace(mixedJson))
-    const rows = rowsOf(views, 'Arranged')
+    // view's own leaves, measured against the box a reader of OUR file draws.
+    // This landscape holds a person, which our export styles `shape Person`
+    // (drawn 400×400), so its factor is 160/400, not the 160/450 of a view of
+    // plain boxes. Exporting it at one constant would zoom it on every round
+    // trip — a diagram that grows a little each time the customer moves their
+    // workspace between two tools.
+    const first = importWorkspace(mixedJson)
+    const diagram = first.diagrams.find((d) => d.sourceViewKey === 'Arranged')!
+    const objectByWireId = (wireId: string) => first.objects.find((o) => o.properties[SOURCE_ID_PROPERTY] === wireId)!
+    const canvasGap =
+      diagram.layouts![objectByWireId('2').id].position.x - diagram.layouts![objectByWireId('1').id].position.x
+    const rows = rowsOf(viewsOf(first), 'Arranged')
     const gap = at(rows, '2')!.x - at(rows, '1')!.x
 
-    expect(Math.abs(gap - 1400)).toBeLessThanOrEqual(2)
+    expect(Math.abs(gap - canvasGap * (400 / 160))).toBeLessThanOrEqual(2)
   })
 
   it('leaves a deployment boundary on the origin and places what is inside it', () => {
@@ -188,7 +203,7 @@ describe('Structurizr JSON views — the round trip is a fixed point', () => {
   const fixedPoint = (fixture: string, viewKeys: readonly string[]) => {
     const first = importWorkspace(fixture)
     const exported = viewsOf(first)
-    const second = importWorkspace(rebuild(fixture, exported))
+    const second = importWorkspace(rebuild(fixture, exported, stylesOf(first)))
     const reExported = viewsOf(second)
     return { first, exported, second, reExported, viewKeys }
   }
@@ -278,8 +293,9 @@ describe('Structurizr JSON views — view kinds and scopes', () => {
     const views = buildWireViewSet(buildExportContext(bundle, { layoutScale: 1 }))
     const rows = rowsOf(views, 'Containers')
     // Unscaled, the 850 wire px between two of these shapes come back as the
-    // ~349 canvas px the import turned them into.
-    expect(at(rows, '3')!.x - at(rows, '1')!.x).toBe(349)
+    // canvas px the import turned them into: 850 × 160/400, the view's largest
+    // (our box / their box) ratio being its person's.
+    expect(at(rows, '3')!.x - at(rows, '1')!.x).toBe(340)
   })
 
   it('keeps the view key each diagram was imported under', () => {

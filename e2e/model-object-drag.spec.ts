@@ -13,7 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import { test, expect } from '@playwright/test'
-import { submitDevLogin } from './support/devLogin'
+import { enterAppWorkspace } from './support/devLogin'
 
 type ModelStoreDebugWindow = Window & {
   __modelStore: {
@@ -24,13 +24,7 @@ type ModelStoreDebugWindow = Window & {
 test.use({ channel: process.env.PW_BROWSER_CHANNEL || undefined })
 
 test('dragging a store onto a system previews the target and reparents it', async ({ page }) => {
-  await page.goto('/')
-  const devLogin = page.getByTestId('dev-login-email')
-  await devLogin.waitFor({ state: 'visible', timeout: 45_000 }).catch(() => null)
-  if (await devLogin.isVisible().catch(() => false)) {
-    await submitDevLogin(page, `e2e-model-drag-${Date.now()}@example.com`)
-  }
-  await page.waitForURL(/\/app\/landscape\/[^/]+\/version\/[^/]+/, { timeout: 90_000 })
+  await enterAppWorkspace(page, `e2e-model-drag-${Date.now()}@example.com`)
 
   await expect(page.getByTestId('nav-menu')).toBeVisible({ timeout: 60_000 })
   await page.getByTestId('nav-menu').click()
@@ -51,9 +45,13 @@ test('dragging a store onto a system previews the target and reparents it', asyn
   await expect
     .poll(() => store.locator('td').first().evaluate((element) => getComputedStyle(element).cursor))
     .toBe('grab')
+  // Every icon in the cell keeps the grab cursor (`.mo-object-row--draggable > td *`).
+  // A non-expandable row has exactly one: its type icon (the disclosure slot is
+  // an empty span); measured 2026-10-18, one `lucide-database` svg. The old
+  // expectation of two failed on that row.
   await expect
     .poll(() => store.locator('td').first().locator('svg').evaluateAll((elements) => elements.map((element) => getComputedStyle(element).cursor)))
-    .toEqual(['grab', 'grab'])
+    .toEqual(['grab'])
 
   // Exercise the browser's native drag data path so both the moving-object
   // preview and the compatible-target treatment are observable before drop.

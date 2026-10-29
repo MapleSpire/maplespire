@@ -50,6 +50,9 @@ interface LowerConnection {
 interface DiagramComposition {
   objectIds: string[]
   groupIds: string[]
+  /** The diagram's own connections. Their ends are looked up in the connection
+   * list; ids absent from it (lower ids, unknown ids) are ignored. */
+  connectionIds?: readonly string[]
 }
 
 /**
@@ -60,8 +63,15 @@ interface DiagramComposition {
  *    the diagram, else null.
  *  - for every connection: roll both endpoints up; skip when an endpoint has no
  *    visible representative, when BOTH endpoints are already directly visible, or
- *    when the rolled-up endpoints coincide (self-loop); first connection to map to a
- *    given visible (from→to) pair wins (one lower per pair).
+ *    when the rolled-up endpoints coincide (self-loop), or when one of the diagram's
+ *    own connections already joins the rolled-up pair in the same direction; first
+ *    connection to map to a given visible (from→to) pair wins (one lower per pair).
+ *
+ * The same-direction direct-edge rule is Structurizr's default implied-relationship
+ * strategy (`CreateImpliedRelationshipsUnlessAnyRelationshipExistsStrategy`: skip
+ * when `source.hasEfferentRelationshipWith(destination)`), scoped to the edges the
+ * diagram draws: without it the pair showed two lines (saoe.dsl IncidentFlow,
+ * 2026-10-21). An edge in the opposite direction does not suppress the roll-up.
  *
  * Ids are deterministic (`lower:<from>→<to>`); lower connections are never persisted
  * (recomputed on load), so the id is internal and only from/to/kind matter.
@@ -90,6 +100,11 @@ export function computeLowerConnections(
     return objectToGroup.get(objectId) ?? null
   }
 
+  // (from→to) pairs the diagram already joins with one of its own edges.
+  const own = new Set(diagram.connectionIds ?? [])
+  const directPairs = new Set<string>()
+  if (own.size) for (const c of allNonLowerConnections) if (own.has(c.id)) directPairs.add(`${c.fromId}→${c.toId}`)
+
   const seen = new Set<string>()
   const lower: LowerConnection[] = []
   for (const c of allNonLowerConnections) {
@@ -99,11 +114,23 @@ export function computeLowerConnections(
     if (vf === c.fromId && vt === c.toId) continue // both directly visible
     if (vf === vt) continue // self-loop after roll-up
     const key = `${vf}→${vt}`
+    if (directPairs.has(key)) continue // the diagram already draws this pair
     if (seen.has(key)) continue
     seen.add(key)
     lower.push({ id: `lower:${key}`, fromId: vf, toId: vt, kind: 'lower', type: 'dashed', label: '' })
   }
   return lower
+}
+
+/**
+ * The roll-up input when the candidates are a slice of the model (the cache
+ * Worker reads only edges leaving the diagram's subtree): the diagram's own
+ * edges ride along, so `computeLowerConnections` sees which pairs it already
+ * draws. A group-sourced own edge is not among such candidates.
+ */
+export function withOwnConnections(candidates: readonly MiniConn[], own: readonly MiniConn[]): MiniConn[] {
+  const ids = new Set(candidates.map((c) => c.id))
+  return [...candidates, ...own.filter((c) => !ids.has(c.id))]
 }
 
 /** One IndexedDB pass → all objects (by id, for parentOf) + all persisted (non-lower)
@@ -174,7 +201,7 @@ export async function buildLocalDiagramRender(
   const graph = await scanGraph(store)
   const parentOf = new Map<string, string | undefined>()
   for (const o of graph.objects.values()) parentOf.set(o.id, o.parentId ?? undefined)
-  const lower = computeLowerConnections({ objectIds, groupIds }, parentOf, groupObjectIds, graph.connections)
+  const lower = computeLowerConnections({ objectIds, groupIds, connectionIds }, parentOf, groupObjectIds, graph.connections)
 
   return {
     // Legacy fallback is not tied to the normalized read-model projection. It is

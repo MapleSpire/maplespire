@@ -27,7 +27,13 @@ import {
   type WireElementKind,
 } from './structurizrJson/types'
 import type { ExportBundle } from './types'
-import { orderedTechnologyUsages } from '../technologyUsage'
+import {
+  IMPLIED_RELATIONSHIP_PROPERTY,
+  isDerivedMapleSpireKey,
+  technologyStringOf,
+} from '../structurizr/maplespireFacts'
+import { DSL_IDENTIFIER_PROPERTY, URL_PROPERTY } from '../structurizr/json/provenance'
+import { maplespireConnectionProperties, maplespireObjectProperties } from './structurizrJson/model'
 
 /**
  * Export the model as a Structurizr DSL workspace — the inverse of
@@ -83,8 +89,29 @@ function buildIdentifiers(objects: C4Object[]): Map<string, string> {
   return byId
 }
 
-function technologyOf(o: C4Object): string {
-  return orderedTechnologyUsages(o.technologyUsages, o.technologyUsageOrder).map((usage) => usage.snapshot.name).join(', ')
+/** Versions included (`"Angular 17, TypeScript"`); the importer parses them back. */
+function technologyOf(o: Pick<C4Object, 'technologyUsages' | 'technologyUsageOrder'>): string {
+  return technologyStringOf(o) ?? ''
+}
+
+/**
+ * The `properties { … }` block of an element or relationship: the customer's
+ * own properties, minus our stamps that are emitted as something else (the
+ * identifier IS the DSL identifier, the url IS `url`) and minus stale copies of
+ * the MapleSpire facts, plus those facts re-derived from the live fields —
+ * status, owners, domain, extra links, the compact summary, technology
+ * versions and notes, a connection's Markdown. Writing `properties` raw sent
+ * the stale copies out and every live MapleSpire field not at all.
+ */
+function propertiesOf(own: Readonly<Record<string, string>> | undefined, facts: Record<string, string>): Array<[string, string]> {
+  const out: Array<[string, string]> = []
+  for (const [key, value] of Object.entries(own ?? {})) {
+    if (key === SOURCE_IDENTIFIER_PROPERTY || key === DSL_IDENTIFIER_PROPERTY || key === URL_PROPERTY) continue
+    if (isDerivedMapleSpireKey(key)) continue
+    out.push([key, String(value)])
+  }
+  for (const [key, value] of Object.entries(facts)) out.push([key, value])
+  return out
 }
 
 /**
@@ -166,7 +193,8 @@ export function buildStructurizrDsl(
     if (tech || asKind === 'container' || asKind === 'component') head.push(q(tech))
     const tags = tagsOf(o, bundle, asKind)
     const kids = childrenOf(o.id)
-    const hasBody = tags.length > 0 || (o.links?.length ?? 0) > 0 || kids.length > 0 || Object.keys(o.properties ?? {}).length > 0
+    const props = propertiesOf(o.properties, maplespireObjectProperties(ctx, o))
+    const hasBody = tags.length > 0 || (o.links?.length ?? 0) > 0 || kids.length > 0 || props.length > 0
     if (!hasBody) {
       push(depth, head.join(' '))
       return
@@ -174,7 +202,6 @@ export function buildStructurizrDsl(
     push(depth, `${head.join(' ')} {`)
     if (tags.length) push(depth + 1, `tags ${tags.map(q).join(' ')}`)
     if (o.links?.[0]) push(depth + 1, `url ${q(objectLinkUrl(o.links[0]))}`)
-    const props = Object.entries(o.properties ?? {})
     if (props.length) {
       push(depth + 1, 'properties {')
       for (const [k, v] of props) push(depth + 2, `${q(k)} ${q(String(v))}`)
@@ -215,10 +242,34 @@ export function buildStructurizrDsl(
 
   if (bundle.connections.length) push(2, '')
   for (const c of bundle.connections) {
+    // Structurizr derives implied relationships itself; writing one makes it authored.
+    if (c.properties?.[IMPLIED_RELATIONSHIP_PROPERTY] === 'true') continue
     const from = identById.get(c.fromId)
     const to = identById.get(c.toId)
     if (!from || !to) continue
-    push(2, `${from} -> ${to}${c.label ? ` ${q(c.label)}` : ''}`)
+    // `a -> b "description" "technology" { tags / url / properties }`. Only the
+    // label went out before: technology, tags, url, properties, status, owners
+    // and the Markdown were all dropped on every DSL export.
+    const tech = technologyOf(c)
+    const head = `${from} -> ${to}`
+    const args = c.label || tech ? ` ${q(c.label ?? '')}${tech ? ` ${q(tech)}` : ''}` : ''
+    const tags = ctx.tagValues(c)
+    const url = c.properties?.[URL_PROPERTY]?.trim()
+    const facts = maplespireConnectionProperties(c)
+    const props = propertiesOf(c.properties, facts)
+    if (tags.length === 0 && !url && props.length === 0) {
+      push(2, `${head}${args}`)
+      continue
+    }
+    push(2, `${head}${args} {`)
+    if (tags.length) push(3, `tags ${tags.map(q).join(' ')}`)
+    if (url) push(3, `url ${q(url)}`)
+    if (props.length) {
+      push(3, 'properties {')
+      for (const [k, v] of props) push(4, `${q(k)} ${q(v)}`)
+      push(3, '}')
+    }
+    push(2, '}')
   }
   push(1, '}')
 

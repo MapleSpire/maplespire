@@ -15,7 +15,8 @@
 import { describe, it, expect } from 'vitest'
 import * as Automerge from '@automerge/automerge'
 import type { DocHandle } from '@automerge/automerge-repo'
-import { restoreDocToHeads } from './history'
+import { restoreDocToHeads, restoreTo } from './history'
+import type { DiagramDoc } from './types'
 
 /**
  * `restoreDocToHeads` is the primitive behind LANDSCAPE-wide version restore: view
@@ -77,6 +78,38 @@ describe('restoreDocToHeads', () => {
     const ok = restoreDocToHeads(handle, ['0000000000000000000000000000000000000000000000000000000000000000'])
     expect(ok).toBe(false)
     expect(handle.doc()!.objects.a.name).toBe('A2')
+    expect(Automerge.getHeads(handle.doc()!)).toEqual(before)
+  })
+})
+
+describe('restoreTo', () => {
+  // The DiagramDoc's name is not what the canvas shows: the registry meta wins
+  // (resolveDiagramProjection). The history panel can only carry the restored
+  // name there if restoreTo hands it back — e2e/sync.spec.ts "History & revert"
+  // is the end-to-end regression for that defect.
+  it('returns the restored state, name included, and keeps the checkpoint list', () => {
+    const handle = fakeHandle<DiagramDoc>({
+      name: 'BASE',
+      type: 'system-context',
+      checkpoints: [],
+    } as unknown as DiagramDoc)
+    const base = Automerge.getHeads(handle.doc()!)
+    handle.change((d) => {
+      d.name = 'CHANGED'
+      d.checkpoints!.push({ id: 'cp', label: 'cp', heads: base, createdAt: 'now' })
+    })
+
+    const past = restoreTo(handle, base)
+
+    expect(past?.name).toBe('BASE')
+    expect(handle.doc()!.name).toBe('BASE')
+    expect(handle.doc()!.checkpoints?.map((c) => c.id)).toEqual(['cp'])
+  })
+
+  it('returns undefined and writes nothing on unknown heads', () => {
+    const handle = fakeHandle<DiagramDoc>({ name: 'X', type: 'system-context' } as unknown as DiagramDoc)
+    const before = Automerge.getHeads(handle.doc()!)
+    expect(restoreTo(handle, ['0000000000000000000000000000000000000000000000000000000000000000'])).toBeUndefined()
     expect(Automerge.getHeads(handle.doc()!)).toEqual(before)
   })
 })

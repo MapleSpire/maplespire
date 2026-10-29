@@ -31,6 +31,7 @@ import { TechnologyFilterSelector } from '../technologies/TechnologyFilterSelect
 import { TagFilterSelector } from '../tags/TagFilterSelector'
 import { ModelObjectsTable } from './ModelObjectsTable'
 import type { C4Type } from '../../types'
+import { defaultShapeSize } from '../../lib/shapeDefaults'
 
 const addOptions = (t: TFunction): { type: C4Type | 'group'; label: string; icon: React.ElementType; testid: string }[] => [
   { type: 'system', label: t('dataViewsB.view.types.system'), icon: Monitor, testid: 'mo-add-system' },
@@ -121,7 +122,7 @@ export function ModelObjectsView() {
         name: `New ${type}`,
         description: '',
         position: scatteredPosition(),
-        size: { width: 160, height: 100 },
+        size: defaultShapeSize(),
         tagAssignments: {},
         tagOrder: [],
         links: [],

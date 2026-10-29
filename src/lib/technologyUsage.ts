@@ -145,6 +145,13 @@ export function seededTechnologyMetadata(name: string): SeededTechnologyMetadata
   return SEEDED_TECHNOLOGY_METADATA[name] ?? UNKNOWN_SEEDED_TECHNOLOGY_METADATA
 }
 
+const SEEDED_NAMES_LOWER = new Set(Object.keys(SEEDED_TECHNOLOGY_IDS).map((name) => name.toLowerCase()))
+
+/** Whether the public starter catalog knows this technology name. */
+export function isSeededTechnologyName(name: string): boolean {
+  return SEEDED_NAMES_LOWER.has(name.trim().toLowerCase())
+}
+
 export function seededTechnologyId(name: string): string {
   const seeded = SEEDED_TECHNOLOGY_IDS[name]
   if (seeded) return seeded
@@ -509,12 +516,21 @@ export function removeTechnologyUsage(
 }
 
 /** Deterministic usages for fixtures, imports and development seeds. */
+/** A technology to seed, optionally with the per-usage facts an import carries. */
+export interface SeededTechnologySpec {
+  name: string
+  usedVersion?: string
+  notes?: string
+}
+
 export function seededTechnologyUsages(
   ownerId: string,
-  names: readonly string[],
+  names: readonly (string | SeededTechnologySpec)[],
   role?: TechnologyRole,
 ): Record<string, TechnologyUsage> {
-  return Object.fromEntries(names.map((name, index) => {
+  return Object.fromEntries(names.map((entry, index) => {
+    const spec = typeof entry === 'string' ? { name: entry } : entry
+    const name = spec.name
     const id = `tu_${ownerId}_${index}_${seededTechnologyId(name).slice('tech_seed_'.length)}`
     const metadata = seededTechnologyMetadata(name)
     return [id, createTechnologyUsage({
@@ -522,6 +538,8 @@ export function seededTechnologyUsages(
       name,
       role,
       ...metadata,
+      ...(spec.usedVersion ? { usedVersion: spec.usedVersion } : {}),
+      ...(spec.notes ? { notes: spec.notes } : {}),
     })]
   }))
 }

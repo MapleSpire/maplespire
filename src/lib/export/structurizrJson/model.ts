@@ -40,8 +40,16 @@
 
 import type { C4Object, Connection, DecisionRecord, Group, TechnologyUsage } from '../../../types'
 import { objectLinkUrl } from '../../objectLinks'
-import { orderedTechnologyUsages } from '../../technologyUsage'
 import { SOURCE_IDENTIFIER_PROPERTY } from '../../structurizr/mapper'
+import {
+  CONNECTION_DESCRIPTION_PROPERTY,
+  encodeOwners,
+  SHORT_DESCRIPTION_PROPERTY,
+  isDerivedMapleSpireKey,
+  ownerNamesOf,
+  technologyDetailProperties,
+  technologyStringOf,
+} from '../../structurizr/maplespireFacts'
 import {
   BOUNDARY_FOR_PROPERTY,
   DEPLOYMENT_GROUPS_PROPERTY,
@@ -181,12 +189,11 @@ interface TechnologyBearing {
   technologyUsageOrder?: string[]
 }
 
+/** Versions included (`"Angular 17, TypeScript"`) — the importer parses them
+ *  back into `usedVersion`, and a Structurizr reader sees what an author would
+ *  have written. Names alone dropped every version on export. */
 function technologyOf(entity: TechnologyBearing): string | undefined {
-  return trimmed(
-    orderedTechnologyUsages(entity.technologyUsages, entity.technologyUsageOrder)
-      .map((usage) => usage.snapshot.name)
-      .join(', '),
-  )
+  return trimmed(technologyStringOf(entity))
 }
 
 function urlOf(entity: Pick<C4Object, 'links'>): string | undefined {
@@ -252,7 +259,7 @@ function wireProperties(own: Readonly<Record<string, string>> | undefined): Wire
   const out: WireProperties = {}
   for (const [key, value] of Object.entries(own)) {
     if (key.startsWith(PERSPECTIVE_PREFIX) || key.startsWith(STYLE_PREFIX)) continue
-    if (INVERTED_PROPERTY_KEYS.has(key)) continue
+    if (INVERTED_PROPERTY_KEYS.has(key) || isDerivedMapleSpireKey(key)) continue
     const stem = key.endsWith(PROPERTY_ORIGINAL_SUFFIX) ? key.slice(0, -PROPERTY_ORIGINAL_SUFFIX.length) : undefined
     if (stem !== undefined && INVERTED_PROPERTY_KEYS.has(stem)) out[stem] = value
     else out[key] = value
@@ -301,7 +308,7 @@ function createNamer(warn: (message: string) => void) {
  * back as ordinary properties by our own importer. A warning naming the loss
  * would not have given a regulated customer their ownership metadata back.
  */
-function maplespireObjectProperties(ctx: ExportContext, object: C4Object): WireProperties {
+export function maplespireObjectProperties(ctx: ExportContext, object: C4Object): WireProperties {
   const out: WireProperties = {}
   // `live` is the seed every imported and every new shape carries, so stating it
   // would put a property on every element in the file for no information.
@@ -309,10 +316,15 @@ function maplespireObjectProperties(ctx: ExportContext, object: C4Object): WireP
   const domain = object.domainId ? ctx.bundle.domains.find((entry) => entry.id === object.domainId) : undefined
   if (object.domainId) out[DOMAIN_ID_PROPERTY] = object.domainId
   if (domain) out[DOMAIN_PROPERTY] = domain.name
-  const owners = (object.ownerAssignmentOrder ?? [])
-    .map((key) => object.ownerAssignments?.[key]?.name)
-    .filter((name): name is string => Boolean(name))
-  if (owners.length) out[OWNERS_PROPERTY] = owners.join(', ')
+  const owners = ownerNamesOf(object)
+  if (owners.length) out[OWNERS_PROPERTY] = encodeOwners(owners)
+  // The wire description carries the Markdown one (`descriptionOf`); the
+  // compact line drawn on the shape had nowhere to go when both exist.
+  const short = trimmed(object.shortDescription)
+  if (short && trimmed(object.description) && short !== trimmed(object.description)) {
+    out[SHORT_DESCRIPTION_PROPERTY] = short
+  }
+  Object.assign(out, technologyDetailProperties(object))
   if (object.ownerTeamIds?.length) out[OWNER_TEAMS_PROPERTY] = object.ownerTeamIds.join(', ')
   if (object.teamIds?.length) out[TEAMS_PROPERTY] = object.teamIds.join(', ')
   // `url` carries the first one; the rest had nowhere to go and were discarded
@@ -323,17 +335,23 @@ function maplespireObjectProperties(ctx: ExportContext, object: C4Object): WireP
 }
 
 /** The same for a connection: its lifecycle status and its MapleSpire kind. */
-function maplespireConnectionProperties(connection: Connection): WireProperties {
+export function maplespireConnectionProperties(connection: Connection): WireProperties {
   const out: WireProperties = {}
   const status = (connection as { status?: string }).status
   if (status && status !== 'live') out[STATUS_PROPERTY] = status
   const kind = (connection as { kind?: string }).kind
   if (kind) out[CONNECTION_KIND_PROPERTY] = kind
-  const owners = (connection.ownerAssignmentOrder ?? [])
-    .map((key) => connection.ownerAssignments?.[key]?.name)
-    .filter((name): name is string => Boolean(name))
-  if (owners.length) out[OWNERS_PROPERTY] = owners.join(', ')
+  const owners = ownerNamesOf(connection)
+  if (owners.length) out[OWNERS_PROPERTY] = encodeOwners(owners)
   if (connection.ownerTeamIds?.length) out[OWNER_TEAMS_PROPERTY] = connection.ownerTeamIds.join(', ')
+  Object.assign(out, technologyDetailProperties(connection))
+  // The Markdown also goes into the wire `description` (after the label, for a
+  // Structurizr reader), but there it cannot be told apart from the label: a
+  // connection whose label is empty or equals its technology writes the
+  // Markdown ALONE. This is what lets an importer split the two exactly
+  // (reviewer lens, 2026-10-21: the first paragraph used to become the label).
+  const markdown = connection.description?.trim()
+  if (markdown && markdown !== connection.label?.trim()) out[CONNECTION_DESCRIPTION_PROPERTY] = markdown
   return out
 }
 

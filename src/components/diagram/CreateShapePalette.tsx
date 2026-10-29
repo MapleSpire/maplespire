@@ -19,6 +19,7 @@ import { X, GripHorizontal, User, Monitor, Box, Database, Shapes, Square } from 
 import { useUIStore } from '../../stores/uiStore'
 import { useModelStore } from '../../stores/modelStore'
 import type { C4Type } from '../../types'
+import { defaultShapeSize } from '../../lib/shapeDefaults'
 
 /**
  * The floating "Create" palette — the relocated "Or create new" quick-add grid,
@@ -264,7 +265,7 @@ function QuickAddTile({ type, label }: { type: C4Type | 'group'; label: string }
         name: t('diagramChrome.createPalette.defaultName.other', { type }),
         description: '',
         position: { x: 200 + Math.random() * 100, y: 200 + Math.random() * 100 },
-        size: { width: 160, height: 100 },
+        size: defaultShapeSize(),
         tagAssignments: {},
         tagOrder: [],
         links: [],

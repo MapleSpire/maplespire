@@ -81,6 +81,10 @@ export interface RawRelationship {
   description?: string
   technology?: string
   tags: string[]
+  /** From the relationship's `{ url … }` block. */
+  url?: string
+  /** From the relationship's `{ properties { … } }` block. */
+  properties?: Record<string, string>
   /**
    * `path` of the element block this relationship was written inside, if any.
    *
@@ -120,6 +124,21 @@ export interface RawView {
   includes: string[]
   excludes: string[]
   autoLayout?: AutoLayoutSpec
+  /** `dynamic` views only: the interaction steps, in file order. */
+  steps?: RawDynamicStep[]
+  /** `dynamic` views only: the body's `title "…"`, when given. */
+  title?: string
+  line: number
+}
+
+/** One `[order:] a -> b ["description" ["technology"]]` line of a dynamic view. */
+export interface RawDynamicStep {
+  sourceRef: string
+  destRef: string
+  description?: string
+  technology?: string
+  /** The explicit `1:` / `1.2:` prefix, without the colon, when written. */
+  order?: string
   line: number
 }
 

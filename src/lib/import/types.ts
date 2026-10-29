@@ -44,8 +44,8 @@ export interface ImportResult {
   /**
    * Ordered message flows for the imported diagrams. A Structurizr dynamic view
    * IS a flow — the same ordered walk over the same edges — so a source that
-   * drops them loses a whole view kind. Optional because the DSL importer does
-   * not read dynamic views at all; `importModel` treats absent as none.
+   * drops them loses a whole view kind. Optional because not every source has
+   * dynamic views; `importModel` treats absent as none.
    */
   flows?: Flow[]
   entryDiagramId: string | null

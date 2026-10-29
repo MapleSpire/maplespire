@@ -18,6 +18,7 @@ import type {
 } from '../../types'
 import { generateId } from '../utils'
 import { sanitizeSceneDecor } from '../../canvas3d/decor/decorSpec'
+import { defaultShapeSize } from '../shapeDefaults'
 
 /**
  * Parse + plan an import of a `maplespire-model` JSON export (the Share →
@@ -46,12 +47,13 @@ export interface MapleSpireExport {
 }
 
 const C4_TYPES: C4Type[] = ['actor', 'system', 'app', 'store', 'component']
+// The editor's box for a new shape, for every type — see `shapeDefaults.ts`.
 const DEFAULT_SIZE: Record<C4Type, { width: number; height: number }> = {
-  actor: { width: 150, height: 90 },
-  system: { width: 200, height: 100 },
-  app: { width: 185, height: 100 },
-  store: { width: 175, height: 100 },
-  component: { width: 165, height: 95 },
+  actor: defaultShapeSize(),
+  system: defaultShapeSize(),
+  app: defaultShapeSize(),
+  store: defaultShapeSize(),
+  component: defaultShapeSize(),
 }
 
 function asArray<T>(v: unknown): T[] {

@@ -63,4 +63,18 @@ describe('UnpublishedDiagramDocs', () => {
     docs.clear()
     expect(docs.size).toBe(0)
   })
+
+  // Merging develop's own fix of this defect (280e1eb9): a diagram tombstoned
+  // while its record was held must never resolve to that document again.
+  it('retires, without putting back, the record of a diagram the caller calls deleted', () => {
+    const docs = new UnpublishedDiagramDocs()
+    docs.record('gone', 'automerge:gone')
+    docs.record('kept', 'automerge:kept')
+    const index = new Map<string, string>()
+    docs.readmit(index, (id) => id === 'gone')
+    expect([...index]).toEqual([['kept', 'automerge:kept']])
+    expect(docs.size).toBe(1)
+    docs.readmit(index)
+    expect(index.has('gone')).toBe(false)
+  })
 })

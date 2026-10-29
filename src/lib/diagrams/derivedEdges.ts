@@ -22,7 +22,7 @@ import { isIndexReady } from '../modelQuery/offlineIndex'
 import { workspaceKvStore } from '../modelQuery/kvStore'
 import { useModelStore } from '../../stores/modelStore'
 
-export type DerivedComposition = Pick<Diagram, 'objectIds'> & Partial<Pick<Diagram, 'groupIds'>>
+export type DerivedComposition = Pick<Diagram, 'objectIds'> & Partial<Pick<Diagram, 'groupIds' | 'connectionIds'>>
 
 export interface DerivedEdgeSources {
   /** The whole model is in the store (the resident tier). */
@@ -144,7 +144,7 @@ export async function readDerivedEdges(
     const groupObjectIds = new Map(groups.map((group) => [group.id, group.objectIds ?? []]))
     const direct = connections.filter((connection) => connection.kind !== 'lower')
     return computeLowerConnections(
-      { objectIds: composition.objectIds, groupIds: composition.groupIds ?? [] },
+      { objectIds: composition.objectIds, groupIds: composition.groupIds ?? [], connectionIds: composition.connectionIds },
       parentOf,
       groupObjectIds,
       direct,

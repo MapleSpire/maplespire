@@ -73,10 +73,13 @@ export class UnpublishedDiagramDocs {
     return this.urls.get(diagramId) ?? ''
   }
 
-  /** Put back every recorded document the rebuilt index does not name. */
-  readmit(index: Map<string, string>): void {
-    for (const [diagramId, docUrl] of this.urls) {
-      if (!index.get(diagramId)) index.set(diagramId, docUrl)
+  /** Put back every recorded document the rebuilt index does not name — and
+   *  retire, without putting back, the record of a diagram `isDeleted` names: a
+   *  deleted diagram must have no resolvable url. */
+  readmit(index: Map<string, string>, isDeleted: (diagramId: string) => boolean = () => false): void {
+    for (const [diagramId, docUrl] of [...this.urls]) {
+      if (isDeleted(diagramId)) this.urls.delete(diagramId)
+      else if (!index.get(diagramId)) index.set(diagramId, docUrl)
     }
   }
 }

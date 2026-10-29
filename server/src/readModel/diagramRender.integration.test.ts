@@ -79,9 +79,10 @@ suite('roDiagramRender (read model → render-ready diagram)', () => {
       conn('deep', 'a1c', 'b1c', { label: 'reads' }),  // rolls up A→B → lower
       conn('self', 'a1', 'a1c'),                        // both → A ⇒ self-loop, skip
     ]
-    // The diagram (top-level) shows A and B; its persisted connectionIds = ['direct'].
+    // Both diagrams show A and B; only 'dg' draws the direct A→B edge itself.
     const diagrams = [
       { id: 'dg', name: 'Landscape', type: 'context', objectIds: ['A', 'B'], connectionIds: ['direct'], groupIds: [] },
+      { id: 'bare', name: 'Bare', type: 'context', objectIds: ['A', 'B'], connectionIds: [], groupIds: [] },
     ]
     await coldBuildReadModel(pool!, WS, null, objects, connections, [], diagrams)
 
@@ -90,9 +91,14 @@ suite('roDiagramRender (read model → render-ready diagram)', () => {
     expect((render!.objects as { id: string }[]).map((o) => o.id).sort()).toEqual(['A', 'B'])
 
     const conns = render!.connections as { id: string; fromId: string; toId: string; kind?: string }[]
-    // The direct edge (full data) + exactly one computed lower A→B.
+    // The direct edge (full data), and no roll-up beside it: deep rolls up to
+    // A→B, which the diagram already draws (saoe.dsl IncidentFlow, 2026-10-21).
     expect(conns.find((c) => c.id === 'direct')?.kind).toBeUndefined()
-    const lower = conns.filter((c) => c.kind === 'lower')
+    expect(conns.filter((c) => c.kind === 'lower')).toEqual([])
+
+    // A diagram that does not draw A→B itself gets exactly one computed lower A→B.
+    const bare = await roDiagramRender(pool!, WS, 'bare')
+    const lower = (bare!.connections as { kind?: string }[]).filter((c) => c.kind === 'lower')
     expect(lower).toEqual([{ id: 'lower:A→B', fromId: 'A', toId: 'B', kind: 'lower', type: 'dashed', label: '' }])
   })
 

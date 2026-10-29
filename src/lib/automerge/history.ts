@@ -26,6 +26,10 @@ import type { DiagramDoc, Checkpoint } from './types'
  *  - previewAt(): materialise the diagram as it was at given heads (read-only).
  *  - restoreTo(): roll the diagram back by writing the past state as a NEW change,
  *    so the restore is itself undoable and the checkpoint list is preserved.
+ *    It returns the restored state because the DiagramDoc is not the whole
+ *    diagram: `name`/`type` are authoritative in the registry meta
+ *    (`DiagramMeta`, types.ts), so the caller must carry them there too or the
+ *    restore leaves the visible name unchanged.
  *  - named checkpoints live in `DiagramDoc.checkpoints`.
  */
 
@@ -88,16 +92,16 @@ export function previewAt(handle: DocHandle<DiagramDoc>, heads: string[]): Diagr
   }
 }
 
-export function restoreTo(handle: DocHandle<DiagramDoc>, heads: string[]): void {
+export function restoreTo(handle: DocHandle<DiagramDoc>, heads: string[]): DiagramDoc | undefined {
   const doc = handle.doc()
-  if (!doc) return
+  if (!doc) return undefined
   const want = normaliseHeads(heads)
   // Guard: never restore to heads this peer doesn't have — `view` would return an
   // empty doc and reconcile would WIPE the diagram (e.g. a checkpoint copied from
   // a forked diagram references the source's history, absent here).
   if (!headsKnown(doc, want)) {
     console.warn('restoreTo: requested heads not in local history; skipping', heads)
-    return
+    return undefined
   }
   let past: DiagramDoc
   try {
@@ -105,7 +109,7 @@ export function restoreTo(handle: DocHandle<DiagramDoc>, heads: string[]): void 
   } catch (err) {
     // Don't leave the doc half-changed — bail before the write if heads are bad.
     console.error('restoreTo: could not view at heads', heads, err)
-    return
+    return undefined
   }
   changeWithDurabilityTracking(handle, (d: DiagramDoc) => {
     // Restore every field to the past state, but KEEP the current checkpoint list
@@ -113,6 +117,7 @@ export function restoreTo(handle: DocHandle<DiagramDoc>, heads: string[]): void 
     const target: DiagramDoc = { ...past, checkpoints: d.checkpoints ?? [] }
     reconcile(d, target)
   })
+  return past
 }
 
 /**
