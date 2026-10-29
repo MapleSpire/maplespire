@@ -16,7 +16,7 @@ import type { Pool } from 'pg'
 import { ensureAuthSchema } from '../auth/schema.js'
 import { ensureBackupSchema } from '../backup/schema.js'
 import { ensureMaintenanceSchema } from '../maintenance/schema.js'
-import { ensureReadModelSchema } from '../readModel/schema.js'
+import { backfillC4ParentIds, ensureReadModelSchema } from '../readModel/schema.js'
 import { ensureSyncCellOwnershipSchema } from '../syncCells/ownership.js'
 import { ensureSyncTopologyContractSchema } from '../syncCells/topologyMirror.js'
 import { ensurePlacementProposerSchema } from '../syncCells/placementProposerSchema.js'
@@ -102,6 +102,15 @@ export function schemaMigrations(pool: Pool): Migration[] {
       // repeatable baseline's last-run timestamp.
       id: '0004-placement-proposer',
       run: ensurePlacementProposerSchema,
+    },
+    {
+      // `ro_objects.c4_parent_id` (the Model Viewer's level) is added by the
+      // baseline above, NULL on every existing row; this fills it once.
+      // Transactional, so the backfill and its ledger row commit together.
+      // Rows written by old-code cells after this has run are the residual
+      // case — see `backfillC4ParentIds`.
+      id: '0005-ro-objects-c4-parent',
+      run: backfillC4ParentIds,
     },
   ]
 }

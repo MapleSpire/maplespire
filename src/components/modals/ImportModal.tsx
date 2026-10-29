@@ -30,6 +30,7 @@ import { parseMapleSpireJson, planJsonImport, existingIdsFromState } from '../..
 import type { Diagram } from '../../types'
 import { cn } from '../../lib/utils'
 import { ensureMintedIdCapacity } from '../../lib/automerge/mintedIdSupply'
+import { importDocumentIdBudget } from '../../lib/automerge/shardSizes'
 
 /** Where a JSON-export import lands. */
 type ImportTarget = 'current' | 'new' | 'draft'
@@ -253,7 +254,14 @@ export function ImportModal({ open, onClose }: ImportModalProps) {
    * has switched into it. Best-effort — a short or failed mint still imports.
    */
   const prepareDocumentIds = async (r: ImportResult): Promise<number> => {
-    const needed = r.diagrams.length + 1 // +1: the registry shard
+    // The diagrams AND every registry/model shard they can overflow into: a
+    // shard short of a minted id cannot have its pointer held until the server
+    // has it (shardSizes.ts).
+    const needed = importDocumentIdBudget({
+      diagrams: r.diagrams.length,
+      objects: r.objects.length,
+      connections: r.connections.length,
+    })
     try {
       const granted = await ensureMintedIdCapacity(needed)
       return Math.max(0, needed - granted)

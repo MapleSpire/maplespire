@@ -28,6 +28,7 @@ interface ViewerCursor extends Record<string, unknown> {
 
 export interface ViewerLevelObject {
   object: Record<string, unknown>
+  /** 1 when the object has at least one child level entry, else 0 — not a count. */
   childCount: number
 }
 
@@ -46,8 +47,11 @@ function likeLiteral(value: string | undefined): string {
   return normalized ? `%${normalized.replace(/([%_\\])/g, '\\$1')}%` : ''
 }
 
-/** A bounded renderer window for one C4 level. The indexed effective parent
- * already incorporates group precedence and dangling-parent repair. */
+/** A bounded renderer window for one C4 level, keyed by the maintained
+ * `c4_parent_id`: the C4 `parent_id` when that parent exists, else NULL — so an
+ * object whose parent was deleted is a root, as in resident mode and the client
+ * model (`src/lib/modelViewer/levels.ts`). Served in page order by
+ * `idx_ro_objects_c4_name_c_page`. */
 export async function roViewerLevel(
   db: Queryable,
   key: WorkspaceKey,
@@ -77,10 +81,26 @@ export async function roViewerLevel(
   }
 
   const params: unknown[] = [key.landscapeId, key.versionId, parentId, query, domainIds]
-  const metadataParams = [...params]
+  // The Model Viewer follows the C4 hierarchy — system ▸ container ▸ component —
+  // like the resident implementation (the offline worker still follows the
+  // explorer tree).
+  // NOT `effective_parent_id`: that is the Model objects explorer's NAVIGATION
+  // tree, where Group membership outranks the parent. An object inside a boundary
+  // group (the system boundary a container diagram draws) would vanish from its
+  // real level and its parent would report no children — no drill-down possible.
+  // NOT raw `parent_id` either: a dangling one would put its object at no level.
+  // (`$3::text IS NULL` keeps $3 referenced at the root: a statement whose
+  // highest placeholder is $5 must still mention every placeholder before it.)
   const parentPredicate = parentId === null
-    ? '(object.effective_parent_id IS NULL AND $3::text IS NULL)'
-    : 'object.effective_parent_id = $3'
+    ? '(object.c4_parent_id IS NULL AND $3::text IS NULL)'
+    : 'object.c4_parent_id = $3'
+  // ORDER BY leads with `c4_parent_id`, constant within a level, so the sort
+  // matches idx_ro_objects_c4_name_c_page. Without it the ROOT level sorts: an
+  // `IS NULL` qual is not an equality the planner can drop from the ordering,
+  // so it read all 6 021 roots and top-N sorted them (543 ms cold on 200 000
+  // objects); with it, 201 rows straight off the index in 2.2 ms, and a deep
+  // cursor becomes an index condition. Measured with
+  // server/scripts/measure-viewer-level-c4.ts.
   const afterSql = after
     ? `AND (object.normalized_name COLLATE "C", object.id COLLATE "C")
          > ($6::text COLLATE "C", $7::text COLLATE "C")`
@@ -88,6 +108,11 @@ export async function roViewerLevel(
   if (after) params.push(after.name, after.id)
   params.push(limit + 1)
   const hasFilters = Boolean(query || domainIds.length)
+  // The placeholders the total/generation statements actually mention. The
+  // empty-page fallback below is a separate statement: binding it more
+  // parameters than it references is a protocol error (HTTP 500 on any empty
+  // level — a childless object, a brand-new landscape).
+  const metadataParams = hasFilters ? params.slice(0, 5) : parentId ? params.slice(0, 3) : params.slice(0, 2)
   const totalExpression = hasFilters
     ? `(SELECT count(*) FROM ro_objects object
         WHERE object.landscape_id = $1 AND object.version_id = $2
@@ -95,10 +120,10 @@ export async function roViewerLevel(
           AND ($4 = '' OR object.normalized_name LIKE $4 ESCAPE '\\')
           AND (cardinality($5::text[]) = 0 OR object.domain_id = ANY($5::text[])))`
     : parentId
-      ? `COALESCE((SELECT child_count FROM ro_object_child_stats
-                   WHERE landscape_id = $1 AND version_id = $2 AND object_id = $3), 0)`
-      : `COALESCE((SELECT root_object_count FROM ro_workspace_stats
-                   WHERE landscape_id = $1 AND version_id = $2), 0)`
+      ? `(SELECT count(*) FROM ro_objects object
+          WHERE object.landscape_id = $1 AND object.version_id = $2 AND object.c4_parent_id = $3)`
+      : `(SELECT count(*) FROM ro_objects object
+          WHERE object.landscape_id = $1 AND object.version_id = $2 AND object.c4_parent_id IS NULL)`
   const generationExpression = `COALESCE((SELECT projected_generation
       FROM read_model_projection_state
       WHERE landscape_id = $1 AND version_id = $2), 0)`
@@ -110,20 +135,25 @@ export async function roViewerLevel(
     page_total: string | number
     projected_generation: string | number
   }>(
+    // child_count is 0 or 1 — EXISTENCE, not a count. The viewer only asks
+    // whether a tile expands (`hasChildren` in src/lib/modelViewer/levels.ts),
+    // and a count over a 200-tile page of hub objects would read every child of
+    // every tile; EXISTS stops at the first index entry.
     `SELECT object.id, object.normalized_name, object.data,
-            COALESCE(children.child_count, 0)::integer AS child_count,
+            (EXISTS (
+               SELECT 1 FROM ro_objects child
+               WHERE child.landscape_id = object.landscape_id
+                 AND child.version_id = object.version_id AND child.c4_parent_id = object.id
+             ))::integer AS child_count,
             ${totalExpression} AS page_total,
             ${generationExpression} AS projected_generation
      FROM ro_objects object
-     LEFT JOIN ro_object_child_stats children
-       ON children.landscape_id = object.landscape_id
-      AND children.version_id = object.version_id AND children.object_id = object.id
      WHERE object.landscape_id = $1 AND object.version_id = $2
        AND ${parentPredicate}
        AND ($4 = '' OR object.normalized_name LIKE $4 ESCAPE '\\')
        AND (cardinality($5::text[]) = 0 OR object.domain_id = ANY($5::text[]))
        ${afterSql}
-     ORDER BY object.normalized_name COLLATE "C", object.id COLLATE "C"
+     ORDER BY object.c4_parent_id, object.normalized_name COLLATE "C", object.id COLLATE "C"
      LIMIT $${params.length}`,
     params,
   )
@@ -136,13 +166,13 @@ export async function roViewerLevel(
   const ancestorResult = parentId
     ? await db.query<{ data: Record<string, unknown>; depth: number }>(
         `WITH RECURSIVE ancestors AS (
-           SELECT id, effective_parent_id, data, 0 AS depth
+           SELECT id, c4_parent_id, data, 0 AS depth
            FROM ro_objects
            WHERE landscape_id = $1 AND version_id = $2 AND id = $3
            UNION ALL
-           SELECT parent.id, parent.effective_parent_id, parent.data, child.depth + 1
+           SELECT parent.id, parent.c4_parent_id, parent.data, child.depth + 1
            FROM ro_objects parent
-           JOIN ancestors child ON child.effective_parent_id = parent.id
+           JOIN ancestors child ON child.c4_parent_id = parent.id
            WHERE parent.landscape_id = $1 AND parent.version_id = $2 AND child.depth < 63
          )
          SELECT data, depth FROM ancestors ORDER BY depth DESC`,

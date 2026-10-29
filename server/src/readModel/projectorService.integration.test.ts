@@ -109,10 +109,16 @@ suite('read-model projector wiring (in-process Automerge → Postgres)', () => {
   /** Run one edit and return the objects events it produced — waiting for the
    *  first, then for the projection to be caught up, so a SECOND event from the
    *  same edit would be seen rather than raced. */
-  const objectsEventsOf = async (edit: () => void): Promise<ObjectsEvent[]> => {
+  /** `generations`: how many feed events the edit produces. A shard attached
+   * through ModelMeta is TWO: the metadata pass publishes, and only then does
+   * the attach resolve the new shard and run its own generation — between the
+   * two, observed === projected holds, so "settled" alone can close the window
+   * before the attach starts (it did, 2026-10-22, whenever the shard resolved
+   * late under ci:local load). */
+  const objectsEventsOf = async (edit: () => void, generations = 1): Promise<ObjectsEvent[]> => {
     const baseline = await projectedGeneration()
     edit()
-    await until(() => objectsEventsAfter(baseline), (events) => events.length > 0)
+    await until(() => objectsEventsAfter(baseline), (events) => events.length >= generations)
     await until(
       async () => (await pool!.query<{ observed: number; projected: number }>(
         `SELECT observed_generation::int AS observed, projected_generation::int AS projected
@@ -208,7 +214,7 @@ suite('read-model projector wiring (in-process Automerge → Postgres)', () => {
       await os2.whenReady()
       const attached = await objectsEventsOf(() => meta.change((d: { objectShardUrls: string[] }) => {
         d.objectShardUrls.push(os2.url)
-      }))
+      }), 2)
       // Two generations: the metadata pass itself, which moved no served row
       // (it used to publish reset/all here), then the attach.
       expect(attached).toEqual([
@@ -238,9 +244,16 @@ suite('read-model projector wiring (in-process Automerge → Postgres)', () => {
       }
       const os3 = repo.create({ objects: big })
       await os3.whenReady()
+      // Resolve this shard 500 ms late, as it did under ci:local load: the
+      // collector must still wait for the attach's own generation.
+      const realFind = repo.find.bind(repo)
+      ;(repo as unknown as { find: typeof repo.find }).find = (async (...args: Parameters<typeof repo.find>) => {
+        if (String(args[0]) === os3.url) await new Promise((resolve) => setTimeout(resolve, 500))
+        return realFind(...args)
+      }) as typeof repo.find
       const bigAttached = await objectsEventsOf(() => meta.change((d: { objectShardUrls: string[] }) => {
         d.objectShardUrls.push(os3.url)
-      }))
+      }), 2)
       // [0] is the metadata pass, which moved nothing; [1] the attach.
       expect(bigAttached.map((event) => event.upsertIds.length)).toEqual([0, 520])
       const lastRenamed = await objectsEventsOf(() => os3.change((d: Shard) => { d.objects.b519.name = 'last' }))

@@ -188,6 +188,10 @@ export interface ObjectExplorerRow {
   kind: 'object' | 'group'
   type: C4Object['type'] | 'group'
   parentId: string | null
+  /** The server's `c4_parent_id` (C4 parent when it exists, else null). Only
+   * the server read model sends it; the browser cache files a working-set row
+   * on its C4 level with it. */
+  c4ParentId?: string | null
   childCount: number
   hasChildren: boolean
   canAcceptChildren: boolean
@@ -297,6 +301,9 @@ export interface ViewerLevelOpts {
 }
 export interface ViewerLevelResult {
   ancestors: C4Object[]
+  /** `childCount` is only meaningful as `> 0` (does the tile expand?): the
+   * server tier answers 0/1 (an EXISTS, server/src/readModel/viewerLevel.ts),
+   * resident and worker tiers a real count. Read it with `hasChildren`. */
   objects: Array<{ object: C4Object; childCount: number }>
   connections: Connection[]
   nextCursor: string | null

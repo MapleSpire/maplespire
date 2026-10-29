@@ -124,7 +124,7 @@ async function seed(client: pg.PoolClient): Promise<void> {
   await client.query(
     `INSERT INTO ro_objects (
        landscape_id, version_id, org_id, id, type, name, description,
-       technology, domain_id, parent_id, effective_parent_id, scope, status, data
+       technology, domain_id, parent_id, effective_parent_id, c4_parent_id, scope, status, data
      )
      SELECT $1, $2, 'load-org',
        'obj-' || lpad(value::text, 6, '0'),
@@ -137,6 +137,8 @@ async function seed(client: pg.PoolClient): Promise<void> {
        CASE WHEN value % 1000 = 0 THEN 'Checkout workload' ELSE '' END,
        CASE WHEN value % 11 = 0 THEN 'PostgreSQL' ELSE '' END,
        'domain-' || (value % 20)::text,
+       CASE WHEN value <= 100 THEN NULL
+         ELSE 'obj-' || lpad((((value - 1) % 100) + 1)::text, 6, '0') END,
        CASE WHEN value <= 100 THEN NULL
          ELSE 'obj-' || lpad((((value - 1) % 100) + 1)::text, 6, '0') END,
        CASE WHEN value <= 100 THEN NULL

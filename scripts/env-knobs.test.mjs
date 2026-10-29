@@ -319,8 +319,8 @@ describe('DECLARED_BARE_ENV_PARSES', () => {
       'server/src/syncCells/ownerAwareWsRouter.ts :: SYNC_WS_OWNER_RECHECK_MS',
       'server/src/tags/operations.ts :: *',
       'server/src/technologies/assets.ts :: *',
-      'src/lib/automerge/bridge.ts :: VITE_MODEL_SHARD_SIZE',
-      'src/lib/automerge/bridge.ts :: VITE_SHARD_SIZE',
+      'src/lib/automerge/shardSizes.ts :: VITE_MODEL_SHARD_SIZE',
+      'src/lib/automerge/shardSizes.ts :: VITE_SHARD_SIZE',
     ])
   })
 

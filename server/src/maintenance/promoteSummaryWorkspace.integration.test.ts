@@ -2166,18 +2166,32 @@ describe.skipIf(!TEST_DATABASE_URL)('summary promotion (live Postgres + real Aut
     expect(reportOnly.report.exclusionProven).toBeUndefined()
   })
 
-  it('a flag repair whose static row vanishes between the plan and the lock is REFUSED', async () => {
+  // `planReadDelayMs` delays one of the plan's four PARALLEL reads (each runs on
+  // its own pooled connection, so Postgres may execute them in any order). The
+  // 300 ms run pins the order that made this test fail intermittently under
+  // ci:local load (2026-10-21): the allow-list read landing after the move.
+  it.each([0, 300])('a flag repair whose static row vanishes between the plan and the lock is REFUSED (plan read delayed %i ms)', async (planReadDelayMs) => {
     // The third door has no callback between its fact-gathering and its lock —
     // no `connectedPeers`, and `onStep` fires only after the flip — so the seam
-    // has to be the POOL it is handed. The proxy answers the first
-    // `readStaticSource` truthfully and only then moves the row, which is
-    // exactly the instant a promotion committing-and-releasing in that window
-    // would move it. Nothing in production changes shape for this.
-    const L = 'L-lock-repair-witness'
+    // has to be the POOL it is handed. The plan gathers its facts with FOUR
+    // PARALLEL reads; the proxy answers all four truthfully and moves the row
+    // only once the last of them has been read, which is exactly the instant a
+    // promotion committing-and-releasing between the plan and the lock would
+    // move it. Moving it after the FIRST read (the old trigger) let a slower
+    // plan read see the move and refuse early, for the wrong reason, under load.
+    // Nothing in production changes shape for this.
+    const L = `L-lock-repair-witness-${planReadDelayMs}`
     const { rootUrl } = await provision(L, 'V1')
     await promote(L, 'V1', { apply: true })
     await stripSummaryFlag(rootUrl)
 
+    const PLAN_READS = [
+      'SELECT source FROM read_model_static_workspaces',
+      'SELECT document_id, kind FROM read_model_static_documents',
+      'SELECT document_id FROM automerge_document_workspace',
+      'SELECT count(*)::text AS n FROM ro_diagrams',
+    ]
+    const planReadsDone = new Set<string>()
     let moved = false
     const movingPool = new Proxy(db.pool, {
       get(target, prop, receiver) {
@@ -2186,9 +2200,14 @@ describe.skipIf(!TEST_DATABASE_URL)('summary promotion (live Postgres + real Aut
           return typeof value === 'function' ? value.bind(target) : value
         }
         return async (text: string, params?: unknown[]) => {
+          if (planReadDelayMs && typeof text === 'string'
+            && text.includes('SELECT document_id, kind FROM read_model_static_documents')) {
+            await new Promise((resolve) => setTimeout(resolve, planReadDelayMs))
+          }
           const result = await target.query(text, params)
-          if (!moved && typeof text === 'string'
-            && text.includes('SELECT source FROM read_model_static_workspaces')) {
+          const planRead = typeof text === 'string' ? PLAN_READS.find((sql) => text.includes(sql)) : undefined
+          if (planRead) planReadsDone.add(planRead)
+          if (!moved && planRead && planReadsDone.size === PLAN_READS.length) {
             moved = true
             await target.query(
               `DELETE FROM read_model_static_workspaces WHERE landscape_id = $1 AND version_id = 'V1'`,

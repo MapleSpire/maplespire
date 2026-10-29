@@ -1,0 +1,396 @@
+{
+  "$comment": "One model, two Model Viewer implementations: the server (viewerLevel.integration.test.ts) and the offline read-cache worker (src/workers/modelReadCache.viewerLevel.test.ts) assert the SAME levels. explorerParents is the group-first parent the object cache page serves the worker (pinned by the server test), so the worker is fed what the server really sends. Boundary groups hold app1 (C4 child of sys) and actor (a root): the explorer tree moves both under a group, the C4 hierarchy does not. Hub pins name order against id order (z1 is Alpha, a9 is Zeta) and the id tie-break between two same-named objects, one of them grouped; Vault is a parent whose ONLY C4 child is grouped, so it has no explorer children at all. Orphan and Ghost name a parent that does not exist (deleted): both are roots, and Ghost is ALSO in a group, so the explorer parks it under the group while the C4 level puts it at the root. c4Parents is the c4_parent_id the cache page serves (pinned by the server test): the worker indexes its levels on it.",
+  "objects": [
+    {
+      "id": "sys",
+      "name": "System1",
+      "type": "system"
+    },
+    {
+      "id": "actor",
+      "name": "Actor",
+      "type": "actor"
+    },
+    {
+      "id": "app1",
+      "name": "app1",
+      "type": "app",
+      "parentId": "sys"
+    },
+    {
+      "id": "app2",
+      "name": "app2",
+      "type": "app",
+      "parentId": "sys"
+    },
+    {
+      "id": "cmp",
+      "name": "cmp",
+      "type": "component",
+      "parentId": "app1"
+    },
+    {
+      "id": "hub",
+      "name": "Hub",
+      "type": "system"
+    },
+    {
+      "id": "z1",
+      "name": "Alpha",
+      "type": "app",
+      "parentId": "hub"
+    },
+    {
+      "id": "a9",
+      "name": "Zeta",
+      "type": "app",
+      "parentId": "hub"
+    },
+    {
+      "id": "api-b",
+      "name": "API",
+      "type": "app",
+      "parentId": "hub"
+    },
+    {
+      "id": "api-a",
+      "name": "API",
+      "type": "app",
+      "parentId": "hub"
+    },
+    {
+      "id": "vault",
+      "name": "Vault",
+      "type": "system"
+    },
+    {
+      "id": "vault-db",
+      "name": "Vault DB",
+      "type": "store",
+      "parentId": "vault"
+    },
+    {
+      "id": "orphan",
+      "name": "Orphan",
+      "type": "system",
+      "parentId": "deleted"
+    },
+    {
+      "id": "ghost",
+      "name": "Ghost",
+      "type": "system",
+      "parentId": "deleted"
+    }
+  ],
+  "groups": [
+    {
+      "id": "boundary",
+      "name": "System1",
+      "objectIds": [
+        "app1"
+      ]
+    },
+    {
+      "id": "zone",
+      "name": "Users",
+      "objectIds": [
+        "actor"
+      ]
+    },
+    {
+      "id": "hub-boundary",
+      "name": "Hub",
+      "objectIds": [
+        "api-b"
+      ]
+    },
+    {
+      "id": "vault-boundary",
+      "name": "Vault",
+      "objectIds": [
+        "vault-db"
+      ]
+    },
+    {
+      "id": "ghost-zone",
+      "name": "Ghosts",
+      "objectIds": [
+        "ghost"
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "uses",
+      "fromId": "actor",
+      "toId": "sys",
+      "kind": "direct"
+    },
+    {
+      "id": "calls",
+      "fromId": "app1",
+      "toId": "app2",
+      "kind": "direct"
+    },
+    {
+      "id": "calls-rollup",
+      "fromId": "app1",
+      "toId": "app2",
+      "kind": "lower"
+    },
+    {
+      "id": "self",
+      "fromId": "app1",
+      "toId": "app1",
+      "kind": "direct"
+    },
+    {
+      "id": "down",
+      "fromId": "cmp",
+      "toId": "app2",
+      "kind": "direct"
+    }
+  ],
+  "explorerParents": {
+    "boundary": null,
+    "zone": null,
+    "sys": null,
+    "actor": "zone",
+    "app1": "boundary",
+    "app2": "sys",
+    "cmp": "app1",
+    "hub-boundary": null,
+    "vault-boundary": null,
+    "hub": null,
+    "z1": "hub",
+    "a9": "hub",
+    "api-b": "hub-boundary",
+    "api-a": "hub",
+    "vault": null,
+    "vault-db": "vault-boundary",
+    "ghost-zone": null,
+    "orphan": null,
+    "ghost": "ghost-zone"
+  },
+  "levels": [
+    {
+      "parentId": null,
+      "objects": [
+        {
+          "id": "actor",
+          "expands": false
+        },
+        {
+          "id": "ghost",
+          "expands": false
+        },
+        {
+          "id": "hub",
+          "expands": true
+        },
+        {
+          "id": "orphan",
+          "expands": false
+        },
+        {
+          "id": "sys",
+          "expands": true
+        },
+        {
+          "id": "vault",
+          "expands": true
+        }
+      ],
+      "totalObjects": 6,
+      "ancestors": [],
+      "connections": [
+        "uses"
+      ]
+    },
+    {
+      "parentId": "sys",
+      "objects": [
+        {
+          "id": "app1",
+          "expands": true
+        },
+        {
+          "id": "app2",
+          "expands": false
+        }
+      ],
+      "totalObjects": 2,
+      "ancestors": [
+        "sys"
+      ],
+      "connections": [
+        "calls"
+      ]
+    },
+    {
+      "parentId": "app1",
+      "objects": [
+        {
+          "id": "cmp",
+          "expands": false
+        }
+      ],
+      "totalObjects": 1,
+      "ancestors": [
+        "sys",
+        "app1"
+      ],
+      "connections": []
+    },
+    {
+      "parentId": "app2",
+      "objects": [],
+      "totalObjects": 0,
+      "ancestors": [
+        "sys",
+        "app2"
+      ],
+      "connections": []
+    },
+    {
+      "parentId": "boundary",
+      "objects": [],
+      "totalObjects": 0,
+      "ancestors": [],
+      "connections": []
+    },
+    {
+      "parentId": "hub",
+      "objects": [
+        {
+          "id": "z1",
+          "expands": false
+        },
+        {
+          "id": "api-a",
+          "expands": false
+        },
+        {
+          "id": "api-b",
+          "expands": false
+        },
+        {
+          "id": "a9",
+          "expands": false
+        }
+      ],
+      "totalObjects": 4,
+      "ancestors": [
+        "hub"
+      ],
+      "connections": []
+    },
+    {
+      "parentId": "vault",
+      "objects": [
+        {
+          "id": "vault-db",
+          "expands": false
+        }
+      ],
+      "totalObjects": 1,
+      "ancestors": [
+        "vault"
+      ],
+      "connections": []
+    },
+    {
+      "parentId": "deleted",
+      "objects": [],
+      "totalObjects": 0,
+      "ancestors": [],
+      "connections": []
+    },
+    {
+      "parentId": "ghost",
+      "objects": [],
+      "totalObjects": 0,
+      "ancestors": [
+        "ghost"
+      ],
+      "connections": []
+    }
+  ],
+  "pages": [
+    {
+      "parentId": "sys",
+      "limit": 1,
+      "pages": [
+        [
+          "app1"
+        ],
+        [
+          "app2"
+        ]
+      ]
+    },
+    {
+      "parentId": null,
+      "limit": 1,
+      "pages": [
+        [
+          "actor"
+        ],
+        [
+          "ghost"
+        ],
+        [
+          "hub"
+        ],
+        [
+          "orphan"
+        ],
+        [
+          "sys"
+        ],
+        [
+          "vault"
+        ]
+      ]
+    },
+    {
+      "parentId": "hub",
+      "limit": 1,
+      "pages": [
+        [
+          "z1"
+        ],
+        [
+          "api-a"
+        ],
+        [
+          "api-b"
+        ],
+        [
+          "a9"
+        ]
+      ]
+    }
+  ],
+  "c4Parents": {
+    "boundary": null,
+    "zone": null,
+    "hub-boundary": null,
+    "vault-boundary": null,
+    "ghost-zone": null,
+    "sys": null,
+    "actor": null,
+    "app1": "sys",
+    "app2": "sys",
+    "cmp": "app1",
+    "hub": null,
+    "z1": "hub",
+    "a9": "hub",
+    "api-b": "hub",
+    "api-a": "hub",
+    "vault": null,
+    "vault-db": "vault",
+    "orphan": null,
+    "ghost": null
+  }
+}

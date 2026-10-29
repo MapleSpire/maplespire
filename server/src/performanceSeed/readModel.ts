@@ -283,6 +283,11 @@ export async function materializePerformanceReadModel(
        SELECT 1 FROM ro_objects parent
        WHERE parent.landscape_id = object.landscape_id
          AND parent.version_id = object.version_id AND parent.id = object.parent_id
+     ) THEN object.parent_id ELSE NULL END,
+     c4_parent_id = CASE WHEN EXISTS (
+       SELECT 1 FROM ro_objects parent
+       WHERE parent.landscape_id = object.landscape_id
+         AND parent.version_id = object.version_id AND parent.id = object.parent_id
      ) THEN object.parent_id ELSE NULL END
      WHERE object.landscape_id = $1 AND object.version_id = $2`,
     [key.landscapeId, key.versionId],
