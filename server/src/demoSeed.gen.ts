@@ -1136,6 +1136,7 @@ export const DEMO_SEED: DemoSeed = {
         "connectionHighlightStyle": "traveling-dot",
         "connectionAnimationsEnabled": true,
         "layouts": {},
+        "lowerRouting": {},
         "comments": {},
         "flows": {
           "flow-auth": {
