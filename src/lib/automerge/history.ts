@@ -114,10 +114,24 @@ export function restoreTo(handle: DocHandle<DiagramDoc>, heads: string[]): Diagr
   changeWithDurabilityTracking(handle, (d: DiagramDoc) => {
     // Restore every field to the past state, but KEEP the current checkpoint list
     // (restore points should not vanish when you roll back).
-    const target: DiagramDoc = { ...past, checkpoints: d.checkpoints ?? [] }
+    const target: DiagramDoc = keepScopeMap(d, { ...past, checkpoints: d.checkpoints ?? [] })
     reconcile(d, target)
   })
   return past
+}
+
+/**
+ * A restore point older than a diagram's first scope override has no
+ * `objectScopes`, and `reconcile` deletes a key its target lacks. Deleting the
+ * map loses a peer's concurrent override and reopens the concurrent-creation
+ * race (diagramViewWrite.ts), so a restore EMPTIES it instead — same result for
+ * this client, nothing lost for the peer (re-review 2026-10-29, F1).
+ */
+function keepScopeMap<T extends object>(current: object, target: T): T {
+  if ('objectScopes' in current && !('objectScopes' in target)) {
+    (target as Record<string, unknown>).objectScopes = {}
+  }
+  return target
 }
 
 /**
@@ -151,7 +165,7 @@ export function restoreDocToHeads<T extends object>(
     return false
   }
   changeWithDurabilityTracking(handle, (d: T) => {
-    reconcile(d as object, past as object)
+    reconcile(d as object, keepScopeMap(d as object, { ...past }))
   })
   return true
 }

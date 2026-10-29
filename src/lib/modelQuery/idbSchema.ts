@@ -111,6 +111,9 @@ export interface CachedModelEntityInput {
   componentCount?: number
   connectionCount?: number
   diagramCount?: number
+  /** Of `diagramCount`, the diagrams the object resolves external on, as the
+   * server reported it when the row was cached. */
+  externalDiagramCount?: number
   inDiagram?: boolean
   breadcrumb?: Array<{ id: string; name: string }>
   searchText?: string

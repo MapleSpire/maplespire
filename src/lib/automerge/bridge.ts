@@ -60,7 +60,7 @@ import {
   type WorkspaceBinding,
 } from './workspaceBinding'
 import { applyCollectionReconcile, planCollectionReconcile, reconcile, reconcileIsNoop } from './reconcile'
-import { applyDiagramViewFields, classifyDiagramViewEdit } from './diagramViewWrite'
+import { applyDiagramViewFields, classifyDiagramViewEdit, ScopeEditTracker, setObjectScopesForReconcile, withObjectScopesAtBirth } from './diagramViewWrite'
 import { syncModelIndex, resetModelIndexSync, applyOffWindowEditsToIndex, notifyServerInvalidation } from '../modelQuery/indexSync'
 import { isBootFromServerEnabled } from '../modelQuery/flag'
 import { isServerReadModelEnabled } from '../modelQuery/tierFlag'
@@ -185,6 +185,7 @@ import {
   sliceToRootModel,
   mergeShards,
   stripDeletedFromComposition,
+  type DiagramComposition,
   resolveDiagramProjection,
   diagramDocComments,
   diagramDocFlows,
@@ -651,6 +652,8 @@ const summaryLocalDiagramIds = new Set<string>()
 
 /** Diagrams the user just created, held until a registry shard carries them. */
 const localDiagramHold = new LocalDiagramHold()
+// Override keys changed LOCALLY per diagram, written as a delta (diagramViewWrite.ts).
+const scopeEdits = new ScopeEditTracker()
 /** Their DiagramDocs, kept resolvable across `docUrlById` rebuilds until a meta
  * names them (see unpublishedDiagramDocs.ts). */
 const unpublishedDiagramDocs = new UnpublishedDiagramDocs()
@@ -1162,10 +1165,27 @@ function byIdMap<T extends { id: string }>(items: readonly T[]): Record<string, 
   return out
 }
 
+/**
+ * `reconcile(doc[key], target)` for a by-id map the document may not hold:
+ * `reconcile` on an absent map is a silent no-op (measured: resident addGroup on
+ * a meta without `groups` left no group and no journal entry). An EMPTY target
+ * creates nothing — two peers each creating the same key is an Automerge
+ * conflict that hides the loser's puts — otherwise create, then reconcile the
+ * RE-READ proxy (`local/no-detached-container-write`).
+ */
+function reconcileMapField(doc: object, key: string, target: Record<string, unknown>): void {
+  const fields = doc as Record<string, unknown>
+  if (fields[key] === undefined || fields[key] === null) {
+    if (Object.keys(target).length === 0) return
+    fields[key] = {}
+  }
+  reconcile(fields[key], target)
+}
+
 /** Never copy a server-paged immutable ADR baseline into ModelMeta. */
 function reconcileDecisionRecordCollection(meta: ModelMeta, records: readonly DecisionRecord[]): void {
   if (!usesDecisionRecordDelta(meta)) {
-    reconcile(meta.decisionRecords, byIdMap(records))
+    reconcileMapField(meta, 'decisionRecords', byIdMap(records))
     return
   }
   const overlayIds = new Set(Object.keys(meta.decisionRecords ?? {}))
@@ -1183,13 +1203,15 @@ function reconcileDecisionRecordCollection(meta: ModelMeta, records: readonly De
         meta.deletedDecisionRecordIds.push(id)
         tombstoned.add(id)
       }
-      delete meta.decisionRecords[id]
+      if (meta.decisionRecords?.[id] !== undefined) delete meta.decisionRecords[id]
     }
   }
   const lifted = new Set<string>()
   for (const record of changedDecisionRecords(records, decisionRecordPageBaseline, overlayIds)) {
     if (tombstoned.has(record.id)) lifted.add(record.id)
     const clean = stripUndefined(record)
+    // Created only right before a write (`local/no-detached-container-write`).
+    if (!meta.decisionRecords) meta.decisionRecords = {}
     if (meta.decisionRecords[record.id]) reconcile(meta.decisionRecords[record.id], clean)
     else meta.decisionRecords[record.id] = clean
   }
@@ -1565,7 +1587,9 @@ function rebuildConnectionRoute(docs: (ConnectionShard | undefined)[]): void {
  * (a Playwright connect-freeze probe, never committed; 739-diagram landscape): with the registry
  * pre-diff in place, this full-bucket walk was the largest remaining piece of
  * a connect's flush — 55 of ~100 ms — to add ONE connection. A shard whose doc
- * cannot be read, or holds no such collection, takes the original call.
+ * cannot be read, or holds no such collection, takes the unplanned path: an
+ * absent map is created by `reconcileMapField` (bare `reconcile` was a silent
+ * no-op there), an ARRAY is left to `reconcile`, which ignores mismatched kinds.
  */
 function reconcileModelShardBucket(
   handle: DocHandle<ObjectShard> | DocHandle<ConnectionShard>,
@@ -1575,9 +1599,12 @@ function reconcileModelShardBucket(
   const target = byIdMap(bucket) as Record<string, unknown>
   const materialized = (handle.doc() as unknown as Record<string, Record<string, unknown> | undefined> | undefined)?.[key]
   // Only a by-id MAP can be planned key by key; an array (a corrupt or
-  // foreign shard) takes the original call, whose reconcile handles kinds.
+  // foreign shard) keeps the bare reconcile, an absent map is created.
   if (!materialized || typeof materialized !== 'object' || Array.isArray(materialized)) {
-    changeAndTrack(handle as unknown as DocHandle<Record<string, unknown>>, (s) => reconcile(s[key], target))
+    changeAndTrack(handle as unknown as DocHandle<Record<string, unknown>>, (s) => {
+      if (Array.isArray(s[key])) reconcile(s[key], target)
+      else reconcileMapField(s, key, target)
+    })
     return
   }
   const plan = planCollectionReconcile(materialized, target)
@@ -1905,9 +1932,9 @@ function writeModelShards(
     small.decisionRecords === lastModelSlices.decisionRecords
   if (!smallUnchanged) {
     changeAndTrack(modelMetaHandle, (m) => {
-      reconcile(m.groups, byIdMap(small.groups))
-      reconcile(m.domains, byIdMap(small.domains))
-      reconcile(m.tagSnapshots, Object.fromEntries(small.tags.map((tag) => [tag.tagId, tag])))
+      reconcileMapField(m, 'groups', byIdMap(small.groups))
+      reconcileMapField(m, 'domains', byIdMap(small.domains))
+      reconcileMapField(m, 'tagSnapshots', Object.fromEntries(small.tags.map((tag) => [tag.tagId, tag])))
       reconcileDecisionRecordCollection(m, small.decisionRecords)
     })
   }
@@ -2144,14 +2171,16 @@ async function replaySmallCollectionIntents(): Promise<void> {
         satisfied: plan.satisfied.length,
       })
       changeAndTrack(metaHandle, (m) => {
-        const targets: Record<SmallCollectionIntentKind, Record<string, unknown>> = {
-          group: (m.groups ??= {}),
-          domain: (m.domains ??= {}),
-          tagSnapshot: (m.tagSnapshots ??= {}),
-          decisionRecord: (m.decisionRecords ??= {}),
+        const fields = m as unknown as Record<string, Record<string, unknown> | undefined>
+        const fieldOf: Record<SmallCollectionIntentKind, string> = {
+          group: 'groups', domain: 'domains', tagSnapshot: 'tagSnapshots', decisionRecord: 'decisionRecords',
         }
         for (const kind of SMALL_INTENT_KINDS) {
-          const target = targets[kind]
+          const field = fieldOf[kind]
+          // Created only for a kind with upserts, then RE-READ (`local/no-detached-container-write`).
+          if (!fields[field] && plan.replayUpserts[kind].some((value) => keyOfValue(kind, value))) fields[field] = {}
+          const target = fields[field]
+          if (!target) continue
           for (const value of plan.replayUpserts[kind]) {
             const id = keyOfValue(kind, value)
             if (!id) continue
@@ -2356,14 +2385,17 @@ async function replayDiagramCollectionIntents(): Promise<void> {
         remaining: plan.remaining,
       })
       changeAndTrack(handle, (d) => {
-        const targets: Record<DiagramCollectionIntentKind, Record<string, unknown>> = {
-          comment: (d.comments ??= {}) as Record<string, unknown>,
-          flow: (d.flows ??= {}) as Record<string, unknown>,
-        }
+        const fields = d as unknown as Record<string, Record<string, unknown> | undefined>
+        const fieldOf: Record<DiagramCollectionIntentKind, string> = { comment: 'comments', flow: 'flows' }
+        const idOf = (value: unknown) => String((value as { id?: unknown }).id ?? '')
         for (const kind of DIAGRAM_INTENT_KINDS) {
-          const target = targets[kind]
+          const field = fieldOf[kind]
+          // Created only for a kind with upserts, then RE-READ (`local/no-detached-container-write`).
+          if (!fields[field] && plan.replayUpserts[kind].some((value) => idOf(value))) fields[field] = {}
+          const target = fields[field]
+          if (!target) continue
           for (const value of plan.replayUpserts[kind]) {
-            const id = String((value as { id?: unknown }).id ?? '')
+            const id = idOf(value)
             if (!id) continue
             const clean = stripUndefined(value)
             if (target[id]) reconcile(target[id] as Record<string, unknown>, clean)
@@ -3373,7 +3405,10 @@ function writeEditsShards(): void {
       createdAt: Date.now(),
     })
     changeAndTrack(editsObjectShardHandle, (s) => {
-      ;(s.writeBatchIds ??= []).push(batchId)
+      // Create, then write through the re-read proxy (`local/no-detached-container-write`).
+      if (!s.writeBatchIds) s.writeBatchIds = []
+      s.writeBatchIds.push(batchId)
+      if (!s.objects) s.objects = {}
       for (const id of pendingObjects) {
         const o = editsObjects.get(id)
         if (!o) continue
@@ -3417,7 +3452,9 @@ function writeEditsShards(): void {
       createdAt: Date.now(),
     })
     changeAndTrack(editsConnectionShardHandle, (s) => {
-      ;(s.writeBatchIds ??= []).push(batchId)
+      if (!s.writeBatchIds) s.writeBatchIds = []
+      s.writeBatchIds.push(batchId)
+      if (!s.connections) s.connections = {}
       for (const id of pendingConnections) {
         const c = editsConnections.get(id)
         if (!c) continue
@@ -3473,9 +3510,9 @@ function writeSmallCollections(state: ReturnType<typeof useModelStore.getState>)
   // acknowledgement site — an edit landing mid-flush keeps its intent.
   const intentRevision = pendingEntityIntents.revisionNow
   changeAndTrack(modelMetaHandle, (m) => {
-    reconcile(m.groups, byIdMap(state.groups))
-    reconcile(m.domains, byIdMap(state.domains))
-    reconcile(m.tagSnapshots, Object.fromEntries(state.tags.map((tag) => [tag.tagId, tag])))
+    reconcileMapField(m, 'groups', byIdMap(state.groups))
+    reconcileMapField(m, 'domains', byIdMap(state.domains))
+    reconcileMapField(m, 'tagSnapshots', Object.fromEntries(state.tags.map((tag) => [tag.tagId, tag])))
     reconcileDecisionRecordCollection(m, state.decisionRecords)
   })
   lastSmall = {
@@ -5046,7 +5083,7 @@ function publishNewRegistryShard(handle: DocHandle<RegistryShard>, summaryWriteH
  * change draft throws "Cannot create a reference to an existing document object". */
 function buildMeta(
   dg: Diagram,
-  composition: { objectIds: string[]; connectionIds: string[]; groupIds: string[] },
+  composition: DiagramComposition,
   docUrl: string,
 ): DiagramMeta {
   const meta: DiagramMeta = {
@@ -5059,6 +5096,12 @@ function buildMeta(
     groupIds: [...composition.groupIds],
   }
   if (dg.parentObjectId !== undefined) meta.parentObjectId = dg.parentObjectId
+  // Same copy rule as the arrays. An EMPTY map is kept, not written as absent:
+  // reconcile would delete the container, and in Automerge a container delete
+  // concurrent with a peer's put inside it loses the put (server twin:
+  // `server/src/ai/core/stubObjectScopes.ts`).
+  const scopes = composition.objectScopes
+  if (scopes) meta.objectScopes = { ...scopes }
   return meta
 }
 
@@ -5104,6 +5147,7 @@ function captureSummaryLocalDiagram(diagram: Diagram): void {
         objectIds: diagram.objectIds,
         connectionIds: withoutDerivedConnectionIds(diagram.connectionIds),
         groupIds: diagram.groupIds,
+        objectScopes: diagram.objectScopes,
       },
       docUrl,
     ),
@@ -5180,6 +5224,7 @@ function writeSummaryLocalRegistry(
         objectIds: diagram.objectIds,
         connectionIds: withoutLower(diagram.connectionIds),
         groupIds: diagram.groupIds,
+        objectScopes: diagram.objectScopes,
       },
       docUrl,
     )
@@ -5233,7 +5278,7 @@ function ensureDiagramDoc(diagram: Diagram): string {
   const revisionBeforeCreate = pendingEntityIntents.revisionNow
   const handle = trackCreatedHandle(createDiagramHandle(
     diagramToDiagramDoc(
-      { ...diagram, connectionIds: withoutDerivedConnectionIds(diagram.connectionIds) },
+      withObjectScopesAtBirth({ ...diagram, connectionIds: withoutDerivedConnectionIds(diagram.connectionIds) }),
       isActive ? commentsFor(diagram.id) : [],
       flowsFor(diagram.id),
       []
@@ -5544,12 +5589,13 @@ function flushWrite(): void {
     // reload (objectIds.length > rendered objects). stripDeletedFromComposition removes
     // only the tombstoned ids, never empties the arrays.
     const composition = isActive || !existingMeta
-      ? { objectIds: dg.objectIds, connectionIds: withoutLower(dg.connectionIds), groupIds: dg.groupIds }
+      ? { objectIds: dg.objectIds, connectionIds: withoutLower(dg.connectionIds), groupIds: dg.groupIds, objectScopes: dg.objectScopes }
       : stripDeletedFromComposition(
           {
             objectIds: existingMeta.objectIds ?? [],
             connectionIds: existingMeta.connectionIds ?? [],
             groupIds: existingMeta.groupIds ?? [],
+            objectScopes: existingMeta.objectScopes,
           },
           tombstoneObjects,
           tombstoneConnections,
@@ -5574,12 +5620,15 @@ function flushWrite(): void {
     // the deleted member lingered in non-active diagrams' objectIds). Active: the store
     // is authoritative (deleteObject already cleaned it).
     const composition = isActive
-      ? { objectIds: dg.objectIds, connectionIds: withoutLower(dg.connectionIds), groupIds: dg.groupIds }
+      ? { objectIds: dg.objectIds, connectionIds: withoutLower(dg.connectionIds), groupIds: dg.groupIds, objectScopes: dg.objectScopes }
       : stripDeletedFromComposition(
           {
             objectIds: existing?.objectIds ?? [],
             connectionIds: existing?.connectionIds ?? [],
             groupIds: existing?.groupIds ?? [],
+            // Scope overrides are preserved like the composition: a stale stub
+            // must never overwrite what a peer wrote for a diagram not open here.
+            objectScopes: existing?.objectScopes,
           },
           tombstoneObjects,
           tombstoneConnections,
@@ -5701,6 +5750,9 @@ function flushWrite(): void {
           flowsFor(activeDiagramId!),
           doc.checkpoints ?? []
         )
+        // The scope map is never deleted and never created by an unrelated
+        // write: see setObjectScopesForReconcile.
+        setObjectScopesForReconcile(target, active.objectScopes, doc, scopeEdits.take(activeDiagramId!))
         reconcile(doc, target)
       })
       if (placementSnapshot) {
@@ -6264,6 +6316,8 @@ function onStoreChange(state: ModelStoreSnapshot, previous: ModelStoreSnapshot):
   // boot, projectActiveFromServer (pre-overlay values), the ADR page
   // projection, the small-collections flush, and the replay's injection.
   if (applyingRemote) return
+  // Before any early return: every local change to a scope map must be recorded.
+  scopeEdits.note(previous.diagrams, state.diagrams)
   if (isBootFromServerEnabled() && state.selectedItems !== previous.selectedItems) {
     syncHydration()
   }
@@ -7596,6 +7650,7 @@ export function stopBridge(): void {
   summaryRegistryWriteUrl = null
   summaryLocalDiagramIds.clear()
   localDiagramHold.clear()
+  scopeEdits.clear()
   shardByDiagramId.clear()
   resetProjectionCache()
   resetModelIndexSync()

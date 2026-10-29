@@ -19,7 +19,10 @@
         "duplicate": "Dupliquer"
       },
       "dropHint": "Déposer sur un objet compatible",
-      "rootDropHint": "Déposer ici pour remettre à la racine"
+      "rootDropHint": "Déposer ici pour remettre à la racine",
+      "externalUsage_one": "Externe dans {{external}} sur {{count}} diagramme",
+      "externalUsage_other": "Externe dans {{external}} sur {{count}} diagrammes",
+      "externalUsageHint": "Portée par défaut : {{scope}}. Chaque diagramme résout sa propre portée : sa surcharge, puis la frontière C4 (hors du focus du diagramme = externe), puis ce défaut."
     },
     "view": {
       "searchPlaceholder": "Rechercher des objets",
@@ -34,7 +37,9 @@
       },
       "filters": {
         "type": "Type",
-        "scope": "Portée",
+        "scope": "Portée par défaut",
+        "scopeOnDiagrams": "Portée dans les diagrammes",
+        "externalOnSomeDiagram": "Externe dans au moins un diagramme",
         "status": "Statut",
         "tags": "Tags",
         "technology": "Technologie",

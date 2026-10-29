@@ -292,7 +292,11 @@ async function foldCollection(
   // full replace is correct (and structurally merges into the CRDT shard).
   for (const [idx, shardIds] of existingByShard) {
     baseHandles[idx].change((s) => {
-      const coll = s[collKey] ?? (s[collKey] = {})
+      // Assign, then RE-READ: `s[k] ?? (s[k] = {})` yields the plain `{}`, not
+      // the document's map, and the fold would land on a detached object right
+      // before the overlay copy is cleared below.
+      if (!s[collKey]) s[collKey] = {}
+      const coll = s[collKey]
       for (const id of shardIds) coll[id] = snapshot[id] as Record<string, unknown>
     })
   }
@@ -307,7 +311,8 @@ async function foldCollection(
       if (room <= 0) continue
       const take = created.slice(ci, ci + room)
       baseHandles[i].change((s) => {
-        const coll = s[collKey] ?? (s[collKey] = {})
+        if (!s[collKey]) s[collKey] = {}
+        const coll = s[collKey]
         for (const id of take) coll[id] = snapshot[id] as Record<string, unknown>
       })
       ci += take.length
@@ -333,7 +338,8 @@ async function foldCollection(
             return handle
           })()
       metaHandle.change((m) => {
-        const urls = (m[urlsField] ?? (m[urlsField] = [])) as string[]
+        if (!m[urlsField]) m[urlsField] = []
+        const urls = m[urlsField] as string[]
         const oIdx = urls.findIndex((url) => overlaySet.has(url))
         if (oIdx >= 0) urls.splice(oIdx, 0, newHandle.url)
         else urls.push(newHandle.url)
@@ -415,7 +421,10 @@ async function foldCollection(
   const keptIds = new Set<string>()
   if (ids.length) {
     overlayHandles.forEach((overlayHandle, segmentIndex) => overlayHandle.change((s) => {
-      const coll = (s[collKey] ?? (s[collKey] = {})) as Record<string, unknown>
+      // Nothing to clear in a segment without the map (and creating one here
+      // would have handed back a detached object anyway).
+      const coll = s[collKey] as Record<string, unknown> | undefined
+      if (!coll) return
       for (const [id, captured] of Object.entries(segmentSnapshots[segmentIndex])) {
         if (tombSet.has(id)) continue
         const cur = coll[id]
@@ -429,7 +438,8 @@ async function foldCollection(
   // history. New clients resolve only this fresh bounded head; historical URLs
   // remain referenced so stale/offline clients can finish syncing safely.
   // The fresh head is claimed before ModelMeta points at it.
-  const nextHeadValue = { [collKey]: {}, writeHeadVersion: 1 } as ShardDoc
+  // `writeBatchIds` from birth, like every head producer (overlaySegments.ts).
+  const nextHeadValue = { [collKey]: {}, writeHeadVersion: 1, writeBatchIds: [] } as unknown as ShardDoc
   const nextHead = claim
     ? await createClaimedDocument<ShardDoc>(repo, claim.workspace, claim.rootUrl, nextHeadValue)
     : await (async () => {
@@ -442,7 +452,8 @@ async function foldCollection(
     const segments = [...new Set([...(m[overlayUrlsField] ?? []), nextHead.url])]
     m[overlayUrlsField] = segments
     m[overlayField] = nextHead.url
-    const shardUrls = (m[urlsField] ?? (m[urlsField] = [])) as string[]
+    if (!m[urlsField]) m[urlsField] = []
+    const shardUrls = m[urlsField] as string[]
     if (!shardUrls.includes(nextHead.url)) shardUrls.push(nextHead.url)
     // NOT the same number as `nextHeadValue`'s `writeHeadVersion` above,
     // despite both reading `1`: that one is a per-document lifecycle marker,

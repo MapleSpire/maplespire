@@ -54,7 +54,10 @@ const importWorkspace = (raw: string): Mapped => mapWorkspace(parseWorkspaceJson
 
 const flowsByDiagram = (flows: readonly Flow[]): Record<string, Flow[]> => {
   const out: Record<string, Flow[]> = {}
-  for (const flow of flows) (out[flow.diagramId] ??= []).push(flow)
+  for (const flow of flows) {
+    out[flow.diagramId] ??= []
+    out[flow.diagramId].push(flow)
+  }
   return out
 }
 

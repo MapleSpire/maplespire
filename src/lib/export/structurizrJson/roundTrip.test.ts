@@ -316,7 +316,10 @@ async function importWorkspace(text: string): Promise<ImportResult> {
 
 function bundleOf(result: ImportResult): ExportBundle {
   const flowsByDiagram: Record<string, NonNullable<ImportResult['flows']>> = {}
-  for (const flow of result.flows ?? []) (flowsByDiagram[flow.diagramId] ??= []).push(flow)
+  for (const flow of result.flows ?? []) {
+    flowsByDiagram[flow.diagramId] ??= []
+    flowsByDiagram[flow.diagramId].push(flow)
+  }
   return {
     landscapeName: result.landscapeName ?? 'Workspace',
     generatedAt: '2026-01-01T00:00:00Z',

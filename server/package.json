@@ -47,6 +47,7 @@
     "audit:global-gc": "tsx scripts/audit-global-gc.ts",
     "verify:retained-documents": "tsx scripts/verify-retained-documents.ts",
     "repair:degenerate-roots": "tsx scripts/repair-degenerate-roots.ts",
+    "repair:missing-containers": "tsx scripts/repair-missing-containers.ts",
     "repair:registry-references": "tsx scripts/repair-registry-references.ts",
     "repair:static-registry-references": "tsx scripts/repair-static-registry-references.ts",
     "audit:static-registry-references": "tsx scripts/audit-static-registry-references.ts",

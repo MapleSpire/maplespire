@@ -61,6 +61,7 @@ import { OVERLAY_SEGMENT_SIZE } from '../overlaySegments.js'
 // the detector and the producer two independent copies that can drift.
 import { OVERLAY_WRITE_HEAD_VERSION } from '../modelMeta.js'
 import { enumerateMaintainableWorkspaces } from './maintainableWorkspaces.js'
+import { hiddenListEntries } from './containerConflicts.js'
 
 export type FsckSeverity =
   /** A user edit is accepted by the UI and never reaches durable storage. */
@@ -76,6 +77,8 @@ export const FSCK_CHECKS = {
   'root-structure': 'The root document names a model and at least one registry shard.',
   'model-write-head': 'A sharded model carries a durable object AND connection overlay write head.',
   'write-head-version': 'The overlay write heads use the current bounded write-head protocol.',
+  'model-containers-present': 'An ordinary ModelMeta and its current overlay heads hold the maps whose absence the projector refuses.',
+  'container-conflict': 'No current write head hides batch ids in a losing concurrent copy of writeBatchIds.',
   'document-present': 'Every document reachable from the root exists in storage.',
   'document-admitted': 'Every reachable document is mapped to this workspace.',
   'document-orphaned': 'Every document mapped to this workspace is reachable from its root.',
@@ -118,6 +121,20 @@ export interface OverlayWriteHeadSize {
   entities: number | null
   /** Unique `writeBatchIds`, the head's OTHER rotation trigger. Same null rule. */
   batches: number | null
+  /**
+   * Whether the head holds its own entity map (`objects` / `connections`) as a
+   * map. `null` when the head did not resolve; omitted by callers that did not
+   * look (test inputs), which `model-containers-present` reads as "no finding".
+   * Kept apart from `entities`, whose 0 deliberately covers both an empty map
+   * and an absent one.
+   */
+  entityMapPresent?: boolean | null
+  /**
+   * Batch ids held by a LOSING copy of a conflicted `writeBatchIds` and absent
+   * from the winner (`hiddenListEntries`) — writes the projector cannot see.
+   * `null` when the head did not resolve; omitted by callers that did not look.
+   */
+  hiddenBatchIds?: number | null
   /**
    * How long since a durable byte last reached this head, from
    * `read_model_static_document_queue.enqueued_at` — the column the STORAGE
@@ -959,6 +976,109 @@ export function checkWorkspaceStructure(input: StructureCheckInput): {
     }
   }
 
+  // ── model-containers-present ──────────────────────────────────────────────
+  // Only the containers whose ABSENCE a reader REFUSES, which is what makes
+  // their absence a defect rather than an older shape — and only on an ORDINARY
+  // workspace, whose projector is the reader (the static plane reads both
+  // `?? {}`):
+  //  - `groups` on the ModelMeta: the ordinary projector reads it through
+  //    `readEntityMapOrDefect` (projectorService.ts, the meta's only such read),
+  //    records `document-uninitialised` and REFUSES the group sync (an empty map
+  //    would mean "every group deleted" and delete rows), so group edits stop
+  //    reaching the read model and `readModelUntrustworthyReason` refuses
+  //    reference repair. `domains` / `tagSnapshots` are NOT checked: nothing in
+  //    the read model reads them, and metas from before 2026-07-18 legitimately
+  //    carry `tags` instead of `tagSnapshots`.
+  //  - the current overlay head's own entity map: its shard delta is refused
+  //    the same way.
+  // Containers that MAY be absent on documents minted before they were created
+  // at birth (the tombstone lists, `writeBatchIds`) are NOT findings here —
+  // `container-conflict` below reports a head's `writeBatchIds` that hides batch
+  // ids, and `npm run repair:missing-containers` is the remedy. DiagramDocs
+  // are not resolved by fsck (cost), so a DiagramDoc without `flows` is not seen.
+  if (!input.root) {
+    skip('model-containers-present', 'the root document did not resolve')
+  } else if (!namesMeta) {
+    skip('model-containers-present', 'monolith workspace: the root names no ModelMeta')
+  } else if (input.modelMetaUnresolved || !input.modelMeta) {
+    skip('model-containers-present', 'the ModelMeta did not resolve')
+  } else if (input.staticSource !== null) {
+    skip('model-containers-present', `static workspace: the static plane reads these containers \`?? {}\` (source: ${input.staticSource})`)
+  } else {
+    ran('model-containers-present')
+    const metaUrl = url(input.root.modelMetaUrl) ?? undefined
+    const groups = input.modelMeta.groups
+    if (!(groups && typeof groups === 'object' && !Array.isArray(groups))) {
+      findings.push({
+        check: 'model-containers-present',
+        severity: 'degraded',
+        detail: `the ModelMeta has no \`groups\` map${groups === undefined ? '' : ` (it holds ${JSON.stringify(groups)?.slice(0, 40)})`}: `
+          + 'the ordinary projector refuses the group sync as `document-uninitialised`, so group edits never reach '
+          + 'the read model, and reference repair is refused for the workspace. Not backfilled automatically — an '
+          + 'empty map would read as "every group deleted"; find where the field went first.',
+        documentUrl: metaUrl,
+      })
+    }
+    for (const head of input.overlayWriteHeads ?? []) {
+      if (head.entityMapPresent !== false) continue
+      const collection = head.field === 'editsObjectShardUrl' ? 'objects' : 'connections'
+      findings.push({
+        check: 'model-containers-present',
+        severity: 'degraded',
+        detail: `the current ${head.field} head has no \`${collection}\` map: its shard delta is refused as `
+          + '`document-uninitialised`, and every write into it creates the map lazily, which two concurrent writers '
+          + 'resolve as an Automerge conflict that hides one of their entries. Not backfilled automatically — an '
+          + 'empty map would read as an empty head.',
+        documentUrl: head.url,
+      })
+    }
+  }
+
+  // ── container-conflict ────────────────────────────────────────────────────
+  // A list created lazily by two concurrent first writers is TWO lists under
+  // one key; Automerge materialises one and the other's entries are invisible
+  // to every reader (measured, modelMeta.test.ts). This reports, on the two
+  // current write heads, a conflicted `writeBatchIds` whose losing copy holds
+  // batch ids the winner lacks: the projector's pending set is read off the
+  // winner, so a hidden id that was not acknowledged before it was hidden is
+  // never acknowledged, and its client waits for ever. `sync-stall`; healed by
+  // `npm run repair:missing-containers -- --apply` (an append-only list). A
+  // conflict whose losers are contained in the winner (a healed one) is not
+  // reported: the conflict itself stays in the document for ever by design.
+  //
+  // NOT the ModelMeta tombstone lists, deliberately. "In a losing copy and not
+  // in the winner" cannot tell a tombstone that never reached the winner from
+  // one the winner's side REMOVED on purpose — compaction splices applied ids
+  // out, and undo/re-create splices too, both on the winner only — so it would
+  // report a permanent, unfixable `data-loss` on healthy workspaces after their
+  // next compaction (reviewer lens, round 2, measured). Telling the two apart
+  // needs the effective model; the CLI's preview lists the ids for a person.
+  if (!input.root) {
+    skip('container-conflict', 'the root document did not resolve')
+  } else if (!namesMeta) {
+    skip('container-conflict', 'monolith workspace: the root names no ModelMeta')
+  } else if (input.modelMetaUnresolved || !input.modelMeta) {
+    skip('container-conflict', 'the ModelMeta did not resolve')
+  } else {
+    // `overlayWriteHeads ?? []`, as `model-containers-present` reads it:
+    // `fsckWorkspace` measures the heads whenever the meta resolved (the wire is
+    // pinned by workspaceFsck.integration.test.ts), and a caller allowed to
+    // skip that measurement on an ordinary workspace (`overlay-head-bounded`'s
+    // ladder test) must not turn the run incomplete.
+    ran('container-conflict')
+    for (const head of input.overlayWriteHeads ?? []) {
+      if (!head.hiddenBatchIds) continue
+      findings.push({
+        check: 'container-conflict',
+        severity: 'sync-stall',
+        detail: `${head.field}.writeBatchIds is conflicted and ${head.hiddenBatchIds} batch id(s) sit only in a `
+          + 'losing copy, invisible to the projector: any of them not acknowledged before it was hidden never will '
+          + 'be. Heal with `npm run repair:missing-containers -- --apply` (sync cells stopped).',
+        documentUrl: head.url,
+      })
+    }
+  }
+
   // ── document-present / document-admitted ──────────────────────────────────
   // Reachability is only as complete as the registries we could read, so an
   // unresolved registry downgrades these to skipped rather than passing on a
@@ -1532,6 +1652,10 @@ export function fsckStatusOf(
     // `the overlay segments were not measured` skip deliberately falls through
     // to `incomplete`.
     && !entry.reason.startsWith('no overlay segments')
+    // `static workspace` — added with `model-containers-present`, the mirror of
+    // `ordinary workspace` above: that check's reader is the ORDINARY projector,
+    // so on a workspace the static plane serves it does not apply.
+    && !entry.reason.startsWith('static workspace')
   ))
     ? 'incomplete'
     : findings.length > 0 ? 'violations' : 'clean'
@@ -1730,6 +1854,9 @@ export async function measureOverlayWriteHeads(
       // which it is. `null` is reserved for the count that could not be taken.
       entities: head === undefined ? null
         : entries && typeof entries === 'object' ? Object.keys(entries).length : 0,
+      entityMapPresent: head === undefined ? null
+        : Boolean(entries) && typeof entries === 'object' && !Array.isArray(entries),
+      hiddenBatchIds: head === undefined ? null : hiddenListEntries(head, 'writeBatchIds').length,
       batches: head === undefined ? null
         : new Set(Array.isArray(head.writeBatchIds)
           ? head.writeBatchIds.filter((id): id is string => typeof id === 'string')

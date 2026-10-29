@@ -276,6 +276,8 @@
         "flows": "Flux",
         "anchorLock": "Verrouillage des ancrages",
         "scope": "Portée",
+        "scopeOnDiagram": "Portée ici",
+        "defaultScope": "Portée par défaut",
         "belongsTo": "Appartient à",
         "contains": "Contient",
         "inGroups": "Dans les groupes",
@@ -291,7 +293,13 @@
       },
       "scope": {
         "internal": "Interne",
-        "external": "Externe"
+        "external": "Externe",
+        "reset": "Réinitialiser",
+        "source": {
+          "diagram": "Définie sur ce diagramme.",
+          "boundary": "Hors de la frontière de ce diagramme (C4).",
+          "default": "Selon la portée par défaut."
+        }
       },
       "shape": {
         "curved": "Courbe",

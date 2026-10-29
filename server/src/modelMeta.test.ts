@@ -12,6 +12,7 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU Affero General Public License for more details.
 
+import * as Automerge from '@automerge/automerge'
 import { describe, it, expect } from 'vitest'
 import { generateAutomergeUrl } from '@automerge/automerge-repo'
 import { OVERLAY_WRITE_HEAD_VERSION, buildModelMeta } from './modelMeta.js'
@@ -83,5 +84,38 @@ describe('buildModelMeta', () => {
     })
     expect(meta.objectShardUrls).toEqual([OBJECT_HEAD])
     expect(meta.connectionShardUrls).toEqual([CONNECTION_HEAD])
+  })
+})
+
+/**
+ * THE MEASUREMENT the "containers at birth" comments cite (buildModelMeta,
+ * overlaySegments.createSegment, createEmptyRoot, compaction's fresh head,
+ * containers.producers.test.ts). Two peers each run the writers' lazy
+ * `if (!m.deletedObjectIds) m.deletedObjectIds = []` and push on a meta
+ * WITHOUT the list, then merge: Automerge keeps ONE of the two lists under the
+ * key, so the other peer's tombstone is unreachable and its delete is undone.
+ * With the list created at birth both pushes land in the same list and merge.
+ * If a future Automerge merged concurrently created lists, the first half goes
+ * red and the birth-time rule can be revisited.
+ */
+describe('two peers creating a tombstone list lazily (the reason it is created at birth)', () => {
+  const lazyDelete = (doc: Automerge.Doc<Record<string, unknown>>, actor: string, id: string) =>
+    Automerge.change(Automerge.clone(doc, { actor }), (m) => {
+      if (!m.deletedObjectIds) m.deletedObjectIds = []
+      ;(m.deletedObjectIds as string[]).push(id)
+    })
+
+  it('LAZY: the merge keeps one peer\'s list and drops the other\'s tombstone', () => {
+    const base = Automerge.from<Record<string, unknown>>({ marker: 1 })
+    const merged = Automerge.merge(lazyDelete(base, 'aaaaaa', 'o-a'), lazyDelete(base, 'bbbbbb', 'o-b'))
+    expect([...(merged.deletedObjectIds as string[])]).toHaveLength(1)
+  })
+
+  it('AT BIRTH (`buildModelMeta`): both tombstones survive the merge', () => {
+    const base = Automerge.from<Record<string, unknown>>(
+      buildModelMeta({ objectWriteHead: OBJECT_HEAD, connectionWriteHead: CONNECTION_HEAD }) as unknown as Record<string, unknown>,
+    )
+    const merged = Automerge.merge(lazyDelete(base, 'aaaaaa', 'o-a'), lazyDelete(base, 'bbbbbb', 'o-b'))
+    expect([...(merged.deletedObjectIds as string[])].sort()).toEqual(['o-a', 'o-b'])
   })
 })

@@ -280,7 +280,8 @@ async function buildFixture(repo: Repo, objectCount: number): Promise<{
   const createdIds = Array.from({ length: OVERLAY_CREATES }, (_, i) => `o-created-${i}`)
   const objectHead = await findReadyDocument<ShardDoc>(repo, meta.editsObjectShardUrl)
   objectHead.change((s) => {
-    const coll = s.objects ?? (s.objects = {})
+    if (!s.objects) s.objects = {}
+    const coll = s.objects
     for (const id of editedIds) coll[id] = object(id, 2)
     for (const id of createdIds) coll[id] = object(id, 1)
   })
@@ -288,7 +289,8 @@ async function buildFixture(repo: Repo, objectCount: number): Promise<{
   const connectionEditIds = Array.from({ length: CONNECTION_EDITS }, (_, i) => `c-${i}`)
   const connectionHead = await findReadyDocument<ShardDoc>(repo, meta.editsConnectionShardUrl)
   connectionHead.change((s) => {
-    const coll = s.connections ?? (s.connections = {})
+    if (!s.connections) s.connections = {}
+    const coll = s.connections
     for (const id of connectionEditIds) {
       coll[id] = {
         id,
@@ -321,13 +323,15 @@ async function reseedOverlay(
   const head = await findReadyDocument<ShardDoc>(repo, metaHandle.doc()!.editsObjectShardUrl)
   const created = Array.from({ length: OVERLAY_CREATES }, (_, i) => `${createdPrefix}${i}`)
   head.change((s) => {
-    const coll = s.objects ?? (s.objects = {})
+    if (!s.objects) s.objects = {}
+    const coll = s.objects
     for (const id of editedIds) coll[id] = object(id, revision)
     for (const id of created) coll[id] = object(id, 1)
   })
   const connHead = await findReadyDocument<ShardDoc>(repo, metaHandle.doc()!.editsConnectionShardUrl)
   connHead.change((s) => {
-    const coll = s.connections ?? (s.connections = {})
+    if (!s.connections) s.connections = {}
+    const coll = s.connections
     for (let i = 0; i < CONNECTION_EDITS; i++) {
       coll[`c-${i}`] = { id: `c-${i}`, fromId: 'o-0-0', toId: 'o-0-1', label: `edge c-${i} r${revision}` }
     }

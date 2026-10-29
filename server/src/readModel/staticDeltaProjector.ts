@@ -178,7 +178,10 @@ export function appendUniqueOverlayRoute(
   field: OverlayRouteField,
   url: string,
 ): void {
-  const routes = meta[field] ?? (meta[field] = [])
+  // Assign, then RE-READ: `meta[field] ?? (meta[field] = [])` yields the plain
+  // `[]`, not the document's list, and the push into it is lost.
+  if (!meta[field]) meta[field] = []
+  const routes = meta[field]
   if (!routes.includes(url)) routes.push(url)
 }
 
@@ -245,7 +248,9 @@ export function substituteOverlayPrefix(
    */
   headDocumentId?: string,
 ): boolean {
-  const routes = meta[field] ?? (meta[field] = [])
+  // Assign, then RE-READ (see appendUniqueOverlayRoute).
+  if (!meta[field]) meta[field] = []
+  const routes = meta[field]
   // Match on document id, never on the string: the lists can carry decorated
   // urls (`automerge:xxx?foo`), and the two ModelMeta fields have historically
   // been written by different hands.
@@ -310,6 +315,37 @@ export function substituteOverlayPrefix(
 }
 interface StaticDiagramLike extends DiagramInput {
   flows?: Record<string, FlowInput>
+}
+
+/** The `ro_diagrams.data` a DiagramDoc projection writes: the doc over the row
+ * (which may carry registry-meta fields such as `docUrl`). The doc is
+ * authoritative for its scope overrides, and a cleared set is an ABSENT key
+ * there — which a plain spread would read as "keep the row's old overrides",
+ * leaving "external in N of M diagrams" counting an override the diagram no
+ * longer has. */
+export function mergeDiagramDocOverRow(
+  row: Record<string, unknown> | undefined,
+  doc: DiagramInput,
+  diagramId: string,
+): DiagramInput {
+  const merged: DiagramInput = { ...(row ?? {}), ...doc, id: diagramId }
+  if (!('objectScopes' in doc)) delete merged.objectScopes
+  return merged
+}
+
+/** The `ro_diagrams.data` a REGISTRY-SHARD projection writes: the meta over the
+ * row, EXCEPT `objectScopes`, which on this plane belongs to the DiagramDoc
+ * projection above. A summary workspace's client never rewrites the meta of an
+ * existing diagram, so a meta copy (e.g. one an AI tool mirrored) can be older
+ * than the doc; letting it win would resurrect a cleared override, or drop a
+ * newer one, whenever any sibling in the shard is re-projected. */
+export function mergeRegistryMetaOverRow(
+  row: Record<string, unknown> | undefined,
+  meta: DiagramInput,
+): DiagramInput {
+  const { objectScopes: _metaScopes, ...rest } = meta
+  const merged: DiagramInput = { ...(row ?? {}), ...rest, id: meta.id }
+  return merged
 }
 
 /** Only the field `projectRoot` needs. The root carries much more; reading more of it here
@@ -2260,9 +2296,13 @@ export class StaticDeltaProjector {
     )
     currentHandle.change((doc) => {
       const mutable = doc as ObjectOverlayLike & ConnectionOverlayLike
-      const target = kind === 'object'
-        ? (mutable.objects ??= {}) as Record<string, ObjectInput | ConnectionInput>
-        : (mutable.connections ??= {}) as Record<string, ObjectInput | ConnectionInput>
+      // Assign, then RE-READ: `(mutable.objects ??= {})` yields the plain `{}`
+      // it assigned, not the document's map, and the forward would be lost
+      // while its batch is acknowledged below.
+      if (kind === 'object' && !mutable.objects) mutable.objects = {}
+      if (kind === 'connection' && !mutable.connections) mutable.connections = {}
+      const target = (kind === 'object' ? mutable.objects : mutable.connections) as
+        Record<string, ObjectInput | ConnectionInput>
       for (const [entityId, value] of upserts) target[entityId] = plain(value)
       // Forwarded acknowledgements must reach the current projector, but they
       // are not new writes on this head. Counting them as local write batches
@@ -3749,7 +3789,7 @@ export class StaticDeltaProjector {
         // `diagrams.length - existing`, so skipping an unchanged row cannot
         // drift the counter: it was already counted.
         if (!row || (row.org_id ?? null) !== orgId) return true
-        return diagramRowFingerprint({ ...row.data, ...meta, id: meta.id })
+        return diagramRowFingerprint(mergeRegistryMetaOverRow(row.data, meta))
           !== diagramRowFingerprint(row.data)
       })
       await bumpDiagramRenderGenerations(tx, descriptor, generation, {
@@ -3757,11 +3797,7 @@ export class StaticDeltaProjector {
       })
 
       if (changed.length) {
-        const merged = changed.map((meta) => ({
-          ...(currentById.get(meta.id)?.data ?? {}),
-          ...meta,
-          id: meta.id,
-        } as DiagramInput))
+        const merged = changed.map((meta) => mergeRegistryMetaOverRow(currentById.get(meta.id)?.data, meta))
         await upsertDiagrams(tx, descriptor, orgId, merged)
       }
 
@@ -3811,7 +3847,7 @@ export class StaticDeltaProjector {
          WHERE landscape_id = $1 AND version_id = $2 AND id = $3`,
         [descriptor.landscapeId, descriptor.versionId, diagramId],
       )
-      const merged: DiagramInput = { ...(current.rows[0]?.data ?? {}), ...doc, id: diagramId }
+      const merged = mergeDiagramDocOverRow(current.rows[0]?.data, doc, diagramId)
       await upsertDiagrams(tx, descriptor, descriptor.orgId ?? current.rows[0]?.org_id ?? null, [merged])
 
       const previousObjects = await membershipValues(tx, 'ro_diagram_objects', 'object_id', descriptor, diagramId)

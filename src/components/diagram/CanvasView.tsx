@@ -19,6 +19,7 @@ import { ZoomIn, ZoomOut, Maximize, Grid2x2, RotateCw, TriangleAlert } from 'luc
 import { cn } from '../../lib/utils'
 import { CanvasEngine } from '../../canvas/engine/CanvasEngine'
 import { useModelStore, getDiagramIndex } from '../../stores/modelStore'
+import { parentLookup } from '../../lib/diagrams/objectScope'
 import { getModelQuery } from '../../lib/modelQuery'
 import { seedObjectForEdit } from '../../lib/automerge/bridge'
 import { reloadWorkspace } from '../../lib/automerge/switchWorkspace'
@@ -82,10 +83,10 @@ import { defaultShapeSize } from '../../lib/shapeDefaults'
 
 // The 2D engine is fed through the SAME `filterAndMergeDiagramData` as the 3D
 // view, the share viewer and the image exporters (src/lib/viewLayouts.ts):
-// composition filter, per-diagram `layouts`, and the diagram's `lowerRouting`
-// on its derived connections. This file kept a private copy until 2026-10-22;
-// a step added to one copy and not the other was invisible to every test,
-// which only exercised the shared one.
+// composition filter, per-diagram `layouts`, the diagram's `lowerRouting`
+// on its derived connections, and each object's per-diagram effective scope.
+// This file kept a private copy until 2026-10-22; a step added to one copy and
+// not the other was invisible to every test, which only exercised the shared one.
 
 /** A diagram's first fit: centre on the entity an "open in diagram" link asked
  *  for, else zoom-to-fit. The request is NOT consumed here — the DiagramDoc
@@ -468,11 +469,16 @@ export function CanvasView() {
     if (!engine) return
     const store = useModelStore.getState()
     const diagram = store.getCurrentDiagram()
+    // Ancestors for the scope boundary rule come from the resident model index
+    // (O(1) per lookup, no per-sync Map over every object).
+    const objectById = getDiagramIndex().objectById
     const merged = filterAndMergeDiagramData(
       diagram,
       store.objects,
       store.connections,
-      store.groups
+      store.groups,
+      '2d',
+      parentLookup((id) => objectById.get(id)),
     )
     // Shapes expanded in place: the linked diagram's contents are folded in on
     // the way to the ENGINE and never written to the model. See `expandInline`.

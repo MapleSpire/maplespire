@@ -215,8 +215,10 @@ export async function healWholeEntityConflicts<T extends Record<string, unknown>
   const field = args.collection === 'object' ? 'objects' : 'connections'
   args.handle.change((doc: unknown) => {
     const mutable = doc as Record<string, Record<string, T> | undefined>
-    const target = (mutable[field] ??= {})
-    applyWholeEntityHealing(target, plan, args.sourceConflicts)
+    // Assign, then RE-READ: `(mutable[field] ??= {})` yields the plain `{}` it
+    // assigned, not the document's map, and the heal would be lost.
+    if (!mutable[field]) mutable[field] = {}
+    applyWholeEntityHealing(mutable[field], plan, args.sourceConflicts)
   })
   await args.repo.flush([args.handle.documentId])
   return 'healed'

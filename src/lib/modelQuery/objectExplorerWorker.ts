@@ -48,6 +48,7 @@ function toExplorerRow(record: CachedModelEntityRecord | ModelCacheSearchItem): 
     componentCount: record.componentCount ?? 0,
     connectionCount: record.connectionCount ?? 0,
     diagramCount: record.diagramCount ?? 0,
+    ...(record.externalDiagramCount !== undefined ? { externalDiagramCount: record.externalDiagramCount } : {}),
     inDiagram: record.inDiagram ?? inDiagram,
     breadcrumb: record.breadcrumb ?? [],
     ...('matchKind' in record ? { matchKind: record.matchKind } : {}),

@@ -485,4 +485,26 @@ describe('healWholeEntityConflicts — the driver', () => {
     expect(outcome).toBe('healed')
     expect(doc.connections.c).toEqual({ id: 'c', fromId: 'a', toId: 'b', fromLeft: 'L', fromRight: 'R' })
   })
+
+  it('persists the heal into a document that has NO collection map', async () => {
+    // Reached only with unknown sampled heads (the heads check otherwise
+    // reports the movement), but the write must not be lost when it is:
+    // `(mutable[field] ??= {})` yields the plain `{}` it assigned, not the
+    // document's map.
+    const fx = fixture(new Map())
+    const sampled = conflicted()
+    let doc = A.from<Record<string, unknown>>({ marker: 1 })
+    const outcome = await healWholeEntityConflicts<Rec>({
+      db: fx.db, key, collection: 'object',
+      handle: { documentId: 'doc-absent' as DocumentId, doc: () => doc, change: (cb) => { doc = A.change(doc, (d) => cb(d)) } },
+      repo: { flush: async (ids) => { fx.flushed.push(ids ?? []) } },
+      sourceConflicts: collectAutomergeEntityConflicts(sampled.objects),
+      sampledHeads: null,
+      current: () => undefined,
+      selected: (id) => sampled.objects[id],
+    })
+    expect(outcome).toBe('healed')
+    expect((doc.objects as Record<string, Rec> | undefined)?.w)
+      .toEqual({ id: 'w', type: 'app', name: 'W', fromLeft: 'L', fromRight: 'R' })
+  })
 })

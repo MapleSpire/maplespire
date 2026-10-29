@@ -122,6 +122,10 @@ export interface BuiltModelMeta {
   domains: Record<string, unknown>
   tagSnapshots: Record<string, unknown>
   decisionRecords: Record<string, unknown>
+  deletedObjectIds: string[]
+  deletedConnectionIds: string[]
+  deletedDecisionRecordIds: string[]
+  deletedDiagramIds: string[]
 }
 
 /** Keep the write head last in its base-shard list — `forkRoot.remapModelMeta`
@@ -151,5 +155,17 @@ export function buildModelMeta(seed: ModelMetaSeed): BuiltModelMeta {
     domains: seed.domains ?? {},
     tagSnapshots: seed.tagSnapshots ?? {},
     decisionRecords: seed.decisionRecords ?? {},
+    // The tombstone lists exist from birth. Every reader treats an absent list
+    // as empty, but every WRITER created it lazily on the first delete — and two
+    // peers deleting concurrently on a meta without it each create their own
+    // list under one key, which Automerge resolves by hiding one of them, its
+    // tombstones with it (the deleted entity comes back). Created here, there is
+    // one list from the start and concurrent pushes merge. Measured in
+    // modelMeta.test.ts "two peers creating a tombstone list lazily": 1 of 2
+    // tombstones survives lazy creation, 2 of 2 survive this one.
+    deletedObjectIds: [],
+    deletedConnectionIds: [],
+    deletedDecisionRecordIds: [],
+    deletedDiagramIds: [],
   }
 }

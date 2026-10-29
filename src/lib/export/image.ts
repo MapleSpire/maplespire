@@ -23,6 +23,7 @@ import type { PdfImage } from './pdf'
 import { getActiveScene3D } from '../../canvas3d/activeScene'
 import { resolveLowerRouting } from '../diagrams/lowerRouting'
 import i18n from '../i18n'
+import { parentLookup, withEffectiveScope } from '../diagrams/objectScope'
 
 /**
  * Diagram → image exports. Both formats read from the SAME offscreen
@@ -73,11 +74,13 @@ export function sceneFromBundle(bundle: ExportBundle, diagramId: string): Diagra
   const objectIds = new Set(diagram.objectIds)
   const connectionIds = new Set(diagram.connectionIds)
   const groupIds = new Set(diagram.groupIds)
+  const objectById = new Map(bundle.objects.map((o) => [o.id, o]))
+  const parentOf = parentLookup((id) => objectById.get(id))
   const objects = bundle.objects
     .filter((o) => objectIds.has(o.id))
     .map((o) => {
       const l = diagram.layouts?.[o.id]
-      return l ? { ...o, position: l.position, size: l.size } : o
+      return withEffectiveScope(l ? { ...o, position: l.position, size: l.size } : o, diagram, parentOf)
     })
   const groups = bundle.groups
     .filter((g) => groupIds.has(g.id))

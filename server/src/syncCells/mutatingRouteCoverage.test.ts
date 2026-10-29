@@ -256,6 +256,7 @@ const AI_WRITE_TOOLS: ReadonlyArray<readonly [string, ToolClassification, string
   ['delete_decision_record', 'body-key', 'model family'],
   ['create_diagram', 'body-key', 'model family'],
   ['update_diagram', 'body-key', 'model family'],
+  ['set_object_scope_on_diagram', 'body-key', 'model family (writes an existing DiagramDoc, like update_diagram)'],
   ['delete_diagram', 'body-key', 'model family'],
   ['resolve_comment', 'body-key', 'model family'],
   ['reply_to_comment', 'body-key', 'model family'],

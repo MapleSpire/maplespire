@@ -13,7 +13,8 @@
 // GNU Affero General Public License for more details.
 
 import { describe, it, expect } from 'vitest'
-import { toShareDiagram, sliceModelForShare } from './sliceModel'
+import { bakeShareScopes, toShareDiagram, sliceModelForShare } from './sliceModel'
+import { filterAndMergeDiagramData } from '../viewLayouts'
 import type { C4Object, Connection, Group, Tag, Diagram } from '../../types'
 
 const obj = (id: string, tagOrder: string[] = []): C4Object => ({
@@ -132,5 +133,52 @@ describe('sliceModelForShare', () => {
     const s = sliceModelForShare([dg('d1', ['o1'], [], []), dg('d2', ['o2'], ['c1'], [])], model)
     expect(s.objects.map((o) => o.id).sort()).toEqual(['o1', 'o2'])
     expect(s.connections.map((c) => c.id)).toEqual(['c1'])
+  })
+})
+
+describe('bakeShareScopes', () => {
+  // Container view of `shop`. `deep` is a component of `api`, and `api` is NOT
+  // on the diagram, so the slice drops it: the viewer alone cannot prove `deep`
+  // sits inside `shop` (inside must be proven) and would grey it out.
+  const full: C4Object[] = [
+    obj('shop'),
+    { ...obj('web'), parentId: 'shop' },
+    { ...obj('api'), parentId: 'shop' },
+    { ...obj('deep'), parentId: 'api' },
+    obj('bank'),
+    { ...obj('ledger'), parentId: 'bank' },
+    { ...obj('stripe'), scope: 'external' },
+    { ...obj('kept'), parentId: 'bank' },
+  ]
+  const diagram = (): Diagram => ({
+    ...dg('d1', ['web', 'deep', 'ledger', 'stripe', 'kept']),
+    type: 'container',
+    parentObjectId: 'shop',
+    objectScopes: { kept: 'internal' },
+  })
+
+  it('freezes the editor-resolved scope for every object on the shared diagram', () => {
+    const shared = [toShareDiagram(diagram())]
+    bakeShareScopes(shared, full)
+    expect(shared[0].objectScopes).toEqual({
+      web: 'internal', deep: 'internal', ledger: 'external', stripe: 'external', kept: 'internal',
+    })
+  })
+
+  it('makes the viewer render what the editor renders, from the sliced model alone', () => {
+    const d = diagram()
+    const editor = filterAndMergeDiagramData(d, full, [], [])
+      .filteredObjects.map((o) => [o.id, o.scope])
+    const shared = [toShareDiagram(d)]
+    bakeShareScopes(shared, full)
+    const sliced = sliceModelForShare(shared, { objects: full, connections: [], groups: [], tags: [] })
+    expect(sliced.objects.some((o) => o.id === 'api')).toBe(false)
+    const viewer = filterAndMergeDiagramData(shared[0], sliced.objects, [], [])
+      .filteredObjects.map((o) => [o.id, o.scope])
+    expect(viewer).toEqual(editor)
+    // Control: without the bake the viewer cannot prove `deep` is inside.
+    const unbaked = filterAndMergeDiagramData(toShareDiagram(d), sliced.objects, [], [])
+      .filteredObjects.find((o) => o.id === 'deep')
+    expect(unbaked?.scope).toBe('external')
   })
 })

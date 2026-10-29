@@ -15,7 +15,7 @@
 import { create } from 'zustand'
 import { immer } from 'zustand/middleware/immer'
 import { isDraft, original } from 'immer'
-import type { C4Object, Connection, Diagram, Flow, FlowStep, Group, Tag, SelectedItem, Domain, Comment, DecisionRecord, Position, Size, ConnectionShape, LowerConnectionRouting } from '../types'
+import type { C4Object, Connection, Diagram, Flow, FlowStep, Group, Tag, SelectedItem, Domain, Comment, DecisionRecord, Position, Size, ConnectionShape, LowerConnectionRouting, ObjectScope } from '../types'
 import { generateId } from '../lib/utils'
 import { LEGACY_COMMENT_AUTHOR, type CommentAuthorship } from '../lib/comments/authorship'
 import { assertTechnologyUsageIdentityPreserved } from '../lib/technologyUsage'
@@ -1163,7 +1163,12 @@ interface ModelState {
   moveSelectedItems: (delta: { x: number; y: number }) => void
   addSelectedToGroup: (groupId: string) => void
   removeSelectedFromGroup: (groupId: string) => void
-  setScopeForSelected: (scope: 'internal' | 'external') => void
+  /** Internal/external override on the ACTIVE diagram. `null` clears it, so the
+   * object resolves from the C4 boundary rule and then its default scope again.
+   * Writes only `diagram.objectScopes`. Deliberately no diagramId: the bridge
+   * persists view fields of the active DiagramDoc only (bridge.ts fast path),
+   * so an override set on another diagram would be silently dropped. */
+  setObjectScopeOnDiagram: (objectIds: string[], scope: ObjectScope | null) => void
   selectAllInDiagram: () => void
 
   // Model objects view getters
@@ -1394,7 +1399,9 @@ function writePlacement(
 ): void {
   const use3d = activeLayoutSpace() === '3d'
   if (use3d) ensureFork3d(state, diagram)
-  const map = use3d ? (diagram.layouts3d ??= {}) : (diagram.layouts ??= {})
+  if (use3d) diagram.layouts3d ??= {}
+  else diagram.layouts ??= {}
+  const map = (use3d ? diagram.layouts3d : diagram.layouts)!
   const existing = map[id]
   const position = patch.position ?? existing?.position ?? fallback.position
   const size = patch.size ?? existing?.size ?? fallback.size
@@ -1740,7 +1747,8 @@ export const useModelStore = create<ModelState>()(
         for (const id of plan.addGroupIds) addUnique(diagram.groupIds, id)
         for (const connection of plan.newConnections) addUnique(diagram.connectionIds, connection.id)
         for (const id of plan.addConnectionIds) addUnique(diagram.connectionIds, id)
-        const layouts = (diagram.layouts ??= {})
+        if (!diagram.layouts) diagram.layouts = {}
+        const layouts = diagram.layouts
         for (const [id, placement] of Object.entries(plan.placements)) {
           const value = { position: { ...placement.position }, size: { ...placement.size } }
           // Pasted on a forked 3D board: shown where it was dropped in 3D, and
@@ -1904,6 +1912,9 @@ export const useModelStore = create<ModelState>()(
           }
           if (d.layouts3d) {
             delete d.layouts3d[id]
+          }
+          if (d.objectScopes) {
+            delete d.objectScopes[id]
           }
         })
         state.groups.forEach((g) => {
@@ -2773,6 +2784,7 @@ export const useModelStore = create<ModelState>()(
             if (d.layouts) delete d.layouts[droppedId]
             if (d.layouts3d) delete d.layouts3d[droppedId]
           }
+          if (d.objectScopes) for (const objectId of objectIds) delete d.objectScopes[objectId]
         })
         state.groups.forEach((g) => {
           g.objectIds = g.objectIds.filter((oid) => !objectIds.includes(oid))
@@ -2848,14 +2860,21 @@ export const useModelStore = create<ModelState>()(
       })
     },
 
-    setScopeForSelected: (scope) => {
+    setObjectScopeOnDiagram: (objectIds, scope) => {
+      const targetDiagramId = get().currentDiagramId
+      if (!targetDiagramId) return
       set((state) => {
-        for (const item of state.selectedItems) {
-          if (item.type === 'object') {
-            const obj = state.objects.find((o) => o.id === item.id)
-            if (obj) obj.scope = scope
-          }
+        const diagram = state.diagrams.find((d) => d.id === targetDiagramId)
+        if (!diagram) return
+        if (scope === null) {
+          if (!diagram.objectScopes) return
+          // Empty the map, never delete it: deleting the Automerge map loses a
+          // peer's concurrent override written into it (an empty `{}` survives).
+          for (const id of objectIds) delete diagram.objectScopes[id]
+          return
         }
+        diagram.objectScopes ??= {}
+        for (const id of objectIds) diagram.objectScopes[id] = scope
       })
     },
 
@@ -3429,7 +3448,7 @@ export const UNDOABLE_ACTIONS = [
   'addTagToObject', 'removeTagFromObject', 'addTagToConnection', 'removeTagFromConnection',
   'addTagToGroup', 'removeTagFromGroup',
   'deleteSelectedItems', 'moveSelectedItems', 'addSelectedToGroup', 'removeSelectedFromGroup',
-  'setScopeForSelected',
+  'setObjectScopeOnDiagram',
   'removeObjectFromDiagram', 'removeObjectsFromDiagram', 'removeConnectionFromDiagram',
   'removeGroupFromDiagram', 'removeGroupsFromDiagram', 'addGroupToDiagram', 'addObjectToDiagram',
   'applyDiagramLayout', 'resetDiagram3dLayout', 'pasteEntities',

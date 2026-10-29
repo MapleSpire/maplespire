@@ -49,7 +49,8 @@ async function bundleFor(fixture: unknown): Promise<ExportBundle> {
   const flowsByDiagram: Record<string, typeof result.flows extends undefined ? never : NonNullable<typeof result.flows>> =
     {}
   for (const flow of result.flows ?? []) {
-    ;(flowsByDiagram[flow.diagramId] ??= []).push(flow)
+    flowsByDiagram[flow.diagramId] ??= []
+    flowsByDiagram[flow.diagramId].push(flow)
   }
   return {
     landscapeName: result.landscapeName ?? 'Workspace',

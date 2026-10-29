@@ -56,7 +56,7 @@
       "tabDetails": "Details",
       "tabConnections": "Connections · {{count}}",
       "type": "Type",
-      "scope": "Scope",
+      "scope": "Default scope",
       "status": "Status",
       "belongsTo": "Belongs to",
       "domain": "Domain",

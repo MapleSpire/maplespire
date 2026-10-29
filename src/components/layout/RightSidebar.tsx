@@ -63,7 +63,8 @@ import { MarkdownEditor } from '../flow/MarkdownEditor'
 import { Badge } from '../ui/badge'
 import { Chip } from '../ui/chip'
 import { useUIStore } from '../../stores/uiStore'
-import { useModelStore } from '../../stores/modelStore'
+import { useModelStore, getDiagramIndex } from '../../stores/modelStore'
+import { parentLookup, resolveObjectScope } from '../../lib/diagrams/objectScope'
 import { useAutomergeStatus } from '../../stores/automergeStatusStore'
 import { getModelQuery } from '../../lib/modelQuery'
 import { projectDecisionRecordPage, seedObjectForEdit, seedConnectionForEdit } from '../../lib/automerge/bridge'
@@ -81,7 +82,7 @@ import { useSkinStore } from '../../stores/skinStore'
 import { useThemeStore, type ResolvedTheme } from '../../stores/themeStore'
 import { getSkinById, getAllSkins } from '../../skins/registry'
 import type { SkinConfig } from '../../skins/types'
-import type { C4Object, Connection, DecisionRecord, TagSnapshot, TechnologyRole, TechnologyUsage, ConnectionHighlightStyle, ConnectionShape, Group, ShapeType, ObjectLinkValue } from '../../types'
+import type { C4Object, Connection, DecisionRecord, TagSnapshot, TechnologyRole, TechnologyUsage, ConnectionHighlightStyle, ConnectionShape, Group, ShapeType, ObjectLinkValue, ObjectScope } from '../../types'
 import { fetchLinkMetadataTitle } from '../../lib/linkMetadata'
 import { fetchDecisionRecordDetail, fetchDecisionRecordPage } from '../../lib/modelQuery/decisionRecords'
 import { mergeUniquePageItems } from '../../lib/modelQuery/pageMerge'
@@ -126,6 +127,37 @@ function propertyTabs(t: TFunction) {
 /** The design's "Type" value chip (Properties panel, line 284): a small
  *  rounded-md, normal-case, 11px/600 badge on surface-200 — NOT the uppercase
  *  status pill. Used for both the object type and a group's "Group". */
+function ScopeToggle({ value, disabled, testId, onChange }: {
+  value: ObjectScope
+  disabled: boolean
+  testId: string
+  onChange: (scope: ObjectScope) => void
+}) {
+  const { t } = useTranslation()
+  return (
+    <div className="inline-flex rounded-lg border border-line overflow-hidden" data-testid={testId}>
+      {(['internal', 'external'] as const).map((scope, i) => (
+        <button
+          key={scope}
+          type="button"
+          aria-pressed={value === scope}
+          onClick={() => !disabled && onChange(scope)}
+          disabled={disabled}
+          className={cn(
+            'px-2.5 py-1 text-[11px] font-semibold capitalize transition-colors disabled:opacity-50',
+            i > 0 && 'border-l border-line',
+            value === scope
+              ? 'bg-accent-subtle text-accent'
+              : 'bg-surface-100 text-fg-subtle hover:text-fg-secondary'
+          )}
+        >
+          {scope === 'internal' ? t('layoutNav.rightSidebar.scope.internal') : t('layoutNav.rightSidebar.scope.external')}
+        </button>
+      ))}
+    </div>
+  )
+}
+
 function TypeBadge({ children }: { children: React.ReactNode }) {
   return (
     <span className="inline-flex items-center rounded-md bg-surface-200 px-2.5 py-0.5 text-[11px] font-semibold capitalize text-fg-secondary">
@@ -246,6 +278,13 @@ export function RightSidebar() {
     selectedFromStore ??
     (selectedObjectIds.length === 1 && seamMatch && 'type' in seamMatch ? (seamMatch as C4Object) : undefined)
   const selectedObjectId = selected?.id
+  // Scope is per diagram: only meaningful when the object is on the active one.
+  const selectedScope = useMemo(() => {
+    if (!selected || !currentDiagram?.objectIds.includes(selected.id)) return null
+    const objectById = getDiagramIndex().objectById
+    return resolveObjectScope(selected, currentDiagram, parentLookup((id) => objectById.get(id)))
+  }, [selected, currentDiagram])
+  const setObjectScopeOnDiagram = useModelStore((s) => s.setObjectScopeOnDiagram)
   const updateSelectedObjectLinks = useCallback((links: ObjectLinkValue[]) => {
     if (selectedObjectId) updateObject(selectedObjectId, { links })
   }, [selectedObjectId, updateObject])
@@ -1221,25 +1260,37 @@ export function RightSidebar() {
                       <span className="text-fg-subtle">{selected.icon || t('layoutNav.rightSidebar.none')}</span>
                     </button>
                   </FieldRow>
-                  <FieldRow label={t('layoutNav.rightSidebar.field.scope')}>
-                    <div className="inline-flex rounded-lg border border-line overflow-hidden">
-                      {(['internal', 'external'] as const).map((scope, i) => (
-                        <button
-                          key={scope}
-                          onClick={() => !isReadonly && updateObject(selected.id, { scope })}
+                  {selectedScope && currentDiagram && (
+                    <FieldRow label={t('layoutNav.rightSidebar.field.scopeOnDiagram')}>
+                      <div className="flex flex-col items-start gap-1">
+                        <ScopeToggle
+                          value={selectedScope.scope}
                           disabled={isReadonly}
-                          className={cn(
-                            'px-2.5 py-1 text-[11px] font-semibold capitalize transition-colors disabled:opacity-50',
-                            i > 0 && 'border-l border-line',
-                            selected.scope === scope
-                              ? 'bg-accent-subtle text-accent'
-                              : 'bg-surface-100 text-fg-subtle hover:text-fg-secondary'
+                          testId="scope-on-diagram"
+                          onChange={(scope) => setObjectScopeOnDiagram([selected.id], scope)}
+                        />
+                        <span className="flex items-center gap-1.5 text-[11px] text-fg-subtle" data-testid="scope-source">
+                          {t(`layoutNav.rightSidebar.scope.source.${selectedScope.source}`)}
+                          {selectedScope.source === 'diagram' && !isReadonly && (
+                            <button
+                              type="button"
+                              onClick={() => setObjectScopeOnDiagram([selected.id], null)}
+                              className="text-accent hover:underline"
+                            >
+                              {t('layoutNav.rightSidebar.scope.reset')}
+                            </button>
                           )}
-                        >
-                          {scope === 'internal' ? t('layoutNav.rightSidebar.scope.internal') : t('layoutNav.rightSidebar.scope.external')}
-                        </button>
-                      ))}
-                    </div>
+                        </span>
+                      </div>
+                    </FieldRow>
+                  )}
+                  <FieldRow label={t('layoutNav.rightSidebar.field.defaultScope')}>
+                    <ScopeToggle
+                      value={selected.scope}
+                      disabled={isReadonly}
+                      testId="scope-default"
+                      onChange={(scope) => updateObject(selected.id, { scope })}
+                    />
                   </FieldRow>
                   <FieldRow label={t('layoutNav.rightSidebar.field.belongsTo')}>
                     {/* Honest empty state until parent/landscape binding is wired —

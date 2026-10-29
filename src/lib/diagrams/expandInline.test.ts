@@ -1602,3 +1602,28 @@ describe('expandDiagramsInline: the target\'s edges', () => {
     expect(drawnIds(result)).not.toContain('lower:mobile→orders')
   })
 })
+
+// Per-diagram scope (2026-10-21): what counts as external is decided ON THE
+// TARGET diagram, so the C4 boundary rule applies there too — a neighbour drawn
+// on the host's drill-down is outside the host even with an internal default.
+describe('expandDiagramsInline — scope on the target diagram', () => {
+  it('leaves objects outside the target drill-down boundary behind, through an off-diagram ancestor', () => {
+    const w = world({
+      objects: [
+        object('host', { position: { x: 500, y: 400 } }),
+        object('peer'),
+        object('inner1', { parentId: 'host', position: { x: 20, y: 10 } }),
+        object('stranger', { position: { x: 220, y: 10 } }),
+        object('bank'),
+        object('ledger', { parentId: 'bank', position: { x: 420, y: 10 } }),
+      ],
+      diagrams: [
+        diagram('A', { objectIds: ['host', 'peer'] }),
+        diagram('B', { parentObjectId: 'host', objectIds: ['inner1', 'stranger', 'ledger'] }),
+      ],
+      connections: [],
+    })
+    const result = expandDiagramsInline(w.base, 'A', [{ objectId: 'host', diagramId: 'B' }], w.lookup)
+    expect(result.groups[0].objectIds).toEqual(['inner1'])
+  })
+})

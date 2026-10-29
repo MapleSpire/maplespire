@@ -104,6 +104,8 @@ export interface ModelObjectsFilter {
   technologyIds?: string[]
   teamIds?: string[]
   inDiagram?: boolean
+  /** Resolves external on at least one diagram (per-diagram scope). */
+  externalOnSomeDiagram?: boolean
   hasDescription?: boolean
 }
 

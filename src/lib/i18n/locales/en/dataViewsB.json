@@ -19,7 +19,10 @@
         "duplicate": "Duplicate"
       },
       "dropHint": "Move to a compatible object",
-      "rootDropHint": "Drop here to move to the root"
+      "rootDropHint": "Drop here to move to the root",
+      "externalUsage_one": "External in {{external}} of {{count}} diagram",
+      "externalUsage_other": "External in {{external}} of {{count}} diagrams",
+      "externalUsageHint": "Default scope: {{scope}}. Each diagram resolves its own scope: its override, then the C4 boundary (outside the diagram's focus is external), then this default."
     },
     "view": {
       "searchPlaceholder": "Search objects",
@@ -34,7 +37,9 @@
       },
       "filters": {
         "type": "Type",
-        "scope": "Scope",
+        "scope": "Default scope",
+        "scopeOnDiagrams": "Scope on diagrams",
+        "externalOnSomeDiagram": "External on some diagram",
         "status": "Status",
         "tags": "Tags",
         "technology": "Technology",

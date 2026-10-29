@@ -282,7 +282,9 @@ async function rotate(
   for (let round = 0; round < rounds; round += 1) {
     const handle = await repo.find<OverlayLike>(head as AutomergeUrl)
     handle.change((doc) => {
-      const objects = (doc.objects ??= {})
+      // Assign, then re-read: `??=` yields the plain `{}`, not the document's map.
+      doc.objects ??= {}
+      const objects = doc.objects
       objects[`obj-${round}`] = { id: `obj-${round}`, name: `object ${round}` }
       objects.shared = { id: 'shared', round }
       doc.writeBatchIds = Array.from({ length: 32 }, (_, index) => `batch-${round}-${index}`)

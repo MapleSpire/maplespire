@@ -276,6 +276,8 @@
         "flows": "Flows",
         "anchorLock": "Anchor lock",
         "scope": "Scope",
+        "scopeOnDiagram": "Scope here",
+        "defaultScope": "Default scope",
         "belongsTo": "Belongs to",
         "contains": "Contains",
         "inGroups": "In groups",
@@ -291,7 +293,13 @@
       },
       "scope": {
         "internal": "Internal",
-        "external": "External"
+        "external": "External",
+        "reset": "Reset",
+        "source": {
+          "diagram": "Set on this diagram.",
+          "boundary": "Outside this diagram's boundary (C4).",
+          "default": "From the default scope."
+        }
       },
       "shape": {
         "curved": "Curved",

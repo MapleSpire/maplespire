@@ -2166,33 +2166,45 @@ describe.skipIf(!TEST_DATABASE_URL)('summary promotion (live Postgres + real Aut
     expect(reportOnly.report.exclusionProven).toBeUndefined()
   })
 
-  // `planReadDelayMs` delays one of the plan's four PARALLEL reads (each runs on
-  // its own pooled connection, so Postgres may execute them in any order). The
-  // 300 ms run pins the order that made this test fail intermittently under
-  // ci:local load (2026-10-21): the allow-list read landing after the move.
-  it.each([0, 300])('a flag repair whose static row vanishes between the plan and the lock is REFUSED (plan read delayed %i ms)', async (planReadDelayMs) => {
+  it('a flag repair whose static row vanishes between the plan and the lock is REFUSED', async () => {
     // The third door has no callback between its fact-gathering and its lock —
     // no `connectedPeers`, and `onStep` fires only after the flip — so the seam
-    // has to be the POOL it is handed. The plan gathers its facts with FOUR
-    // PARALLEL reads; the proxy answers all four truthfully and moves the row
-    // only once the last of them has been read, which is exactly the instant a
-    // promotion committing-and-releasing between the plan and the lock would
-    // move it. Moving it after the FIRST read (the old trigger) let a slower
-    // plan read see the move and refuse early, for the wrong reason, under load.
-    // Nothing in production changes shape for this.
-    const L = `L-lock-repair-witness-${planReadDelayMs}`
+    // has to be the POOL it is handed. The proxy answers the first
+    // `readStaticSource` truthfully and only then moves the row, which is
+    // exactly the instant a promotion committing-and-releasing in that window
+    // would move it. Nothing in production changes shape for this.
+    //
+    // AND it schedules the plan's OTHER reads adversarially: until the row has
+    // moved, any query that is in flight alongside the trigger read, or that
+    // reads another plan fact (the allow-list, the admitted set, the diagram
+    // count), is held until after the DELETE. The DELETE cascades to the
+    // allow-list, so a plan whose facts are not one snapshot sees "static row
+    // present, allow-list empty" and refuses for the wrong reason
+    // (`write-head-not-writable`, `allow-list-incomplete`) before ever reaching
+    // the lock. Before the hold, that ordering depended on which of four pooled
+    // clients the server answered first: green almost always, red once in a
+    // loaded `ci-local --static` run (2026-10-22), 0/58 locally. With it, the
+    // four-query `Promise.all` shape is red in EITHER array order (QA lens,
+    // 2026-10-22: static-first 3/3, allow-list-first 3/3), and so is a split
+    // into two statements. A plan read held waiting for a trigger that never
+    // comes fails loudly after 5 s rather than at the test timeout.
+    const L = 'L-lock-repair-witness'
     const { rootUrl } = await provision(L, 'V1')
     await promote(L, 'V1', { apply: true })
     await stripSummaryFlag(rootUrl)
 
-    const PLAN_READS = [
-      'SELECT source FROM read_model_static_workspaces',
-      'SELECT document_id, kind FROM read_model_static_documents',
-      'SELECT document_id FROM automerge_document_workspace',
-      'SELECT count(*)::text AS n FROM ro_diagrams',
-    ]
-    const planReadsDone = new Set<string>()
+    const OTHER_PLAN_FACT = /read_model_static_documents|automerge_document_workspace|ro_diagrams/
     let moved = false
+    let triggerInFlight = false
+    let signalMoved!: () => void
+    const movedForGood = new Promise<void>((resolve) => { signalMoved = resolve })
+    const awaitMoved = () => new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(
+        'the proxy held a plan read for 5 s and the static-source read never arrived: '
+        + 'the plan no longer reads the static row before its other facts, so this seam needs rewiring',
+      )), 5_000)
+      void movedForGood.then(() => { clearTimeout(timer); resolve() })
+    })
     const movingPool = new Proxy(db.pool, {
       get(target, prop, receiver) {
         if (prop !== 'query') {
@@ -2200,21 +2212,29 @@ describe.skipIf(!TEST_DATABASE_URL)('summary promotion (live Postgres + real Aut
           return typeof value === 'function' ? value.bind(target) : value
         }
         return async (text: string, params?: unknown[]) => {
-          if (planReadDelayMs && typeof text === 'string'
-            && text.includes('SELECT document_id, kind FROM read_model_static_documents')) {
-            await new Promise((resolve) => setTimeout(resolve, planReadDelayMs))
+          const readsStatic = typeof text === 'string'
+            && text.includes('SELECT source FROM read_model_static_workspaces')
+          const isTrigger = readsStatic && !moved && !triggerInFlight
+          if (!isTrigger && !moved
+            && (triggerInFlight || (typeof text === 'string' && OTHER_PLAN_FACT.test(text)))) {
+            await awaitMoved()
           }
-          const result = await target.query(text, params)
-          const planRead = typeof text === 'string' ? PLAN_READS.find((sql) => text.includes(sql)) : undefined
-          if (planRead) planReadsDone.add(planRead)
-          if (!moved && planRead && planReadsDone.size === PLAN_READS.length) {
-            moved = true
+          if (!isTrigger) return target.query(text, params)
+          triggerInFlight = true
+          try {
+            const result = await target.query(text, params)
             await target.query(
               `DELETE FROM read_model_static_workspaces WHERE landscape_id = $1 AND version_id = 'V1'`,
               [L],
             )
+            moved = true
+            return result
+          } finally {
+            triggerInFlight = false
+            // Released on failure too, so a DB error surfaces as itself and
+            // not as the 5 s hold.
+            signalMoved()
           }
-          return result
         }
       },
     })

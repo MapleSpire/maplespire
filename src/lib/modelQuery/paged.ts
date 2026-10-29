@@ -272,7 +272,8 @@ export const pagedModelQuery: ModelQuery = {
       opts.filter?.types?.length || opts.filter?.scope || opts.filter?.technologyIds?.length
       || opts.filter?.tagIds?.length || opts.filter?.statuses?.length || opts.filter?.status
       || opts.filter?.teamIds?.length || opts.filter?.hasDescription !== undefined
-      || opts.filter?.inDiagram !== undefined || opts.domainId,
+      || opts.filter?.inDiagram !== undefined || opts.filter?.externalOnSomeDiagram !== undefined
+      || opts.domainId,
     )
     if (!filtered) {
       try {

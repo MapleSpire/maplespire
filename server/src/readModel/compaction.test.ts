@@ -324,6 +324,110 @@ describe('compactOverlay', () => {
     expect(first.doc()?.objects).toEqual({})
     expect(current.doc()?.objects).toEqual({})
   })
+
+  // `x ?? (x = {})` yields the plain value the assignment was given, not the
+  // document's proxy. The fold then CLEARS the overlay, so a value written into
+  // the detached object is not merely dropped but deleted from the workspace.
+  it('places a created object into a base shard that has NO collection map', async () => {
+    const repo = new Repo({})
+    const base = repo.create<Record<string, unknown>>({ marker: 1 })
+    const overlay = repo.create<ObjShard>({ objects: { n0: { id: 'n0', name: 'New' } } })
+    const meta = repo.create({
+      objectShardUrls: [base.url, overlay.url], connectionShardUrls: [] as string[], editsObjectShardUrl: overlay.url,
+    })
+    const root = repo.create({ modelMetaUrl: meta.url, modelUrl: '', shardUrls: [] as string[] })
+    await Promise.all([base, overlay, meta, root].map((handle) => handle.whenReady()))
+
+    expect((await compactOverlay(repo, root.url, { mode: 'apply' })).objectsFolded).toBe(1)
+
+    expect(base.doc()?.objects).toEqual({ n0: { id: 'n0', name: 'New' } })
+    expect(overlay.doc()?.objects).toEqual({})
+  })
+
+  it('a ModelMeta WITHOUT objectShardUrls lists the new base shard and the fresh head', async () => {
+    const repo = new Repo({})
+    const overlay = repo.create<ObjShard>({ objects: { n0: { id: 'n0', name: 'New' } } })
+    const meta = repo.create<Record<string, unknown>>({ connectionShardUrls: [], editsObjectShardUrl: overlay.url })
+    const root = repo.create({ modelMetaUrl: meta.url, modelUrl: '', shardUrls: [] as string[] })
+    await Promise.all([overlay, meta, root].map((handle) => handle.whenReady()))
+
+    expect((await compactOverlay(repo, root.url, { mode: 'apply' })).objectsFolded).toBe(1)
+
+    const after = meta.doc() as { objectShardUrls?: string[]; editsObjectShardUrl?: string }
+    // [new base shard, fresh write head]
+    expect(after.objectShardUrls).toHaveLength(2)
+    expect(after.objectShardUrls!.at(-1)).toBe(after.editsObjectShardUrl)
+    const placed = await repo.find<ObjShard>(after.objectShardUrls![0] as never)
+    expect(placed.doc()?.objects).toEqual({ n0: { id: 'n0', name: 'New' } })
+  })
+
+  // The fold-in-place and clear sites read a map that the PARTITION saw, so an
+  // absent map there needs a peer's change landing during an await between the
+  // two. `stillSafeToWrite` is awaited at exactly those points (before the first
+  // write, before the clear), which is where a sync message can be applied.
+  it('folds an edit even when a peer removed the base map while ownership was re-checked', async () => {
+    const b = await build(
+      [{ o0: { id: 'o0', name: 'A' } }],
+      { o0: { id: 'o0', name: 'A-edited' } },
+    )
+    let calls = 0
+    const res = await compactOverlay(b.repo, b.rootUrl, {
+      mode: 'apply',
+      stillSafeToWrite: async () => {
+        calls += 1
+        // First consultation of the objects pass: right before the fold writes.
+        if (calls === 1) b.baseObj[0].change((s) => { delete (s as Partial<ObjShard>).objects })
+        return true
+      },
+    })
+    expect(calls).toBeGreaterThanOrEqual(1)
+    expect(res.objectsFolded).toBe(1)
+    // The fold re-created the map and wrote through it: the edit is not left in
+    // a detached object while the overlay copy is cleared below.
+    expect(b.baseObj[0].doc()?.objects).toEqual({ o0: { id: 'o0', name: 'A-edited' } })
+    expect(b.overlayObj!.doc()?.objects).toEqual({})
+  })
+
+  it('the clear pass leaves alone an overlay segment whose map a peer removed mid-fold', async () => {
+    const b = await build(
+      [{ o0: { id: 'o0', name: 'A' } }],
+      { o0: { id: 'o0', name: 'A-edited' } },
+    )
+    let calls = 0
+    const res = await compactOverlay(b.repo, b.rootUrl, {
+      mode: 'apply',
+      stillSafeToWrite: async () => {
+        calls += 1
+        // Second consultation of the objects pass: right before the clear.
+        if (calls === 2) b.overlayObj!.change((s) => { delete (s as Partial<ObjShard>).objects })
+        return true
+      },
+    })
+    expect(calls).toBeGreaterThanOrEqual(2)
+    // Nothing to clear, so nothing written: no throw on the absent map, and no
+    // empty container re-created over the peer's removal.
+    expect(res.objectsFolded).toBe(1)
+    expect(b.baseObj[0].doc()?.objects.o0.name).toBe('A-edited')
+    expect('objects' in (b.overlayObj!.doc() as object)).toBe(false)
+  })
+
+  it('a tombstone-only pass on a ModelMeta WITHOUT objectShardUrls still lists the fresh head', async () => {
+    // The only path to the fresh-head push with the list still absent: no
+    // created id means the base-shard splice above never ran to create it.
+    const repo = new Repo({})
+    const overlay = repo.create<ObjShard>({ objects: {} })
+    const meta = repo.create<Record<string, unknown>>({
+      connectionShardUrls: [], editsObjectShardUrl: overlay.url, deletedObjectIds: ['gone'],
+    })
+    const root = repo.create({ modelMetaUrl: meta.url, modelUrl: '', shardUrls: [] as string[] })
+    await Promise.all([overlay, meta, root].map((handle) => handle.whenReady()))
+
+    await compactOverlay(repo, root.url, { mode: 'apply' })
+
+    const after = meta.doc() as { objectShardUrls?: string[]; editsObjectShardUrl?: string }
+    expect(after.editsObjectShardUrl).not.toBe(overlay.url)
+    expect(after.objectShardUrls).toEqual([after.editsObjectShardUrl])
+  })
 })
 
 describe('compaction acknowledgement gate', () => {

@@ -56,7 +56,7 @@
       "tabDetails": "Détails",
       "tabConnections": "Connexions · {{count}}",
       "type": "Type",
-      "scope": "Portée",
+      "scope": "Portée par défaut",
       "status": "Statut",
       "belongsTo": "Appartient à",
       "domain": "Domaine",

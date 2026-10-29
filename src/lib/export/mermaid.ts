@@ -15,6 +15,7 @@
 import type { C4Object, Diagram } from '../../types'
 import type { ExportBundle } from './types'
 import { orderedTechnologyUsages } from '../technologyUsage'
+import { parentLookup, withEffectiveScope } from '../diagrams/objectScope'
 
 /**
  * Export as a Mermaid C4 diagram (https://mermaid.js.org/syntax/c4.html).
@@ -112,7 +113,12 @@ function buildLandscapeMermaid(bundle: ExportBundle): string {
 function buildDiagramMermaid(bundle: ExportBundle, diagram: Diagram): string {
   const header = diagram.type === 'container' ? 'C4Container' : diagram.type === 'component' ? 'C4Component' : 'C4Context'
   const objById = new Map(bundle.objects.map((o) => [o.id, o]))
-  const members = diagram.objectIds.map((id) => objById.get(id)).filter((o): o is C4Object => !!o)
+  const parentOf = parentLookup((id) => objById.get(id))
+  // `_Ext` flavours follow the object's scope ON THIS diagram.
+  const members = diagram.objectIds
+    .map((id) => objById.get(id))
+    .filter((o): o is C4Object => !!o)
+    .map((o) => withEffectiveScope(o, diagram, parentOf))
   const memberIds = new Set(members.map((o) => o.id))
 
   const lines: string[] = [header, `    title ${esc(diagram.name)}`]

@@ -14,6 +14,7 @@
 
 import { randomBytes } from 'node:crypto'
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
+import * as Automerge from '@automerge/automerge'
 import { Repo, generateAutomergeUrl } from '@automerge/automerge-repo'
 import { createEmptyRoot } from '../automergeServer.js'
 import { PostgresStorageAdapter, isDocumentStorageKey } from '../automergeStorage.js'
@@ -270,11 +271,12 @@ describe.skipIf(!TEST_DATABASE_URL)('workspace fsck (live Postgres + real storag
     const retiredUrl = generateAutomergeUrl()
     const segmentId = documentIdOf(retiredUrl)
     meta.change((doc) => {
-      const listed = (doc.editsObjectShardUrls ?? (doc.editsObjectShardUrls = [])) as string[]
+      // Assign, then re-read: `?? (x = [])` yields the plain `[]`, not the list.
+      if (!doc.editsObjectShardUrls) doc.editsObjectShardUrls = []
       // Ahead of the head, which is where a retired segment lives.
-      listed.unshift(retiredUrl)
-      const shards = (doc.objectShardUrls ?? (doc.objectShardUrls = [])) as string[]
-      shards.unshift(retiredUrl)
+      ;(doc.editsObjectShardUrls as string[]).unshift(retiredUrl)
+      if (!doc.objectShardUrls) doc.objectShardUrls = []
+      ;(doc.objectShardUrls as string[]).unshift(retiredUrl)
     })
     await repo.flush([meta.documentId])
     // Present, admitted, and SMALL — the control state.
@@ -325,10 +327,10 @@ describe.skipIf(!TEST_DATABASE_URL)('workspace fsck (live Postgres + real storag
     const peerUrl = generateAutomergeUrl()
     const peerSegmentId = documentIdOf(peerUrl)
     peerMeta.change((doc) => {
-      const listed = (doc.editsObjectShardUrls ?? (doc.editsObjectShardUrls = [])) as string[]
-      listed.unshift(peerUrl)
-      const shards = (doc.objectShardUrls ?? (doc.objectShardUrls = [])) as string[]
-      shards.unshift(peerUrl)
+      if (!doc.editsObjectShardUrls) doc.editsObjectShardUrls = []
+      ;(doc.editsObjectShardUrls as string[]).unshift(peerUrl)
+      if (!doc.objectShardUrls) doc.objectShardUrls = []
+      ;(doc.objectShardUrls as string[]).unshift(peerUrl)
     })
     await repo.flush([peerMeta.documentId])
     await db.pool.query(
@@ -381,6 +383,30 @@ describe.skipIf(!TEST_DATABASE_URL)('workspace fsck (live Postgres + real storag
     expect(report.status).toBe('violations')
     const finding = report.findings.find((f) => f.check === 'model-write-head')
     expect(finding?.severity).toBe('data-loss')
+  })
+
+  it('container-conflict FIRES through fsckWorkspace on a head whose writeBatchIds two peers created concurrently', async () => {
+    // The WIRE (reviewer lens, round 2): the pure suite injects `hiddenBatchIds`,
+    // so replacing the collector's measurement with `0` survived every unit
+    // test. Here the head is a real stored document with a real conflict.
+    const key = { landscapeId: 'L-batch-conflict', versionId: 'V1' }
+    const rootUrl = await provision(key.landscapeId, key.versionId)
+    const root = await findReadyDocument<{ modelMetaUrl?: string }>(repo, rootUrl)
+    const meta = await findReadyDocument<Record<string, unknown>>(repo, root.doc()!.modelMetaUrl!)
+    const head = await findReadyDocument<Record<string, unknown>>(repo, meta.doc()!.editsObjectShardUrl as string)
+    // Control: a clean head reports nothing.
+    expect((await fsckWorkspace(db.pool, repo, key, rootUrl)).findings.filter((f) => f.check === 'container-conflict')).toEqual([])
+    const base = head.doc()!
+    const assign = (actor: string, id: string) => Automerge.change(Automerge.clone(base, { actor }), (d) => {
+      d.writeBatchIds = [id]
+    })
+    head.update((doc) => Automerge.merge(Automerge.merge(Automerge.clone(doc), assign('aaaaaa', 'batch-a')), assign('bbbbbb', 'batch-b')))
+    await repo.flush([head.documentId])
+
+    const report = await fsckWorkspace(db.pool, repo, key, rootUrl)
+    const found = report.findings.filter((f) => f.check === 'container-conflict')
+    expect(found).toEqual([expect.objectContaining({ severity: 'sync-stall', documentUrl: head.url })])
+    expect(found[0]!.detail).toMatch(/1 batch id/)
   })
 
   it('finds a de-admitted reachable document as sync-stall', async () => {

@@ -21,6 +21,7 @@ import { useUIStore } from '../../stores/uiStore'
 import { useSkinStore } from '../../stores/skinStore'
 import { useThemeStore } from '../../stores/themeStore'
 import { filterAndMergeDiagramData } from '../../lib/viewLayouts'
+import { parentLookup } from '../../lib/diagrams/objectScope'
 import { resolveTheme3d, themeFor3d } from '../../plugins/theme3d'
 import { resolveSceneDecor } from '../../canvas3d/decor/decorSpec'
 import { DecorPopover } from './DecorPopover'
@@ -165,7 +166,8 @@ export function Canvas3DView({
       store.objects,
       store.connections,
       store.groups,
-      '3d'
+      '3d',
+      parentLookup((id) => getDiagramIndex().objectById.get(id)),
     )
     scene.setData(filteredObjects, filteredConnections, filteredGroups, store.tags)
   }, [])

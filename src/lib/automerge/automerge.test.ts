@@ -132,6 +132,7 @@ describe('projection round-trips', () => {
       groupIds: [],
       layouts: { o1: { position: { x: 10, y: 20 }, size: { width: 160, height: 100 } } },
       lowerRouting: { 'o1→o2': { fromAnchor: 3, lockedToAnchors: true } },
+      objectScopes: { o2: 'external' },
       readonly: false,
     }
     const comments: Comment[] = [
@@ -144,6 +145,10 @@ describe('projection round-trips', () => {
     expect(diagramDocComments(doc)).toEqual(comments)
     expect(diagramDocFlows(doc)).toEqual(flows)
     expect(doc.checkpoints).toEqual([])
+    // The projection itself never invents the scope map: creating it is the
+    // caller's decision (at birth only — see withObjectScopesAtBirth).
+    const { objectScopes: _none, ...plain } = diagram
+    expect('objectScopes' in diagramToDiagramDoc(plain, [], [])).toBe(false)
   })
 
   it('metaToStubDiagram preserves parentObjectId so drill-down stays discoverable', () => {
@@ -165,6 +170,20 @@ describe('projection round-trips', () => {
     // A top-level diagram has no parent; the key must be absent (not undefined).
     const top = metaToStubDiagram({ ...meta, id: 'dg1', parentObjectId: undefined })
     expect('parentObjectId' in top).toBe(false)
+  })
+
+  it('metaToStubDiagram carries the scope overrides (a COPY), so model-wide scope usage needs no DiagramDoc', () => {
+    const meta: DiagramMeta = {
+      id: 'dg2', name: 'Container view', type: 'container', docUrl: 'automerge:fake',
+      parentObjectId: 'sys1', objectIds: ['o1', 'bank'], connectionIds: [], groupIds: [],
+      objectScopes: { bank: 'internal' },
+    }
+    const stub = metaToStubDiagram(meta)
+    expect(stub.objectScopes).toEqual({ bank: 'internal' })
+    expect(stub.objectScopes).not.toBe(meta.objectScopes)
+    // None, or an empty map: the key is absent (an Automerge write of it throws on undefined).
+    expect('objectScopes' in metaToStubDiagram({ ...meta, objectScopes: undefined })).toBe(false)
+    expect('objectScopes' in metaToStubDiagram({ ...meta, objectScopes: {} })).toBe(false)
   })
 })
 
@@ -212,6 +231,25 @@ describe('stripDeletedFromComposition (registry delete cleanup)', () => {
     expect(out.objectIds).toBe(objectIds)
     expect(out.connectionIds).toBe(connectionIds)
     expect(out.groupIds).toBe(groupIds)
+  })
+
+  it('strips a deleted object\'s scope override from a preserved non-active meta, same map when untouched', () => {
+    const objectScopes = { a: 'external' as const, gone: 'internal' as const }
+    const out = stripDeletedFromComposition(
+      { objectIds: ['a', 'gone'], connectionIds: [], groupIds: [], objectScopes },
+      new Set(['gone']),
+      new Set(),
+    )
+    expect(out.objectScopes).toEqual({ a: 'external' })
+    const untouched = stripDeletedFromComposition(
+      { objectIds: ['a'], connectionIds: [], groupIds: [], objectScopes },
+      new Set(['not-present']),
+      new Set(),
+    )
+    expect(untouched.objectScopes).toBe(objectScopes)
+    // No overrides in, none out.
+    expect(stripDeletedFromComposition({ objectIds: [], connectionIds: [], groupIds: [] }, new Set(['x']), new Set()))
+      .not.toHaveProperty('objectScopes')
   })
 
   it('removes a deleted group id from groupIds, which used to be copied through verbatim', () => {
@@ -477,6 +515,7 @@ describe('reconcile on real Automerge drafts', () => {
       groupIds: [],
       layouts: { o1: { position: { x: 5, y: 6 }, size: { width: 160, height: 100 } } },
       lowerRouting: { 'o1→o2': { waypoints: [{ x: 1, y: 2 }], shape: 'straight', lockedToAnchors3d: false } },
+      objectScopes: { o1: 'external' },
       readonly: true,
       skinId: 'skin-x',
       defaultConnectionShape: 'straight',

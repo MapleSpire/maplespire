@@ -166,10 +166,18 @@ export interface C4Object {
   ownerTeamIds?: string[]
   teamIds?: string[]
   links?: ObjectLinkValue[]
-  scope: 'internal' | 'external'
+  /**
+   * DEFAULT scope only. Whether an object is internal or external is decided per
+   * diagram — `Diagram.objectScopes` override, then the C4 boundary rule, then
+   * this value (`lib/diagrams/objectScope.ts`). Display copies merged for one
+   * diagram carry the EFFECTIVE scope here; never write such a copy back.
+   */
+  scope: ObjectScope
   status: 'live' | 'draft' | 'down' | 'unstable'
   properties: Record<string, string>
 }
+
+export type ObjectScope = 'internal' | 'external'
 
 export type ConnectionShape = 'curved' | 'straight'
 
@@ -280,6 +288,12 @@ export interface Diagram {
    * (`resolveLowerRouting`). An entry is ABSOLUTE: a field it lacks is cleared.
    */
   lowerRouting?: Record<string, LowerConnectionRouting>
+  /**
+   * Per-diagram internal/external overrides, keyed by object id. Absent entry =
+   * resolve from the C4 boundary rule, then the object's default scope (see
+   * `lib/diagrams/objectScope.ts`). Lives only in the DiagramDoc, like `layouts`.
+   */
+  objectScopes?: Record<string, ObjectScope>
   /**
    * Scene decoration (3D board): curated prop pack + density + board style,
    * placed deterministically from the seed — shared with the team exactly

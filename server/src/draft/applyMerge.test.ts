@@ -13,7 +13,8 @@
 // GNU Affero General Public License for more details.
 
 import { describe, it, expect, vi } from 'vitest'
-import { Repo } from '@automerge/automerge-repo'
+import { Repo, type AutomergeUrl } from '@automerge/automerge-repo'
+import * as A from '@automerge/automerge'
 import { DummyStorageAdapter } from '@automerge/automerge-repo/helpers/DummyStorageAdapter.js'
 import { materializeFullModel, type FullModel } from './materialize.js'
 import {
@@ -37,7 +38,7 @@ const obj = (id: string, name: string, extra: Record<string, unknown> = {}) => (
   position: { x: 0, y: 0 }, size: { width: 100, height: 60 }, ...extra,
 })
 
-interface SeedDiagram { id: string; name: string; type?: string; objectIds?: string[]; layouts?: Record<string, unknown>; parentObjectId?: string }
+interface SeedDiagram { id: string; name: string; type?: string; objectIds?: string[]; layouts?: Record<string, unknown>; parentObjectId?: string; objectScopes?: Record<string, string> }
 
 async function seedMonolith(repo: Repo, objects: Record<string, unknown>, diagrams: SeedDiagram[]): Promise<string> {
   const model = repo.create<Record<string, unknown>>({ objects, connections: {}, groups: {}, domains: {}, tagSnapshots: {}, decisionRecords: {} })
@@ -50,6 +51,7 @@ async function seedMonolith(repo: Repo, objects: Record<string, unknown>, diagra
     }
     const stub: Record<string, unknown> = { id: d.id, name: d.name, type: d.type ?? 'context', objectIds: d.objectIds ?? [], connectionIds: [], groupIds: [] }
     if (d.parentObjectId !== undefined) { docFields.parentObjectId = d.parentObjectId; stub.parentObjectId = d.parentObjectId }
+    if (d.objectScopes !== undefined) docFields.objectScopes = d.objectScopes
     const doc = repo.create<Record<string, unknown>>(docFields)
     await doc.whenReady()
     stub.docUrl = doc.url
@@ -262,6 +264,67 @@ describe('applyChangeset (monolith)', () => {
     const merged = await materializeFullModel(repo, rootUrl)
     expect((merged.diagrams.D.detail!.settings as Record<string, unknown>).parentObjectId).toBeUndefined() // doc cleared
     expect((merged.diagrams.D.meta as Record<string, unknown>).parentObjectId).toBeUndefined()             // stub cleared
+  })
+
+  it('merges per-diagram scope overrides key by key, and a draft that clears them all empties the live map instead of deleting it', async () => {
+    const repo = new Repo({})
+    const rootUrl = await seedMonolith(repo, { a: obj('a', 'A'), b: obj('b', 'B') },
+      [{ id: 'D', name: 'D', objectIds: ['a', 'b'], objectScopes: { a: 'external' } }])
+    const ours = await materializeFullModel(repo, rootUrl)
+    expect(ours.diagrams.D.detail!.settings.objectScopes).toEqual({ a: 'external' })
+
+    const theirs = clone(ours)
+    theirs.diagrams.D.detail!.settings.objectScopes = { a: 'internal', b: 'external' }
+    let diff = diffModels(ours, ours, theirs)
+    expect(has(diff, 'updated', 'diagram', 'D')).toBe(true)
+    await applyChangeset(repo, rootUrl, theirs, ours, diff.changes)
+    let merged = await materializeFullModel(repo, rootUrl)
+    expect(merged.diagrams.D.detail!.settings.objectScopes).toEqual({ a: 'internal', b: 'external' })
+
+    const cleared = clone(merged)
+    delete (cleared.diagrams.D.detail!.settings as Record<string, unknown>).objectScopes
+    diff = diffModels(merged, merged, cleared)
+    expect(has(diff, 'updated', 'diagram', 'D')).toBe(true)
+    const docUrl = merged.diagrams.D.meta.docUrl as AutomergeUrl
+    const handle = await repo.find<Record<string, unknown>>(docUrl)
+    // A peer, concurrently with the merge, overrides a third object.
+    const peer = A.change(A.clone(handle.doc()!), (d) => {
+      (d.objectScopes as Record<string, unknown>).c = 'external'
+    })
+    await applyChangeset(repo, rootUrl, cleared, merged, diff.changes)
+    merged = await materializeFullModel(repo, rootUrl)
+    // An empty map reads as "no overrides" in the diff model…
+    expect(merged.diagrams.D.detail!.settings.objectScopes).toBeUndefined()
+    expect(handle.doc()?.objectScopes).toEqual({})
+    // …and because the live map was emptied, not deleted and recreated, the
+    // peer's concurrent override survives the merge of the two histories.
+    const converged = A.merge(A.clone(handle.doc()!), peer)
+    expect(converged.objectScopes).toEqual({ c: 'external' })
+  })
+
+  // The stub's copy of the per-diagram scope overrides feeds Model Objects'
+  // "external in N of M diagrams" (read model: ro_diagrams.data). A draft that
+  // only touched the DiagramDoc's overrides must still move the stub.
+  it('a draft\'s per-diagram scope override reaches the registry stub, from the DOC (not the draft meta)', async () => {
+    const repo = new Repo({})
+    const rootUrl = await seedMonolith(repo, { a: obj('a', 'A') }, [{ id: 'D', name: 'D', objectIds: ['a'] }])
+    const ours = await materializeFullModel(repo, rootUrl)
+    const theirs = clone(ours)
+    ;(theirs.diagrams.D.detail!.settings as Record<string, unknown>).objectScopes = { a: 'external' }
+    const diff = diffModels(ours, ours, theirs)
+    expect(has(diff, 'updated', 'diagram', 'D')).toBe(true)
+    await applyChangeset(repo, rootUrl, theirs, ours, diff.changes)
+    let merged = await materializeFullModel(repo, rootUrl)
+    expect((merged.diagrams.D.detail!.settings as Record<string, unknown>).objectScopes).toEqual({ a: 'external' })
+    expect((merged.diagrams.D.meta as Record<string, unknown>).objectScopes).toEqual({ a: 'external' })
+
+    // …and a draft clearing it empties the stub's map too.
+    const cleared = clone(merged)
+    delete (cleared.diagrams.D.detail!.settings as Record<string, unknown>).objectScopes
+    const clearDiff = diffModels(merged, merged, cleared)
+    await applyChangeset(repo, rootUrl, cleared, merged, clearDiff.changes)
+    merged = await materializeFullModel(repo, rootUrl)
+    expect((merged.diagrams.D.meta as Record<string, unknown>).objectScopes).toEqual({})
   })
 
   it('sharded: a re-created object is NOT wiped by a stale delete tombstone (un-tombstone on upsert)', async () => {

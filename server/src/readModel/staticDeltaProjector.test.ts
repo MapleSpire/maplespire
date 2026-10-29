@@ -20,6 +20,7 @@ import {
   appendUniqueOverlayRoute,
   mergeStaticOverlaySegments,
   StaticDeltaProjector,
+  substituteOverlayPrefix,
   updateStaticOverlaySegment,
 } from './staticDeltaProjector.js'
 import { isAppendOnlyOverlayOrder } from './overlayHistoryProtocol.js'
@@ -218,6 +219,28 @@ describe('StaticDeltaProjector', () => {
     // One list insert plus its scalar value stays constant as the retained
     // history grows. A whole-array assignment adds hundreds of operations.
     expect(Automerge.stats(after).numOps - beforeOps).toBeLessThan(64)
+  })
+
+  // `meta[f] ?? (meta[f] = [])` yields the plain `[]`, not the document's list,
+  // so the push landed on a detached array whenever the field was absent.
+  it('appends an overlay route to a ModelMeta that has NO such list', () => {
+    const after = Automerge.change(Automerge.from<Record<string, unknown>>({ marker: 1 }), (meta) => {
+      appendUniqueOverlayRoute(meta, 'editsObjectShardUrls', 'automerge:segment-0')
+    })
+    expect(after.editsObjectShardUrls).toEqual(['automerge:segment-0'])
+  })
+
+  it('names the merged segment on a ModelMeta that has NO such list', () => {
+    // An unnamed merged segment is invisible to the GC walk, which may then
+    // collect it.
+    let substituted: boolean | undefined
+    const after = Automerge.change(Automerge.from<Record<string, unknown>>({ marker: 1 }), (meta) => {
+      substituted = substituteOverlayPrefix(
+        meta, 'objectShardUrls', ['automerge:folded-0'], ['automerge:merged-0'], false, false,
+      )
+    })
+    expect(substituted).toBe(true)
+    expect(after.objectShardUrls).toEqual(['automerge:merged-0'])
   })
 
   it('reconstructs an already-projected ModelMeta without rewriting enterprise metadata', async () => {
@@ -461,6 +484,119 @@ describe('StaticDeltaProjector', () => {
     expect(refusing).toHaveBeenCalledTimes(1)
     expect(String(refusing.mock.calls[0]?.[0])).toContain('read_model_static_workspaces')
     expect(current.doc()?.forwardedBatchIds).toEqual(forwardedBefore)
+  })
+
+  it('forwards a historical edit into a current head that has NO collection map', async () => {
+    // `(mutable.connections ??= {})` yields the plain `{}` it assigned, not the
+    // document's map, so the forwarded value landed on a detached object while
+    // the batch was acknowledged as forwarded.
+    const repo = new Repo({})
+    const before = { id: 'c1', fromId: 'a', toId: 'b', type: 'solid', label: 'before' }
+    const edited = { ...before, label: 'edited' }
+    const retired = repo.create({ connections: { c1: edited }, writeHeadVersion: 2, writeBatchIds: ['late-edit'] })
+    const current = repo.create<Record<string, unknown>>({ writeHeadVersion: 2, writeBatchIds: [] })
+    const meta = repo.create({
+      staticBaseline: true,
+      editsConnectionShardUrls: [retired.url, current.url],
+      editsConnectionShardUrl: current.url,
+      deletedConnectionIds: [] as string[],
+    })
+    await Promise.all([retired.whenReady(), current.whenReady(), meta.whenReady()])
+    const query = vi.fn(async (sql: string, planeParams?: unknown[]) => {
+      if (isOverlayRotationLock(sql)) return overlayRotationLockAnswer(sql, planeParams)
+      if (isPlaneCheck(sql)) return planeAnswer(planeParams)
+      if (sql.includes('SELECT last_projected_snapshot FROM read_model_overlay_segments')) {
+        return { rows: [{ last_projected_snapshot: { c1: before } }], rowCount: 1 }
+      }
+      return { rows: [], rowCount: 1 }
+    })
+    const projector = new StaticDeltaProjector(repo, poolLike(query) as never)
+    running.push(projector)
+    const retiredDescriptor = {
+      landscapeId: 'land', versionId: 'draft', documentId: retired.documentId,
+      kind: 'connection-overlay', entityId: null, orgId: 'org',
+    }
+    const internals = projector as unknown as {
+      descriptors: Map<string, typeof retiredDescriptor>
+      forwardHistoricalOverlay(...args: unknown[]): Promise<void>
+    }
+    internals.descriptors.set(meta.documentId, { ...retiredDescriptor, documentId: meta.documentId, kind: 'model-meta' })
+
+    await internals.forwardHistoricalOverlay(
+      retiredDescriptor, 'connection',
+      { connections: { c1: edited }, writeBatchIds: ['late-edit'] },
+      2, [retired.documentId, current.documentId], current.documentId,
+      {
+        objectDocumentIds: [],
+        connectionDocumentIds: [retired.documentId, current.documentId],
+        deletedObjectIds: new Set(),
+        deletedConnectionIds: new Set(),
+        objectSegments: new Map(),
+        connectionSegments: new Map([[current.documentId, {}]]),
+        effectiveObjects: new Map(),
+        effectiveConnections: new Map(),
+      },
+      new Map(),
+    )
+
+    expect(current.doc()?.forwardedBatchIds).toEqual(['late-edit'])
+    expect(current.doc()?.connections).toEqual({ c1: edited })
+  })
+
+  it('forwards a historical OBJECT edit into a current head that has NO objects map', async () => {
+    // The object branch of the same fix; the QA lens's mutant there survived
+    // the connection-only test above.
+    const repo = new Repo({})
+    const before = { id: 'o1', type: 'system', name: 'before' }
+    const edited = { ...before, name: 'edited' }
+    const retired = repo.create({ objects: { o1: edited }, writeHeadVersion: 2, writeBatchIds: ['late-edit'] })
+    const current = repo.create<Record<string, unknown>>({ writeHeadVersion: 2, writeBatchIds: [] })
+    const meta = repo.create({
+      staticBaseline: true,
+      editsObjectShardUrls: [retired.url, current.url],
+      editsObjectShardUrl: current.url,
+      deletedObjectIds: [] as string[],
+    })
+    await Promise.all([retired.whenReady(), current.whenReady(), meta.whenReady()])
+    const query = vi.fn(async (sql: string, planeParams?: unknown[]) => {
+      if (isOverlayRotationLock(sql)) return overlayRotationLockAnswer(sql, planeParams)
+      if (isPlaneCheck(sql)) return planeAnswer(planeParams)
+      if (sql.includes('SELECT last_projected_snapshot FROM read_model_overlay_segments')) {
+        return { rows: [{ last_projected_snapshot: { o1: before } }], rowCount: 1 }
+      }
+      return { rows: [], rowCount: 1 }
+    })
+    const projector = new StaticDeltaProjector(repo, poolLike(query) as never)
+    running.push(projector)
+    const retiredDescriptor = {
+      landscapeId: 'land', versionId: 'draft', documentId: retired.documentId,
+      kind: 'object-overlay', entityId: null, orgId: 'org',
+    }
+    const internals = projector as unknown as {
+      descriptors: Map<string, typeof retiredDescriptor>
+      forwardHistoricalOverlay(...args: unknown[]): Promise<void>
+    }
+    internals.descriptors.set(meta.documentId, { ...retiredDescriptor, documentId: meta.documentId, kind: 'model-meta' })
+
+    await internals.forwardHistoricalOverlay(
+      retiredDescriptor, 'object',
+      { objects: { o1: edited }, writeBatchIds: ['late-edit'] },
+      2, [retired.documentId, current.documentId], current.documentId,
+      {
+        objectDocumentIds: [retired.documentId, current.documentId],
+        connectionDocumentIds: [],
+        deletedObjectIds: new Set(),
+        deletedConnectionIds: new Set(),
+        objectSegments: new Map([[current.documentId, {}]]),
+        connectionSegments: new Map(),
+        effectiveObjects: new Map(),
+        effectiveConnections: new Map(),
+      },
+      new Map(),
+    )
+
+    expect(current.doc()?.forwardedBatchIds).toEqual(['late-edit'])
+    expect(current.doc()?.objects).toEqual({ o1: edited })
   })
 
   it('does not attribute tombstoned conflicts from an earlier run to a later forwarded batch', async () => {

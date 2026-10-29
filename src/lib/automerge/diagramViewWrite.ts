@@ -13,7 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import type { Diagram } from '../../types'
-import { reconcileKey } from './reconcile'
+import { clonePlain, reconcileKey } from './reconcile'
 import { persistentSlicesChanged } from './persistentSlices'
 
 /**
@@ -46,6 +46,10 @@ export const DIAGRAM_VIEW_FIELDS = [
   'connectionHighlightStyle',
   'connectionAnimationsEnabled',
   'defaultConnectionShape',
+  // NOT `objectScopes`: the per-diagram internal/external overrides are
+  // denormalised into the registry meta (`buildMeta`) so model-wide pages can
+  // count "external in N of M diagrams" without every DiagramDoc — a targeted
+  // DiagramDoc-only write would leave that copy stale.
 ] as const satisfies readonly (keyof Diagram)[]
 
 const VIEW_FIELD_SET: ReadonlySet<string> = new Set(DIAGRAM_VIEW_FIELDS)
@@ -106,4 +110,103 @@ export function applyDiagramViewFields(doc: object, diagram: Diagram): void {
   const draft = doc as Record<string, unknown>
   const source = diagram as unknown as Record<string, unknown>
   for (const key of DIAGRAM_VIEW_FIELDS) reconcileKey(draft, key, source[key])
+}
+
+/**
+ * Per-diagram scope overrides are written as a DELTA, never as the store's
+ * whole map. Three Automerge facts decide it:
+ *
+ * - a DELETED map takes a peer's concurrent override with it, so a write never
+ *   removes the map;
+ * - two peers that each CREATE the key concurrently keep one map and hide the
+ *   other's entries, so only a write that actually SETS an override may create
+ *   it on an older diagram (new diagrams get it at birth,
+ *   `withObjectScopesAtBirth`, the only race-free creation);
+ * - the store can LAG the document (remote changes are projected late, e.g.
+ *   boot-from-server defers it while the user edits), so reconciling the
+ *   store's whole map would delete a peer's override the document has already
+ *   merged (re-review 2026-10-29, F2). Only the keys THIS client changed are
+ *   written; every other key keeps the document's value.
+ *
+ * `ScopeEditTracker` records those keys from local store changes (the bridge
+ * feeds it from `onStoreChange`, which skips remote projections), and
+ * `objectScopesForReconcile` applies them onto the document's own map.
+ */
+export class ScopeEditTracker {
+  private dirty = new Map<string, Set<string>>()
+
+  /** Record every override key that differs between two local store states. */
+  note(previous: readonly Diagram[], next: readonly Diagram[]): void {
+    if (previous === next) return
+    const before = new Map(previous.map((d) => [d.id, d.objectScopes]))
+    for (const d of next) {
+      const prevScopes = before.get(d.id)
+      if (prevScopes === d.objectScopes) continue
+      const a = prevScopes ?? {}
+      const b = d.objectScopes ?? {}
+      for (const id of new Set([...Object.keys(a), ...Object.keys(b)])) {
+        if (a[id] === b[id]) continue
+        let set = this.dirty.get(d.id)
+        if (!set) this.dirty.set(d.id, (set = new Set()))
+        set.add(id)
+      }
+    }
+  }
+
+  /** The keys changed locally on a diagram since its last write; forgets them. */
+  take(diagramId: string): ReadonlySet<string> | undefined {
+    const set = this.dirty.get(diagramId)
+    this.dirty.delete(diagramId)
+    return set
+  }
+
+  clear(): void {
+    this.dirty.clear()
+  }
+}
+
+/**
+ * The `objectScopes` value for a full `reconcile(doc, target)` of the active
+ * DiagramDoc: the document's own map (cloned — never hand an Automerge proxy
+ * back in) with only `dirty` keys taken from the store. `undefined` = the key
+ * stays absent (the document has no map and no dirty key SETS an override).
+ */
+export function objectScopesForReconcile(
+  docMap: unknown,
+  store: Diagram['objectScopes'],
+  dirty: ReadonlySet<string> | undefined,
+): Record<string, unknown> | undefined {
+  const base = docMap && typeof docMap === 'object' ? clonePlain(docMap as Record<string, unknown>) : undefined
+  if (!dirty || dirty.size === 0) return base
+  const result: Record<string, unknown> = base ?? {}
+  let setsOne = false
+  for (const id of dirty) {
+    const value = store?.[id]
+    if (value === 'internal' || value === 'external') {
+      result[id] = value
+      setsOne = true
+    } else {
+      delete result[id]
+    }
+  }
+  return base || setsOne ? result : undefined
+}
+
+/** Put `objectScopesForReconcile`'s value on a reconcile target (absent = delete
+ * the key from the TARGET, which `reconcile` then leaves absent in the doc). */
+export function setObjectScopesForReconcile(
+  target: { objectScopes?: unknown },
+  store: Diagram['objectScopes'],
+  doc: { objectScopes?: unknown },
+  dirty: ReadonlySet<string> | undefined,
+): void {
+  const value = objectScopesForReconcile(doc.objectScopes, store, dirty)
+  if (value === undefined) delete target.objectScopes
+  else target.objectScopes = value
+}
+
+/** A diagram about to become a NEW DiagramDoc: give it the scope map now, so
+ * no two peers ever have to create it concurrently later. */
+export function withObjectScopesAtBirth<T extends Diagram>(diagram: T): T {
+  return diagram.objectScopes ? diagram : { ...diagram, objectScopes: {} }
 }

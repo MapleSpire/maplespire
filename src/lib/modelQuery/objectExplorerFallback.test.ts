@@ -36,6 +36,7 @@ import { describe, it, expect, beforeEach } from 'vitest'
 import { useModelStore } from '../../stores/modelStore'
 import { residentObjectSearchPage, residentObjectTreePage } from './objectExplorerFallback'
 import type { ObjectExplorerRow } from './types'
+import { parentLookup, resolveObjectScope } from '../diagrams/objectScope'
 import type { C4Object, Connection, Diagram, Group } from '../../types'
 
 function obj(id: string, over: Partial<C4Object> = {}): C4Object {
@@ -97,6 +98,10 @@ function refRowForObject(object: C4Object, objects: C4Object[], inDiagram: Reado
     ...(object.domainId ? { domainId: object.domainId } : {}),
     ...refIconFields(object),
     ...refMetrics(object.id, 'object', children),
+    // Added with per-diagram scope (not part of the transcribed original): an
+    // independent full scan, so the indexed path is still pinned by equality.
+    externalDiagramCount: useModelStore.getState().diagrams.filter((d) => d.objectIds.includes(object.id)
+      && resolveObjectScope(object, d, parentLookup((id) => objects.find((o) => o.id === id))).scope === 'external').length,
     inDiagram: inDiagram.has(object.id),
     breadcrumb: [],
   }
@@ -439,5 +444,68 @@ describe('residentObjectTreePage — indexed rewrite matches the original scan',
     expect(after.items.map((r) => r.id)).toEqual(['only'])
     expect(after.items[0]?.inDiagram).toBe(true)
     expect(after.total).toBe(1)
+  })
+})
+
+// Per-diagram scope usage, resident tier. Same model and expectations as the
+// server SQL twin (server/src/readModel/objectScopeUsage.integration.test.ts).
+// The diagrams here are what the store holds for NON-active diagrams: stubs
+// built from the registry meta, which carries parentObjectId + objectScopes.
+describe('resident tier — "external in N of M diagrams" and its filter', () => {
+  beforeEach(() => {
+    useModelStore.setState({
+      objects: [
+        obj('shop', { type: 'system' }), obj('web', { parentId: 'shop' }), obj('api', { parentId: 'shop' }),
+        obj('auth', { type: 'component', parentId: 'api' }),
+        obj('bank', { type: 'system' }), obj('ledger', { parentId: 'bank' }),
+        obj('stripe', { type: 'system', scope: 'external' }), obj('customer', { type: 'actor' }),
+      ],
+      groups: [grp('g1', { objectIds: ['bank'] })],
+      connections: [],
+      diagrams: [
+        dia('landscape', { objectIds: ['shop', 'bank', 'stripe', 'customer'] }),
+        dia('shop-c', { parentObjectId: 'shop', objectIds: ['web', 'api', 'bank', 'stripe', 'customer'] }),
+        dia('api-c', { parentObjectId: 'api', objectIds: ['auth', 'web', 'ledger'] }),
+      ],
+    })
+  })
+  const counts = async () => {
+    const page = await residentObjectSearchPage({ filter: { types: ['system', 'app', 'component', 'actor'] }, limit: 50 })
+    return new Map(page.items.map((row) => [row.id, [row.externalDiagramCount, row.diagramCount]]))
+  }
+
+  it('counts the C4 boundary rule, nested ancestry and an external default', async () => {
+    const byId = await counts()
+    expect(byId.get('bank')).toEqual([1, 2])
+    expect(byId.get('web')).toEqual([1, 2])
+    expect(byId.get('auth')).toEqual([0, 1])
+    expect(byId.get('ledger')).toEqual([1, 1])
+    expect(byId.get('stripe')).toEqual([2, 2])
+    expect(byId.get('shop')).toEqual([0, 1])
+  })
+
+  it('lets a diagram override win both ways', async () => {
+    useModelStore.setState((state) => ({
+      diagrams: state.diagrams.map((d) => d.id === 'landscape'
+        ? { ...d, objectScopes: { shop: 'external' as const, stripe: 'internal' as const } }
+        : d.id === 'shop-c' ? { ...d, objectScopes: { bank: 'internal' as const } } : d),
+    }))
+    const byId = await counts()
+    expect(byId.get('shop')).toEqual([1, 1])
+    expect(byId.get('stripe')).toEqual([1, 2])
+    expect(byId.get('bank')).toEqual([0, 2])
+  })
+
+  it('serves the count on tree pages too', async () => {
+    const roots = await residentObjectTreePage({ diagramId: 'landscape', limit: 50 })
+    // (bank is in group g1, so it is not a root row; customer is.)
+    expect(roots.items.find((row) => row.id === 'customer')).toMatchObject({ diagramCount: 2, externalDiagramCount: 1 })
+  })
+
+  it('filters "external on some diagram" both ways; a group is never external', async () => {
+    const external = await residentObjectSearchPage({ filter: { externalOnSomeDiagram: true }, limit: 50 })
+    expect(external.items.map((row) => row.id).sort()).toEqual(['bank', 'customer', 'ledger', 'stripe', 'web'])
+    const never = await residentObjectSearchPage({ filter: { externalOnSomeDiagram: false }, limit: 50 })
+    expect(never.items.map((row) => row.id).sort()).toEqual(['api', 'auth', 'g1', 'shop'])
   })
 })

@@ -13,6 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import type { C4Object, Connection, Diagram, Group, Position } from '../../types'
+import { parentLookup, resolveObjectScope } from './objectScope'
 import {
   PARENT_WRAPPER_MAX_MIN_WIDTH,
   parentWrapperBox,
@@ -490,6 +491,7 @@ export function expandDiagramsInline(
   const roots: Block[] = []
 
   // ── Phase 1: what each expansion pulls in ─────────────────────────────────
+  const parentOfTarget = parentLookup((id) => lookup.object(id))
   const resolve = (expansion: InlineExpansion, host: C4Object, parent: Block | null): void => {
     const target = lookup.diagram(expansion.diagramId)
     if (!target) {
@@ -509,7 +511,9 @@ export function expandDiagramsInline(
     const pulled = target.objectIds
       .map((id) => lookup.object(id))
       .filter((object): object is C4Object => !!object)
-      .filter((object) => object.scope !== 'external')
+      // External ON THE TARGET diagram. `target` is usually a stub, which carries
+      // `parentObjectId` (boundary rule) and `objectScopes` from the registry meta.
+      .filter((object) => resolveObjectScope(object, target, parentOfTarget).scope !== 'external')
       .filter((object) => !presentObjectIds.has(object.id))
     if (pulled.length === 0) {
       skipped.push({ objectId: expansion.objectId, reason: 'empty' })

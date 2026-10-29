@@ -395,3 +395,63 @@ describe('group auto-size switch', () => {
     expect((showGroup(group()) as HTMLButtonElement).disabled).toBe(true)
   })
 })
+
+// Per-diagram scope (2026-10-21): the panel shows the scope ON the active
+// diagram, writes the override there (never the model default), and Reset
+// clears the override instead of pinning a value.
+describe('RightSidebar per-diagram scope', () => {
+  const host: C4Object = { ...shape, id: 'host', name: 'Host system', type: 'system' }
+  const neighbour: C4Object = { ...shape, id: 'neighbour', name: 'Neighbour' }
+  const drill: Diagram = {
+    id: 'drill', name: 'Host containers', type: 'container', parentObjectId: 'host',
+    objectIds: ['neighbour'], connectionIds: [], groupIds: [],
+  }
+  // Buttons are [internal, external]; the pressed one's index.
+  const pressedIndex = (testId: string) =>
+    Array.from(screen.getByTestId(testId).querySelectorAll('button'))
+      .findIndex((b) => b.getAttribute('aria-pressed') === 'true')
+  const press = (testId: string, index: number) =>
+    fireEvent.click(screen.getByTestId(testId).querySelectorAll('button')[index])
+
+  beforeEach(() => {
+    __setWorkspaceKvBaseForTest(createMemoryKvStore())
+    mocks.fetchDecisionRecordPage.mockResolvedValue({
+      paged: true, serverFiltered: true, total: 0, limit: 20, nextCursor: null, nextOffset: null,
+      detailsIncluded: false, items: [],
+    })
+    useAutomergeStatus.setState({ editReady: true, visualReady: true, ready: true, status: 'ready' })
+    useUIStore.setState({ rightSidebarOpen: true, currentView: 'diagram', propertyTab: 'details' })
+    useModelStore.setState({
+      objects: [host, neighbour], connections: [], diagrams: [drill], groups: [], domains: [], tags: [],
+      decisionRecords: [], comments: [], currentDiagramId: 'drill', workspaceReadOnly: false,
+      selectedItems: [{ id: 'neighbour', type: 'object' }],
+    })
+  })
+  afterEach(() => cleanup())
+
+  it('shows the boundary verdict, writes an override on the diagram only, and Reset clears it', () => {
+    render(<RightSidebar />)
+    // neighbour is outside host's drill-down: external HERE, default internal.
+    expect(pressedIndex('scope-on-diagram')).toBe(1)
+    expect(pressedIndex('scope-default')).toBe(0)
+    expect(screen.getByTestId('scope-source').querySelector('button')).toBeNull()
+
+    act(() => press('scope-on-diagram', 0)) // Internal, on this diagram
+    const state = useModelStore.getState()
+    expect(state.diagrams[0].objectScopes).toEqual({ neighbour: 'internal' })
+    expect(state.objects.find((o) => o.id === 'neighbour')!.scope).toBe('internal')
+    expect(pressedIndex('scope-on-diagram')).toBe(0)
+
+    const reset = screen.getByTestId('scope-source').querySelector('button')!
+    act(() => fireEvent.click(reset))
+    expect(useModelStore.getState().diagrams[0].objectScopes).toEqual({})
+    expect(pressedIndex('scope-on-diagram')).toBe(1)
+  })
+
+  it('hides the per-diagram row for an object that is not on the active diagram', () => {
+    useModelStore.setState({ selectedItems: [{ id: 'host', type: 'object' }] })
+    render(<RightSidebar />)
+    expect(screen.queryByTestId('scope-on-diagram')).toBeNull()
+    expect(screen.getByTestId('scope-default')).toBeTruthy()
+  })
+})

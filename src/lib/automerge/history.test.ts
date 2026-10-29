@@ -113,3 +113,35 @@ describe('restoreTo', () => {
     expect(Automerge.getHeads(handle.doc()!)).toEqual(before)
   })
 })
+
+// Re-review 2026-10-29, F1: a restore point older than a diagram's first scope
+// override has no `objectScopes`; reconcile would DELETE the map, taking a
+// peer's concurrent override with it. Both restore paths empty it instead.
+describe('restore keeps the per-diagram scope map (emptied, never deleted)', () => {
+  const legacyDiagram = (): DiagramDoc => ({
+    name: 'D', type: 'context', objectIds: ['X', 'Y'], connectionIds: [], groupIds: [],
+    layouts: {}, comments: {}, flows: {}, checkpoints: [],
+  } as unknown as DiagramDoc)
+
+  for (const [label, restore] of [
+    ['restoreTo', (h: DocHandle<DiagramDoc>, heads: string[]) => { restoreTo(h, heads) }],
+    ['restoreDocToHeads', (h: DocHandle<DiagramDoc>, heads: string[]) => { restoreDocToHeads(h, heads) }],
+  ] as const) {
+    it(`${label}: to a point before the first override, a peer's concurrent override survives`, () => {
+      const handle = fakeHandle<DiagramDoc>(legacyDiagram())
+      const before = Automerge.getHeads(handle.doc()!)
+      handle.change((d) => {
+        if (!d.objectScopes) d.objectScopes = {}
+        d.objectScopes.X = 'external'
+      })
+      // A peer, concurrently, overrides Y in the same map.
+      const peer = Automerge.change(Automerge.clone(handle.doc()!), (d) => {
+        d.objectScopes!.Y = 'internal'
+      })
+      restore(handle, before)
+      expect(handle.doc()!.objectScopes).toEqual({})
+      const converged = Automerge.merge(Automerge.clone(handle.doc()!), peer)
+      expect(converged.objectScopes).toEqual({ Y: 'internal' })
+    })
+  }
+})

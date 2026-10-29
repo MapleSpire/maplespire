@@ -15,7 +15,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { Repo } from '@automerge/automerge-repo'
 import type { Pool } from 'pg'
-import { ModelSession } from './modelOps.js'
+import { ModelSession, findDiagram } from './modelOps.js'
 import type { AiToolCtx } from './toolContext.js'
 import { AiToolError } from './toolContext.js'
 import { TagRepository } from '../../tags/repository.js'
@@ -211,7 +211,7 @@ describe('ai tool registry', () => {
       'create_model_object', 'update_model_object', 'delete_model_object',
       'create_connection', 'update_connection', 'delete_connection',
       'create_decision_record', 'update_decision_record',
-      'create_diagram', 'update_diagram', 'resolve_comment',
+      'create_diagram', 'update_diagram', 'set_object_scope_on_diagram', 'resolve_comment',
       'list_drafts', 'create_draft', 'get_draft_changes', 'merge_draft',
       'list_versions', 'create_version', 'switch_workspace',
       'search_icons', 'list_groups', 'create_group', 'update_group', 'delete_group',
@@ -588,6 +588,62 @@ describe('write tools (monolith)', () => {
     }
     expect(comments.comments[0].resolved).toBe(true)
     expect(comments.comments[0].replies.map((r) => r.text)).toEqual(['Confirmed REST now.'])
+  })
+
+  // Scope is per diagram (user report 2026-10-21): the same object can be
+  // external on one diagram and internal on another.
+  it('sets and clears an object scope on ONE diagram; get_diagram reports the per-diagram value', async () => {
+    const repo = new Repo({})
+    const rootUrl = await seedMonolith(repo, richSeed)
+    const ctx = ctxFor(repo, rootUrl)
+    type Got = { objects: { id: string; scope?: string; scopeSource?: string }[] }
+    const scopeOn = async (id: string, objectId: string) =>
+      ((await executeAiTool(ctx, 'get_diagram', { id })) as Got).objects.find((o) => o.id === objectId)
+
+    const focus = (await executeAiTool(ctx, 'create_diagram', {
+      name: 'A inside', type: 'container', parentObjectId: 'sysA', objectIds: ['sysA', 'sysB'],
+    })) as { created: { id: string } }
+    const flat = (await executeAiTool(ctx, 'create_diagram', {
+      name: 'Flat', type: 'context', objectIds: ['sysA', 'sysB'],
+    })) as { created: { id: string } }
+
+    // C4 boundary rule: sysB is outside sysA's drill-down.
+    expect(await scopeOn(focus.created.id, 'sysB')).toMatchObject({ scope: 'external', scopeSource: 'boundary' })
+    expect(await scopeOn(flat.created.id, 'sysB')).toMatchObject({ scope: 'internal', scopeSource: 'default' })
+
+    await executeAiTool(ctx, 'set_object_scope_on_diagram', { diagramId: focus.created.id, objectIds: ['sysB'], scope: 'internal' })
+    await executeAiTool(ctx, 'set_object_scope_on_diagram', { diagramId: flat.created.id, objectIds: ['sysA'], scope: 'external' })
+    expect(await scopeOn(focus.created.id, 'sysB')).toMatchObject({ scope: 'internal', scopeSource: 'diagram' })
+    expect(await scopeOn(flat.created.id, 'sysA')).toMatchObject({ scope: 'external', scopeSource: 'diagram' })
+    // The model object's default is untouched.
+    const sysA = (await executeAiTool(ctx, 'get_model_object', { id: 'sysA' })) as { object: { scope: string } }
+    expect(sysA.object.scope).toBe('internal')
+
+    // The registry stub carries the same overrides: the read model counts
+    // "external in N of M diagrams" from it, never from the DiagramDoc.
+    const stubScopes = async (id: string) =>
+      (await findDiagram(repo as unknown as Parameters<typeof findDiagram>[0], rootUrl, id))?.stub.objectScopes
+    expect(await stubScopes(focus.created.id)).toEqual({ sysB: 'internal' })
+
+    await executeAiTool(ctx, 'set_object_scope_on_diagram', { diagramId: focus.created.id, objectIds: ['sysB'], scope: null })
+    expect(await scopeOn(focus.created.id, 'sysB')).toMatchObject({ scope: 'external', scopeSource: 'boundary' })
+    // Emptied, not deleted: the map is kept so a concurrent set cannot be lost.
+    expect(await stubScopes(focus.created.id)).toEqual({})
+    expect(await stubScopes(flat.created.id)).toEqual({ sysA: 'external' })
+
+    await expect(executeAiTool(ctx, 'set_object_scope_on_diagram', {
+      diagramId: flat.created.id, objectIds: ['actU'], scope: 'external',
+    })).rejects.toThrow(/not on diagram/)
+
+    // Deleting the object sweeps its override (a stale key would re-apply if
+    // the id came back) and keeps the map itself.
+    const settingsOf = async (id: string) =>
+      ((await executeAiTool(ctx, 'get_diagram', { id })) as { settings: { objectScopes?: Record<string, string> } }).settings
+    expect((await settingsOf(flat.created.id)).objectScopes).toEqual({ sysA: 'external' })
+    await executeAiTool(ctx, 'delete_model_object', { id: 'sysA', deleteChildren: true })
+    // Settings report an empty map as no map (withoutEmptyObjectScopes); the
+    // map itself staying in the document is pinned by the diagramDoc test below.
+    expect((await settingsOf(flat.created.id)).objectScopes).toBeUndefined()
   })
 
   // Regression (2026-10-16): replies were stamped with a display label only, so
@@ -1124,5 +1180,36 @@ describe('icons, groups, domains, audit', () => {
     expect(audit.summary.connectionsUnlabeled).toBe(0)
     // the icon-less group is flagged
     expect(audit.groups.some((g) => g.missing.includes('icon'))).toBe(true)
+  })
+})
+
+describe('set_object_scope_on_diagram — stored shape and ancestry', () => {
+  it('clearing the last override leaves an EMPTY map (never deleted, never a null entry)', async () => {
+    const repo = new Repo({})
+    const rootUrl = await seedMonolith(repo, richSeed)
+    const ctx = ctxFor(repo, rootUrl)
+    const created = (await executeAiTool(ctx, 'create_diagram', {
+      name: 'Flat', type: 'context', objectIds: ['sysA', 'sysB'],
+    })) as { created: { id: string } }
+    const id = created.created.id
+    await executeAiTool(ctx, 'set_object_scope_on_diagram', { diagramId: id, objectIds: ['sysB'], scope: 'external' })
+    expect((await new ModelSession(repo, rootUrl).diagramDoc(id))?.objectScopes).toEqual({ sysB: 'external' })
+    await executeAiTool(ctx, 'set_object_scope_on_diagram', { diagramId: id, objectIds: ['sysB'], scope: null })
+    // A deleted map would drop a peer's concurrent override written into it.
+    expect((await new ModelSession(repo, rootUrl).diagramDoc(id))?.objectScopes).toEqual({})
+  })
+
+  it('get_diagram walks ancestors: a nested object of ANOTHER system is outside the boundary', async () => {
+    const repo = new Repo({})
+    const rootUrl = await seedMonolith(repo, richSeed)
+    const ctx = ctxFor(repo, rootUrl)
+    const created = (await executeAiTool(ctx, 'create_diagram', {
+      name: 'B inside', type: 'container', parentObjectId: 'sysB', objectIds: ['sysB', 'appA1'],
+    })) as { created: { id: string } }
+    const got = (await executeAiTool(ctx, 'get_diagram', { id: created.created.id })) as {
+      objects: { id: string; scope?: string; scopeSource?: string }[]
+    }
+    expect(got.objects.find((o) => o.id === 'appA1')).toMatchObject({ scope: 'external', scopeSource: 'boundary' })
+    expect(got.objects.find((o) => o.id === 'sysB')).toMatchObject({ scope: 'internal', scopeSource: 'default' })
   })
 })

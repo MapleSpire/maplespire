@@ -629,3 +629,32 @@ describe('groups and connections', () => {
     expect(c.label).toBeUndefined()
   })
 })
+
+// Per-diagram scope overrides (merge of claude/model-scope-per-diagram-e1e3f6,
+// architect lens): undo diffs diagram fields whole, and the write path ignores
+// an ABSENT objectScopes (it never deletes the map). Undoing the first override
+// must therefore restore `{}` (which the write path persists by emptying the
+// map), never `undefined` (which it would ignore, so the override came back).
+describe('per-diagram scope overrides', () => {
+  it('undoing the FIRST override leaves an empty map, and redo brings it back', () => {
+    expect(diagram().objectScopes).toBeUndefined()
+    store().setObjectScopeOnDiagram(['B'], 'external')
+    expect(diagram().objectScopes).toEqual({ B: 'external' })
+
+    expect(undoHistory.undo()).toBe(true)
+    expect(diagram().objectScopes).toEqual({})
+
+    expect(undoHistory.redo()).toBe(true)
+    expect(diagram().objectScopes).toEqual({ B: 'external' })
+  })
+
+  it('an override a peer changed since is not clobbered by undo', () => {
+    store().setObjectScopeOnDiagram(['B'], 'external')
+    nextGesture()
+    useModelStore.setState({
+      diagrams: store().diagrams.map((d) => (d.id === 'd1' ? { ...d, objectScopes: { B: 'external', A: 'external' } } : d)),
+    })
+    undoHistory.undo()
+    expect(diagram().objectScopes).toEqual({ B: 'external', A: 'external' })
+  })
+})
