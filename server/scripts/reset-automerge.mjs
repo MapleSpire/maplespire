@@ -15,8 +15,8 @@
 // Dev utility (authorized by the user): clear ONLY the corrupted shared-root
 // pointer so the sync server rebuilds a clean root (with a valid modelUrl) on
 // next start. Document chunks in `automerge_storage` are left intact (the old
-// root just becomes orphaned); the frontend re-seeds the demo workspace when it
-// finds the new model empty. `entities`, `theme_plugins`, `sync_state` untouched.
+// root just becomes orphaned); the server seeds the demo into the new root before
+// publishing it (server/src/demoSeed.ts). `entities`, `theme_plugins`, `sync_state` untouched.
 import { Pool } from 'pg'
 
 const DATABASE_URL =

@@ -125,6 +125,7 @@ function summaryFixture() {
   vi.spyOn(repoModule, 'findModelMetaHandle').mockResolvedValue(meta as any)
   vi.spyOn(repoModule, 'getRegistryShardHandles').mockResolvedValue([] as any)
   vi.spyOn(repoModule, 'getModelShardHandles').mockResolvedValue([] as any)
+  return { meta }
 }
 
 /** The overlay heads were never fetched into this browser: offline, their
@@ -237,6 +238,29 @@ describe('a boot-from-server client with its server unreachable', () => {
     useModelStore.getState().updateObject(SHAPE, { name: 'Edited after the recovery' })
     await settle()
     expect(status()).not.toBe('offline')
+  })
+
+  it('a boot-from-server session still publishes a model-shard pointer an earlier resident session held back', async () => {
+    // 2026-10-19: resume used to run only on the resident
+    // path, so a session that booted from the server left the pointer held
+    // for ever and the shard's objects invisible to everyone.
+    const { meta } = summaryFixture()
+    mocks.fetchDiagramRender.mockResolvedValue(render())
+    const held = repo.create<Record<string, unknown>>({ objects: { o9: shape('Held') } })
+    kv.set('deferred-references:v1', [{ holderDocumentId: meta.documentId, field: 'objectShardUrls', url: held.url }])
+    const findHeld = vi.spyOn(repoModule, 'findHeldModelShardHandle').mockResolvedValue(held as any)
+    const durableSync = await import('./durableSync')
+    vi.spyOn(durableSync, 'acknowledgeDurableDocumentHeads').mockImplementation(async (documents) =>
+      documents.map(({ documentId }) => ({ documentId, durable: documentId === held.documentId })))
+
+    const { startBridge } = await import('./bridge')
+    await startBridge(DEFAULT_WORKSPACE_REF)
+    await vi.waitFor(() => expect(shapeName()).toBe('Server name'), { timeout: 3_000 })
+    expect((window as any).__bridgeDebug().bfsActive).toBe(true) // void-run guard: booted from the server
+
+    expect(findHeld).toHaveBeenCalledWith(held.url)
+    await vi.waitFor(() => expect([...(meta.doc()?.objectShardUrls ?? [])]).toContain(held.url), { timeout: 3_000 })
+    await vi.waitFor(() => expect(kv.get('deferred-references:v1')).toEqual([]), { timeout: 3_000 })
   })
 
   it('a render answered with an HTTP error is NOT "unreachable": the badge does not stay Offline', async () => {
