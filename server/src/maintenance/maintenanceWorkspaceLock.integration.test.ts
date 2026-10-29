@@ -162,7 +162,11 @@ describe.skipIf(!TEST_DATABASE_URL)('per-workspace maintenance lock (T-25)', () 
       // "Postgres said no" must not be confused with "Postgres did not answer".
       const dead = await pool.connect()
       const pid = (await dead.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')).rows[0].pid
-      await client.query('SELECT pg_terminate_backend($1)', [pid])
+      // With a timeout, pg_terminate_backend returns once the backend has EXITED,
+      // not once the signal is sent — otherwise the release below can still be
+      // answered by the dying session and report no error.
+      const terminated = await client.query<{ ok: boolean }>('SELECT pg_terminate_backend($1, 10000) AS ok', [pid])
+      expect(terminated.rows[0].ok, 'the session did not exit within 10 s').toBe(true)
       const broken = await releaseMaintenanceWorkspaceLock(
         dead, maintenanceWorkspaceLockKeyText('default_compaction', WS_A),
       )
