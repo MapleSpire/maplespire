@@ -33,3 +33,28 @@ export async function submitDevLogin(page: Page, email: string): Promise<void> {
   }
   await page.getByTestId('dev-login-submit').click()
 }
+
+const WORKSPACE_URL = /\/app\/landscape\/[^/]+\/version\/[^/]+/
+
+/**
+ * Open the app itself and land in a workspace, on either kind of stack.
+ *
+ * Starts at `/app`, never `/`: `/` is the marketing landing page in this
+ * repository (the public copy redirects it to `/app`), so a spec that opens `/`
+ * and waits for the editor waits on a page that never leaves the landing.
+ *
+ * At AUTH=on the dev-login form appears and is completed with `email`; at
+ * AUTH=off the app goes straight to the workspace URL. The redirect lands a tick
+ * after `load`, so this waits for whichever outcome arrives instead of reading
+ * `isVisible()` before the page has decided.
+ */
+export async function enterAppWorkspace(page: Page, email: string): Promise<void> {
+  await page.goto('/app')
+  const devLogin = page.getByTestId('dev-login-email')
+  await Promise.race([
+    devLogin.waitFor({ state: 'visible', timeout: 45_000 }).catch(() => null),
+    page.waitForURL(WORKSPACE_URL, { timeout: 45_000 }).catch(() => null),
+  ])
+  if (await devLogin.isVisible().catch(() => false)) await submitDevLogin(page, email)
+  await page.waitForURL(WORKSPACE_URL, { timeout: 90_000 })
+}

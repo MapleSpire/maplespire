@@ -59,6 +59,10 @@ interface Probe {
   sockets: SocketOpen[]
   /** Every `[switchWorkspace] <lid>/<vid> in Nms` the bridge logged. */
   switches: string[]
+  /** The landscape the address bar named once sign-in landed (see expectNeverDefaultScoped). */
+  homeLandscapeId?: string
+  /** Socket indices a verified, requested switch into a landscape named `default` opened. */
+  requestedDefault: Set<number>
 }
 
 /**
@@ -71,7 +75,7 @@ interface Probe {
  * between the action and the assertion.
  */
 function attachProbe(page: Page): Probe {
-  const probe: Probe = { sockets: [], switches: [] }
+  const probe: Probe = { sockets: [], switches: [], requestedDefault: new Set() }
   page.on('websocket', (socket) => {
     const url = socket.url()
     if (!url.includes('/automerge')) return // Vite HMR and friends
@@ -123,12 +127,28 @@ async function expectSingleScopedSwitch(
   expect(probe.switches.slice(since.switches), `${what}: [switchWorkspace] log lines`).toEqual([
     expect.stringContaining(`] ${key} in `),
   ])
+  // A switch the spec ASKED for, into a landscape that is really named
+  // `default`, accounts for exactly the one socket just verified above.
+  if (expected.landscapeId === 'default') probe.requestedDefault.add(since.sockets)
 }
 
-/** Regression 3's direct witness. */
+/**
+ * Regression 3's direct witness.
+ *
+ * At AUTH=on the session's home is a fresh org's GENERATED landscape, so every
+ * `default` socket is a tear. At AUTH=off (dev:local) the app boots into the
+ * legacy workspace whose landscape id IS `default`. Two kinds of `default`
+ * socket are then the session's own, not a tear: the LEADING run, opened before
+ * the spec entered its own landscape (every flow here leaves at its first step,
+ * `createLandscape`), and a socket `expectSingleScopedSwitch` verified as the
+ * one a requested switch to `default` opened. Every other one is a witness.
+ */
 function expectNeverDefaultScoped(probe: Probe, what: string): void {
+  const firstElsewhere = probe.sockets.findIndex((s) => s.landscapeId !== 'default')
+  const homeRun = probe.homeLandscapeId === 'default' ? (firstElsewhere < 0 ? probe.sockets.length : firstElsewhere) : 0
+  const witnesses = probe.sockets.filter((_, index) => index >= homeRun && !probe.requestedDefault.has(index))
   expect(
-    probe.sockets.filter((s) => s.landscapeId === 'default').map((s) => s.url),
+    witnesses.filter((s) => s.landscapeId === 'default').map((s) => s.url),
     `${what}: sockets routed at landscapeId=default`,
   ).toEqual([])
 }
@@ -207,7 +227,7 @@ function currentRef(page: Page): { landscapeId: string; versionId: string } {
   return ref!
 }
 
-async function signIn(page: Page, tag: string): Promise<void> {
+async function signIn(page: Page, probe: Probe, tag: string): Promise<void> {
   await page.goto('/app')
   const devLogin = page.getByTestId('dev-login-email')
   // The sign-in redirect lands a tick or more after `load`, so a bare
@@ -224,6 +244,7 @@ async function signIn(page: Page, tag: string): Promise<void> {
     await submitDevLogin(page, `e2e-ws-versions-${tag}-${Date.now().toString(36)}@example.com`)
   }
   await page.waitForURL(WS_URL_RE, { timeout: 90_000 })
+  probe.homeLandscapeId = currentRef(page).landscapeId
   await installOrderProbe(page)
 }
 
@@ -421,7 +442,7 @@ test.describe('workspace versions — newVersion + makeDefault', () => {
     test.setTimeout(300_000)
     const probe = attachProbe(page)
     cleanupApiUrl = trackApiOrigin(page)
-    await signIn(page, 'new')
+    await signIn(page, probe, 'new')
 
     // ── a landscape with REAL content, so there is something to lose ──────────
     const landscapeId = await createLandscape(page, `e2e-newversion-${Date.now().toString(36)}`)
@@ -496,7 +517,7 @@ test.describe('workspace versions — newVersion + makeDefault', () => {
     test.setTimeout(300_000)
     const probe = attachProbe(page)
     cleanupApiUrl = trackApiOrigin(page)
-    await signIn(page, 'fork')
+    await signIn(page, probe, 'fork')
 
     const landscapeId = await createLandscape(page, `e2e-forkversion-${Date.now().toString(36)}`)
     const systemId = await addModelObject(page, 'system')
@@ -570,7 +591,7 @@ test.describe('workspace versions — newVersion + makeDefault', () => {
     test.setTimeout(300_000)
     const probe = attachProbe(page)
     cleanupApiUrl = trackApiOrigin(page)
-    await signIn(page, 'default')
+    await signIn(page, probe, 'default')
     const homeLandscapeId = currentRef(page).landscapeId
 
     const landscapeId = await createLandscape(page, `e2e-makedefault-${Date.now().toString(36)}`)

@@ -78,6 +78,7 @@ import { CommentDetail } from '../comments/CommentDetail'
 import { CommentComposer } from '../comments/CommentComposer'
 import type { C4Object, C4Type, Comment, Connection, Group, SelectedItem } from '../../types'
 import type { Scene3D } from '../../canvas3d'
+import { defaultShapeSize } from '../../lib/shapeDefaults'
 
 // The 2D engine is fed through the SAME `filterAndMergeDiagramData` as the 3D
 // view, the share viewer and the image exporters (src/lib/viewLayouts.ts):
@@ -1494,7 +1495,7 @@ export function CanvasView() {
             name: `New ${item.c4Type}`,
             description: '',
             position: { x: worldPos.x - 80, y: worldPos.y - 50 },
-            size: { width: 160, height: 100 },
+            size: defaultShapeSize(),
             tagAssignments: {},
             tagOrder: [],
             links: [],

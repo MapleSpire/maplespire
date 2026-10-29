@@ -21,10 +21,14 @@ import childProcess from 'node:child_process'
 import { syncBuiltinESMExports } from 'node:module'
 import { startObservation } from './sync-cell-redis-pause-observe.mjs'
 import { analyzeRedisPauseClock as analyze } from './sync-cell-redis-pause-clock.mjs'
+import { untilAdmitted } from './fixtures/real-time-void.mjs'
 
 const loss = '[sync-cell] partition-worker-redis-unavailable failed: Error: partition lease keeper lost authority'
 
-test('real HTTP collector preserves source timestamp and actual request/body arrival, then wires calibrated verdict', async () => {
+test('real HTTP collector preserves source timestamp and actual request/body arrival, then wires calibrated verdict', async t => {
+  // Void when loopback reads on a starved loop leave the last completed cell
+  // sample older than two 50 ms periods at the pause admission.
+  await untilAdmitted(t, 'real HTTP clock admission', async () => {
   let down = false, everLost = false, lossLine = null, firstState = null, phase = 'before'
   const clockReads = { before: 0, during: 0, after: 0 }
   const calibratedPhase = async name => {
@@ -74,7 +78,12 @@ test('real HTTP collector preserves source timestamp and actual request/body arr
     }, { logsSince: cell => ({ containerId: cell.id, kept: [], admissionLines: 0, totalLines: 1,
       lossLines: cell.service === 'a' && lossLine ? [lossLine] : [] }) })
     await calibratedPhase('before')
-    observation.pauseStarted(); observation.pauseCompleted(); phase = 'during'
+    try { observation.pauseStarted() } catch (error) {
+      const { summary } = await observation.stop()
+      if (summary.baseline?.valid === false) return { void: summary.baseline.issues }
+      throw error
+    }
+    observation.pauseCompleted(); phase = 'during'
     await delay(100); down = true; everLost = true; lossLine = `${sourceTime()} ${loss}`
     await calibratedPhase('during')
     observation.unpauseStarted(); down = false; observation.unpauseCompleted(); phase = 'after'
@@ -90,6 +99,7 @@ test('real HTTP collector preserves source timestamp and actual request/body arr
     const count = report.samples.length
     await delay(70)
     assert.equal(report.samples.length, count, 'collector stopped before return')
+    return { void: null }
   } finally {
     try {
       if (observation) await observation.stop({ error: report ? null : new Error('QA assertion or collection failed') })
@@ -99,6 +109,7 @@ test('real HTTP collector preserves source timestamp and actual request/body arr
       await new Promise(resolve => server.close(resolve))
     }
   }
+  })
 })
 
 const t0 = Date.UTC(2026, 8, 6)

@@ -61,8 +61,16 @@ export interface DiagramComposition {
  *    the diagram, else null.
  *  - for every NON-lower connection: roll both endpoints up; skip when an endpoint
  *    has no visible representative, when BOTH endpoints are already directly visible,
- *    or when the rolled-up endpoints coincide (self-loop); first connection to map to
- *    a given visible (from→to) pair wins (one lower per pair).
+ *    when the rolled-up endpoints coincide (self-loop), or when one of the diagram's
+ *    own connections (`connectionIds`) already joins the rolled-up pair in the same
+ *    direction; first connection to map to a given visible (from→to) pair wins (one
+ *    lower per pair).
+ *
+ * The same-direction direct-edge rule is Structurizr's default implied-relationship
+ * strategy (`CreateImpliedRelationshipsUnlessAnyRelationshipExistsStrategy`: skip
+ * when `source.hasEfferentRelationshipWith(destination)`), scoped to the edges the
+ * diagram draws: without it the pair showed two lines (saoe.dsl IncidentFlow,
+ * 2026-10-21). An edge in the opposite direction does not suppress the roll-up.
  *
  * Ids are deterministic (`lower:<from>→<to>`) — the same ids the client's roll-up
  * mints (`lowerConnectionId`, src/lib/diagrams/lowerRouting.ts). Lower connections are
@@ -93,6 +101,11 @@ export function computeLowerConnections(
     return objectToGroup.get(objectId) ?? null
   }
 
+  // (from→to) pairs the diagram already joins with one of its own edges.
+  const own = new Set(diagram.connectionIds)
+  const directPairs = new Set<string>()
+  if (own.size) for (const c of allNonLowerConnections) if (own.has(c.id)) directPairs.add(`${c.fromId}→${c.toId}`)
+
   const seen = new Set<string>()
   const lower: LowerConnection[] = []
   for (const c of allNonLowerConnections) {
@@ -102,6 +115,7 @@ export function computeLowerConnections(
     if (vf === c.fromId && vt === c.toId) continue // both directly visible
     if (vf === vt) continue // self-loop after roll-up
     const key = `${vf}→${vt}`
+    if (directPairs.has(key)) continue // the diagram already draws this pair
     if (seen.has(key)) continue
     seen.add(key)
     lower.push({ id: `lower:${key}`, fromId: vf, toId: vt, kind: 'lower', type: 'dashed', label: '' })

@@ -36,7 +36,7 @@
  * dev login, an empty personal landscape created by the first login):
  *
  *     E2E_BASE_URL=http://127.0.0.1:<frontend port> \
- *       npx playwright test e2e/workspace-move-retryable.spec.ts --project=chromium
+ *       npx playwright test e2e/workspace-move-retryable.spec.ts --project=sync-cell-failover
  *
  * « Document … is unavailable after 3 attempt(s) » on that stack means the
  * frontend cannot reach the WebSocket router (see the `SYNC_WS_PORT` comment in

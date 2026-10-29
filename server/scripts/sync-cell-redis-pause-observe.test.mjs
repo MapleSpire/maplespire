@@ -16,8 +16,19 @@ import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
 import { test } from 'node:test'
 import { identifyObservationCells, observationOptions, runStandaloneObservation, startObservation, validateRouterReadinessUrl } from './sync-cell-redis-pause-observe.mjs'
+import { untilAdmitted } from './fixtures/real-time-void.mjs'
 
 const sleep = (ms) => new Promise((settle) => setTimeout(settle, ms))
+// Wait for what a test needs, not for the time it usually takes: a starved
+// event loop delays the sampler's interval past any fixed sleep. The deadline
+// is a give-up bound only.
+async function waitFor(condition, what, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs
+  while (!condition()) {
+    if (Date.now() > deadline) assert.fail(`timed out waiting for ${what}`)
+    await sleep(5)
+  }
+}
 const healthyResponse = async (url) => new Response(JSON.stringify(String(url).includes('sync-cell')
   ? { partitionIndex: 0, ready: true } : { checks: { redis: true } }), { status: 200 })
 const options = () => ({
@@ -75,9 +86,16 @@ test('collector preserves request and arrival clocks and propagates incomplete c
       : { checks: { redis: true } })),
     logsSince: cell => ({ containerId: cell.id, lossLines: [], kept: [], totalLines: 0, admissionLines: 0 }),
   })
-  await sleep(260)
-  observer.pauseStarted(); observer.pauseCompleted(); observer.unpauseStarted(); observer.unpauseCompleted()
-  const result = await observer.stop()
+  let result
+  try {
+    // The Engine clock is read every fourth tick. A fixed sleep(260) admitted
+    // with ONE engine sample whenever a tick ran late (measured: ticks at 0, 73,
+    // 147, 215, 324 ms), and the refusal skipped stop(), so the leaked interval
+    // kept this file's process alive until the harness's 10-minute ceiling.
+    await waitFor(() => reads >= 2, 'two Engine clock reads')
+    observer.pauseStarted(); observer.pauseCompleted(); observer.unpauseStarted(); observer.unpauseCompleted()
+    result = await observer.stop()
+  } finally { await observer.stop() }
   assert.ok(reads >= 2)
   for (const sample of result.samples) {
     const state = sample.a.state
@@ -109,6 +127,30 @@ test('real HTTP: slow readiness does not delay state polling, arrivals are recor
     res.flushHeaders()
     setTimeout(() => res.end(JSON.stringify(body)), !isState && observedPause ? 500 : 5)
   })
+  // The summary assigns each answer to a phase by its ARRIVAL, so the phases
+  // below end on readiness bodies that have arrived, counted per source (both
+  // cells and the router) and status, never on a fixed duration: the sampler's
+  // interval runs late on a starved loop, and the old sleep(1_050) read 9-14
+  // paused ticks instead of 15 (40 spinning threads on 32 cores, 2026-10-25),
+  // and fell short beside a root vitest run too. Two per source, because a tick fired
+  // just before a transition can answer just after it, and an answer can share
+  // the transition's millisecond.
+  let phase = 'before'
+  const arrivals = new Map()
+  const arrived = (url, status) => {
+    const key = `${phase} ${status} ${String(url).replace(/\/api\/ready$/, '')}`
+    arrivals.set(key, (arrivals.get(key) ?? 0) + 1)
+  }
+  const everySource = (status, n) => ['/a', '/b', ''].every(source =>
+    (arrivals.get(`${phase} ${status} ${base}${source}`) ?? 0) >= n)
+  const countingFetch = async (url, init) => {
+    const response = await fetch(url, init)
+    if (!String(url).endsWith('/api/ready')) return response
+    const json = response.json.bind(response)
+    // The collector stamps the arrival in the same macrotask, after this body.
+    response.json = async () => { const body = await json(); arrived(url, response.status); return body }
+    return response
+  }
   await new Promise((settle) => server.listen(0, '127.0.0.1', settle))
   t.after(async () => {
     server.closeAllConnections()
@@ -119,25 +161,31 @@ test('real HTTP: slow readiness does not delay state polling, arrivals are recor
   const observer = startObservation({
     ...options(), out: 'in-memory', routerReadyUrl: `${base}/api/ready`, samplePeriodMs: 50,
     cells: [{ service: 'a', base: `${base}/a` }, { service: 'b', base: `${base}/b` }],
-  }, { writeReport: (_path, report) => { written = report } })
+  }, { fetch: countingFetch, writeReport: (_path, report) => { written = report } })
   t.after(() => observer.stop())
-  await sleep(250)
+  await waitFor(() => everySource(200, 2), 'healthy pre-pause readiness from both cells and the router')
   observer.pauseStarted()
   paused = true
   observer.pauseCompleted()
-  await sleep(1_050)
+  phase = 'paused'
+  await waitFor(() => everySource(503, 2) && authenticatedStateReads >= 8, 'paused 503 readiness from every source')
   observer.unpauseStarted()
   paused = false
   observer.unpauseCompleted()
-  await sleep(250)
+  phase = 'unpaused'
+  await waitFor(() => everySource(200, 2), 'healthy post-unpause readiness from both cells and the router')
   const report = await observer.stop()
   assert.equal(report, written)
   assert.equal(report.summary.measurementValid, true, report.summary.measurementIssues.join('; '))
   const during = report.samples.filter((s) => s.t >= report.summary.pausedAtMs && s.t < report.summary.unpauseStartedAtMs)
-  assert.ok(during.length >= 15, `the configured 50 ms sampler must keep polling despite slow readiness (${during.length} ticks)`)
   const delayed = during.find((s) => s.a.ready.status === 503)
   assert.ok(delayed, 'the HTTP server really returned a delayed 503')
   assert.ok(delayed.a.ready.at - delayed.a.state.at >= 400, 'state answers arrive while the readiness body is still pending')
+  // The non-blocking property itself, independent of how late ticks run: new
+  // ticks keep firing while that 500 ms readiness body is still outstanding. A
+  // sampler that waited on its previous reads would fire none.
+  const overlapping = report.samples.filter((s) => s.t > delayed.t && s.t < delayed.a.ready.at)
+  assert.ok(overlapping.length >= 3, `the 50 ms sampler must keep polling while readiness is slow (${overlapping.length} ticks)`)
   assert.ok(authenticatedStateReads >= 8, 'the gate cookie reached actual state endpoints on repeated ticks')
   assert.equal(report.summary.samplePeriodMs, 50)
   assert.equal(report.summary.router.samplePeriodMs, 50)
@@ -150,13 +198,18 @@ test('real HTTP: slow readiness does not delay state polling, arrivals are recor
 })
 
 test('legacy internal-router path remains one in five ticks and carries its slower sample period', async () => {
-  let insideCalls = 0
+  let insideCalls = 0, cellReads = 0
   const observer = startObservation({ ...options(), routerReadyUrl: null }, {
-    fetch: healthyResponse,
+    fetch: async url => { cellReads += 1; return healthyResponse(url) },
     readRouterFromInside: async () => { insideCalls += 1; return { status: 200, body: { checks: { redis: true } }, execMs: 3 } },
   })
-  await sleep(430)
-  const report = await observer.stop()
+  let report
+  try {
+    // Three ticks (two cells x ready + state each), not sleep(430): a 200 ms
+    // interval delayed by 30 ms leaves two samples, which says nothing about routing.
+    await waitFor(() => cellReads >= 12, 'three sampler ticks')
+    report = await observer.stop()
+  } finally { await observer.stop() }
   assert.ok(report.samples.length >= 3)
   assert.equal(insideCalls, Math.ceil(report.samples.length / 5))
   assert.equal(report.summary.router.samplePeriodMs, 1_000)
@@ -238,13 +291,14 @@ test('failed cleanup inspection cannot suppress release after the pause acknowle
   assert.ok(stoppedWith.error, 'failed inspection invalidates the observation even when unpause succeeds')
 })
 
-test('standalone injector refuses a bad baseline before acquiring a pause; healthy control reaches the transport', async () => {
+test('standalone injector refuses a bad baseline before acquiring a pause; healthy control reaches the transport', async t => {
   for (const badClock of [false, true]) {
-    let stateReads = 0, paused = false, written = null
-    const changes = []
+    let stateReads, paused, written, changes
+    const arm = async () => {
+    stateReads = 0; paused = false; written = null; changes = []
     const opts = { ...options(), clockCalibration: true, includeLogs: true, samplePeriodMs: 50,
       out: 'in-memory', beforeMs: 300, pauseMs: 0, recoverMs: 0 }
-    const pendingRun = runStandaloneObservation(opts, {
+    return runStandaloneObservation(opts, {
       docker: async (_command, _flag, format, target) => format === '{{.Id}}'
         ? (target === opts.cells[0].name ? 'a' : 'b').repeat(64) : String(paused),
       createPauseTransport: async () => ({ evidence: { engineContainerId: 'c'.repeat(64) },
@@ -264,8 +318,19 @@ test('standalone injector refuses a bad baseline before acquiring a pause; healt
         writeReport: (_path, report) => { written = report },
       }),
     })
-    if (badClock) await assert.rejects(pendingRun, /baseline refused before Redis pause/)
-    else await pendingRun
+    }
+    // The bad-clock arm EXPECTS a clock refusal and is never void. The healthy
+    // control is void when a fixed 300 ms window on a starved loop held fewer
+    // than two Engine reads or no fresh sample (fixtures/real-time-void.mjs).
+    if (badClock) await assert.rejects(arm(), /baseline refused before Redis pause/)
+    else {
+      await untilAdmitted(t, 'healthy standalone control', async () => {
+        try { await arm(); return { void: null } } catch (error) {
+          if (written?.summary.baseline?.valid === false) return { void: written.summary.baseline.issues }
+          throw error
+        }
+      })
+    }
     assert.deepEqual(changes, badClock ? [] : ['pause', 'unpause'])
     assert.equal(paused, false)
     assert.equal(written.summary.baseline.valid, !badClock)
@@ -279,7 +344,10 @@ test('standalone injector refuses a bad baseline before acquiring a pause; healt
   }
 })
 
-test('admission discloses an unfinished Engine read and stop still waits for that original promise', async () => {
+test('admission discloses an unfinished Engine read and stop still waits for that original promise', async t => {
+  // Void when the loop ran the fourth-tick Engine reads more than 400 ms apart,
+  // so the second completed read is stale by the time the third is in flight.
+  await untilAdmitted(t, 'held Engine read admission', async () => {
   let releaseEngine, engineReads = 0
   const heldEngine = new Promise(resolve => { releaseEngine = resolve })
   const opts = options()
@@ -300,7 +368,12 @@ test('admission discloses an unfinished Engine read and stop still waits for tha
     const deadline = Date.now() + 3_000
     while (engineReads < 3 && Date.now() < deadline) await sleep(5)
     assert.equal(engineReads, 3, 'the intended Engine request is actually in flight')
-    observer.pauseStarted()
+    try { observer.pauseStarted() } catch (error) {
+      releaseEngine()
+      const { summary } = await observer.stop()
+      if (summary.baseline?.valid === false) return { void: summary.baseline.issues }
+      throw error
+    }
     let settled = false
     const stopped = observer.stop().then(report => { settled = true; return report })
     await sleep(30)
@@ -313,8 +386,10 @@ test('admission discloses an unfinished Engine read and stop still waits for tha
     assert.equal(report.samples.filter(sample => sample.engineClock?.generatedAt).length, 3)
     assert.ok(report.samples.every(sample => !sample.engineClock?.pending))
     assert.equal(report.summary.measurementValid, false, 'preflight admission does not qualify a missing outage')
+    return { void: null }
   } finally {
     releaseEngine()
     await observer.stop()
   }
+  })
 })

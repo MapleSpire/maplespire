@@ -13,6 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import { test, expect } from '@playwright/test'
+import { enterAppWorkspace } from './support/devLogin'
 
 // Lets local validation reuse an installed Chrome when Playwright's bundled
 // browser cache is intentionally absent from an isolated worktree/container.
@@ -25,15 +26,7 @@ test.use({ channel: process.env.PW_BROWSER_CHANNEL || undefined })
  * proves the real Tailwind utility still resolves the runtime theme token.
  */
 test('workspace sidebars use the design-system dark xl elevation', async ({ page }) => {
-  await page.goto('/')
-  const devLogin = page.getByTestId('dev-login-email')
-  if (await devLogin.isVisible().catch(() => false)) {
-    await devLogin.fill(process.env.E2E_SIDEBAR_EMAIL ?? 'e2e-sidebar-elevation@example.com')
-    await page.getByTestId('dev-login-submit').click()
-    await page.waitForURL(/\/app\//)
-  }
-  const start = page.getByRole('button', { name: /Start designing free/i })
-  if (await start.isVisible().catch(() => false)) await start.click()
+  await enterAppWorkspace(page, process.env.E2E_SIDEBAR_EMAIL ?? 'e2e-sidebar-elevation@example.com')
 
   // The diagram editor owns a distinct left panel from the workspace pages.
   // Check it explicitly so a workspace-only fix cannot mask a regression here.
@@ -122,15 +115,7 @@ test('workspace sidebars use the design-system dark xl elevation', async ({ page
 })
 
 test('workspace tables keep 24px of breathing room beside the left sidebar', async ({ page }) => {
-  await page.goto('/')
-  const devLogin = page.getByTestId('dev-login-email')
-  if (await devLogin.isVisible().catch(() => false)) {
-    await devLogin.fill(process.env.E2E_SIDEBAR_GAP_EMAIL ?? 'e2e-sidebar-gap@example.com')
-    await page.getByTestId('dev-login-submit').click()
-    await page.waitForURL(/\/app\//)
-  }
-  const start = page.getByRole('button', { name: /Start designing free/i })
-  if (await start.isVisible().catch(() => false)) await start.click()
+  await enterAppWorkspace(page, process.env.E2E_SIDEBAR_GAP_EMAIL ?? 'e2e-sidebar-gap@example.com')
 
   await page.getByTestId('nav-menu').click()
   await page.getByTestId('nav-connections').click()

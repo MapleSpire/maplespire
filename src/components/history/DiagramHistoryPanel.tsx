@@ -18,7 +18,7 @@ import { useTranslation } from 'react-i18next'
 import type { TFunction } from 'i18next'
 import { useUIStore } from '../../stores/uiStore'
 import { useModelStore } from '../../stores/modelStore'
-import { getActiveDiagramHandle } from '../../lib/automerge/bridge'
+import { getActiveDiagramHandle, isBootFromServerActive } from '../../lib/automerge/bridge'
 import {
   listHistory,
   listCheckpoints,
@@ -114,7 +114,23 @@ export function DiagramHistoryPanel() {
 
   const doRestore = (heads: string[]) => {
     if (!handle) return
-    restoreTo(handle, heads)
+    const past = restoreTo(handle, heads)
+    // The registry meta, not the DiagramDoc, decides the shown name/type
+    // (resolveDiagramProjection), so a doc-only restore left the name as it
+    // was. Going through the store lets the active-diagram flush write both.
+    // RESIDENT SESSIONS ONLY: there the restore's own change re-projected the
+    // store synchronously (`withRemote(projectAll)`), so the flush this store
+    // write triggers carries the restored view. Under boot-from-server the
+    // re-projection is an async server refresh, and that flush would reconcile
+    // the active doc from the PRE-restore store — undoing the restore. Two
+    // review lenses found it (2026-10-18); not exercised on a BFS stack, so
+    // the name there stays as it was before this change.
+    if (past && currentDiagramId && !isBootFromServerActive()) {
+      const restored: Partial<Pick<DiagramDoc, 'name' | 'type'>> = {}
+      if (typeof past.name === 'string') restored.name = past.name
+      if (past.type) restored.type = past.type
+      useModelStore.getState().updateDiagram(currentDiagramId, restored)
+    }
     // A time-travel restore rewrites the diagram under every recorded entry;
     // replaying those afterwards would mix two timelines.
     undoHistory.clear()
@@ -184,6 +200,7 @@ export function DiagramHistoryPanel() {
                       </div>
                       <div className="flex items-center gap-1 shrink-0">
                         <button
+                          data-testid={`checkpoint-restore-${cp.id}`}
                           onClick={() => doRestore(cp.heads)}
                           className="flex items-center gap-1 text-xs px-2 py-1 border border-line rounded hover:bg-surface-50 text-fg-secondary"
                           title={t('misc.diagramHistory.restoreThisCheckpoint')}

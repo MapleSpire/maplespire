@@ -13,7 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import { describe, it, expect } from 'vitest'
-import { computeLowerConnections, buildLocalDiagramRender } from './diagramRenderLocal'
+import { computeLowerConnections, buildLocalDiagramRender, withOwnConnections } from './diagramRenderLocal'
 import { buildModelIndex } from './modelIndex'
 import { createMemoryKvStore } from './kvStore'
 import type { C4Object, Connection, Group, Diagram } from '../../types'
@@ -72,9 +72,39 @@ describe('computeLowerConnections — parity with the server roll-up', () => {
     ])
   })
 
+  it('skips a roll-up the diagram already draws with its own edge, same direction only', () => {
+    const conns = [
+      { id: 'own', fromId: 'A', toId: 'B' },
+      { id: 'deep1', fromId: 'a1c', toId: 'b1c' }, // A→B: drawn by 'own'
+      { id: 'back', fromId: 'b1c', toId: 'a1c' }, // B→A: not drawn
+    ]
+    const withOwn = { objectIds: ['A', 'B'], groupIds: [], connectionIds: ['own'] }
+    expect(computeLowerConnections(withOwn, parentOf, noGroups, conns).map((l) => l.id)).toEqual(['lower:B→A'])
+    // The same model edge, not on the diagram, suppresses nothing.
+    expect(computeLowerConnections(diagram, parentOf, noGroups, conns).map((l) => l.id)).toEqual(['lower:A→B', 'lower:B→A'])
+  })
+
   it('ignores a group that is NOT on the diagram (no fallback)', () => {
     const groups = new Map<string, string[]>([['G', ['gObj']]])
     expect(computeLowerConnections({ objectIds: ['A', 'B'], groupIds: [] }, parentOf, groups, [{ id: 'e', fromId: 'a1c', toId: 'gObj' }])).toEqual([])
+  })
+})
+
+describe('withOwnConnections — the roll-up input of the cache Worker', () => {
+  // The Worker's candidates are the edges leaving the diagram's subtree; an own
+  // edge leaving a GROUP on the diagram is not among them.
+  it('lets a group-sourced own edge suppress the roll-up of its pair', () => {
+    const diagram = { objectIds: ['B'], groupIds: ['G'], connectionIds: ['own'] }
+    const groups = new Map<string, string[]>([['G', ['gObj']]])
+    const candidates = [{ id: 'deep', fromId: 'gObj', toId: 'b1c' }] // G→B
+    const own = [{ id: 'own', fromId: 'G', toId: 'B' }]
+    expect(computeLowerConnections(diagram, parentOf, groups, candidates).map((l) => l.id)).toEqual(['lower:G→B'])
+    expect(computeLowerConnections(diagram, parentOf, groups, withOwnConnections(candidates, own))).toEqual([])
+  })
+
+  it('does not list an edge twice', () => {
+    const edge = { id: 'e', fromId: 'A', toId: 'B' }
+    expect(withOwnConnections([edge], [edge])).toEqual([edge])
   })
 })
 
@@ -99,7 +129,7 @@ describe('buildLocalDiagramRender — render from the local index', () => {
     conn('direct1', 'A', 'B'), // both visible → stays direct, no lower
     conn('deep1', 'a1c', 'b1c'), // rolls up A→B
   ]
-  const diagrams = [diag('dg', ['A', 'B'], ['direct1'])]
+  const diagrams = [diag('dg', ['A', 'B'], ['direct1']), diag('bare', ['A', 'B'], [])]
 
   async function freshStore() {
     const store = createMemoryKvStore()
@@ -116,8 +146,17 @@ describe('buildLocalDiagramRender — render from the local index', () => {
     const direct = render!.connections.filter((c) => c.kind !== 'lower')
     const lower = render!.connections.filter((c) => c.kind === 'lower')
     expect(direct.map((c) => c.id)).toEqual(['direct1'])
-    // deep1 (a1c→b1c) rolled up to A→B; direct1 (A↔B both visible) does NOT produce a lower.
-    expect(lower).toEqual([{ id: 'lower:A→B', fromId: 'A', toId: 'B', kind: 'lower', type: 'dashed', label: '' }])
+    // deep1 (a1c→b1c) rolls up to A→B, which the diagram already draws with
+    // direct1: no second line beside it (saoe.dsl IncidentFlow, 2026-10-21).
+    expect(lower).toEqual([])
+  })
+
+  it('rolls the deep edge up on a diagram that does not draw the pair itself', async () => {
+    const store = await freshStore()
+    const render = await buildLocalDiagramRender(store, 'bare')
+    expect(render!.connections).toEqual([
+      { id: 'lower:A→B', fromId: 'A', toId: 'B', kind: 'lower', type: 'dashed', label: '' },
+    ])
   })
 
   it('resolves groups on the diagram and uses them for the roll-up fallback', async () => {

@@ -43,6 +43,7 @@ import { TechIconBadge } from '../shared/TechIconBadge'
 import { useVirtualRows } from '../common/VirtualList'
 import { canReparentObject } from '../../lib/modelHierarchy'
 import { useObjectExplorer, type ExplorerVisualRow } from '../diagram/useObjectExplorer'
+import { defaultShapeSize } from '../../lib/shapeDefaults'
 
 const typeIcons: Record<string, React.ElementType> = {
   actor: User,
@@ -466,7 +467,7 @@ export function ModelObjectsTable({
                                     name: `New ${addType}`,
                                     description: '',
                                     position: { x: 100 + Math.random() * 200, y: 100 + Math.random() * 200 },
-                                    size: { width: 160, height: 100 },
+                                    size: defaultShapeSize(),
                                     tagAssignments: {},
                                     tagOrder: [],
                                     links: [],

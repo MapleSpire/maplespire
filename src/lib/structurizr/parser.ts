@@ -15,7 +15,7 @@
 // Recursive-descent parser for the Structurizr DSL → typed Workspace AST.
 //
 // Scope: the structural subset we can import (model elements, groups,
-// relationships, and structural views). Deployment/dynamic/filtered/image views,
+// relationships, structural views and dynamic views). Deployment/filtered/image views,
 // styles, and `!` directives are parsed-and-skipped, with a human-readable note
 // pushed to `workspace.warnings`.
 
@@ -270,13 +270,13 @@ class Parser {
 
     // Relationship: explicit `SRC -> DST ...` or implicit `-> DST ...`.
     if (head?.type === 'arrow') {
-      this.parseRelationship(rest, ctx.parentRef, ctx.parentPath, stmt.line)
-      if (stmt.blockFollows) this.skipBlock() // relationship children (tags/url/...) — ignored
+      const rel = this.parseRelationship(rest, ctx.parentRef, ctx.parentPath, stmt.line)
+      if (stmt.blockFollows) this.parseRelationshipBody(rel, stmt.line)
       return
     }
     if (rest.length >= 2 && rest[1]?.type === 'arrow') {
-      this.parseRelationship(rest, ctx.parentRef, ctx.parentPath, stmt.line)
-      if (stmt.blockFollows) this.skipBlock()
+      const rel = this.parseRelationship(rest, ctx.parentRef, ctx.parentPath, stmt.line)
+      if (stmt.blockFollows) this.parseRelationshipBody(rel, stmt.line)
       return
     }
 
@@ -482,7 +482,7 @@ class Parser {
     implicitSource: string | undefined,
     scopeRef: string | undefined,
     line: number,
-  ): void {
+  ): RawRelationship | undefined {
     let source: string | undefined
     let idx: number // set unconditionally in both branches below
     if (rest[0].type === 'arrow') {
@@ -495,10 +495,10 @@ class Parser {
     const dest = rest[idx]?.value
     if (!source || !dest) {
       this.warnOnce('A relationship was skipped because its source or destination could not be resolved.')
-      return
+      return undefined
     }
     const strings = rest.slice(idx + 1).filter((t) => t.type === 'string').map((t) => t.value)
-    this.relationships.push({
+    const rel: RawRelationship = {
       sourceRef: source,
       destRef: dest,
       description: strings[0]?.trim() || undefined,
@@ -506,7 +506,51 @@ class Parser {
       tags: splitTags(strings[2]),
       ...(scopeRef ? { scopeRef } : {}),
       line,
-    })
+    }
+    this.relationships.push(rel)
+    return rel
+  }
+
+  /**
+   * A relationship's `{ … }` body. It was skipped wholesale, so tags, url and
+   * properties written in block form — which is how our own exporter writes
+   * them, and the only form `properties` has — were dropped on import.
+   */
+  private parseRelationshipBody(rel: RawRelationship | undefined, line: number): void {
+    for (;;) {
+      const stmt = this.readStatement()
+      if (!stmt) {
+        this.expectRBrace(line)
+        return
+      }
+      const head = stmt.tokens[0]
+      const kw = head?.type === 'word' ? head.value.toLowerCase() : ''
+      const strings = stmt.tokens.slice(1).filter((t) => t.type === 'string').map((t) => t.value)
+      if (rel && kw === 'properties' && stmt.blockFollows) {
+        rel.properties ??= {}
+        this.parseProperties(rel.properties, stmt.line)
+        continue
+      }
+      if (rel) {
+        switch (kw) {
+          case 'tags':
+            for (const value of strings) rel.tags.push(...splitTags(value))
+            break
+          case 'url':
+            rel.url = strings[0] ?? stmt.tokens[1]?.value
+            break
+          case 'description':
+            if (strings[0]?.trim()) rel.description = strings[0].trim()
+            break
+          case 'technology':
+            if (strings[0]?.trim()) rel.technology = strings[0].trim()
+            break
+          default:
+            break
+        }
+      }
+      if (stmt.blockFollows) this.skipBlock()
+    }
   }
 
   // ── views ────────────────────────────────────────────────────────────────
@@ -525,8 +569,10 @@ class Parser {
         const kind = VIEW_KEYWORDS[kw]
         if (kind === 'systemLandscape' || kind === 'systemContext' || kind === 'container' || kind === 'component') {
           this.parseStructuralView(kind, stmt)
+        } else if (kind === 'dynamic') {
+          this.parseDynamicView(stmt)
         } else {
-          // dynamic / deployment / filtered / image / custom → not imported.
+          // deployment / filtered / image / custom → not imported.
           this.warnOnce(`"${kw}" views were ignored (not supported by the importer yet).`)
           if (stmt.blockFollows) this.skipBlock()
         }
@@ -596,6 +642,88 @@ class Parser {
         }
       }
       if (stmt.blockFollows) this.skipBlock() // animation {}, properties {}, etc.
+    }
+  }
+
+  /**
+   * `dynamic <scope|*> ["key"] ["description"] { … }` — an ordered sequence of
+   * interactions, each `[order:] a -> b ["description" ["technology"]]`. The
+   * mapper resolves every step to a model relationship, the way Structurizr does.
+   */
+  private parseDynamicView(stmt: Statement): void {
+    const rest = stmt.tokens.slice(1)
+    const strings = rest.slice(1).filter((t) => t.type === 'string').map((t) => t.value)
+    const view: RawView = {
+      kind: 'dynamic',
+      scopeRef: rest[0]?.type === 'word' && rest[0].value !== '*' ? rest[0].value : undefined,
+      key: strings[0],
+      description: strings[1],
+      includes: [],
+      excludes: [],
+      steps: [],
+      line: stmt.line,
+    }
+    if (stmt.blockFollows) this.parseDynamicBody(view, stmt.line)
+    this.views.push(view)
+  }
+
+  private parseDynamicBody(view: RawView, line: number): void {
+    for (;;) {
+      const stmt = this.readStatement()
+      if (!stmt) {
+        this.expectRBrace(line)
+        return
+      }
+      const tokens = stmt.tokens
+      // A bare `{ … }` is a parallel sequence. Its steps are kept, in file order:
+      // a flow is one ordered list, and dropping them would lose interactions.
+      if (tokens.length === 0) {
+        if (stmt.blockFollows) {
+          this.warnOnce('Parallel sequences in dynamic views were flattened into file order.')
+          this.parseDynamicBody(view, stmt.line)
+        }
+        continue
+      }
+      let order: string | undefined
+      let at = 0
+      if (tokens[0].type === 'word' && /^[\d.]+:$/.test(tokens[0].value)) {
+        order = tokens[0].value.slice(0, -1)
+        at = 1
+      }
+      if (tokens[at + 1]?.type === 'arrow' && tokens[at]?.type === 'word' && tokens[at + 2]?.type === 'word') {
+        const strings = tokens.slice(at + 3).filter((t) => t.type === 'string').map((t) => t.value.trim())
+        view.steps!.push({
+          sourceRef: tokens[at].value,
+          destRef: tokens[at + 2].value,
+          ...(strings[0] ? { description: strings[0] } : {}),
+          ...(strings[1] ? { technology: strings[1] } : {}),
+          ...(order ? { order } : {}),
+          line: stmt.line,
+        })
+        // A step has no body of its own. `readStatement` hands it a `{` written
+        // on the NEXT line, which is a parallel sequence opening after it.
+        if (stmt.blockFollows) {
+          this.warnOnce('Parallel sequences in dynamic views were flattened into file order.')
+          this.parseDynamicBody(view, stmt.line)
+        }
+        continue
+      }
+      const kw = tokens[0].type === 'word' ? tokens[0].value.toLowerCase() : ''
+      const firstString = tokens.find((t) => t.type === 'string')?.value
+      if (kw === 'autolayout') view.autoLayout = parseAutoLayout(tokens.slice(1).map((t) => t.value))
+      else if (kw === 'title' && firstString) view.title = firstString
+      else if (kw === 'description' && firstString) view.description = firstString
+      else if (kw === 'include' || kw === 'exclude' || kw === 'animation' || kw === 'properties' || kw === 'default') {
+        // Element includes add nothing a flow can show; the rest is presentation.
+      } else if (tokens[0].type === 'word') {
+        // `relationshipIdentifier "description"` — the step names a relationship
+        // by its identifier. Relationship identifiers are not tracked, so it is
+        // named instead of silently dropped.
+        this.warnOnce(
+          'A dynamic-view step that names a relationship by its identifier (rather than `a -> b`) is not supported and was skipped.',
+        )
+      }
+      if (stmt.blockFollows) this.skipBlock()
     }
   }
 

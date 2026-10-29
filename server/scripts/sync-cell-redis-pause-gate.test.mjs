@@ -19,9 +19,22 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+import { untilAdmitted } from './fixtures/real-time-void.mjs'
 
 const gate = fileURLToPath(new URL('./verify-sync-cell-failover.mjs', import.meta.url))
 const preload = new URL('./fixtures/sync-cell-redis-pause-gate-preload.mjs', import.meta.url).href
+// An arm that must reach the pause is VOID when the host starved the gate's
+// real-time admissions (fixtures/real-time-void.mjs); measured alone, these
+// children took 2.3-4.7 s, so the 15 s ceiling below is not what flakes.
+async function admitted(t, mode) {
+  return untilAdmitted(t, mode, async () => {
+    const outcome = await run(mode)
+    const { baseline, pauseAdmission } = outcome.observation.summary
+    if (baseline?.valid === false) return { void: baseline.issues, value: outcome }
+    const admissionExpected = mode.startsWith('witness-') && mode !== 'witness-refused'
+    return { void: admissionExpected && pauseAdmission?.valid === false ? pauseAdmission.issues : null, value: outcome }
+  })
+}
 async function run(mode) {
   const directory = await mkdtemp(join(tmpdir(), 'maplespire-gate-baseline-'))
   const reportPath = join(directory, 'fixture.json')
@@ -73,8 +86,8 @@ test('real gate refuses a clock step during baseline before ANY Redis pause or c
   assert.deepEqual(report.commands.filter(command => ['pause', 'unpause'].includes(command.args?.[0])), [])
 })
 
-test('same real gate reaches pause on a healthy baseline and releases an uncertain acquired pause by pinned ID', async () => {
-  const { report, observation } = await run('healthy')
+test('same real gate reaches pause on a healthy baseline and releases an uncertain acquired pause by pinned ID', async t => {
+  const { report, observation } = await admitted(t, 'healthy')
   assert.ok(observation.summary.baseline, 'gate must execute and retain the baseline admission')
   assert.equal(observation.summary.baseline.valid, true)
   assert.doesNotMatch(report.error, /baseline refused/)
@@ -112,8 +125,8 @@ function assertWitnessExecuted(report, observation) {
   assert.equal(observation.summary.measurementValid, false, 'these targeted arms deliberately interrupt qualification')
 }
 
-test('real gate refuses only the RESP witness on a valid clock, without acquiring pause or cleanup', async () => {
-  const { report, observation } = await run('witness-refused')
+test('real gate refuses only the RESP witness on a valid clock, without acquiring pause or cleanup', async t => {
+  const { report, observation } = await admitted(t, 'witness-refused')
   assert.equal(report.redisConnections, 1)
   assert.ok(report.redisRequests >= 1, 'must actually deliver the malformed nonce echo')
   assert.match(report.error, /pause admission refused before Redis pause/)
@@ -130,8 +143,8 @@ test('real gate refuses only the RESP witness on a valid clock, without acquirin
   assert.deepEqual(report.commands.filter(command => ['pause', 'unpause'].includes(command.args?.[0])), [])
 })
 
-test('real gate seals an uncertain pause before release and actually receives but excludes its late echo', async () => {
-  const { report, observation } = await run('witness-uncertain')
+test('real gate seals an uncertain pause before release and actually receives but excludes its late echo', async t => {
+  const { report, observation } = await admitted(t, 'witness-uncertain')
   assertWitnessExecuted(report, observation)
   assert.match(report.error, /returned HTTP 500, expected 204/)
   assert.equal(observation.freezeWitness.marks.pauseAcknowledged, null)
@@ -143,8 +156,8 @@ test('real gate seals an uncertain pause before release and actually receives bu
   assert.ok(!observation.summary.freezeWitness.qualifiedRecordIds.includes(late[0].id))
 })
 
-test('real gate with a successful ACK releases even when its unpause marker clock throws after cutoff', async () => {
-  const { report, observation } = await run('witness-marker-error')
+test('real gate with a successful ACK releases even when its unpause marker clock throws after cutoff', async t => {
+  const { report, observation } = await admitted(t, 'witness-marker-error')
   assertWitnessExecuted(report, observation)
   assert.equal(report.markerThrew, true, 'must execute the ACK-dependent marker failure')
   assert.match(report.error, /qa-unpause-marker-clock-failed/)
@@ -156,8 +169,8 @@ test('real gate with a successful ACK releases even when its unpause marker cloc
   assert.ok(cutoff.ordinal < marker.ordinal && marker.ordinal < release.ordinal)
 })
 
-test('real gate preserves a final pinned-ID inspection failure as witness INVALID after releasing its pause', async () => {
-  const { report, observation } = await run('witness-identity-error')
+test('real gate preserves a final pinned-ID inspection failure as witness INVALID after releasing its pause', async t => {
+  const { report, observation } = await admitted(t, 'witness-identity-error')
   assertWitnessExecuted(report, observation)
   assert.ok(report.commands.some(command => command.method === 'GET'
     && command.path === `/v1.40/containers/${'c'.repeat(64)}/json`))
@@ -166,8 +179,8 @@ test('real gate preserves a final pinned-ID inspection failure as witness INVALI
   assert.ok(observation.summary.measurementIssues.some(issue => /final identity is unverified/.test(issue)))
 })
 
-test('real gate awaits the actual witness close event before final inspection, synchronous logs and report', async () => {
-  const { report, observation } = await run('witness-close-held')
+test('real gate awaits the actual witness close event before final inspection, synchronous logs and report', async t => {
+  const { report, observation } = await admitted(t, 'witness-close-held')
   assertWitnessExecuted(report, observation)
   const held = report.events.find(event => event.kind === 'witness-close-held')
   const closed = report.events.find(event => event.kind === 'witness-close-delivered')

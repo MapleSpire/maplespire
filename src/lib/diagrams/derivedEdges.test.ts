@@ -84,6 +84,15 @@ describe('readDerivedEdges', () => {
     expect(got).toEqual([expect.objectContaining({ fromId: 'mobile', toId: 'orders', kind: 'lower' })])
   })
 
+  it('adds no roll-up beside an edge the diagram already draws between the pair', async () => {
+    const model = { ...MODEL, connections: [...MODEL.connections, edge('mobile-orders', 'mobile', 'orders')] }
+    const got = await readDerivedEdges('containers', { ...CONTAINERS, connectionIds: ['mobile-orders'] }, sources({
+      resident: () => true,
+      model: () => model,
+    }))
+    expect(got).toEqual([])
+  })
+
   it('rolls an end up to a group placed on the diagram', async () => {
     const got = await readDerivedEdges('containers', { objectIds: ['mobile'], groupIds: ['g'] }, sources({
       resident: () => true,

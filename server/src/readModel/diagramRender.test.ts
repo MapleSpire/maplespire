@@ -76,6 +76,18 @@ describe('computeLowerConnections — parity with client syncLowerConnections', 
     ])
   })
 
+  it('skips a roll-up the diagram already draws with its own edge, same direction only', () => {
+    const conns: MiniConn[] = [
+      { id: 'direct1', fromId: 'A', toId: 'B' }, // on the diagram
+      { id: 'deep1', fromId: 'a1c', toId: 'b1c' }, // A→B: drawn by direct1
+      { id: 'back', fromId: 'b1c', toId: 'a1c' }, // B→A: not drawn
+    ]
+    expect(computeLowerConnections(diagram, parentOf, noGroups, conns).map((l) => l.id)).toEqual(['lower:B→A'])
+    // The same model edge, not on the diagram, suppresses nothing.
+    const without = { ...diagram, connectionIds: [] }
+    expect(computeLowerConnections(without, parentOf, noGroups, conns).map((l) => l.id)).toEqual(['lower:A→B', 'lower:B→A'])
+  })
+
   it('ignores a group that is NOT on the diagram (no fallback)', () => {
     const diag = { objectIds: ['A', 'B'], connectionIds: [], groupIds: [] } // group G not placed
     const groups = new Map<string, string[]>([['G', ['gObj']]])

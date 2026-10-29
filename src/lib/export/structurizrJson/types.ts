@@ -651,7 +651,7 @@ export interface StructurizrJsonExportOptions {
    *  Nothing in the format states which scheme a style block means (§18.4), so
    *  the caller says. */
   colorScheme?: WireColorScheme
-  /** Canvas px → Structurizr's 300-dpi space. Our boxes are roughly 2.4× smaller
+  /** Canvas px → Structurizr's 300-dpi space. Our 160-wide box is 450/160 ≈ 2.8× smaller
    *  than the box Structurizr draws for an unstyled element, so an unscaled
    *  export overlaps every shape it just placed. */
   layoutScale?: number
@@ -827,33 +827,21 @@ export function depthsIn(ids: readonly string[], parentOf: ReadonlyMap<string, s
  * mitigation: a customer whose estate is organised by domain, or whose shapes
  * carry an owning team, does not get that back from a sentence in a dialog.
  */
-export const DOMAIN_PROPERTY = 'maplespire.domain'
-export const DOMAIN_ID_PROPERTY = 'maplespire.domainId'
-export const STATUS_PROPERTY = 'maplespire.status'
-export const OWNER_TEAMS_PROPERTY = 'maplespire.ownerTeamIds'
-export const TEAMS_PROPERTY = 'maplespire.teamIds'
-export const OWNERS_PROPERTY = 'maplespire.owners'
-export const EXTRA_LINKS_PROPERTY = 'maplespire.links'
-export const CONNECTION_KIND_PROPERTY = 'maplespire.connectionKind'
-export const SKIN_PROPERTY = 'maplespire.skinId'
-
-/**
- * Keys this export DERIVES from a live field on every run. A copy of one read
- * back off a previous export is stale by construction — the field may have
- * changed since — so `wireProperties` drops them exactly as it drops the
- * import's own stamps.
- */
-export const MAPLESPIRE_DERIVED_PROPERTY_KEYS: readonly string[] = [
-  DOMAIN_PROPERTY,
-  DOMAIN_ID_PROPERTY,
-  STATUS_PROPERTY,
-  OWNER_TEAMS_PROPERTY,
-  TEAMS_PROPERTY,
-  OWNERS_PROPERTY,
-  EXTRA_LINKS_PROPERTY,
+// The keys live with the importer that reads them back; see that module's header.
+export {
+  CONNECTION_DESCRIPTION_PROPERTY,
   CONNECTION_KIND_PROPERTY,
+  DOMAIN_ID_PROPERTY,
+  DOMAIN_PROPERTY,
+  EXTRA_LINKS_PROPERTY,
+  MAPLESPIRE_DERIVED_PROPERTY_KEYS,
+  OWNERS_PROPERTY,
+  OWNER_TEAMS_PROPERTY,
+  SHORT_DESCRIPTION_PROPERTY,
   SKIN_PROPERTY,
-]
+  STATUS_PROPERTY,
+  TEAMS_PROPERTY,
+} from '../../structurizr/maplespireFacts'
 
 /** The scope tag `detectScope` reads back on the way in. There is no other
  *  channel: `location` is in §2's legacy register and has no declaration here. */

@@ -204,7 +204,11 @@ test('absolute request deadline includes delayed headers and a body that keeps s
     const startedAt = performance.now()
     await assert.rejects(createLocalDockerPauseTransport(transportOptions, { ...fake, timeoutMs: 40 }), /timed out/)
     assert.ok(performance.now() - startedAt < 400, 'incoming bytes cannot indefinitely rearm the deadline')
-    await new Promise((resolve) => setTimeout(resolve, 10))
+    // The server sees the destroyed socket in a later poll phase, not within a
+    // fixed 10 ms (red once under load). A request the client never destroyed
+    // keeps receiving bytes and never closes, so this bound still fails it.
+    const closeDeadline = performance.now() + 2_000
+    while (!responseClosed && performance.now() < closeDeadline) await new Promise((resolve) => setTimeout(resolve, 5))
     assert.equal(responseClosed, true, 'timeout destroys the active request')
   }
 })
@@ -218,7 +222,12 @@ test('a timed-out Engine pause still releases an acquired pause and invalidates 
     else if (req.url.endsWith('/unpause')) { paused = false; res.writeHead(204); res.end() }
     else { res.writeHead(500); res.end() }
   })
-  const transport = await createLocalDockerPauseTransport(transportOptions, { ...fake, timeoutMs: 40 })
+  // One ceiling serves the pause that must time out AND the cleanup unpause
+  // that must not. 40 ms failed that unpause once in 15 suite runs beside a
+  // root vitest run (2026-10-25), while 400 sequential unpause round trips on
+  // this loopback under the same load measured p99 6.9 ms, max 20.2 ms: the
+  // red was a starved loop, not a slow request. 500 ms is 25x that maximum.
+  const transport = await createLocalDockerPauseTransport(transportOptions, { ...fake, timeoutMs: 500 })
   await assert.rejects(runStandaloneObservation({
     redisName: containerName, cells: [{ name: 'unit-cell-a' }, { name: 'unit-cell-b' }],
     cookie: 'maplespire_session=fixture', beforeMs: 0, pauseMs: 0, recoverMs: 0,

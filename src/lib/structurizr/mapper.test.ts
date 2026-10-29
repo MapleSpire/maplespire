@@ -51,8 +51,8 @@ describe('mapWorkspace — Big Bank plc', () => {
     expect(signin.parentId).toBe(api.id)
   })
 
-  it('produces context (x2), container, component diagrams', () => {
-    expect(m.stats.byLevel).toEqual({ context: 2, container: 1, component: 1 })
+  it('produces context (x2), container, component diagrams + the SignIn dynamic view (component level)', () => {
+    expect(m.stats.byLevel).toEqual({ context: 2, container: 1, component: 2 })
   })
 
   it('container diagram = focal containers + externals, with a system boundary group', () => {
@@ -106,7 +106,7 @@ describe('mapWorkspace — autoLayout direction hint', () => {
   })
 })
 
-describe('mapWorkspace — system-level external relations roll up to container diagram', () => {
+describe('mapWorkspace — a container view shows the neighbours of its CONTAINERS (C4 / Structurizr include *)', () => {
   const dsl = `workspace "T" {
     model {
       mySystem = softwareSystem "My System" {
@@ -114,7 +114,9 @@ describe('mapWorkspace — system-level external relations roll up to container 
         api = container "API" "" "Java"
       }
       externalCRM = softwareSystem "External CRM" "" "External"
+      billing = softwareSystem "Billing" "" "External"
       mySystem -> externalCRM "Syncs"
+      api -> billing "Charges"
       web -> api "Calls"
     }
     views {
@@ -123,16 +125,23 @@ describe('mapWorkspace — system-level external relations roll up to container 
   }`
   let n = 0
   const m = mapWorkspace(parseWorkspace(dsl), { idFactory: () => `id${++n}` })
+  const container = m.diagrams.find((d) => d.type === 'container')!
 
-  it('includes the external system reached via a focal-system-level relationship', () => {
-    const container = m.diagrams.find((d) => d.type === 'container')!
+  it('leaves out a system reached only by a relationship on the focal system itself', () => {
+    // Regression (user report, saoe.dsl): `mySystem -> externalCRM` is drawn
+    // between the system and the CRM. Nothing on the container view stands for
+    // `mySystem` but its boundary, so the CRM landed on the canvas with no edge
+    // at all. Structurizr's `include *` does not add it either.
     const crm = m.objects.find((o) => o.name === 'External CRM')!
-    // The relationship `mySystem -> externalCRM` is declared at system level; the
-    // external CRM must still surface on the container diagram.
-    expect(container.objectIds).toContain(crm.id)
+    expect(container.objectIds).not.toContain(crm.id)
     // The focal system itself is NOT rendered as a member of its own drill-down.
     const focal = m.objects.find((o) => o.name === 'My System')!
     expect(container.objectIds).not.toContain(focal.id)
+  })
+
+  it('includes a system connected to one of its containers', () => {
+    const billing = m.objects.find((o) => o.name === 'Billing')!
+    expect(container.objectIds).toContain(billing.id)
   })
 })
 

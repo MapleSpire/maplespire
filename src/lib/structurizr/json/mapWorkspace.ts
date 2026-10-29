@@ -47,7 +47,8 @@ import {
   groupTitleMinWidth,
 } from '../../layout/metrics'
 import type { ImportStats } from '../../import/types'
-import { SIZE_BY_TYPE, detectScope, isDatastore, technologyNames } from '../conventions'
+import { SIZE_BY_TYPE, compareOrder, detectScope, isDatastore, parseTechnologies, technologyNames } from '../conventions'
+import { ownerFields, reviveMapleSpireFacts, withTechnologyDetails } from '../maplespireFacts'
 import { SOURCE_IDENTIFIER_PROPERTY, importedTag, type LayoutDirection } from '../mapper'
 import {
   BOUNDARY_FOR_PROPERTY,
@@ -628,7 +629,11 @@ export function mapWorkspace(ws: SzWorkspace, opts: JsonMapOptions = {}): Mapped
     const technology = el.technology ?? display.technology
     const tags = dedupe([...display.tags, ...el.tags])
     const type = objectTypeFor(el.kind, technology, tags, style.shape)
-    const technologies = technologyNames(technology)
+    const technologies = parseTechnologies(technology)
+    // Facts our own exporter parked in `properties` (status, owners, the compact
+    // summary, technology notes) go back into their fields — see
+    // `maplespireFacts.ts` for why leaving them as properties lost them.
+    const revived = reviveMapleSpireFacts(el.properties)
     const id = newId()
 
     objects.push({
@@ -636,16 +641,23 @@ export function mapWorkspace(ws: SzWorkspace, opts: JsonMapOptions = {}): Mapped
       type,
       name: name || `(${el.kind} ${el.id})`,
       description: el.description ?? display.description,
-      ...(technologies.length ? { technologyUsages: seededTechnologyUsages(id, technologies) } : {}),
-      icon: technologies[0],
+      ...(revived.shortDescription ? { shortDescription: revived.shortDescription } : {}),
+      ...(technologies.length
+        ? { technologyUsages: seededTechnologyUsages(id, withTechnologyDetails(technologies, revived.technologies)) }
+        : {}),
+      icon: technologies[0]?.name,
       position: { x: 0, y: 0 },
       size: { ...SIZE_BY_TYPE[type] },
       ...assignTags(tags),
-      links: (el.url ?? display.url) ? [objectLink((el.url ?? display.url)!)] : [],
+      links: [
+        ...((el.url ?? display.url) ? [objectLink((el.url ?? display.url)!)] : []),
+        ...revived.extraLinks.map((url) => objectLink(url)),
+      ],
       scope: detectScope(scopeLevelFor(el.kind), tags, declaredScope(el.location ?? display.location)),
-      status: 'live',
+      status: revived.status ?? 'live',
+      ...ownerFields(revived.owners),
       properties: withProvenance(
-        { ...el.properties, ...perspectiveProperties(el), ...styleProperties(style) },
+        { ...revived.properties, ...perspectiveProperties(el), ...styleProperties(style) },
         {
           // Exact provenance. Without it nothing downstream — export, re-import,
           // the fidelity harness — can tell two same-named elements apart.
@@ -868,13 +880,36 @@ export function mapWorkspace(ws: SzWorkspace, opts: JsonMapOptions = {}): Mapped
     warnings.push(...style.warnings)
     const id = newId()
     connectionIdByRelationship.set(rel.id, id)
-    const technologies = technologyNames(rel.technology)
+    const technologies = parseTechnologies(rel.technology)
+    const revived = reviveMapleSpireFacts(rel.properties)
+    // Our exporter writes `label` + blank line + the connection's Markdown into
+    // the one wire field, AND the Markdown alone as `maplespire.description`.
+    // Only that property says where the label ends: without it the field is
+    // someone else's description and is drawn whole (a Structurizr author's
+    // multi-paragraph description is not a label plus documentation), and with
+    // it a description that IS the Markdown carried no label at all.
+    const wireDescription = rel.description ?? ''
+    const documentation = revived.description
+    const ourSuffix = documentation === undefined ? undefined : `\n\n${documentation}`
+    const drawnLabel =
+      documentation === undefined
+        ? wireDescription
+        : wireDescription.trim() === documentation
+          ? ''
+          : ourSuffix && wireDescription.endsWith(ourSuffix)
+            ? wireDescription.slice(0, -ourSuffix.length).trim()
+            : wireDescription
     const connection: Connection = {
       id,
       fromId,
       toId,
-      label: rel.description || rel.technology || '',
-      ...(technologies.length ? { technologyUsages: seededTechnologyUsages(id, technologies) } : {}),
+      label: drawnLabel || rel.technology || '',
+      ...(documentation ? { description: documentation } : {}),
+      ...(revived.status ? { status: revived.status } : {}),
+      ...ownerFields(revived.owners),
+      ...(technologies.length
+        ? { technologyUsages: seededTechnologyUsages(id, withTechnologyDetails(technologies, revived.technologies)) }
+        : {}),
       // Structurizr's UNSTYLED relationship is dashed, not solid (§7.4). Drawing
       // solid by default mis-renders every workspace that never styled its edges.
       type: style.style === 'Dotted' ? 'dotted' : style.style === 'Solid' ? 'solid' : 'dashed',
@@ -889,7 +924,7 @@ export function mapWorkspace(ws: SzWorkspace, opts: JsonMapOptions = {}): Mapped
       // instead, which is what it actually is.
       ...assignTags(rel.tags),
       properties: withProvenance(
-        rel.properties,
+        revived.properties,
         {
           [SOURCE_ID_PROPERTY]: rel.id,
           [SOURCE_IDENTIFIER_PROPERTY]: rel.properties[DSL_IDENTIFIER_PROPERTY],
@@ -1288,32 +1323,6 @@ function applyEdgeRouting(
 }
 
 // ── Dynamic views → flows ────────────────────────────────────────────────────
-
-/**
- * Compare two Structurizr step orders.
- *
- * The order is a STRING because nested sequences are real: "1.1" comes after "1"
- * and before "2", and `parseFloat` would put "1.10" before "1.9". So it is
- * compared segment by segment, numerically where both segments are numbers.
- */
-function compareOrder(a: string, b: string): number {
-  const left = a.split('.')
-  const right = b.split('.')
-  for (let i = 0; i < Math.max(left.length, right.length); i += 1) {
-    const l = left[i]
-    const r = right[i]
-    if (l === undefined) return -1
-    if (r === undefined) return 1
-    const ln = Number(l)
-    const rn = Number(r)
-    if (Number.isFinite(ln) && Number.isFinite(rn)) {
-      if (ln !== rn) return ln - rn
-    } else if (l !== r) {
-      return l < r ? -1 : 1
-    }
-  }
-  return 0
-}
 
 function buildFlow(
   view: SzView,

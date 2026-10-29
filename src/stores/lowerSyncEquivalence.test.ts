@@ -119,8 +119,8 @@ function randomModel(r: Rng, opts: { staleLowers: boolean }): Model {
 
 // ---------------------------------------------------------------------------
 // ORACLE: the ORIGINAL syncLowerConnections (before the 2026-10-11 hoisting),
-// copied verbatim apart from reading/writing a plain `Model` and minting ids
-// through `mint`.
+// copied verbatim apart from reading/writing a plain `Model`, minting ids
+// through `mint`, and the direct-pair rule marked below.
 // ---------------------------------------------------------------------------
 function oracleSyncLowerConnections(state: Model, diagramId: string, mint: () => string): void {
   const { diagrams, objects, groups, connections } = state
@@ -154,6 +154,13 @@ function oracleSyncLowerConnections(state: Model, diagramId: string, mint: () =>
   }
   const newConnectionIds = diagram.connectionIds.filter((cid) => connectionMap.get(cid)?.kind !== 'lower')
   const newConnectionIdSet = new Set(newConnectionIds)
+  // 2026-10-22, not in the original: no roll-up beside a pair the diagram
+  // already draws with its own edge, in that direction.
+  const directPairs = new Set<string>()
+  for (const cid of newConnectionIds) {
+    const own = connectionMap.get(cid)
+    if (own) directPairs.add(`${own.fromId}→${own.toId}`)
+  }
   const seenPairs = new Set<string>()
   const usedLowerIds = new Set<string>()
   const additions: Connection[] = []
@@ -165,6 +172,7 @@ function oracleSyncLowerConnections(state: Model, diagramId: string, mint: () =>
     if (visibleFrom === directConn.fromId && visibleTo === directConn.toId) continue
     if (visibleFrom === visibleTo) continue
     const pairKey = `${visibleFrom}→${visibleTo}`
+    if (directPairs.has(pairKey)) continue
     if (seenPairs.has(pairKey)) continue
     seenPairs.add(pairKey)
     const existingLower = lowerByPair.get(pairKey)

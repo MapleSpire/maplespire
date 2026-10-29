@@ -36,23 +36,21 @@
  * elementView.getX() + style.getWidth()`), MapleSpire per `CanvasEngine`'s hit
  * test — so nothing here converts between corners and centres.
  *
- * One assumption is worth stating because it is shared with a module this one
- * does not import: the SOURCE box of an element upstream is taken to be
- * `STRUCTURIZR_DEFAULT_ELEMENT_SIZE` (450×300, the box structurizr-ui draws for
- * an element that matched no style, §7.4). That is the same assumption
- * `DEFAULT_LAYOUT_SCALE` is derived from. If the styles emitter ever writes
- * `width`/`height` into an `ElementStyle`, the box upstream stops being 450×300
- * and this scale has to read those numbers instead — otherwise the round trip
- * zooms by exactly the ratio between them.
+ * The SOURCE box of an element upstream is the one the importer will resolve
+ * from the styles THIS export writes (`upstreamSizeOf`: 450×300 for an unstyled
+ * element, 400×400 for a `Person` shape, a sized style's own size, §7.4). The
+ * view scale must be the exact reciprocal of the importer's, so it reads the
+ * same boxes — measuring everything at 450×300 zoomed any view whose largest
+ * (our box / their box) ratio belonged to a person.
  */
 
 import type { C4Object, Connection, Diagram, Flow, Group, MessageStep, Position, Size } from '../../../types'
 import { scaleFactorFor } from '../../structurizr/json/layoutPolicy'
 import { resolveLowerRouting } from '../../diagrams/lowerRouting'
+import { upstreamSizeOf } from './styles'
 import { ENVIRONMENT_PROPERTY, SOURCE_ID_PROPERTY, SOURCE_INSTANCE_OF_PROPERTY } from '../../structurizr/json/provenance'
 import {
   DEFAULT_LAYOUT_SCALE,
-  STRUCTURIZR_DEFAULT_ELEMENT_SIZE,
   SYNTHETIC_UNGROUPED_SYSTEM_ENTITY_ID,
   type ExportContext,
   type WireComponentView,
@@ -200,10 +198,16 @@ function viewScale(ctx: ExportContext, placed: readonly PlacedMember[]): number 
   // every view in the fixture corpus — the factor there is unchanged, and it has
   // to be, because it is the exact reciprocal of the importer's and anything
   // else makes import→export→import a slow zoom.
+  // The box upstream is the one the IMPORTER will measure against when it reads
+  // this file: a `Person`-shaped element is drawn 400×400, a sized style at its
+  // size. Measuring everyone against 450×300 only held while no such element's
+  // ratio was the largest on its view; with every shape the editor's 160 wide,
+  // a person's is.
+  const sourceFor = (member: PlacedMember): Size => upstreamSizeOf(ctx, member.object)
   const constraining = placed.filter(
     (member) =>
-      member.size.width <= STRUCTURIZR_DEFAULT_ELEMENT_SIZE.width &&
-      member.size.height <= STRUCTURIZR_DEFAULT_ELEMENT_SIZE.height,
+      member.size.width <= sourceFor(member).width &&
+      member.size.height <= sourceFor(member).height,
   )
   // A view of nothing BUT oversized shapes has no member to measure against, so
   // it takes the landscape-wide default rather than a factor derived from a box
@@ -213,7 +217,7 @@ function viewScale(ctx: ExportContext, placed: readonly PlacedMember[]): number 
   return (
     1 /
     scaleFactorFor(
-      measured.map((member) => ({ source: STRUCTURIZR_DEFAULT_ELEMENT_SIZE, target: member.size })),
+      measured.map((member) => ({ source: sourceFor(member), target: member.size })),
     )
   )
 }

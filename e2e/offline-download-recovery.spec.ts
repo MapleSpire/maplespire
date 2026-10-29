@@ -173,15 +173,19 @@ test('quota blocking preserves the old copy and abandoning removes only the targ
 // vanished manifest deleted, or offline keeps drawing the old diagram for ever.
 test('an exact page updates manifests in place and drops the renders built from the old ones', async ({ page }) => {
   // The feed reader calls `${API_BASE}/…`, cross-origin from this fixture page:
-  // answer the preflight and carry the CORS headers a real server sends.
-  const cors = {
-    'access-control-allow-origin': 'http://127.0.0.1:5199',
+  // answer the preflight and carry the CORS headers a real server sends. The
+  // allowed origin is the requesting page's own: this spec runs under its own
+  // config (127.0.0.1:5199) AND inside the `chromium` project (E2E_BASE_URL),
+  // and a hardcoded origin made every fetch fail CORS under the second.
+  type FixtureRoute = Parameters<Parameters<typeof page.route>[1]>[0]
+  const cors = (route: FixtureRoute) => ({
+    'access-control-allow-origin': route.request().headers()['origin'] ?? new URL(page.url()).origin,
     'access-control-allow-credentials': 'true',
     'access-control-allow-headers': '*',
     'access-control-allow-methods': 'GET, OPTIONS',
-  }
-  const preflight = (route: Parameters<Parameters<typeof page.route>[1]>[0]) =>
-    route.request().method() === 'OPTIONS' ? route.fulfill({ status: 204, headers: cors }).then(() => true) : Promise.resolve(false)
+  })
+  const preflight = (route: FixtureRoute) =>
+    route.request().method() === 'OPTIONS' ? route.fulfill({ status: 204, headers: cors(route) }).then(() => true) : Promise.resolve(false)
   await page.route('**/api/model/cache/changes**', async (route) => {
     if (await preflight(route)) return
     const after = Number(new URL(route.request().url()).searchParams.get('afterGeneration'))
@@ -192,7 +196,7 @@ test('an exact page updates manifests in place and drops the renders built from 
         : null
     await route.fulfill({
       contentType: 'application/json',
-      headers: cors,
+      headers: cors(route),
       body: JSON.stringify({
         projectionGeneration: event?.generation ?? 44,
         events: event ? [event] : [],
@@ -206,7 +210,7 @@ test('an exact page updates manifests in place and drops the renders built from 
     if (await preflight(route)) return
     await route.fulfill({
       contentType: 'application/json',
-      headers: cors,
+      headers: cors(route),
       body: JSON.stringify({ projectionGeneration: 43, items: [
         { diagramId: 'diagram-1', objectIds: ['object-1'], connectionIds: [], groupIds: [] },
       ] }),

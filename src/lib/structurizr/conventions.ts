@@ -27,15 +27,20 @@
  */
 
 import type { C4Type } from '../../types'
+import { isSeededTechnologyName } from '../technologyUsage'
+import { defaultShapeSize } from '../shapeDefaults'
 
 /** Our box for each C4 level. Both importers size an imported shape from this,
- *  so the same element is the same size whichever file it came from. */
+ *  so the same element is the same size whichever file it came from — and the
+ *  same size as a shape drawn in the editor (`DEFAULT_SHAPE_SIZE`). It used to be
+ *  a per-type table of its own, which made every imported shape a different
+ *  size from the ones a user then added by hand. */
 export const SIZE_BY_TYPE: Record<C4Type, { width: number; height: number }> = {
-  actor: { width: 150, height: 90 },
-  system: { width: 200, height: 100 },
-  app: { width: 185, height: 100 },
-  store: { width: 185, height: 100 },
-  component: { width: 170, height: 90 },
+  actor: defaultShapeSize(),
+  system: defaultShapeSize(),
+  app: defaultShapeSize(),
+  store: defaultShapeSize(),
+  component: defaultShapeSize(),
 }
 
 // Compound names like "PostgreSQL" must match even though a `\b` after "postgres"
@@ -69,6 +74,38 @@ export function technologyNames(tech?: string): string[] {
     .split(/[,/]/)
     .map((t) => t.trim())
     .filter(Boolean)
+}
+
+/** One technology named in a Structurizr `technology` string. */
+export interface TechnologySpec {
+  name: string
+  version?: string
+}
+
+/** `17`, `20.1`, `v3.11`, `5.x`, `2.0.0-rc1` — a trailing word that is a version. */
+const VERSION_TOKEN_RE = /^v?\d+(?:\.(?:\d+|x))*(?:[-+][0-9A-Za-z.]+)?$/i
+
+/**
+ * `"Angular 17, TypeScript"` → `[{ name: 'Angular', version: '17' }, { name: 'TypeScript' }]`.
+ *
+ * Structurizr has one free-text technology field, so a version is written into
+ * it (`"Node.js 20, Express"`). Importing `Angular 17` as a technology NAMED
+ * "Angular 17" mints a separate catalog entry per version and leaves the
+ * version field empty; the exporter writes `name version` back, so this is
+ * also what closes the round trip.
+ *
+ * A trailing number is a version only when it is unambiguous: dotted (`3.11`),
+ * `v`-prefixed, or after a name the seeded catalog knows. "Office 365" and
+ * "Dynamics 365" are product names, not Office version 365.
+ */
+export function parseTechnologies(tech?: string): TechnologySpec[] {
+  return technologyNames(tech).map((raw) => {
+    const match = /^(.*\S)\s+(\S+)$/.exec(raw)
+    if (!match || !VERSION_TOKEN_RE.test(match[2])) return { name: raw }
+    const [, base, version] = match
+    const unambiguous = /\.|^v/i.test(version) || isSeededTechnologyName(base)
+    return unambiguous ? { name: base, version } : { name: raw }
+  })
 }
 
 /** Which side of the enterprise boundary rule an element is judged by. */
@@ -108,4 +145,30 @@ export function detectScope(
   if (declared) return declared
   // People default to external (customers); everything else to internal.
   return level === 'person' ? 'external' : 'internal'
+}
+
+/**
+ * Compare two Structurizr step orders.
+ *
+ * The order is a STRING because nested sequences are real: "1.1" comes after "1"
+ * and before "2", and `parseFloat` would put "1.10" before "1.9". So it is
+ * compared segment by segment, numerically where both segments are numbers.
+ */
+export function compareOrder(a: string, b: string): number {
+  const left = a.split('.')
+  const right = b.split('.')
+  for (let i = 0; i < Math.max(left.length, right.length); i += 1) {
+    const l = left[i]
+    const r = right[i]
+    if (l === undefined) return -1
+    if (r === undefined) return 1
+    const ln = Number(l)
+    const rn = Number(r)
+    if (Number.isFinite(ln) && Number.isFinite(rn)) {
+      if (ln !== rn) return ln - rn
+    } else if (l !== r) {
+      return l < r ? -1 : 1
+    }
+  }
+  return 0
 }

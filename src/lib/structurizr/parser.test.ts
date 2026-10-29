@@ -68,9 +68,9 @@ describe('parseWorkspace — Big Bank plc', () => {
     expect(ws.relationships.length).toBeGreaterThanOrEqual(25)
   })
 
-  it('keeps only the four structural views', () => {
+  it('keeps the four structural views and the dynamic view', () => {
     expect(ws.views.map((v) => v.kind).sort()).toEqual(
-      ['component', 'container', 'systemContext', 'systemLandscape'].sort(),
+      ['component', 'container', 'dynamic', 'systemContext', 'systemLandscape'].sort(),
     )
     const ctx = ws.views.find((v) => v.kind === 'systemContext')!
     expect(ctx.scopeRef).toBe('internetBankingSystem')
@@ -79,10 +79,10 @@ describe('parseWorkspace — Big Bank plc', () => {
     expect(comp.scopeRef).toBe('apiApplication')
   })
 
-  it('warns about ignored constructs (deployment, dynamic, image)', () => {
+  it('warns about ignored constructs (deployment), not about the imported dynamic view', () => {
     const joined = ws.warnings.join(' ').toLowerCase()
     expect(joined).toContain('deployment')
-    expect(joined).toContain('dynamic')
+    expect(joined).not.toContain('dynamic')
   })
 })
 
