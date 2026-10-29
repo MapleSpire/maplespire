@@ -619,10 +619,11 @@ export function expandDiagramsInline(
   // nothing. An end not drawn here leaves its edge behind. Applied order: the
   // first block to draw an edge keeps it.
   //
-  // Roll-ups are matched by their two ends, not their id: on the resident tier
-  // the store holds them under generated ids, and the same pair also comes back
-  // as `lower:<from>→<to>` from a render — one id-only dedupe drew every roll-up
-  // twice (architect and reviewer lenses, 2026-10-16).
+  // Roll-ups are matched by their two ends, not their id: the store held them
+  // under generated ids until 2026-10-22, while a render names the same pair
+  // `lower:<from>→<to>` — one id-only dedupe drew every roll-up twice (architect
+  // and reviewer lenses, 2026-10-16). Both sides now use that id; matching by
+  // the pair stays correct and does not depend on it.
   const lowerPair = (connection: Connection) => `${connection.fromId}→${connection.toId}`
   const presentLowerPairs = new Set(base.connections.filter((c) => c.kind === 'lower').map(lowerPair))
   for (const block of applied) {

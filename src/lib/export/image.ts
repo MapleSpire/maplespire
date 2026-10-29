@@ -21,6 +21,7 @@ import { renderExportSvg, type SvgScene } from './svg'
 import { buildLegendModel, drawLegendCanvas, legendSize, renderLegendSvg, type LegendModel } from './legend'
 import type { PdfImage } from './pdf'
 import { getActiveScene3D } from '../../canvas3d/activeScene'
+import { resolveLowerRouting } from '../diagrams/lowerRouting'
 import i18n from '../i18n'
 
 /**
@@ -87,7 +88,9 @@ export function sceneFromBundle(bundle: ExportBundle, diagramId: string): Diagra
   return {
     diagram,
     objects,
-    connections: bundle.connections.filter((c) => connectionIds.has(c.id)),
+    connections: bundle.connections
+      .filter((c) => connectionIds.has(c.id))
+      .map((c) => resolveLowerRouting(c, diagram.lowerRouting)),
     groups,
     flows: bundle.flowsByDiagram[diagramId] ?? [],
     tags: bundle.tags,

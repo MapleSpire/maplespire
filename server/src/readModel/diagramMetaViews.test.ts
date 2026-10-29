@@ -20,6 +20,7 @@ describe('diagram meta views', () => {
     id: 'd1', name: 'System', type: 'context', docUrl: 'automerge:doc',
     objectIds: ['o1'], connectionIds: ['c1'], groupIds: [], layouts: { o1: { position: { x: 1, y: 2 }, size: { width: 3, height: 4 } } },
     sceneDecor: { packId: 'maquette-people', density: 'rich', seed: 7 },
+    lowerRouting: { 'o1→o2': { fromAnchor: 4, lockedToAnchors: true } },
     comments: { cm1: { text: 'lazy' } }, flows: { f1: { name: 'lazy' } }, checkpoints: [{ id: 'cp1' }],
     description: 'editor', shapeCount: 1,
   }
@@ -29,6 +30,9 @@ describe('diagram meta views', () => {
     // the 3D scene decoration is paint-critical too: a cold boot must dress
     // the board on first render, not after the full doc loads
     expect(toFirstPaintDiagramMeta(diagram)).toMatchObject({ sceneDecor: diagram.sceneDecor })
+    // so is the routing of the diagram's derived (lower) connections: it is
+    // placement, like `layouts` (no client requests this view today)
+    expect(toFirstPaintDiagramMeta(diagram)).toMatchObject({ lowerRouting: diagram.lowerRouting })
     expect(toFirstPaintDiagramMeta(diagram)).not.toHaveProperty('comments')
     expect(toFirstPaintDiagramMeta(diagram)).not.toHaveProperty('flows')
   })

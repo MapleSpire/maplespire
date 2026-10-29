@@ -91,6 +91,19 @@ describe('geometry — connectionGeometry', () => {
     expect(g.fromEdge.x).toBeCloseTo(100)
     expect(g.toEdge.x).toBeCloseTo(300)
   })
+  it('aims a free end at the other end\'s anchor, as the canvas does', () => {
+    // CanvasEngine.getConnectionGeometry raycasts an unlocked end toward the other
+    // end's resolved point — its ANCHOR when locked — not toward the box centre.
+    // A tall target box anchored at its top-left port: aiming at the centre (y=150)
+    // lands mid-height on the source's right side; aiming at the port (y≈50) lands
+    // well above it.
+    const from = box(0, 100, 100, 100)
+    const to = box(400, 0, 100, 300)
+    const g = connectionGeometry(from, to, { lockedToAnchors: true, toAnchor: 9 }) // left side, 0.2
+    expect(g.toEdge.y).toBeCloseTo(8 + 0.2 * (300 - 16))
+    expect(g.fromEdge.face).toBe('right')
+    expect(g.fromEdge.y).toBeLessThan(140) // the centre aim would give ~150
+  })
 })
 
 describe('geometry — center helper', () => {

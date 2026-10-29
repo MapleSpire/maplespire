@@ -50,6 +50,8 @@ import {
 import { useInlineExpansionContents } from './useInlineExpansionContents'
 import { collectRelatedDiagramObjectIds } from '../../canvas/relatedDiagramAffordances'
 import { resolveParentNavigation } from '../../lib/diagrams/parentNavigation'
+import { resolveLowerRouting } from '../../lib/diagrams/lowerRouting'
+import { filterAndMergeDiagramData } from '../../lib/viewLayouts'
 import { editorCanvasInsets, fitActiveCanvas, zoomActiveCanvas } from './canvasViewportControls'
 import { usesMultiSelectMenu } from './contextMenuTarget'
 import { useCanvasCommands } from './useCanvasCommands'
@@ -74,39 +76,15 @@ import { RemoteCursorOverlay } from '../presence/RemoteCursorOverlay'
 
 import { CommentDetail } from '../comments/CommentDetail'
 import { CommentComposer } from '../comments/CommentComposer'
-import type { C4Object, C4Type, Comment, Connection, Diagram, Group, SelectedItem } from '../../types'
+import type { C4Object, C4Type, Comment, Connection, Group, SelectedItem } from '../../types'
 import type { Scene3D } from '../../canvas3d'
 
-// Filters objects/connections/groups down to the given diagram's composition and
-// applies its `layouts` overrides (per-diagram position/size). Used by BOTH the
-// engine-creation effect and the data-sync effect below — they must never diverge:
-// if one path skipped the `layouts` merge and happened to make the last `setData`
-// call (e.g. when `automergeReady` flips after the diagram's data settled), the
-// canvas would show raw un-merged positions.
-function filterAndMergeDiagramData(
-  diagram: Diagram | undefined,
-  objects: C4Object[],
-  connections: Connection[],
-  groups: Group[]
-) {
-  const diagramObjectIds = new Set(diagram?.objectIds ?? [])
-  const diagramConnectionIds = new Set(diagram?.connectionIds ?? [])
-  const diagramGroupIds = new Set(diagram?.groupIds ?? [])
-  const filteredObjects = objects
-    .filter((o) => diagramObjectIds.has(o.id))
-    .map((o) => {
-      const layout = diagram?.layouts?.[o.id]
-      return layout ? { ...o, position: layout.position, size: layout.size } : o
-    })
-  const filteredConnections = connections.filter((c) => diagramConnectionIds.has(c.id))
-  const filteredGroups = groups
-    .filter((g) => diagramGroupIds.has(g.id))
-    .map((g) => {
-      const layout = diagram?.layouts?.[g.id]
-      return layout ? { ...g, position: layout.position, size: layout.size } : g
-    })
-  return { filteredObjects, filteredConnections, filteredGroups }
-}
+// The 2D engine is fed through the SAME `filterAndMergeDiagramData` as the 3D
+// view, the share viewer and the image exporters (src/lib/viewLayouts.ts):
+// composition filter, per-diagram `layouts`, and the diagram's `lowerRouting`
+// on its derived connections. This file kept a private copy until 2026-10-22;
+// a step added to one copy and not the other was invisible to every test,
+// which only exercised the shared one.
 
 /** A diagram's first fit: centre on the entity an "open in diagram" link asked
  *  for, else zoom-to-fit. The request is NOT consumed here — the DiagramDoc
@@ -678,8 +656,11 @@ export function CanvasView() {
           ...objectUpdates.map(({ id }) => id),
           ...groupUpdates.map(({ id }) => id),
         ])
+        const lowerRouting = store.getCurrentDiagram()?.lowerRouting
         const connectionUpdates = engine
-          ? store.connections.flatMap((connection) => {
+          ? store.connections.flatMap((stored) => {
+              // As drawn here: a lower's lock and anchors are the diagram's.
+              const connection = resolveLowerRouting(stored, lowerRouting)
               if (!connection.lockedToAnchors) return []
               if (!touchedIds.has(connection.fromId) && !touchedIds.has(connection.toId)) return []
               if (connection.fromAnchor !== undefined && connection.toAnchor !== undefined) return []
@@ -1965,7 +1946,10 @@ export function ConnectionContextMenu({
   const connections = useModelStore((s) => s.connections)
   const updateConnection = useModelStore((s) => s.updateConnection)
   const isConnectionOnlyInDiagram = useModelStore((s) => s.isConnectionOnlyInDiagram)
-  const conn = connections.find((c) => c.id === connectionId)
+  const lowerRouting = useModelStore((s) => s.diagrams.find((d) => d.id === currentDiagramId)?.lowerRouting)
+  const stored = connections.find((c) => c.id === connectionId)
+  // As drawn on this diagram: a lower's lock is the diagram's `lowerRouting`.
+  const conn = stored ? resolveLowerRouting(stored, lowerRouting) : undefined
   const { ref, pos } = useClampedMenuPosition(x, y)
 
   if (!conn) return null

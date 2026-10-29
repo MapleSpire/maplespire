@@ -17,7 +17,7 @@ type Json = Record<string, unknown>
 const FIRST_PAINT_FIELDS = [
   'id', 'name', 'type', 'docUrl', 'objectIds', 'connectionIds', 'groupIds',
   'parentObjectId', 'domainId', 'connectionHighlightStyle', 'connectionAnimationsEnabled',
-  'defaultConnectionShape', 'readonly', 'skinId', 'layouts', 'layouts3d', 'sceneDecor',
+  'defaultConnectionShape', 'readonly', 'skinId', 'layouts', 'layouts3d', 'lowerRouting', 'sceneDecor',
 ] as const
 
 const EDITOR_FIELDS = ['id', 'description', 'comments', 'flows', 'checkpoints', 'shapeCount'] as const

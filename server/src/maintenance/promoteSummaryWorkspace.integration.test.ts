@@ -942,19 +942,34 @@ describe.skipIf(!TEST_DATABASE_URL)('summary promotion (live Postgres + real Aut
     //
     // Both sides are seeded because the check COMPARES them; seeding only the
     // head would turn a vacuous pass into a guaranteed failure.
+    //
+    // Its document is REAL — stored and admitted, as a client-created diagram's
+    // is. A placeholder url (`automerge:dgSincePromotion`) used to pass here only
+    // because every reachability check dropped an invalid url; `diagram-doc-url`
+    // now reports exactly that.
+    const sinceDoc = repo.create({
+      name: 'Since', type: 'context', objectIds: [], connectionIds: [], groupIds: [],
+      layouts: {}, comments: {}, flows: {}, checkpoints: [],
+    })
+    await repo.flush([sinceDoc.documentId])
+    await db.pool.query(
+      `INSERT INTO automerge_document_workspace (document_id, landscape_id, version_id)
+       VALUES ($1, $2, $3) ON CONFLICT (document_id) DO NOTHING`,
+      [idOf(sinceDoc.url), L, 'V1'],
+    )
     const head = await findReadyDocument<{ diagrams: Record<string, { docUrl: string; name?: string }> }>(
       repo, writeHeadUrl,
     )
     head.change((doc) => {
       doc.diagrams = {
         ...(doc.diagrams ?? {}),
-        'dg-since-promotion': { docUrl: 'automerge:dgSincePromotion', name: 'Since' },
+        'dg-since-promotion': { docUrl: sinceDoc.url, name: 'Since' },
       }
     })
     await repo.flush([head.documentId])
     await db.pool.query(
       `INSERT INTO ro_diagrams (landscape_id, version_id, id, data) VALUES ($1, $2, $3, $4::jsonb)`,
-      [L, 'V1', 'dg-since-promotion', JSON.stringify({ id: 'dg-since-promotion', docUrl: 'automerge:dgSincePromotion' })],
+      [L, 'V1', 'dg-since-promotion', JSON.stringify({ id: 'dg-since-promotion', docUrl: sinceDoc.url })],
     )
 
     const steps: string[] = []

@@ -26,34 +26,35 @@ import {
   boundaryBoxes,
   buildLayoutGraph,
   contentBounds,
+  deriveGroupBoxes,
   groupTextBands,
+  layeringEdges,
   measureLaidOut,
+  modelGroupBoundaries,
+  nestGroups,
   packIsolatedBelow,
   repairRoute,
   snapAlignBoxes,
   splitIsolatedNodes,
+  trimLayoutContext,
   type ConnPatch,
   type LaidEdge,
   type LayoutContext,
   type LayoutSolution,
 } from './graph'
-import { groupHeaderBandHeight, groupTitleMinWidth, GROUP_FOOTER_PAD, GROUP_SIDE_PAD, GROUP_STD_PAD_TOP, type EdgeGeom, type LayoutMetrics, type Rect } from './metrics'
+import { type EdgeGeom, type LayoutMetrics, type Rect } from './metrics'
 import { strategiesFor } from './elk/elkConfig'
 import { layoutDiagramElk } from './elk/elkLayout'
+import { layoutWorkerPool } from './layoutRunner'
+import { DeadlineError, WorkerDiedError } from './workerPool'
 
 export type { LayoutMetrics, Rect, EdgeGeom, Point } from './metrics'
 export type { LayoutContext, LayoutSolution, ConnPatch } from './graph'
 export { computeMetrics } from './metrics'
 
-const GROUP_PAD = GROUP_SIDE_PAD
-// Standard (non-parent) groups reserve GROUP_STD_PAD_TOP on top for the icon + title row
-// (shared with the canvas + ELK + preview via metrics.ts). Parent-wrapper boundaries instead
-// reserve a per-group header band (groupHeaderBandHeight) on top + GROUP_FOOTER_PAD below —
-// matching the centered identity stack the canvas renders. See metrics.ts / CanvasEngine.
-
-// Shared with the canvas, the ELK layout and the Structurizr JSON importer via
-// metrics.ts — a group box narrower than its title spills the label out.
-const titleMinWidth = groupTitleMinWidth
+// Group padding (a standard group's title row, a parent wrapper's centred header band
+// and footer, the title-width floor) comes from graph.ts `groupPadding`, shared with
+// the ELK engine; the numbers themselves live in metrics.ts, mirrored by CanvasEngine.
 
 // ── custom (fallback) engine ─────────────────────────────────────────────────
 
@@ -71,7 +72,9 @@ export function layoutDiagram(diagram: Diagram, ctx: LayoutContext, direction: D
     if (g) for (const oid of g.objectIds) groupedIds.add(oid)
   }
   const { connected, isolated } = splitIsolatedNodes(nodes, edges, groupedIds)
-  const result = layoutGraph(connected, edges, { direction })
+  // Rank on the C4 layering edges (people first, reciprocal pairs once) — the same
+  // ranking graph the ELK path uses; the drawn edges are routed separately below.
+  const result = layoutGraph(connected, layeringEdges(edges, (id) => objectById.get(id)?.type === 'actor'), { direction })
 
   const objectBoxes = new Map<string, Box>()
   for (const [id, n] of result.nodes) objectBoxes.set(id, { x: Math.round(n.x), y: Math.round(n.y), width: n.width, height: n.height })
@@ -102,6 +105,14 @@ export function layoutDiagram(diagram: Diagram, ctx: LayoutContext, direction: D
   const layouts = groupAndObjectLayouts(diagram, ctx, objectBoxes)
   const boundaries = boundaryBoxes(diagram, ctx.groups, (id) => layouts[id])
   const softZones = groupTextBands(boundaries)
+  // Score non-members inside/straddling a model-level group box too, as the ELK
+  // candidates are scored (see modelGroupBoundaries).
+  boundaries.push(
+    ...modelGroupBoundaries(diagram, ctx.groups, (id) => {
+      const l = layouts[id]
+      return l ? { x: l.position.x, y: l.position.y, width: l.size.width, height: l.size.height } : undefined
+    }),
+  )
 
   const laid: LaidEdge[] = []
   const connPatches: Record<string, ConnPatch> = {}
@@ -141,29 +152,11 @@ function groupAndObjectLayouts(
 ): Record<string, { position: Position; size: Size }> {
   const layouts: Record<string, { position: Position; size: Size }> = {}
   for (const [id, b] of objectBoxes) layouts[id] = { position: { x: b.x, y: b.y }, size: { width: b.width, height: b.height } }
-  for (const gid of diagram.groupIds) {
-    const g = ctx.groups.find((x) => x.id === gid)
-    if (!g) continue
-    const members = g.objectIds.map((oid) => objectBoxes.get(oid)).filter(Boolean) as Box[]
-    if (members.length === 0) continue
-    const minX = Math.min(...members.map((m) => m.x))
-    const minY = Math.min(...members.map((m) => m.y))
-    const maxX = Math.max(...members.map((m) => m.x + m.width))
-    const maxY = Math.max(...members.map((m) => m.y + m.height))
-    // Parent wrappers reserve a per-group centered-header band on top (sized exactly to
-    // the canvas's identity stack) and a slim footer below; standard groups keep the
-    // legacy symmetric reservation. Both kinds floor their width to the title so the
-    // label never overflows the box.
-    const isParentWrapper = !!g.parentObjectId
-    const topPad = isParentWrapper ? groupHeaderBandHeight(g) : GROUP_STD_PAD_TOP
-    const bottomPad = isParentWrapper ? GROUP_FOOTER_PAD : GROUP_PAD
-    const bboxW = maxX - minX + GROUP_PAD * 2
-    const width = Math.max(bboxW, titleMinWidth(g.name, isParentWrapper ? 13 : 11))
-    const x = minX - GROUP_PAD - (width - bboxW) / 2
-    layouts[gid] = {
-      position: { x: Math.round(x), y: Math.round(minY - topPad) },
-      size: { width: Math.round(width), height: Math.round(maxY - minY + topPad + bottomPad) },
-    }
+  // Nested groups enclose their inner groups' boxes (header bands included), exactly
+  // as the ELK engine derives them — graph.ts deriveGroupBoxes.
+  const nesting = nestGroups(diagram, ctx.groups, new Set(objectBoxes.keys()), ctx.groupDepths)
+  for (const [gid, b] of deriveGroupBoxes(nesting, ctx.groups, objectBoxes)) {
+    layouts[gid] = { position: { x: b.x, y: b.y }, size: { width: b.width, height: b.height } }
   }
   return layouts
 }
@@ -206,7 +199,22 @@ function better(a: LayoutSolution, b: LayoutSolution): LayoutSolution {
   return a.metrics.score <= b.metrics.score ? a : b
 }
 
-/** Best layout for one diagram: ELK portfolio + custom fallback, lowest score wins. */
+/** Too elongated to read: beyond 4:1 AND longer than a screen, so fitting it forces a
+ * small zoom (the 8:1 one-row flows that motivated row wrapping). A short row of four
+ * shapes is not a sliver whatever its ratio. */
+function isSliver(m: LayoutMetrics): boolean {
+  const ratio = m.aspect >= 1 ? m.aspect : m.aspect > 0 ? 1 / m.aspect : 1
+  return ratio > 4 && Math.max(m.width, m.height) > 1600
+}
+
+/** Best layout for one diagram: ELK portfolio + custom fallback, lowest score wins.
+ *
+ * A direction `hint` (a Structurizr view's `autoLayout lr`/`tb`) is the author's
+ * instruction: the best candidate laid out in that direction is kept unless it is a
+ * sliver or does worse on the hard rules (more hard violations, or failing the gates
+ * the overall best passes). Ordering the hinted strategies first only decided exact
+ * ties, so a hinted view went the other way for any lower score (SAOE `SystemContext`,
+ * `autoLayout tb`: left-to-right won 10 to 12). */
 export async function bestLayout(
   diagram: Diagram,
   ctx: LayoutContext,
@@ -214,16 +222,63 @@ export async function bestLayout(
 ): Promise<LayoutSolution> {
   const candidates: LayoutSolution[] = []
   const strategies = strategiesFor(hint)
-  const elkResults = await Promise.all(
-    strategies.map((s) => layoutDiagramElk(diagram, ctx, s).catch(() => null)),
-  )
-  for (const r of elkResults) if (r) candidates.push(r)
+  const direction = hint ?? 'tb'
+  let custom: LayoutSolution | undefined
+  // A candidate that throws is left out of the choice; say so, or a portfolio
+  // that lost every ELK candidate looks exactly like one that chose the custom engine.
+  const failures: unknown[] = []
+  const orDrop = (run: Promise<LayoutSolution | null>) => run.catch((error: unknown) => {
+    failures.push(error)
+    return null
+  })
+  const pool = await layoutWorkerPool()
+  if (pool) {
+    // In a browser every candidate — ELK, routing and scoring — runs in a layout
+    // worker, in parallel and off the page's thread; only the choice below runs
+    // here. Workers receive the diagram's part of the model, not all of it.
+    const trimmed = trimLayoutContext(diagram, ctx)
+    let customUnsafeHere = false
+    const [elkResults, fromWorker] = await Promise.all([
+      Promise.all(strategies.map((strategy) => orDrop(pool.run({ kind: 'elk', strategy, diagram, ctx: trimmed })))),
+      orDrop(pool.run({ kind: 'custom', direction, diagram, ctx: trimmed }).catch((error: unknown) => {
+        customUnsafeHere = error instanceof DeadlineError || error instanceof WorkerDiedError
+        throw error
+      })),
+    ])
+    for (const r of elkResults) if (r) candidates.push(r)
+    // The custom engine is the safety net: without a worker answer, lay it out
+    // here — unless it spent a worker's whole deadline, or crashed two workers
+    // (the pool reruns a dead worker's job once), and ELK answered: the same work
+    // here would freeze or crash the page, for a candidate not needed.
+    custom = fromWorker ?? (customUnsafeHere && candidates.length > 0 ? undefined : layoutDiagram(diagram, ctx, direction))
+  } else {
+    const placements = new Map<string, LayoutSolution>()
+    const elkResults = await Promise.all(strategies.map((s) => orDrop(layoutDiagramElk(diagram, ctx, s, placements))))
+    for (const r of elkResults) if (r) candidates.push(r)
+    // Always include the custom engine as a safety net.
+    custom = layoutDiagram(diagram, ctx, direction)
+  }
+  // ELK also answers "nothing" (null) instead of throwing — elkLayout swallows its
+  // own errors — and a non-empty view with no ELK candidate at all is that case.
+  const elkMissing = strategies.length - candidates.length
+  if (failures.length > 0 || (elkMissing > 0 && diagram.objectIds.length > 0)) {
+    console.warn(`[layout] "${diagram.name}": ${elkMissing} of ${strategies.length} ELK candidates missing, ${failures.length} candidate(s) failed`, failures[0] ?? '')
+  }
+  if (custom) candidates.push(custom)
 
-  // Always include the custom engine as a safety net.
-  const custom = layoutDiagram(diagram, ctx, hint ?? 'tb')
-  candidates.push(custom)
-
-  return candidates.reduce((best, c) => better(best, c))
+  const best = candidates.reduce((b, c) => better(b, c))
+  if (!hint) return best
+  const wanted = hint === 'lr' || hint === 'rl' ? 'RIGHT' : 'DOWN'
+  const hintedIds = new Set(strategies.filter((s) => s.direction === wanted).map((s) => s.id))
+  const hinted = candidates.filter((c) => (c === custom || hintedIds.has(c.source)) && !isSliver(c.metrics))
+  if (hinted.length === 0) return best
+  const bestHinted = hinted.reduce((b, c) => better(b, c))
+  if (hardViolations(bestHinted.metrics) > hardViolations(best.metrics)) return best
+  if (passesGates(best.metrics) && !passesGates(bestHinted.metrics)) return best
+  // A group box drawn over a non-member or another group is what the hint must
+  // never buy: the soft straddle count is in neither check above.
+  if (bestHinted.metrics.groupStraddles > best.metrics.groupStraddles) return best
+  return bestHinted
 }
 
 export interface LayoutReport {

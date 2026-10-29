@@ -61,6 +61,7 @@ import { getCommunityTheme } from '../../plugins/community/registry'
 import type { FrameSnapshot, SnapshotObject } from '../../plugins/sandbox/snapshot'
 import { SpatialGridIndex, type SpatialBounds } from './spatialGrid'
 import { AdaptiveFrameQuality } from './frameQuality'
+import { autoSizedInnerGroupIds, storedGroupsCarriedBy } from '../../lib/groupNesting'
 import {
   parentWrapperBox,
   HDR_DESC_BASE,
@@ -337,6 +338,8 @@ export class CanvasEngine {
   private dragCommentMoved = false
   private draggingGroupId: string | null = null
   private dragGroupStartPositions = new Map<string, { x: number; y: number }>()
+  /** Stored-box groups nested in the dragged group, which ride along with it. */
+  private dragGroupCarriedStarts = new Map<string, { x: number; y: number }>()
   private dragGroupStartPosition = { x: 0, y: 0 }
   private dragGroupStartBounds: GuideRect | null = null
   private dragMultiStartPositions = new Map<string, { x: number; y: number }>()
@@ -816,6 +819,20 @@ export class CanvasEngine {
       affectedGroupIds.add(update.id)
       affectedShapeIds.add(update.id)
     }
+    // An auto-sized group is drawn around the groups nested in it, so it moves
+    // with them. (An object move needs no such step: an enclosing group holds
+    // that object too, and is already in the set above.)
+    if (groupUpdates.length > 0) {
+      const isOnDiagram = (id: string) => this.objectMap.has(id)
+      for (const outer of this.groups) {
+        if (affectedGroupIds.has(outer.id)) continue
+        const inner = autoSizedInnerGroupIds(outer, this.groupMap.values(), isOnDiagram)
+        if (inner.some((id) => affectedGroupIds.has(id))) {
+          affectedGroupIds.add(outer.id)
+          affectedShapeIds.add(outer.id)
+        }
+      }
+    }
 
     for (const groupId of affectedGroupIds) this.groupBoundsCache.delete(groupId)
     if (groupUpdates.some((update) => update.size !== undefined)) this.groupHeaderCache.clear()
@@ -937,6 +954,7 @@ export class CanvasEngine {
     }
     if (this.draggingGroupId) {
       groupIds.add(this.draggingGroupId)
+      for (const id of this.dragGroupCarriedStarts.keys()) groupIds.add(id)
       for (const id of this.dragGroupStartPositions.keys()) objectIds.add(id)
     }
     if (this.resizingId) {
@@ -2133,6 +2151,11 @@ export class CanvasEngine {
             for (const o of groupObjects) {
               this.dragGroupStartPositions.set(o.id, { ...o.position })
             }
+            this.dragGroupCarriedStarts.clear()
+            for (const id of storedGroupsCarriedBy(group, this.groupMap.values(), (oid) => this.objectMap.has(oid))) {
+              const carried = this.groupMap.get(id)
+              if (carried?.position) this.dragGroupCarriedStarts.set(id, { ...carried.position })
+            }
             this.dragGroupStartPosition = group.position ? { ...group.position } : { x: 0, y: 0 }
             const startBounds = this.getGroupBounds(group)
             this.dragGroupStartBounds = startBounds
@@ -2389,6 +2412,9 @@ export class CanvasEngine {
             const newX = this.dragGroupStartPosition.x + dx
             const newY = this.dragGroupStartPosition.y + dy
             groupUpdates.push({ id: group.id, position: { x: newX, y: newY } })
+          }
+          for (const [id, start] of this.dragGroupCarriedStarts) {
+            groupUpdates.push({ id, position: { x: start.x + dx, y: start.y + dy } })
           }
         } else if (group.position) {
           const newX = this.dragGroupStartPosition.x + dx
@@ -2815,20 +2841,23 @@ export class CanvasEngine {
       if (this.draggingGroupId) {
         const group = this.groups.find((g) => g.id === this.draggingGroupId)
         if (group) {
+          // ONE snap delta for everything the drag moved, read off one anchor: the
+          // first member (what people align on the grid — a group's own position
+          // sits a header band above its members, off the grid), else the group's
+          // stored position (a group carries nested boxes only when it has members
+          // on the diagram, so these two always cover it). Rounding each piece on its own
+          // moved them by different amounts: members and nested boxes drifted
+          // apart by up to half a grid step per drop.
           const snap = this.gridSize / 2
-          // Snap group position too
-          if (group.position) {
-            const snappedGroupX = this.smartGuideSnap.x ? group.position.x : Math.round(group.position.x / snap) * snap
-            const snappedGroupY = this.smartGuideSnap.y ? group.position.y : Math.round(group.position.y / snap) * snap
-            snappedGroups.push({ id: group.id, position: { x: snappedGroupX, y: snappedGroupY } })
-          }
-          for (const obj of this.objects) {
-            if (group.objectIds.includes(obj.id)) {
-              const snappedX = this.smartGuideSnap.x ? obj.position.x : Math.round(obj.position.x / snap) * snap
-              const snappedY = this.smartGuideSnap.y ? obj.position.y : Math.round(obj.position.y / snap) * snap
-              snappedObjects.push({ id: obj.id, position: { x: snappedX, y: snappedY } })
-            }
-          }
+          const moved = group.objectIds.map((id) => this.objectMap.get(id)).filter((o): o is C4Object => !!o)
+          const carried = [...this.dragGroupCarriedStarts.keys()].map((id) => this.groupMap.get(id)).filter((g): g is Group => !!g?.position)
+          const anchor = moved[0]?.position ?? group.position
+          const dx = anchor && !this.smartGuideSnap.x ? Math.round(anchor.x / snap) * snap - anchor.x : 0
+          const dy = anchor && !this.smartGuideSnap.y ? Math.round(anchor.y / snap) * snap - anchor.y : 0
+          const shift = (p: Position) => ({ x: p.x + dx, y: p.y + dy })
+          if (group.position) snappedGroups.push({ id: group.id, position: shift(group.position) })
+          for (const g of carried) snappedGroups.push({ id: g.id, position: shift(g.position!) })
+          for (const obj of moved) snappedObjects.push({ id: obj.id, position: shift(obj.position) })
         }
       }
       this.updatePlacements({ objects: snappedObjects, groups: snappedGroups })
@@ -2867,6 +2896,10 @@ export class CanvasEngine {
       } else if (this.draggingGroupId) {
         const group = this.groupMap.get(this.draggingGroupId)
         if (group?.position) groupUpdates.push({ id: group.id, position: { ...group.position } })
+        for (const id of this.dragGroupCarriedStarts.keys()) {
+          const carried = this.groupMap.get(id)
+          if (carried?.position) groupUpdates.push({ id, position: { ...carried.position } })
+        }
         for (const objectId of group?.objectIds ?? []) {
           const object = this.objectMap.get(objectId)
           if (object) objectUpdates.push({ id: object.id, position: { ...object.position } })
@@ -2930,6 +2963,7 @@ export class CanvasEngine {
     this.draggingGroupId = null
     this.dragGroupStartBounds = null
     this.dragGroupStartPositions.clear()
+    this.dragGroupCarriedStarts.clear()
     this.dragMultiStartPositions.clear()
     this.clearSmartGuides()
     this.resizingId = null
@@ -3818,6 +3852,19 @@ export class CanvasEngine {
       minY = Math.min(minY, obj.position.y)
       maxX = Math.max(maxX, obj.position.x + obj.size.width)
       maxY = Math.max(maxY, obj.position.y + obj.size.height)
+    }
+    // An auto-sized group is drawn around the groups nested in it as well (read
+    // from membership — lib/groupNesting.ts, shared with the auto-layout), so a
+    // nested group's title band sits inside it instead of on the same border.
+    // Strictly smaller member sets (or a later id), so the recursion ends.
+    for (const innerId of autoSizedInnerGroupIds(group, this.groupMap.values(), (id) => this.objectMap.has(id))) {
+      const inner = this.groupMap.get(innerId)
+      const bounds = inner ? this.getGroupBounds(inner) : null
+      if (!bounds) continue
+      minX = Math.min(minX, bounds.x)
+      minY = Math.min(minY, bounds.y)
+      maxX = Math.max(maxX, bounds.x + bounds.width)
+      maxY = Math.max(maxY, bounds.y + bounds.height)
     }
 
     const padding = PARENT_WRAPPER_SIDE_PAD

@@ -21,6 +21,7 @@ import type { DiagramDoc } from './types'
 import {
   applyPlacementSnapshotToDiagramDoc,
   hydratePlacementIntents,
+  isDiagramDocPlacementRecord,
   PendingPlacementIntents,
   pendingPlacementIntents,
   persistPlacementIntents,
@@ -263,6 +264,83 @@ describe('PendingPlacementIntents', () => {
       position: { x: 50, y: 60 },
       size: { width: 500, height: 400 },
     })
+  })
+
+  // A lower's routing is the diagram's, keyed by endpoint pair, carried by the
+  // DiagramDoc alone (src/lib/diagrams/lowerRouting.ts). These pin the record
+  // kind end to end: journal → snapshot → the targeted DiagramDoc write.
+  it('writes lower routes into a real Automerge DiagramDoc, absolute per space', () => {
+    const initial: DiagramDoc = {
+      name: 'Diagram',
+      type: 'context',
+      objectIds: ['S', 'P'],
+      connectionIds: [],
+      groupIds: [],
+      layouts: {},
+      // An earlier write: a stale 2D waypoint the new route does not hold, and a
+      // 3D twin a 2D record must not touch.
+      lowerRouting: { 'S→P': { waypoints: [{ x: 1, y: 1 }], fromAnchor: 9, fromAnchor3d: 3 } },
+      comments: {},
+      flows: {},
+      checkpoints: [],
+    }
+    intents.record(workspace, 'd1', '2d', {
+      lowerRoutes: [
+        { pair: 'S→P', routing: { fromAnchor: 4, toAnchor: 10, lockedToAnchors: true } },
+        { pair: 'P→S', routing: { waypoints: [{ x: 330, y: -40 }] } },
+      ],
+    })
+    const snapshot = intents.snapshot(workspace, 'd1')!
+    expect(snapshot.connections).toEqual([])
+
+    const updated = change(from(initial), (doc) => {
+      applyPlacementSnapshotToDiagramDoc(doc, snapshot)
+    })
+
+    expect(updated.lowerRouting?.['S→P']).toEqual({ fromAnchor: 4, toAnchor: 10, lockedToAnchors: true, fromAnchor3d: 3 })
+    expect(updated.lowerRouting?.['P→S']).toEqual({ waypoints: [{ x: 330, y: -40 }] })
+  })
+
+  it('overlays pending lower routes on a projected diagram, which rebuilds it from a stale doc', () => {
+    intents.record(workspace, 'd1', '3d', {
+      lowerRoutes: [{ pair: 'S→P', routing: { fromAnchor3d: 1, waypoints3d: [] } }],
+    })
+    const stale: Diagram = { ...diagram(0), lowerRouting: { 'S→P': { fromAnchor: 4, fromAnchor3d: 7, toAnchor3d: 2 } } }
+
+    const rebased = intents.overlayProjection(workspace, 'd1', { diagrams: [stale], groups: [], connections: [] })
+
+    expect(rebased.diagrams[0].lowerRouting?.['S→P']).toEqual({ fromAnchor: 4, fromAnchor3d: 1, waypoints3d: [] })
+  })
+
+  it('serializes and hydrates lower routes', () => {
+    intents.record(workspace, 'd1', '2d', {
+      lowerRoutes: [{ pair: 'S→P', routing: { waypoints: [{ x: 5, y: 6 }], shape: 'straight' } }],
+    })
+    const restored = new PendingPlacementIntents()
+    restored.hydrate(workspace, JSON.parse(JSON.stringify(intents.serialize(workspace))))
+    expect(restored.snapshot(workspace, 'd1')?.lowerRoutes).toEqual([
+      { pair: 'S→P', routing: { waypoints: [{ x: 5, y: 6 }], shape: 'straight' }, space: '2d' },
+    ])
+  })
+
+  it('the off-active drain\'s predicate retires DiagramDoc records (lower routes included) and spares model-doc ones', () => {
+    const recorded = intents.record(workspace, 'd1', '2d', {
+      objects: [{ id: 'o1', position: { x: 1, y: 2 }, size: { width: 160, height: 90 } }],
+      groups: [
+        { id: 'gGeom', position: { x: 5, y: 6 }, size: { width: 300, height: 200 } },
+        { id: 'gAuto', position: { x: 7, y: 8 }, size: { width: 300, height: 200 }, autoSize: true },
+      ],
+      connections: [{ id: 'c1', data: { fromAnchor: 2 } }],
+      lowerRoutes: [{ pair: 'S→P', routing: { fromAnchor: 4 } }],
+    })
+
+    intents.acknowledgeWhere(workspace, 'd1', recorded.revision, isDiagramDocPlacementRecord)
+
+    const snapshot = intents.snapshot(workspace, 'd1')!
+    expect(snapshot.objects).toEqual([])
+    expect(snapshot.lowerRoutes).toEqual([])
+    expect(snapshot.groups.map((g) => g.id)).toEqual(['gAuto'])
+    expect(snapshot.connections.map((c) => c.id)).toEqual(['c1'])
   })
 
   it('persists, restores and clears the singleton crash-recovery journal', async () => {

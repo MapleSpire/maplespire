@@ -22,6 +22,7 @@
 //   canvas geometry (so metrics see the same curves the canvas draws).
 
 import type { C4Object, Connection, Diagram, Group, Position, Size } from '../../types'
+import { autoSizedInnerGroupIds, isAutoSized } from '../groupNesting'
 import type { LayoutEdgeInput, LayoutNodeInput } from './engine'
 import {
   connectionGeometry,
@@ -36,7 +37,11 @@ import {
 } from './geometry'
 import {
   computeMetrics,
+  GROUP_FOOTER_PAD,
+  GROUP_SIDE_PAD,
+  GROUP_STD_PAD_TOP,
   groupHeaderBandHeight,
+  groupTitleMinWidth,
   headerBandRect,
   headerTextWidth,
   labelRect,
@@ -76,6 +81,10 @@ export interface LayoutContext {
   objects: C4Object[]
   connections: Connection[]
   groups: Group[]
+  /** Nesting depth per group, when the caller knows it (the Structurizr JSON
+   *  importer does: deployment nodes, group paths). Decides which of two groups
+   *  with the SAME members is the outer one — see {@link nestGroups}. */
+  groupDepths?: Readonly<Record<string, number>>
 }
 
 export interface EffectiveEdge extends LayoutEdgeInput {
@@ -338,6 +347,39 @@ export function snapAlignBoxes(
   }
 }
 
+/**
+ * The edges a layered engine should RANK on — not the edges it draws. Both engines
+ * only place nodes here (every connection is re-routed afterwards), so the ranking
+ * graph is free to encode C4 reading conventions instead of raw arrow direction:
+ *
+ * - People come first. An edge INTO an actor from a non-actor ("the system notifies
+ *   the agent") is ranked actor → system, so people are SOURCES of the ranking graph
+ *   and an unwrapped layered layout puts them in its first layer (top in DOWN, left
+ *   in RIGHT) — the canonical C4 context arrangement. Ranking on arrow direction put
+ *   a notified person BELOW the system and split the people across rows (SAOE
+ *   `FSSystemContext`: Inspecteur and Agent ended up under Microsoft Power Platform,
+ *   Répartiteur and Employé above it). This is a ranking input, not a guarantee:
+ *   row wrapping or a compound can still move a person, and no score term rewards
+ *   people-first, so such a candidate can win.
+ * - A reciprocal pair (A→B and B→A) is one relationship for placement. Keeping both
+ *   hands the engine a 2-cycle whose arbitrary break decides which of the two nodes
+ *   goes first; collapsing it lets the rest of the graph (and rule 1) decide.
+ */
+export function layeringEdges(edges: LayoutEdgeInput[], isActor: (id: string) => boolean): LayoutEdgeInput[] {
+  const out: LayoutEdgeInput[] = []
+  const seen = new Set<string>()
+  for (const e of edges) {
+    let fromId = e.fromId
+    let toId = e.toId
+    if (isActor(toId) && !isActor(fromId)) [fromId, toId] = [toId, fromId]
+    const key = fromId < toId ? `${fromId}|${toId}` : `${toId}|${fromId}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push({ id: e.id, fromId, toId })
+  }
+  return out
+}
+
 export function buildLayoutGraph(
   diagram: Diagram,
   objectById: Map<string, C4Object>,
@@ -375,6 +417,7 @@ export function buildLayoutGraph(
 
   const edges: EffectiveEdge[] = []
   const pairSeen = new Map<string, number>()
+  const drawn = new Set(diagram.connectionIds)
   for (const c of connections) {
     const vf = visible(c.fromId)
     const vt = visible(c.toId)
@@ -383,7 +426,21 @@ export function buildLayoutGraph(
     const key = `${vf}→${vt}`
     const existing = pairSeen.get(key)
     if (existing != null) {
-      if (real && !edges[existing].real) edges[existing] = { id: c.id, fromId: vf, toId: vt, real: true }
+      const prev = edges[existing]
+      // A real edge replaces an implied one, and a DRAWN real edge replaces one this
+      // diagram does not draw — the slot belongs to a line the canvas shows.
+      if (real && (!prev.real || (!drawn.has(prev.id) && drawn.has(c.id)))) {
+        edges[existing] = { id: c.id, fromId: vf, toId: vt, real: true }
+      }
+      // A second connection DRAWN on the same pair — typically a direct connection and
+      // the store's rolled-up `lower` twin (SAOE permit containers: Angular Web App -
+      // Employé → Node.js API, twice) — is its own line on the canvas. Dropping it here
+      // left it un-laid-out: never anchored, never re-routed, drawn over its twin with
+      // whatever routing it last had. Kept as a parallel edge, it gets its own lane.
+      // Only when both are drawn: an undrawn twin would push a lane for no line.
+      else if (real && prev.real && drawn.has(prev.id) && drawn.has(c.id)) {
+        edges.push({ id: c.id, fromId: vf, toId: vt, real: true })
+      }
       continue
     }
     pairSeen.set(key, edges.length)
@@ -391,6 +448,48 @@ export function buildLayoutGraph(
   }
 
   return { nodes, edges }
+}
+
+/**
+ * The part of a layout context one diagram's layout can read — what a layout
+ * worker is sent instead of the whole model (which can hold tens of thousands
+ * of objects). Kept: the diagram's objects; every connection whose two ends roll
+ * up (parentId chain) to two different objects of the diagram, as
+ * {@link buildLayoutGraph} rolls them; the objects on those chains; the
+ * diagram's groups. Everything else is invisible to the layout.
+ */
+export function trimLayoutContext(diagram: Diagram, ctx: LayoutContext): LayoutContext {
+  const objectById = new Map(ctx.objects.map((o) => [o.id, o]))
+  const nodeSet = new Set(diagram.objectIds.filter((id) => objectById.has(id)))
+  const keepObjects = new Set(nodeSet)
+  const chainTo = (objId: string): string[] | null => {
+    const chain: string[] = []
+    let cur: string | undefined = objId
+    const guard = new Set<string>()
+    while (cur && !nodeSet.has(cur)) {
+      if (guard.has(cur) || !objectById.has(cur)) return null
+      guard.add(cur)
+      chain.push(cur)
+      cur = objectById.get(cur)?.parentId
+    }
+    return cur && nodeSet.has(cur) ? chain : null
+  }
+  const connections: Connection[] = []
+  for (const c of ctx.connections) {
+    const from = chainTo(c.fromId)
+    const to = chainTo(c.toId)
+    if (!from || !to) continue
+    connections.push(c)
+    for (const id of from) keepObjects.add(id)
+    for (const id of to) keepObjects.add(id)
+  }
+  const groupIds = new Set(diagram.groupIds)
+  return {
+    objects: ctx.objects.filter((o) => keepObjects.has(o.id)),
+    connections,
+    groups: ctx.groups.filter((g) => groupIds.has(g.id)),
+    ...(ctx.groupDepths ? { groupDepths: ctx.groupDepths } : {}),
+  }
 }
 
 /**
@@ -826,10 +925,234 @@ export function groupTextBands(boundaries: BoundaryBox[]): Rect[] {
   return out
 }
 
+/** BoundaryBox descriptors for a diagram's MODEL-LEVEL groups (no parent object), for
+ * the auto-layout's candidate scoring: a non-member inside or straddling the box
+ * (`boundaryViolations` / `groupStraddles`) counts exactly as for a system boundary.
+ * No header band — their title sits top-left, not centred — so they add no masking
+ * zone. */
+export function modelGroupBoundaries(
+  diagram: Diagram,
+  groups: Group[],
+  boxOf: (id: string) => Box | undefined,
+): BoundaryBox[] {
+  const out: BoundaryBox[] = []
+  for (const gid of new Set(diagram.groupIds)) {
+    const g = groups.find((x) => x.id === gid)
+    if (!g || g.parentObjectId) continue
+    const b = boxOf(gid)
+    if (!b) continue
+    out.push({ x: b.x, y: b.y, width: b.width, height: b.height, memberIds: new Set(g.objectIds), headerBandHeight: GROUP_STD_PAD_TOP, headerTextWidth: 0 })
+  }
+  return out
+}
+
+/**
+ * How a diagram's groups nest, read from membership — a Group has no parent
+ * pointer. `a` encloses `b` when b's on-diagram members are a subset of a's.
+ * Equal sets put auto-sized groups outside the rest, by id among themselves, as
+ * the canvas draws them (lib/groupNesting.ts). The rest — stored boxes and
+ * wrappers, like a deployment node whose only child is another node: big-bank's
+ * "Amazon Web Services" → "US-East-1" — are ordered by the caller's depth hint
+ * when it has one (the JSON importer), else by the current box, larger outside —
+ * an imported view's boxes already nest, so a later Auto-layout keeps them — then
+ * by `diagram.groupIds` order, earlier outside. One total order, so every chain
+ * is strict (placement.test.ts, "three groups with equal members").
+ *
+ * A group sharing members with another while neither encloses the other cannot
+ * be an ELK compound (a node has one parent): it is `loose`, laid out as plain
+ * nodes, and still boxed around its members.
+ */
+export interface GroupNesting {
+  /** Groups on the diagram with at least one on-diagram member, diagram order. */
+  ids: string[]
+  membersOf: Map<string, string[]>
+  /** The groups each group encloses, at any depth. */
+  enclosed: Map<string, string[]>
+  /** How many groups enclose each group. */
+  depth: Map<string, number>
+  loose: Set<string>
+  /** Immediate compound parent: the deepest non-loose group enclosing it. */
+  compoundParent: Map<string, string>
+  /** The innermost non-loose group holding each object. */
+  compoundOf: Map<string, string>
+}
+
+export function nestGroups(
+  diagram: Diagram,
+  groups: Group[],
+  nodeSet: Set<string>,
+  depthHint: Readonly<Record<string, number>> = {},
+): GroupNesting {
+  const byId = new Map(groups.map((g) => [g.id, g]))
+  const ids: string[] = []
+  const membersOf = new Map<string, string[]>()
+  const sets = new Map<string, Set<string>>()
+  for (const gid of diagram.groupIds) {
+    const g = byId.get(gid)
+    if (!g || sets.has(gid)) continue
+    const members = [...new Set(g.objectIds.filter((id) => nodeSet.has(id)))]
+    if (members.length === 0) continue
+    ids.push(gid)
+    membersOf.set(gid, members)
+    sets.set(gid, new Set(members))
+  }
+  const order = new Map(ids.map((id, i) => [id, i]))
+  const area = (id: string) => {
+    const size = diagram.layouts?.[id]?.size
+    return size ? size.width * size.height : 0
+  }
+  const encloses = (a: string, b: string): boolean => {
+    const outer = sets.get(a)!
+    const inner = sets.get(b)!
+    if (inner.size > outer.size) return false
+    for (const m of inner) if (!outer.has(m)) return false
+    if (inner.size < outer.size) return true
+    // Equal members, in the order the canvas draws them (lib/groupNesting.ts):
+    // auto-sized groups outside the others, by id among themselves; the rest by
+    // the layout's own key below. Two keys, one after the other — a total order.
+    const autoA = isAutoSized(byId.get(a)!)
+    const autoB = isAutoSized(byId.get(b)!)
+    if (autoA !== autoB) return autoA
+    if (autoA) return a < b
+    const hinted = (depthHint[a] ?? 0) - (depthHint[b] ?? 0)
+    return (hinted || area(b) - area(a) || order.get(a)! - order.get(b)!) < 0
+  }
+  const enclosed = new Map(ids.map((id) => [id, [] as string[]]))
+  const depth = new Map(ids.map((id) => [id, 0]))
+  const loose = new Set<string>()
+  for (const a of ids) {
+    for (const b of ids) {
+      if (a === b) continue
+      if (encloses(a, b)) {
+        enclosed.get(a)!.push(b)
+        depth.set(b, depth.get(b)! + 1)
+      } else if (!encloses(b, a)) {
+        // A partial overlap cannot nest. A system boundary stays a compound — it
+        // always was one — and the model group gives way; two overlapping
+        // boundaries both stay (a shared member goes to the first, as before).
+        const outer = sets.get(a)!
+        for (const m of sets.get(b)!) {
+          if (outer.has(m)) {
+            if (!byId.get(a)!.parentObjectId) loose.add(a)
+            if (!byId.get(b)!.parentObjectId) loose.add(b)
+            break
+          }
+        }
+      }
+    }
+  }
+  const compoundParent = new Map<string, string>()
+  for (const a of ids) {
+    if (loose.has(a)) continue
+    for (const b of enclosed.get(a)!) {
+      if (loose.has(b)) continue
+      const cur = compoundParent.get(b)
+      if (!cur || depth.get(a)! > depth.get(cur)!) compoundParent.set(b, a)
+    }
+  }
+  const compoundOf = new Map<string, string>()
+  for (const gid of ids) {
+    if (loose.has(gid)) continue
+    for (const m of membersOf.get(gid)!) {
+      const cur = compoundOf.get(m)
+      if (!cur || depth.get(gid)! > depth.get(cur)!) compoundOf.set(m, gid)
+    }
+  }
+  return { ids, membersOf, enclosed, depth, loose, compoundParent, compoundOf }
+}
+
+/** The padding a group box reserves around its content — the canvas's: a parent
+ *  wrapper's centred header band and slim footer, a standard group's top-left
+ *  title row and symmetric sides. */
+export function groupPadding(g: Group): { top: number; bottom: number; side: number; titleFloor: number } {
+  const wrapper = !!g.parentObjectId
+  return {
+    top: wrapper ? groupHeaderBandHeight(g) : GROUP_STD_PAD_TOP,
+    bottom: wrapper ? GROUP_FOOTER_PAD : GROUP_SIDE_PAD,
+    side: GROUP_SIDE_PAD,
+    titleFloor: groupTitleMinWidth(g.name, wrapper ? 13 : 11),
+  }
+}
+
+/**
+ * Every group's box, inner boxes first, by the rules the canvas DRAWS it with
+ * (CanvasEngine.computeGroupBounds; Scene3D.groupRect applies the same
+ * stored-versus-hugged rule, with its own padding and no inner wrappers): a
+ * standard group with `autoSize: false` is drawn at its stored box, so that box
+ * encloses every group nested in it — a node's header band then sits inside its
+ * parent instead of on the parent's border; a parent wrapper hugs its members
+ * plus the wrappers named in `innerWrapperIds`; an auto-sized group hugs its
+ * members and the groups nested in it by the canvas's own rule
+ * (lib/groupNesting.ts). Scoring a nesting the canvas will not draw ranks a
+ * layout nobody sees.
+ * Whole pixels, each box rounded before its parent reads it (the JSON importer's
+ * `sizeGroupBoxes` does the same, so a re-import's expand pass finds nothing to
+ * grow).
+ */
+export function deriveGroupBoxes(
+  nesting: GroupNesting,
+  groups: Group[],
+  objectBoxes: Map<string, Box>,
+): Map<string, Box> {
+  const byId = new Map(groups.map((g) => [g.id, g]))
+  const onDiagram = new Set(nesting.ids)
+  const onDiagramGroups = nesting.ids.map((id) => byId.get(id)!)
+  const out = new Map<string, Box>()
+  const sizing = new Set<string>()
+  // On demand, inner boxes first. A depth order is not enough: `innerWrapperIds`
+  // is an explicit nesting that membership may order the other way (an inner
+  // wrapper with the same members as its outer one, listed first).
+  const boxOf = (gid: string): Box | undefined => {
+    if (out.has(gid)) return out.get(gid)
+    if (sizing.has(gid) || !onDiagram.has(gid)) return undefined // a cycle, or not on this diagram
+    sizing.add(gid)
+    const g = byId.get(gid)!
+    const content: Box[] = []
+    for (const m of nesting.membersOf.get(gid)!) {
+      const b = objectBoxes.get(m)
+      if (b) content.push(b)
+    }
+    const inners = g.parentObjectId
+      ? (g.innerWrapperIds ?? [])
+      : g.autoSize === false
+        ? nesting.enclosed.get(gid)!
+        : autoSizedInnerGroupIds(g, onDiagramGroups, (id) => objectBoxes.has(id))
+    for (const inner of inners) {
+      const b = boxOf(inner)
+      if (b) content.push(b)
+    }
+    sizing.delete(gid)
+    if (content.length === 0) return undefined
+    const minX = Math.min(...content.map((b) => b.x))
+    const minY = Math.min(...content.map((b) => b.y))
+    const maxX = Math.max(...content.map((b) => b.x + b.width))
+    const maxY = Math.max(...content.map((b) => b.y + b.height))
+    const pad = groupPadding(g)
+    const bboxW = maxX - minX + pad.side * 2
+    const width = Math.max(bboxW, pad.titleFloor)
+    const box = {
+      x: Math.round(minX - pad.side - (width - bboxW) / 2),
+      y: Math.round(minY - pad.top),
+      width: Math.round(width),
+      height: Math.round(maxY - minY + pad.top + pad.bottom),
+    }
+    out.set(gid, box)
+    return box
+  }
+  for (const gid of nesting.ids) boxOf(gid)
+  return out
+}
+
 /** Build BoundaryBox descriptors for a diagram's system/container boundary groups. The
  * reserved top-band height + widest header line are derived from the group exactly as
  * the canvas/layout do, so the masking band the metric checks is the space the box
- * actually reserves for the centered header. */
+ * actually reserves for the centered header.
+ *
+ * Model-level groups are NOT included: this also measures persisted layouts the
+ * auto-layout never produced (a Structurizr JSON view keeps the source tool's
+ * coordinates, and its deployment-node boxes overlap their neighbours' shapes —
+ * big-bank `LiveDeployment`). The auto-layout adds {@link modelGroupBoundaries} to
+ * its own candidate scoring instead. */
 export function boundaryBoxes(
   diagram: Diagram,
   groups: Group[],

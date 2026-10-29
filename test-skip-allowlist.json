@@ -14,6 +14,7 @@
       "requiresEnv": "TEST_DATABASE_URL"
     },
     "src/lib/layout/genPreview.test.ts": "Not a test — a developer tool behind `describe.runIf(GEN_PREVIEW === '1')` that writes one SVG per generated diagram into preview/ (gitignored) for eyeballing layout changes. It asserts nothing, so running it in CI would cost time and prove nothing.",
+    "src/lib/layout/portfolioReplay.test.ts": "The measurement behind elkConfig.ts STRATEGIES, kept runnable behind `describe.runIf(LAYOUT_REPLAY === '1')`: it replays bestLayout's selection over every fixture view plus synthetic chains under three direction hints, once per portfolio (~10 minutes). Run it when changing the portfolio; the placement regressions that matter on every run live in placement.test.ts.",
     "server/src/backup/backupRestore.integration.test.ts": {
       "reason": "The real pg_dump/pg_restore drill. Needs the client binaries plus CREATEDB for its temporary restore database, so it stays opt-in via BACKUP_RESTORE_TEST_DATABASE_URL for a bare `npm test`. Both CI and `npm run ci:local` set it, and borrow the binaries from the Postgres container over `docker exec` (DockerPgTools) rather than depending on whatever client the host has — Windows has none, and a runner's pg_dump refuses to talk to a server newer than itself. With the variable set this entry becomes an assertion that the drill RAN.",
       "requiresEnv": "BACKUP_RESTORE_TEST_DATABASE_URL"

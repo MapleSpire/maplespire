@@ -305,10 +305,14 @@ export function diagramToDiagramDoc(
   flows: readonly Flow[],
   checkpoints: readonly Checkpoint[] = []
 ): DiagramDoc {
-  const { id: _id, layouts, ...fields } = diagram
+  const { id: _id, layouts, lowerRouting, ...fields } = diagram
   return {
     ...fields,
     layouts: layouts ?? {},
+    // Created with the document, like `layouts`: two peers that each create
+    // the map on a document lacking it keep only one of the two map objects,
+    // and the other peer's pairs vanish.
+    lowerRouting: lowerRouting ?? {},
     comments: byId(comments),
     flows: byId(flows),
     checkpoints: [...checkpoints],

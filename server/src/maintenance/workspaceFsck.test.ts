@@ -14,7 +14,7 @@
 
 import { describe, expect, it, vi } from 'vitest'
 import { generateAutomergeUrl, isValidAutomergeUrl } from '@automerge/automerge-repo'
-import { FSCK_CHECKS, REGISTRY_HEAD_PROJECTION_GRACE_MS, checkWorkspaceStructure, collectReferencedUrls, documentIdOf, fsckStatusOf, groupSharedRoots, OVERLAY_CHAIN_CEILING, OVERLAY_HEAD_CEILING, OVERLAY_HEAD_ROTATION_GRACE_MS, measureOverlayWriteHeads, overlayWriteHeadBytesTotal, OVERLAY_SEGMENT_BYTE_CEILING, type OverlayWriteHeadSize, type OverlaySegmentSize } from './workspaceFsck.js'
+import { FSCK_CHECKS, REGISTRY_HEAD_PROJECTION_GRACE_MS, checkWorkspaceStructure, collectReferencedUrls, documentIdOf, fsckStatusOf, registryDiagramEntries, groupSharedRoots, OVERLAY_CHAIN_CEILING, OVERLAY_HEAD_CEILING, OVERLAY_HEAD_ROTATION_GRACE_MS, measureOverlayWriteHeads, overlayWriteHeadBytesTotal, OVERLAY_SEGMENT_BYTE_CEILING, type OverlayWriteHeadSize, type OverlaySegmentSize } from './workspaceFsck.js'
 import { OVERLAY_WRITE_HEAD_VERSION, buildModelMeta } from '../modelMeta.js'
 import { OVERLAY_SEGMENT_SIZE } from '../overlaySegments.js'
 import { OVERLAY_CHAIN_FOLD_MIN } from '../readModel/overlayChainFold.js'
@@ -64,13 +64,15 @@ const registryWith = (docUrl: string) => ({ diagrams: { d1: { id: 'd1', docUrl }
 function healthyInput(overrides: Partial<Parameters<typeof checkWorkspaceStructure>[0]> = {}) {
   const root = shardedRoot()
   const modelMeta = healthyMeta()
-  const referenced = collectReferencedUrls(root, modelMeta, [registryWith(DIAGRAM), { diagrams: {} }])
+  const registries = [registryWith(DIAGRAM), { diagrams: {} }]
+  const referenced = collectReferencedUrls(root, modelMeta, registries)
   const all = ids(ROOT, ...referenced)
   return {
     rootUrl: ROOT,
     root,
     modelMeta,
     unresolvedRegistries: [],
+    registryDiagramDocUrls: registryDiagramEntries(registries) as readonly { diagramId: string; docUrl: unknown }[] | undefined,
     referenced,
     presentIds: all,
     admittedIds: all,
@@ -189,6 +191,37 @@ describe('workspace fsck — the document-graph invariants', () => {
     expect(result.checksSkipped).toEqual([])
   })
 
+  describe('diagram-doc-url — a registry meta that names no document', () => {
+    // A classic-workspace Structurizr import published 14 such metas before the
+    // 2026-10-21 client fix (bridgeImportDocUrl.test.ts). `referenced` drops an
+    // invalid url, so every other check passed over them and the run was clean.
+    const damaged = [registryWith(DIAGRAM), { diagrams: { d2: { id: 'd2', docUrl: '' } } }]
+
+    it('keeps the raw url of every entry, an empty one included', () => {
+      expect(registryDiagramEntries(damaged)).toEqual([
+        { diagramId: 'd1', docUrl: DIAGRAM },
+        { diagramId: 'd2', docUrl: '' },
+      ])
+      expect(collectReferencedUrls(shardedRoot(), healthyMeta(), damaged)).not.toContain('')
+    })
+
+    it('reports it, and the run is not clean', () => {
+      const result = checkWorkspaceStructure(healthyInput({ registryDiagramDocUrls: registryDiagramEntries(damaged) }))
+      expect(result.findings.map((f) => [f.check, f.severity])).toEqual([['diagram-doc-url', 'degraded']])
+      expect(result.findings[0].detail).toContain('d2')
+      expect(fsckStatusOf(result.findings, result.checksSkipped)).not.toBe('clean')
+    })
+
+    it('skips rather than passes on a partial walk or when the entries were not gathered', () => {
+      const partial = checkWorkspaceStructure(healthyInput({ unresolvedRegistries: [REGISTRY] }))
+      expect(partial.checksRun).not.toContain('diagram-doc-url')
+      expect(partial.checksSkipped.map((s) => s.check)).toContain('diagram-doc-url')
+      const omitted = checkWorkspaceStructure(healthyInput({ registryDiagramDocUrls: undefined }))
+      expect(omitted.checksSkipped).toContainEqual({ check: 'diagram-doc-url', reason: 'the registry entries were not gathered' })
+      expect(fsckStatusOf(omitted.findings, omitted.checksSkipped)).not.toBe('clean')
+    })
+  })
+
   it('reports a sharded model with no overlay write head as data-loss', () => {
     // The defect that lost a real object today: the client-authored ModelMeta
     // (bridge.ts from splitModel().meta) carries the shard arrays and none
@@ -230,8 +263,11 @@ describe('workspace fsck — the document-graph invariants', () => {
       // so that check RUNS. Conflating the two is how a run that never looked
       // reports itself clean.
       retainedOverlaySegments: [],
+      // A monolith has registry shards too, so `diagram-doc-url` RUNS.
+      registryDiagramDocUrls: registryDiagramEntries([registryWith(DIAGRAM)]),
     })
     expect(result.findings).toEqual([])
+    expect(result.checksRun).toContain('diagram-doc-url')
     expect(result.checksSkipped.map((s) => s.check)).toEqual([
       'write-head-writable',
       'model-write-head', 'write-head-version', 'overlay-chain-bounded',

@@ -109,9 +109,10 @@ const lowerOnly = (connections: readonly Connection[]): Connection[] =>
  * drawn as Mobile App -> Order Service), and an inline expansion read from the
  * stub alone drew 2 of its 13 edges (2026-10-16, FoodDash).
  *
- * On the RESIDENT tier the store's lower sync does list them, under generated
- * ids, so the stub may already carry them: the planner matches roll-ups by
- * their two ends, not their id. There the roll-up is computed from the store,
+ * On the RESIDENT tier the store's lower sync does list them (under the same
+ * `lower:<from>→<to>` ids since 2026-10-22, generated ids before), so the stub
+ * may already carry them: the planner matches roll-ups by their two ends, not
+ * their id. There the roll-up is computed from the store,
  * which is complete and current (unsynced local edits included) — never from a
  * cached render, which offline could be older than the store.
  *

@@ -13,6 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import type { C4Object, Connection, Diagram, Group } from '../types'
+import { resolveLowerRouting } from './diagrams/lowerRouting'
 
 /**
  * Resolving a diagram's VISUAL layer for the canvas: the model is shared between
@@ -57,7 +58,7 @@ export function resolveConnectionFor3d(c: Connection): Connection {
  * `Diagram` and the share viewer's `ShareDiagram`. */
 export type DiagramLayoutSource = Pick<
   Diagram,
-  'objectIds' | 'connectionIds' | 'groupIds' | 'layouts' | 'layouts3d'
+  'objectIds' | 'connectionIds' | 'groupIds' | 'layouts' | 'layouts3d' | 'lowerRouting'
 >
 
 /** A diagram's composition with per-item layout merged onto positions/sizes —
@@ -81,9 +82,15 @@ export function filterAndMergeDiagramData(
       const layout = layoutOf(o.id)
       return layout ? { ...o, position: layout.position, size: layout.size } : o
     })
+  // A lower's routing is the diagram's (`lowerRouting`), merged first so the
+  // 3D read rule then applies to it like to any connection.
+  const lowerRouting = diagram?.lowerRouting
   const filteredConnections = connections
     .filter((c) => diagramConnectionIds.has(c.id))
-    .map((c) => (use3d ? resolveConnectionFor3d(c) : c))
+    .map((c) => {
+      const routed = resolveLowerRouting(c, lowerRouting)
+      return use3d ? resolveConnectionFor3d(routed) : routed
+    })
   const filteredGroups = groups
     .filter((g) => diagramGroupIds.has(g.id))
     .map((g) => {

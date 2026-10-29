@@ -95,6 +95,7 @@ import { Switch } from '../ui/switch'
 import { FieldRow } from './FieldRow'
 import { ContainsField, UsageFields } from './EntityUsageFields'
 import { TagPicker } from '../tags/TagPicker'
+import { resolveLowerRouting } from '../../lib/diagrams/lowerRouting'
 import {
   assignTechnologyUsage,
   assignTechnologyUsages,
@@ -283,8 +284,13 @@ export function RightSidebar() {
       cancelled = true
     }
   }, [connSeamId, indexVersion])
-  const selectedConnection =
+  const selectedRawConnection =
     selectedConnectionFromStore ?? (seamConn && seamConn.id === connSeamId ? seamConn.conn : undefined)
+  // As drawn on this diagram: a lower's routing (shape, anchor lock) is the
+  // diagram's `lowerRouting`, not the shared lower object's.
+  const selectedConnection = selectedRawConnection
+    ? resolveLowerRouting(selectedRawConnection, currentDiagram?.lowerRouting)
+    : undefined
 
   // The selected connection's endpoint objects can be off-window too, so resolve
   // their names through the seam (the Sender/Receiver fields otherwise show Unknown).
