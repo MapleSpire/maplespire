@@ -372,7 +372,15 @@ suite('session advisory lock — the fencing token', () => {
         backendStart: lock!.backendStart,
       })).toEqual({ verdict: 'ours', fenced: true, error: null })
 
-      await asker.query('SELECT pg_terminate_backend($1)', [lock!.backendPid])
+      // The one-argument form returns once the signal is SENT; the session keeps
+      // its lock until it has exited, so a check right after it can still answer
+      // `ours` (seen on CI; reproduced with the holder's backend SIGSTOPped: true
+      // after 2 ms, lock still held). With a timeout it returns once the backend
+      // is gone.
+      const terminated = await asker.query<{ ok: boolean }>(
+        'SELECT pg_terminate_backend($1, 10000) AS ok', [lock!.backendPid],
+      )
+      expect(terminated.rows[0].ok, 'the holder did not exit within 10 s').toBe(true)
 
       expect(await checkAdvisoryLockOwnership(asker, key, lock!.backendPid, {
         backendStart: lock!.backendStart,

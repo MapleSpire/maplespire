@@ -105,6 +105,16 @@ function harness(options = {}) {
   return { witness, time, timers, socket, advance, reply, ready, get connections() { return connections } }
 }
 
+// The two real-TCP tests run on the wall clock, so their deadlines measure the
+// scheduler too: on a starved CI runner the process went ~150 ms without
+// running a timer (last reply at 304 ms, admission checked at 460 ms, no request
+// in between), and the default 50 ms admission age refused it as stale —
+// correctly. Staleness, timeouts and cleanup budgets are pinned with the manual
+// clock above; these tests are about real bytes on a real socket, so they give
+// every scheduling-dependent deadline room. The clock-model constants are not
+// tunable and stay at their defaults.
+const REAL_TCP_LIMITS = { maxAdmissionAgeMs: 1500, responseTimeoutMs: 1500, connectTimeoutMs: 1500, closeTimeoutMs: 1500 }
+
 async function goodArtifact() {
   const h = harness()
   h.ready()
@@ -165,13 +175,15 @@ test('real TCP uses only complete PING nonces, filters target, and closes its so
   const witness = startRedisFreezeWitness({
     target: { ...target, port: server.address().port, Config: { Env: ['SECRET=never retain'] } },
     clock: () => { const monoAt = performance.now() - origin; return { at: Math.floor(monoAt), monoAt, ordinal: ++ordinal } },
+    limits: REAL_TCP_LIMITS,
   })
   t.after(() => witness.stop())
   const deadline = performance.now() + 1500
   while (commands.length < 3 && performance.now() < deadline) await sleep(3)
   assert.ok(commands.length >= 3)
   // Do not repeatedly call the admission gate while waiting for enough samples.
-  assert.equal(witness.admissionBeforePause().valid, true)
+  const admission = witness.admissionBeforePause()
+  assert.equal(admission.valid, true, JSON.stringify(admission))
   witness.pauseAttempted()
   witness.pauseAcknowledged()
   await sleep(5)
@@ -212,11 +224,13 @@ test('real TCP stays healthy for the full two-second baseline and stops normally
   const origin = performance.now()
   let ordinal = 0
   const witness = startRedisFreezeWitness({ target: { ...target, port: server.address().port },
-    clock: () => { const monoAt = performance.now() - origin; return { at: Math.floor(monoAt), monoAt, ordinal: ++ordinal } } })
+    clock: () => { const monoAt = performance.now() - origin; return { at: Math.floor(monoAt), monoAt, ordinal: ++ordinal } },
+    limits: REAL_TCP_LIMITS })
   t.after(() => witness.stop())
   await sleep(2000)
   assert.ok(count >= 2)
-  assert.equal(witness.admissionBeforePause().valid, true)
+  const admission = witness.admissionBeforePause()
+  assert.equal(admission.valid, true, JSON.stringify(admission))
   witness.pauseAttempted()
   witness.pauseAcknowledged()
   await sleep(10)
