@@ -23,6 +23,7 @@ import {
 import { legendSize, legendSvgFragment, type LegendModel } from './legend'
 import { objectTypeBadgeLabel } from '../objectTypeBadge'
 import { objectShortDescription } from '../objectDescription'
+import { resolveTechnologyIconPath } from '../technologies/iconPath'
 
 /**
  * Serialise a diagram to a standalone, product-styled SVG. Pure — geometry
@@ -108,7 +109,74 @@ function cylinderPathD(x: number, y: number, w: number, h: number, capRy: number
   ].join(' ')
 }
 
-export function renderExportSvg(scene: SvgScene, opts?: { measure?: MeasureFn; legend?: LegendModel | null }): string {
+/**
+ * The catalog asset a node paints, chosen exactly as CanvasEngine.renderObject +
+ * renderTechnologyIcon choose it: only a shape with an `icon` shows technology
+ * artwork, and the image comes from its `iconAssignment` for the theme. A bare
+ * `icon` with no assignment has no artwork (the canvas draws a letter badge).
+ */
+export function exportIconPath(o: C4Object, theme: 'light' | 'dark'): string | undefined {
+  if (!o.icon) return undefined
+  return resolveTechnologyIconPath(theme, o.iconAssignment?.iconLightPath, o.iconAssignment?.iconDarkPath)
+}
+
+/** Fetch the asset behind each path and return it as a `data:` URI. Inlined
+ * because catalog paths are same-origin (`/icons/light/<hash>.png`): an
+ * `<image href>` to them resolves against nothing once the file is opened from
+ * disk or another site. A path that cannot be fetched is left out — that node
+ * keeps its type glyph rather than carrying a broken image. */
+export async function inlineExportIcons(
+  paths: Iterable<string>,
+  fetchFn: typeof fetch = fetch,
+): Promise<Map<string, string>> {
+  const out = new Map<string, string>()
+  await Promise.all(
+    [...new Set(paths)].map(async (path) => {
+      if (path.startsWith('data:')) {
+        out.set(path, path)
+        return
+      }
+      try {
+        const res = await fetchFn(path)
+        if (!res.ok) return
+        const buf = new Uint8Array(await res.arrayBuffer())
+        if (buf.length === 0) return
+        const type = (res.headers.get('content-type') ?? '').split(';')[0].trim() || guessImageType(path)
+        if (!type.startsWith('image/')) return
+        out.set(path, `data:${type};base64,${base64(buf)}`)
+      } catch {
+        // Unreachable asset (offline, CORS): the node keeps its glyph.
+      }
+    }),
+  )
+  return out
+}
+
+function guessImageType(path: string): string {
+  const ext = path.split(/[?#]/)[0].split('.').pop()?.toLowerCase()
+  return ext === 'svg' ? 'image/svg+xml' : ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg' : ext === 'webp' ? 'image/webp' : 'image/png'
+}
+
+function base64(bytes: Uint8Array): string {
+  let bin = ''
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000))
+  }
+  return btoa(bin)
+}
+
+export function renderExportSvg(
+  scene: SvgScene,
+  opts?: {
+    measure?: MeasureFn
+    legend?: LegendModel | null
+    /** Which appearance of dual-variant artwork to embed. */
+    theme?: 'light' | 'dark'
+    /** Icon path → embeddable href (see `inlineExportIcons`). A node whose
+     * artwork is absent here draws its type glyph. */
+    icons?: ReadonlyMap<string, string>
+  },
+): string {
   const { skin } = scene
   const fontFamily = skin.renderStyle.fontFamily ?? 'Inter, system-ui, sans-serif'
   const measure = opts?.measure ?? canvasMeasure(fontFamily) ?? heuristicMeasure
@@ -150,6 +218,25 @@ export function renderExportSvg(scene: SvgScene, opts?: { measure?: MeasureFn; l
   )
   parts.push(`<rect width="100%" height="100%" fill="${skin.canvas.bg}"/>`)
   if (legend && legendAt) parts.push(legendSvgFragment(legend, skin, legendAt.x, legendAt.y, measure))
+
+  // ── Technology artwork: each distinct asset embedded once, placed by <use> ──
+  // 20×20 with a 4px rounded clip, as renderTechnologyIcon draws it.
+  const theme = opts?.theme ?? 'light'
+  const iconIds = new Map<string, string>()
+  const iconDefs: string[] = []
+  for (const o of scene.objects) {
+    const path = exportIconPath(o, theme)
+    const href = path ? opts?.icons?.get(path) : undefined
+    if (!path || !href || iconIds.has(path)) continue
+    const id = `ms-icon-${iconIds.size}`
+    iconIds.set(path, id)
+    iconDefs.push(
+      `<image id="${id}" width="20" height="20" preserveAspectRatio="xMidYMid meet" clip-path="url(#ms-icon-clip)" href="${esc(href)}"/>`,
+    )
+  }
+  if (iconDefs.length) {
+    parts.push(`<defs><clipPath id="ms-icon-clip"><rect width="20" height="20" rx="4"/></clipPath>${iconDefs.join('')}</defs>`)
+  }
 
   // ── Groups (behind everything, same z-order as the canvas) ──────────────────
   for (const { group, bounds: b } of scene.groups) {
@@ -263,11 +350,17 @@ export function renderExportSvg(scene: SvgScene, opts?: { measure?: MeasureFn; l
       )
     }
 
-    // Icon (glyph shape carries the type, per the design system).
+    // Icon: the technology logo when the shape has one (stores included, as on
+    // the canvas), else the glyph whose shape carries the type.
     const iconColor = isExternal ? objSkin.iconExternal : objSkin.icon
     const cx = x + w / 2
     const iconY = y + 22
-    if (!isStore) {
+    const artworkPath = exportIconPath(o, theme)
+    const iconId = artworkPath ? iconIds.get(artworkPath) : undefined
+    if (iconId) {
+      // Lifted 1px like the canvas: logos sit visually low against the title.
+      parts.push(`<use href="#${iconId}" x="${n(tx(cx) - 10)}" y="${n(ty(iconY - 1) - 10)}"/>`)
+    } else if (!isStore) {
       if (o.type === 'actor') {
         parts.push(`<circle cx="${tx(cx)}" cy="${ty(iconY - 4)}" r="5" fill="${iconColor}"/>`)
         parts.push(

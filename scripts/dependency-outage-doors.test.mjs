@@ -179,6 +179,18 @@ const DOORS = {
       why: 'Raises it at the two acquisition sites (`withClient` for the borrow, `acquireStoragePermit` for the queue deadline). Deliberately NOT re-exported: unlike `StaleSyncCellWriteError` nothing outside catches it by name.',
     },
   ],
+  WorkspaceRegistryUnavailableError: [
+    {
+      path: 'server/src/runtime/dependencyOutageResponse.ts',
+      kind: 'http',
+      why: 'THE shared mapping: the 503 that replaced the 404 "unknown workspace" a failed registry read was answered with.',
+    },
+    {
+      path: 'server/src/rbac/workspaceGate.ts',
+      kind: 'throw-site',
+      why: '`canonicalWorkspaceKey` converts the untyped pg failure of its one read, where its meaning is known.',
+    },
+  ],
 }
 
 /** Exactly one `class X extends Error` per name, in the LEAF module. */
@@ -186,6 +198,7 @@ const DECLARED_IN = {
   RedisUnavailableError: 'server/src/runtime/redisErrors.ts',
   StaleSyncCellWriteError: 'server/src/automergeStorageErrors.ts',
   StoragePoolExhaustedError: 'server/src/automergeStorageErrors.ts',
+  WorkspaceRegistryUnavailableError: 'server/src/rbac/workspaceRegistryErrors.ts',
 }
 
 for (const [className, allowed] of Object.entries(DOORS)) {
@@ -408,6 +421,105 @@ test('every self-terminating handler that can be fenced consults the shared mapp
     + 'and a fence refusal is transient. Their neighbours GET /api/automerge/root and '
     + 'POST /api/automerge/durable-heads already answer 503 for the same condition.',
   )
+})
+
+/**
+ * EVERY SELF-TERMINATING HANDLER THAT CANONICALISES A WORKSPACE consults the
+ * shared mapping before its own 500.
+ *
+ * `canonicalWorkspaceKey` throws `WorkspaceRegistryUnavailableError` when the
+ * registry cannot be read — it used to answer null, which every caller read as
+ * "unknown workspace". `route()` and the terminal handler both map the class;
+ * a handler that catches its own errors and answers 500 does not, unless it
+ * asks `sendDependencyOutage` first.
+ *
+ * UNLIKE THE FENCE POPULATION ABOVE, THIS ONE IS COMPUTED: every `app.<verb>(`
+ * registration whose handler calls a canonicalising helper and ends a `catch`
+ * in its own `res.status(500)`. The expected set is pinned beside it, so a
+ * NEW member is red until somebody has looked at it, and so is a lost one —
+ * an empty walk cannot pass. A handler's extent is up to the first line that
+ * closes the registration at its own indentation (`})` / `}))`): slicing to
+ * the NEXT registration instead ran the last module-level handler into
+ * `main()`'s boot code and reported its canonicalisation as the handler's.
+ */
+const CANONICALISING = /\b(?:canonicalWorkspaceKey|readableWorkspace|resolveWorkspaceRoot|shareWorkspaceKey|filterSharesByReadAccess|ensureWorkspace|resolveAiToolCtx)\(/
+const REGISTRY_READING_SELF_TERMINATING = [
+  'POST /api/shares',
+  'GET /api/shares',
+  'PATCH /api/shares/:token',
+  'DELETE /api/shares/:token',
+  'GET /api/automerge/doc-heads',
+  'GET /api/automerge/registry-diagram',
+  'GET /api/me/workspace-access',
+]
+
+function routeHandlers(source) {
+  const lines = source.split('\n')
+  const handlers = []
+  for (let i = 0; i < lines.length; i++) {
+    const opening = /^(\s*)app\.(get|post|put|patch|delete)\(\s*'([^']+)'/.exec(lines[i])
+    if (!opening) continue
+    const closing = new RegExp(`^${opening[1]}\\}\\)+`)
+    let end = i + 1
+    while (end < lines.length && !closing.test(lines[end])) end++
+    handlers.push({ route: `${opening[2].toUpperCase()} ${opening[3]}`, body: lines.slice(i, end + 1).join('\n') })
+  }
+  return handlers
+}
+
+test('every self-terminating handler that canonicalises a workspace consults the shared mapping first', () => {
+  const index = SOURCES.find((file) => file.path === 'server/src/index.ts')
+  assert.ok(index, 'server/src/index.ts not found')
+  const handlers = routeHandlers(index.body)
+  // Vacuity: the walker found the routes at all, and found the ones it must.
+  // 95 measured 2026-10-29, equal to `grep -cE "app\.(get|post|put|patch|delete)\("`
+  // on the file; a floor rather than an equality, so adding a route is not red.
+  assert.ok(handlers.length >= 95, `only ${handlers.length} route registrations found in index.ts; the walker is broken`)
+  assert.ok(handlers.some((h) => h.route === 'GET /api/automerge/root' && CANONICALISING.test(h.body)))
+
+  const population = []
+  const problems = []
+  for (const { route, body } of handlers) {
+    if (!CANONICALISING.test(body)) continue
+    let terminates = false
+    for (let at = body.indexOf('res.status(500)'); at >= 0; at = body.indexOf('res.status(500)', at + 1)) {
+      const before = body.slice(0, at)
+      const catchAt = before.lastIndexOf('catch (')
+      if (catchAt < 0) continue
+      terminates = true
+      const variable = /^catch \((\w+)(?:\s*:[^)]*)?\)/.exec(before.slice(catchAt))?.[1] ?? 'err'
+      if (!new RegExp(`if \\(sendDependencyOutage\\(res, ${variable}\\)\\) return`).test(before.slice(catchAt))) {
+        problems.push(route)
+      }
+    }
+    if (terminates) population.push(route)
+  }
+
+  assert.deepEqual(
+    [...population].sort(),
+    [...REGISTRY_READING_SELF_TERMINATING].sort(),
+    'the handlers that canonicalise a workspace and terminate their own errors are a MEASURED set. A new one '
+    + 'must consult `sendDependencyOutage` before its 500 and be added here; a lost one means the walk changed.',
+  )
+  assert.deepEqual(
+    problems,
+    [],
+    `${problems.join('; ')}: a failed registry read here answers 500 — it used to be a 404 "unknown workspace" — `
+    + 'instead of the shared 503. Add "if (sendDependencyOutage(res, err)) return" at the top of the catch.',
+  )
+})
+
+test('the tag capability check consults the shared mapping before its own 500', () => {
+  // `tags/access.ts` canonicalises the workspace of a workspace-scoped write
+  // inside `requireTagCapability`'s own `try`, whose catch answers 500 — so
+  // that catch, and not the routes' `sendError`, is where the error lands.
+  // `tags.test.ts` drives it; this pins the guard's place.
+  const access = SOURCES.find((file) => file.path === 'server/src/tags/access.ts')
+  assert.ok(access, 'server/src/tags/access.ts not found')
+  const check = access.body.slice(access.body.indexOf('export async function requireTagCapability('))
+  const handler = check.slice(check.indexOf('} catch (error) {'))
+  assert.ok(handler.includes("res.status(500).json({ error: 'tag_access_check_failed' })"), 'the slice is not the capability check\'s catch')
+  assert.match(handler, /^\} catch \(error\) \{\s*if \(sendDependencyOutage\(res, error\)\) return null\s*\n/)
 })
 
 test('the leaf modules stay leaves: no import that builds a pool or a client at import time', () => {

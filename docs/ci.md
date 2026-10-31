@@ -161,7 +161,9 @@ evidence the container path did the work.
   is exercised against a real stack — evidence and scope in
   `maplespire-sponsor-kit/docs/operations/backup-drill.md`; `coldApi.ts` itself has unit coverage against a fake
   server, `coldServer.ts` only its entrypoint-selection rule.
-- **`GEN_PREVIEW=1` layout previews.** A developer tool that asserts nothing.
+- **Layout previews** (`npm run gen:layout-preview`). A developer tool that
+  asserts nothing; it lives outside the test suite (`src/lib/layout/genPreview.tool.ts`,
+  its own `vitest.genpreview.config.ts`) rather than as a skipped test file.
 - **The `load:*` gates** in `server/package.json`. Long-running and stateful;
   they stay manual.
 

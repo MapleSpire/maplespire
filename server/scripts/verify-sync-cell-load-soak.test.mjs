@@ -63,7 +63,7 @@ const here = dirname(fileURLToPath(import.meta.url))
 const gateUrl = pathToFileURL(resolve(here, 'verify-sync-cell-load-soak.mjs')).href
 const benchPath = resolve(here, 'sync-cell-bench.mjs')
 import { AuthenticatedWebSocketClientAdapter, qaReconnectDelayMs } from '../qa/authenticatedWebSocketAdapter.mjs'
-import { RehearsalObservations, RehearsalSampler, closeRehearsalSeeder, freshnessIdentityValid, isFreshWitness, measureTakeover, publishRehearsalBases } from './sync-cell-rehearsal.mjs'
+import { RehearsalObservations, RehearsalSampler, closeRehearsalSeeder, freshnessIdentityValid, isFreshWitness, measureTakeover, populationP99, populationTail, publishRehearsalBases } from './sync-cell-rehearsal.mjs'
 import { readRuntimeTopology, inspectRunningTopology, qualifyRuntimeTopology, assertTopologyBuild, revalidateTopologyTargets } from './sync-bench-posture.mjs'
 import { assertCalibrationMeasurement, assertCalibrationReceipt, calibrationHostHashes, calibrationProjectCensus,
   readCalibrationReceipt, runIsolatedCalibrationStage } from './sync-cell-calibration.mjs'
@@ -900,7 +900,8 @@ test('G4-7 failover requires an actual writer inside the acknowledged pause inte
 
 test('G4-7 receives convergence before child close and a slow freshness result', () => {
   let time = 1_000
-  const recorder = new RehearsalObservations({ initialSnapshots: rehearsalSnapshots(20, 0), publish() {}, wall: () => time, monotonic: () => time })
+  const journal = []
+  const recorder = new RehearsalObservations({ initialSnapshots: rehearsalSnapshots(20, 0), publish: event => journal.push(event), wall: () => time, monotonic: () => time })
   const rows = rehearsalEpisode().evidence.baselineResults
   rows[7].convergedAt = 4_000
   const tracker = createLoadOutputTracker(row => recorder.received({ ...row, receivedAt: time }, 'soak', 1))
@@ -910,31 +911,33 @@ test('G4-7 receives convergence before child close and a slow freshness result',
     const line = `QARESULT ${JSON.stringify(raw)}\n`
     tracker.push(line.slice(0, 17)); tracker.push(line.slice(17))
   }
-  assert.equal(recorder.firstFailure.criterion, 'convergence')
-  assert.equal(recorder.firstFailure.value, 3_000)
-  assert.equal(recorder.firstFailure.convergedAt, 4_000)
-  assert.equal(recorder.firstFailure.observedAt, 4_010)
-  time = 5_000
-  recorder.sample(rehearsalSnapshots(150), { phase: 'soak', cycle: 1 })
-  assert.equal(recorder.firstFailure.criterion, 'convergence', 'later diagnostics cannot overtake an already received result')
+  // D60: one episode over budget is a published population member, not a verdict.
+  assert.equal(recorder.firstFailure, null)
+  const over = journal.filter(event => event.kind === 'convergence-episode-over-budget')
+  assert.equal(over.length, 1)
+  assert.equal(over[0].value, 3_000, 'equality is over budget')
+  assert.equal(over[0].convergedAt, 4_000)
+  assert.equal(over[0].observedAt, 4_010)
+  assert.deepEqual([...recorder.convergencePopulation.values()].map(entry => entry.convergenceMs).sort((a, b) => a - b), [900, 3_000])
   assert.equal(recorder.episodes.length, 0, 'stdout reception does not qualify natural exit or an episode')
 })
 
-test('G4-7 an established partition failure does not wait for the other partition', () => {
+test('D60 an episode-partition keeps its final convergence and is published over budget once', () => {
   let time = 1_000
-  const recorder = new RehearsalObservations({ initialSnapshots: rehearsalSnapshots(20, 0), publish() {}, wall: () => time, monotonic: () => time })
+  const journal = []
+  const recorder = new RehearsalObservations({ initialSnapshots: rehearsalSnapshots(20, 0), publish: event => journal.push(event), wall: () => time, monotonic: () => time })
   const rows = rehearsalEpisode().evidence.baselineResults
   rows[0].convergedAt = 4_100
   time = 5_000
   recorder.received(rows[0], 'soak', 1)
-  assert.equal(recorder.firstFailure.criterion, 'convergence')
-  assert.equal(recorder.firstFailure.partition, 0)
-  time = 10_000
-  recorder.sample(rehearsalSnapshots(101), { phase: 'soak', cycle: 1 })
+  assert.equal(recorder.convergencePopulation.get('soak:1:0:convergence').convergenceMs, 3_100)
+  rows[1].convergedAt = 4_500
   time = 20_000
   for (const row of rows.slice(1)) recorder.received(row, 'soak', 1)
-  assert.equal(recorder.firstFailure.observedAt, 5_000)
-  assert.equal(recorder.failures.filter(event => event.criterion === 'convergence').length, 1)
+  assert.equal(recorder.convergencePopulation.size, 2, 'one population member per episode-partition, not per cohort row')
+  assert.equal(recorder.convergencePopulation.get('soak:1:0:convergence').convergenceMs, 3_500, 'the later, larger value replaces the partial one')
+  assert.equal(journal.filter(event => event.kind === 'convergence-episode-over-budget').length, 1)
+  assert.equal(recorder.firstFailure, null)
 })
 
 test('G4-7 malformed early JSON becomes VOID evidence without throwing from stdout', () => {
@@ -1000,35 +1003,128 @@ test('D57 calibration cannot equate two absent process identities or ignore the 
   }
 })
 
-test('G4-7 first crossing survives later larger peaks and equality is a crossing', () => {
+test('D60 a window over budget is published immediately, equality included, and is not a verdict', () => {
   let time = 1_000
   const journal = []
   const recorder = new RehearsalObservations({ initialSnapshots: rehearsalSnapshots(20, 0), publish: event => journal.push(event), wall: () => time, monotonic: () => time })
   recorder.sample(rehearsalSnapshots(99.999), { phase: 'baseline', cycle: 0 })
-  assert.equal(recorder.firstFailure, null)
+  assert.equal(journal.some(event => event.kind === 'event-loop-window-over-budget'), false)
   time = 1_500
   recorder.sample(rehearsalSnapshots(100, 2), { phase: 'baseline', cycle: 0 })
+  assert.equal(journal[2].kind, 'event-loop-window-over-budget', 'published right after the opening and first sample')
+  assert.equal(journal[2].value, 100)
+  assert.equal(journal[2].observedAt, 1_500)
   time = 2_000
   for (let i = 0; i < 13; i++) recorder.sample(rehearsalSnapshots(150 + i, 3 + i), { phase: 'soak', cycle: i + 1 })
-  assert.equal(recorder.firstFailure.criterion, 'event-loop')
-  assert.equal(recorder.firstFailure.value, 100)
-  assert.equal(recorder.firstFailure.observedAt, 1_500)
-  assert.equal(recorder.firstFailure.elapsedMs, 500)
-  assert.equal(journal[2].kind, 'criterion-failed', 'the first crossing is published immediately after the opening and first sample')
+  assert.equal(recorder.firstFailure, null)
+  assert.equal(recorder.loopPopulation['sync-cell-a'].length, 15)
   assert.equal(recorder.maxEventLoopP99MsByService['sync-cell-a'], 162)
 })
 
-test('G4-7 a later unexcluded sample of the former owner counts again', () => {
+test('D60 the drained former-owner window stays out of the population; its next unexcluded sample counts', () => {
   const recorder = new RehearsalObservations({ initialSnapshots: rehearsalSnapshots(20, 0), publish() {} })
   const snapshots = rehearsalSnapshots(20)
   snapshots[0].stats.transport.eventLoopDelayMs.p99 = 5_000
   recorder.sample([snapshots[0]], { phase: 'failover', cycle: 0, drainService: 'sync-cell-a', excludedEventLoopServices: ['sync-cell-a'] })
-  assert.equal(recorder.firstFailure, null)
+  assert.deepEqual(recorder.loopPopulation['sync-cell-a'], [])
   snapshots[0].stats.transport.eventLoopDelayMs.p99 = 150
   snapshots[0].stats.transport.eventLoopWindow.resetCount = 2
   recorder.sample(snapshots, { phase: 'soak', cycle: 1 })
-  assert.equal(recorder.firstFailure.service, 'sync-cell-a')
-  assert.equal(recorder.firstFailure.value, 150)
+  assert.deepEqual(recorder.loopPopulation['sync-cell-a'], [150])
+  assert.deepEqual(recorder.loopPopulation['sync-cell-b'], [20])
+})
+
+// G4-4's executable exit, ratified as D60 (owner, 2026-10-21): a pass of 2 400
+// windows with exactly one at 150 ms PASSES; the population p99 decides.
+function populatedRecorder({ windows = 2_400, overLoop = 0, loopValue = 150, episodes = 200, overConvergence = 0, journal = [] } = {}) {
+  const recorder = new RehearsalObservations({ initialSnapshots: rehearsalSnapshots(20, 0), publish: event => journal.push(event) })
+  for (let i = 0; i < windows; i++) {
+    const rows = rehearsalSnapshots(i < overLoop ? loopValue : 40, i + 1)
+    recorder.sample(rows, { phase: 'soak', cycle: 1 })
+  }
+  recorder.episode(rehearsalEpisode(100, 'baseline').record, 'baseline', 0)
+  recorder.episode(rehearsalEpisode(101, 'failover').record, 'failover', 0)
+  recorder.episode(rehearsalEpisode().record, 'soak', 1)
+  // baseline + soak 1 already give four real steady members; synthetic ones
+  // bring the steady population to `episodes`. Failover keeps its two.
+  const real = [...recorder.convergencePopulation.values()].filter(entry => entry.phase !== 'failover').length
+  if (episodes === 0) for (const [key, entry] of recorder.convergencePopulation) if (entry.phase !== 'failover') recorder.convergencePopulation.delete(key)
+  for (let i = 0; i < episodes - real; i++) {
+    recorder.convergencePopulation.set(`soak:${i + 10}:${i % 2}:convergence`, { phase: 'soak', cycle: i + 10, partition: i % 2,
+      convergenceMs: i < overConvergence ? 3_400 : 450 })
+  }
+  return recorder
+}
+
+const qualifyingFinal = { actualSoakMs: 7_200_000, freshness: { valid: true, freshAfterTakeoverMs: 1_200 }, calibration: { valid: true, freshAfterTakeoverMs: 200 } }
+
+test('D60 ratified: 2400 windows with exactly one at 150 ms PASS; the published maximum is 150', () => {
+  const result = populatedRecorder({ overLoop: 1 }).finish(qualifyingFinal)
+  assert.equal(result.status, 'PASS', JSON.stringify(result.failures))
+  assert.equal(result.eventLoopPopulation['sync-cell-a'].windows, 2_400)
+  assert.equal(result.eventLoopPopulation['sync-cell-a'].maxMs, 150)
+  assert.equal(result.eventLoopPopulation['sync-cell-a'].overBudget, 1)
+  assert.equal(result.eventLoopPopulation['sync-cell-a'].allowedOverBudget, 24)
+  assert.equal(result.eventLoopPopulation['sync-cell-a'].longestOverBudgetRun, 1)
+  assert.equal(result.eventLoopPopulation['sync-cell-a'].legacyMaxRuleFailed, true, 'the report shows where D60 changed the verdict')
+  assert.equal(result.eventLoopPopulation['sync-cell-a'].p99Ms, 40)
+  assert.equal(populationP99([150]), 150, 'a single-window population is its own p99: the maximum is never excluded by construction')
+})
+
+test('D60 boundary: 24 of 2400 windows over budget PASS, 25 FAIL on the population p99 of that cell', () => {
+  assert.equal(populatedRecorder({ overLoop: 24 }).finish(qualifyingFinal).status, 'PASS')
+  const failed = populatedRecorder({ overLoop: 25 }).finish(qualifyingFinal)
+  assert.equal(failed.status, 'FAIL')
+  const loop = failed.failures.filter(event => event.criterion === 'event-loop')
+  assert.equal(loop.length, 3, 'each cell is its own population')
+  assert.equal(loop[0].statistic, 'population-p99')
+  assert.equal(loop[0].value, 150)
+  assert.equal(loop[0].overBudget, 25)
+  assert.equal(loop[0].allowedOverBudget, 24)
+  assert.equal(populatedRecorder({ overLoop: 25, loopValue: 100 }).finish(qualifyingFinal).status, 'FAIL', 'a p99 equal to the budget fails')
+})
+
+test('D60 convergence: 2 of 200 episode-partitions over budget PASS, 3 FAIL', () => {
+  assert.equal(populatedRecorder({ overConvergence: 2 }).finish(qualifyingFinal).status, 'PASS')
+  const failed = populatedRecorder({ overConvergence: 3 }).finish(qualifyingFinal)
+  assert.equal(failed.status, 'FAIL')
+  assert.deepEqual(failed.failures.map(event => [event.criterion, event.value, event.overBudget]), [['convergence', 3_400, 3]])
+  assert.deepEqual(failed.convergencePopulation.steady.byPartition.map(entry => entry.overBudget), [2, 1])
+})
+
+test('D60 the failover episode is not pooled: one partition at 3000 ms fails at once, before the pass ends', () => {
+  let time = 1_000
+  const recorder = new RehearsalObservations({ initialSnapshots: rehearsalSnapshots(20, 0), publish() {}, wall: () => time, monotonic: () => time })
+  const rows = rehearsalEpisode(101, 'failover').evidence.baselineResults
+  rows[0].convergedAt = rows[0].convergedAt + 30_000
+  for (const row of rows) recorder.received(row, 'failover', 0)
+  assert.equal(recorder.firstFailure?.criterion, 'convergence')
+  assert.equal(recorder.firstFailure.statistic, 'failover-each')
+  const pooled = populatedRecorder()
+  for (const [key, entry] of pooled.convergencePopulation) if (entry.phase === 'failover') pooled.convergencePopulation.delete(key)
+  const result = pooled.finish(qualifyingFinal)
+  assert.equal(result.status, 'VOID', 'a pass without its two failover partitions cannot qualify')
+  assert.ok(pooled.invalid.some(event => /failover convergence population/.test(event.reason)))
+})
+
+test('D60 an empty population is VOID, never a vacuous PASS', () => {
+  const noWindows = populatedRecorder({ windows: 0 })
+  assert.equal(noWindows.finish(qualifyingFinal).status, 'VOID')
+  assert.ok(noWindows.invalid.some(event => event.reason === 'empty event-loop window population'))
+  const noEpisodes = populatedRecorder({ episodes: 0 })
+  assert.equal(noEpisodes.finish(qualifyingFinal).status, 'VOID')
+  assert.ok(noEpisodes.invalid.some(event => event.reason === 'empty convergence population'))
+})
+
+test('D60 the supplementary evaluator stops gating maxima only for the population-gated caller', () => {
+  const slowLoop = evidence({ metrics: { ...evidence().metrics, maxEventLoopP99Ms: config.maxEventLoopP99Ms + 1 } })
+  assert.throws(() => evaluateLoadSoakEvidence(slowLoop, config), /event-loop p99 exceeded budget/)
+  assert.doesNotThrow(() => evaluateLoadSoakEvidence(slowLoop, { ...config, populationGated: true }))
+  const slowFailover = evidence({ failoverResults: [result(config.failoverConvergenceBudgetMs + 1, 0), result(1_100, 1)] })
+  assert.throws(() => evaluateLoadSoakEvidence(slowFailover, config), /failover convergence exceeded budget/)
+  assert.throws(() => evaluateLoadSoakEvidence(slowFailover, { ...config, populationGated: true }), /failover convergence exceeded budget/, 'failover is never population-gated')
+  const diverged = evidence({ failoverResults: [{ ...result(8_000, 0), hotDiverged: 1 }, result(1_100, 1)] })
+  assert.throws(() => evaluateLoadSoakEvidence(diverged, { ...config, populationGated: true }), /diverged/, 'lost-edit guards are never population-gated')
 })
 
 test('G4-7 incomplete samples and resets are VOID instead of zero', () => {
@@ -3109,4 +3205,158 @@ test('outside a posture qualification, cohorts are released together and only on
   assert.equal(admission.cohorts.length, 4)
   assert.deepEqual(released, ready.map((item) => [item.partition, item.cohort, nonce]))
   await assert.rejects(releaseCohortsIfReady(barrierId, ready, () => barrierId), /separate nonce/)
+})
+
+// QA lens on D60 (2026-10-21) — each test below was RED on a named mutant and
+// green on the real code; adapted to the failover-not-pooled revision.
+test('D60 QA nearest rank: a fractional rank rounds UP, so below 100 members the p99 is the maximum', () => {
+  const ramp = n => Array.from({ length: n }, (_, index) => index + 1)
+  assert.equal(populationP99(ramp(60)), 60, 'ceil(59.4) = 60; floor or round would give 59')
+  assert.equal(populationP99(ramp(99)), 99)
+  assert.equal(populationP99(ramp(100)), 99)
+  assert.equal(populationP99(ramp(150)), 149, 'ceil(148.5) = 149')
+  assert.equal(populationP99(ramp(14_400)), 14_256, 'a two-hour pass of 500 ms windows')
+  assert.equal(populationP99(ramp(60).reverse()), 60, 'arrival order is irrelevant')
+  assert.equal(populationP99([]), null)
+  assert.equal(populationP99([1, Number.NaN]), null, 'a non-finite member voids the statistic instead of being dropped')
+})
+
+test('D60 QA one slow cell FAILS although the fleet-wide pooled p99 would pass', () => {
+  const recorder = populatedRecorder({ windows: 0 })
+  for (let i = 0; i < 2_400; i++) {
+    const rows = rehearsalSnapshots(40, i + 1)
+    if (i < 25) rows.find(row => row.service === 'sync-cell-a').stats.transport.eventLoopDelayMs.p99 = 150
+    recorder.sample(rows, { phase: 'soak', cycle: 1 })
+  }
+  const result = recorder.finish(qualifyingFinal)
+  assert.equal(result.status, 'FAIL')
+  assert.deepEqual(result.failures.map(event => [event.criterion, event.service, event.value]), [['event-loop', 'sync-cell-a', 150]])
+  assert.equal(result.eventLoopPopulation['sync-cell-b'].p99Ms, 40)
+})
+
+test('D60 QA one cell with an empty population VOIDs the pass even when the others are populated', () => {
+  const recorder = populatedRecorder()
+  recorder.loopPopulation['sync-cell-c'].length = 0
+  const result = recorder.finish(qualifyingFinal)
+  assert.equal(result.status, 'VOID')
+  assert.deepEqual(result.invalid.filter(event => event.reason === 'empty event-loop window population').map(event => event.service), ['sync-cell-c'])
+})
+
+test('D60 QA equality at the budget: a population p99 of exactly 100 ms or 3000 ms FAILS, counted and published', () => {
+  const loop = populatedRecorder({ overLoop: 25, loopValue: 100 }).finish(qualifyingFinal)
+  assert.equal(loop.status, 'FAIL')
+  assert.equal(loop.eventLoopPopulation['sync-cell-a'].overBudget, 25, 'a window equal to the budget is over it')
+  assert.equal(loop.eventLoopPopulation['sync-cell-a'].maxMs, 100)
+  const recorder = populatedRecorder()
+  const steady = [...recorder.convergencePopulation.values()].filter(entry => entry.phase !== 'failover')
+  for (const entry of steady.slice(-3)) entry.convergenceMs = 3_000
+  const convergence = recorder.finish(qualifyingFinal)
+  assert.equal(convergence.status, 'FAIL')
+  assert.deepEqual(convergence.failures.map(event => [event.criterion, event.value, event.overBudget]), [['convergence', 3_000, 3]])
+  assert.equal(convergence.convergencePopulation.steady.maxMs, 3_000, 'the published maximum is the maximum, not the first member')
+  assert.equal(convergence.convergencePopulation.steady.episodePartitions, 200)
+})
+
+test('D60 QA failover partitions are recorded but kept out of the steady population', () => {
+  const recorder = new RehearsalObservations({ initialSnapshots: rehearsalSnapshots(20, 0), publish() {} })
+  for (const row of rehearsalEpisode(101, 'failover').evidence.baselineResults) recorder.received(row, 'failover', 0)
+  for (const row of rehearsalEpisode(102).evidence.baselineResults) recorder.received(row, 'soak', 1)
+  assert.deepEqual([...recorder.convergencePopulation.keys()].sort(),
+    ['failover:0:0:convergence', 'failover:0:1:convergence', 'soak:1:0:convergence', 'soak:1:1:convergence'])
+  const result = populatedRecorder().finish(qualifyingFinal)
+  assert.equal(result.convergencePopulation.failover.length, 2)
+  assert.equal(result.convergencePopulation.steady.episodePartitions, 200, 'the two failover members are not steady members')
+})
+
+test('D60 QA a steady episode that lost a partition VOIDs the pass instead of shrinking the population', () => {
+  const recorder = populatedRecorder()
+  recorder.convergencePopulation.delete('soak:1:1:convergence')
+  const result = recorder.finish(qualifyingFinal)
+  assert.equal(result.status, 'VOID')
+  assert.ok(result.invalid.some(event => event.reason === 'steady episode missing from the convergence population'
+    && event.cycle === 1 && event.missing.join() === '1'))
+})
+
+test('D60 QA lost edits stay an immediate per-event failure: one missing field or refused own edit fails at reception', () => {
+  let time = 1_000
+  const recorder = new RehearsalObservations({ initialSnapshots: rehearsalSnapshots(20, 0), publish() {}, wall: () => time, monotonic: () => time })
+  const rows = rehearsalEpisode().evidence.baselineResults
+  rows[3].missingFields = 1
+  time = 2_000
+  for (const row of rows) recorder.received(row, 'soak', 1)
+  assert.equal(recorder.firstFailure?.criterion, 'lost-edits')
+  assert.equal(recorder.firstFailure.value, 1)
+  assert.equal(recorder.firstFailure.observedAt, 2_000, 'at reception, not deferred to finish')
+  assert.equal(recorder.failures.filter(event => event.criterion === 'lost-edits').length, 1, 'once per episode')
+  const refused = new RehearsalObservations({ initialSnapshots: rehearsalSnapshots(20, 0), publish() {} })
+  const own = rehearsalEpisode().evidence.baselineResults
+  own.find(row => row.localOwnFieldsAfterEdit.length).localOwnFieldsAfterEdit[0].values = [null]
+  for (const row of own) refused.received(row, 'soak', 1)
+  assert.deepEqual(refused.failures.map(event => [event.criterion, event.value]), [['lost-edits', 1]])
+})
+
+test('D60 QA populationGated lifts only the loop and steady-convergence maxima; every other evaluator guard still fails', () => {
+  const gated = { ...config, populationGated: true }
+  const slowNormal = evidence({ baselineResults: [result(config.normalConvergenceBudgetMs + 1, 0), result(900, 1)] })
+  assert.throws(() => evaluateLoadSoakEvidence(slowNormal, config), /normal-load convergence exceeded budget/)
+  assert.doesNotThrow(() => evaluateLoadSoakEvidence(slowNormal, gated), 'normal-load convergence is population-gated too')
+  const unmeasured = evidence({ baselineResults: [result(900, 0), { ...result(900, 1), lastWriteCompletedAt: null, editCompletedAt: null }] })
+  const unmeasuredSummary = summarizeCycleConvergence(unmeasured.baselineResults.map(convergedResult))
+  if (unmeasuredSummary.some(entry => !Number.isFinite(entry.convergenceMs))) {
+    assert.throws(() => evaluateLoadSoakEvidence(unmeasured, gated), /normal-load convergence exceeded budget/, 'an unmeasurable convergence fails even when gated')
+  }
+  const normalDiverged = evidence({ soakResults: [{ ...result(800, 0), missingFields: 1 }, result(950, 1)] })
+  assert.throws(() => evaluateLoadSoakEvidence(normalDiverged, gated), /a normal-load workspace diverged/)
+  const disagree = evidence({ failoverResults: [result(8_000, 0), result(1_100, 1), { ...result(1_100, 1), cohort: 1, hotValues: ['other'] }] })
+  assert.throws(() => evaluateLoadSoakEvidence(disagree, gated), /failover cohorts disagree/)
+  const slowTakeover = evidence({ takeover: { ...evidence().takeover, takeoverMs: config.takeoverBudgetMs + 1 } })
+  assert.throws(() => evaluateLoadSoakEvidence(slowTakeover, gated), /spare-cell takeover exceeded budget/)
+})
+
+test('D60 QA only the rehearsal is population-gated, and its takeover stays a per-event failure', () => {
+  const start = gateSource.indexOf('async function runLocalRehearsal(')
+  assert.notEqual(start, -1)
+  const rehearsal = gateSource.slice(start, gateSource.indexOf('\n}\n', start))
+  assert.match(rehearsal, /evaluateLoadSoakEvidence\(evidence, \{ \.\.\.config, benchPosture: null, populationGated: true \}\)/)
+  assert.equal((gateSource.match(/populationGated: true/g) ?? []).length, 1, 'no other caller is population-gated')
+  assert.match(rehearsal, /if \(value\.takeoverMs >= 2_000\) observations\.fail\('takeover', value\.takeoverMs,/)
+})
+
+test('D61 the qualification fleet profile keeps writer actors; contention and overrides stay explicit', () => {
+  assert.equal(LOAD_PROFILES.fleet.writerActors, 'persistent')
+  assert.equal(LOAD_PROFILES.contention.writerActors, 'fresh')
+  assert.equal(parseLoadSoakConfig({ SYNC_LOAD_PROFILE: 'fleet' }, []).writerActors, 'persistent')
+  assert.equal(parseLoadSoakConfig({ SYNC_LOAD_PROFILE: 'fleet', SYNC_LOAD_WRITER_ACTORS: 'fresh' }, []).writerActors, 'fresh')
+  assert.throws(() => parseLoadSoakConfig({ SYNC_LOAD_WRITER_ACTORS: 'sticky' }, []), /fresh or persistent/)
+  assert.match(gateSource, /'--writerActors', config\.writerActors,/)
+})
+
+// QA lens, revision 2 (2026-10-21): each test below was RED on a named mutant.
+test('D60 QA2 populationTail: tolerance is n - ceil(0.99 n), runs reset, equality is over budget', () => {
+  assert.equal(populationTail(Array(150).fill(0), 100).allowedOverBudget, 1, 'ceil(148.5) = 149; floor would allow 2')
+  assert.equal(populationTail(Array(60).fill(0), 100).allowedOverBudget, 0, 'below 100 members nothing is tolerated')
+  assert.equal(populationTail([], 100).allowedOverBudget, 0)
+  const tail = populationTail([100, 0, 100, 100, 0, 100], 100)
+  assert.equal(tail.overBudget, 4)
+  assert.equal(tail.longestOverBudgetRun, 2, 'an under-budget window ends the run')
+  assert.equal(tail.legacyMaxRuleFailed, true, 'a window equal to the budget failed the pre-D60 rule')
+  assert.equal(tail.maxMs, 100)
+  const clean = populationTail([99.9, 50, 99.9], 100)
+  assert.deepEqual([clean.overBudget, clean.longestOverBudgetRun, clean.legacyMaxRuleFailed], [0, 0, false])
+})
+
+test('D60 QA2 a failover population of more than two partitions is VOID, not truncated', () => {
+  const recorder = populatedRecorder()
+  recorder.convergencePopulation.set('failover:1:0:convergence', { phase: 'failover', cycle: 1, partition: 0, convergenceMs: 900 })
+  const result = recorder.finish(qualifyingFinal)
+  assert.equal(result.status, 'VOID')
+  assert.ok(result.invalid.some(event => /failover convergence population/.test(event.reason) && event.failover === 3))
+  assert.equal(result.convergencePopulation.failover.length, 3, 'every failover member is published')
+})
+
+test('D61 QA2 a posture qualification refuses fresh writer actors', () => {
+  const env = { SYNC_BENCH_POSTURE: 'shipped', SYNC_LOAD_PROFILE: 'fleet' }
+  assert.equal(parseLoadSoakConfig(env, []).writerActors, 'persistent')
+  assert.throws(() => parseLoadSoakConfig({ ...env, SYNC_LOAD_WRITER_ACTORS: 'fresh' }, []),
+    /T-POST qualification configuration refused: writerActors="fresh" \(requires "persistent"\)/)
 })

@@ -16,6 +16,9 @@ import { create } from 'zustand'
 
 export type AutomergeStatus = 'connecting' | 'saving' | 'ready' | 'offline' | 'error'
 
+/** Why a repoint HELD this tab instead of carrying it (`workspaceRepointNotice`). */
+export type WorkspaceRepointHoldReason = 'unsaved-work' | 'boot-fallback'
+
 /**
  * WHAT THE BADGE MAY SAY WHILE A ROUTED READ IS BEING RETRIED.
  *
@@ -91,8 +94,12 @@ interface AutomergeStatusState {
    * untouched and still says `'current'`, so the banner's condition is "still on
    * the alias, in this landscape" — any real move away hides it without a rule
    * to forget. Nothing here is persisted: a reload ends the hold on its own.
+   *
+   * `reason` is why the tab was held rather than carried: `unsaved-work`, or
+   * `boot-fallback` — this session booted from its cached root because the
+   * new default's did not arrive (see `onWorkspaceBound` in bridge.ts).
    */
-  workspaceRepointNotice: { landscapeId: string; pinnedVersionId: string } | null
+  workspaceRepointNotice: { landscapeId: string; pinnedVersionId: string; reason: WorkspaceRepointHoldReason } | null
   /**
    * Bumped each time the sync transport comes BACK (not connected → connected).
    *
@@ -110,7 +117,10 @@ interface AutomergeStatusState {
   /** The bridge saw the workspace contract change mid-session — ask for a reload. */
   markWorkspaceContractStale: () => void
   /** The transport was held on `versionId` because the landscape's default moved. */
-  noteWorkspacePinnedAfterRepoint: (workspace: { landscapeId: string; versionId: string }) => void
+  noteWorkspacePinnedAfterRepoint: (
+    workspace: { landscapeId: string; versionId: string },
+    reason: WorkspaceRepointHoldReason,
+  ) => void
   /** The user acknowledged the notice. */
   dismissWorkspaceRepointNotice: () => void
   /**
@@ -161,10 +171,11 @@ export const useAutomergeStatus = create<AutomergeStatusState>((set) => ({
   setBootFallbackActive: (active) => set({ bootFallbackActive: active }),
   markWorkspaceContractStale: () => set({ workspaceContractStale: true }),
   clearWorkspaceContractStale: () => set({ workspaceContractStale: false }),
-  noteWorkspacePinnedAfterRepoint: (workspace) => set({
+  noteWorkspacePinnedAfterRepoint: (workspace, reason) => set({
     workspaceRepointNotice: {
       landscapeId: workspace.landscapeId,
       pinnedVersionId: workspace.versionId,
+      reason,
     },
   }),
   dismissWorkspaceRepointNotice: () => set({ workspaceRepointNotice: null }),

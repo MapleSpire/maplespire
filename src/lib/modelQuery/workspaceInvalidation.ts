@@ -18,6 +18,7 @@ import {
   workspaceRefKey,
   type WorkspaceRef,
 } from '../automerge/workspace'
+import { workspaceSearchParams } from './workspaceParams'
 
 import { API_BASE } from '../api/base'
 
@@ -30,24 +31,27 @@ type Listener = (event: WorkspaceInvalidation) => void
 
 const listeners = new Set<Listener>()
 let source: EventSource | null = null
-let sourceWorkspaceKey: string | null = null
+let sourceUrl: string | null = null
 let workspaceUnsubscribe: (() => void) | null = null
 let lifecycleInstalled = false
 let pending: WorkspaceInvalidation | null = null
 let flushScheduled = false
 
-function eventUrl(workspace: WorkspaceRef): string {
-  const params = new URLSearchParams({
-    landscapeId: workspace.landscapeId,
-    versionId: workspace.versionId,
-  })
-  return `${API_BASE}/api/model/cache/events?${params.toString()}`
+/** The generations streamed are those of the workspace the READS address
+ * (`workspaceSearchParams`) when the stream opens, not of the `'current'`
+ * alias: the bridge compares them with the generation of the render it fetched,
+ * and after a repoint the alias's generations belong to another version's
+ * projector. Opening is re-evaluated on every subscribe (the bridge subscribes
+ * after each boot), a ref change, `online` and visibility — not on a hold or a
+ * basis change by themselves. */
+function eventUrl(): string {
+  return `${API_BASE}/api/model/cache/events?${workspaceSearchParams().toString()}`
 }
 
 function closeSource(): void {
   source?.close()
   source = null
-  sourceWorkspaceKey = null
+  sourceUrl = null
 }
 
 function parseGeneration(event: Event): number | null {
@@ -96,12 +100,12 @@ function openSource(): void {
     return
   }
   const workspace = currentWorkspaceRef()
-  const workspaceKey = workspaceRefKey(workspace)
-  if (source && sourceWorkspaceKey === workspaceKey) return
+  const url = eventUrl()
+  if (source && sourceUrl === url) return
   closeSource()
-  const next = new EventSource(eventUrl(workspace), { withCredentials: true })
+  const next = new EventSource(url, { withCredentials: true })
   source = next
-  sourceWorkspaceKey = workspaceKey
+  sourceUrl = url
   next.addEventListener('ready', (event) => {
     const generation = parseGeneration(event)
     if (source === next && generation !== null) enqueue('ready', workspace, generation)

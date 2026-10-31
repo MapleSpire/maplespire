@@ -19,6 +19,10 @@ import { appendAudit } from '../auth/audit.js'
 import { clampInviteTtlHours } from '../auth/invites.js'
 import { explainAccess } from './access.js'
 import { getOrgReadModelHealth } from '../readModel/health.js'
+import { isDeadlockVictim } from '../readModel/projectionAuthority.js'
+
+/** PUT /access attempts when Postgres picks the batch as a deadlock victim. */
+const ACCESS_BATCH_ATTEMPTS = 3
 
 /**
  * Org Admin console REST endpoints. Every route here requires `req.auth` (401 otherwise) and
@@ -307,6 +311,11 @@ export function registerOrgAdminRoutes(app: import('express').Express): void {
     const client = await pool.connect()
     try {
       await client.query('BEGIN')
+      // The permission-write lock BEFORE the admin rows below: the role UPDATE
+      // takes it anyway (statement trigger), and taking it after these row
+      // locks would be the reverse of every other permission writer (reviewer
+      // lens, 2026-10-17; rbac/schema.ts lock_permission_writes).
+      await client.query('SELECT lock_permission_writes()')
 
       // Lock every admin row of this org for the duration of the tx so a
       // concurrent demote/remove of a DIFFERENT admin can't race this one
@@ -369,6 +378,8 @@ export function registerOrgAdminRoutes(app: import('express').Express): void {
     const client = await pool.connect()
     try {
       await client.query('BEGIN')
+      // Before the admin rows, as in PATCH above (the DELETE takes it anyway).
+      await client.query('SELECT lock_permission_writes()')
 
       const { rows: adminRows } = await client.query<{ user_id: string }>(
         `SELECT user_id FROM org_members WHERE org_id = $1 AND role = 'admin' FOR UPDATE`,
@@ -1100,7 +1111,10 @@ export function registerOrgAdminRoutes(app: import('express').Express): void {
     const scopeIds = [...new Set(validChanges.map((c) => c.scopeId))]
 
     const client = await pool.connect()
-    try {
+    let committed = false
+    // One attempt of the whole batch, BEGIN to response. Re-run as a whole if
+    // Postgres picks it as a deadlock victim (below).
+    const applyOnce = async (): Promise<void> => {
       await client.query('BEGIN')
 
       const { rows: ownedTeams } = await client.query<{ id: string }>(
@@ -1124,6 +1138,13 @@ export function registerOrgAdminRoutes(app: import('express').Express): void {
 
       const conflicts: Array<{ teamId: string; scopeId: string; resourceType: string }> = []
       const diff: Array<{ teamId: string; scopeId: string; resourceType: string; before: unknown; after: unknown }> = []
+
+      // The permission-write lock BEFORE the first row lock below. The
+      // statement triggers take it too, but a SELECT … FOR UPDATE fires no
+      // trigger; two batches over the same grant rows in opposite order would
+      // otherwise invert on the rows themselves (rbac/schema.ts
+      // lock_permission_writes; epochDeadlock.integration.test.ts pins it).
+      await client.query('SELECT lock_permission_writes()')
 
       for (const change of validChanges) {
         // Row-level lock so a concurrent batch touching the same
@@ -1207,6 +1228,7 @@ export function registerOrgAdminRoutes(app: import('express').Express): void {
       )
 
       await client.query('COMMIT')
+      committed = true
 
       await appendAudit(pool, {
         orgId,
@@ -1224,9 +1246,26 @@ export function registerOrgAdminRoutes(app: import('express').Express): void {
           landscapeId: r.landscape_id,
         })),
       })
-    } catch (err) {
-      await client.query('ROLLBACK').catch(() => {})
-      fail(res, 'Failed to apply access changes', err)
+    }
+
+    try {
+      for (let attempt = 1; ; attempt++) {
+        try {
+          await applyOnce()
+          return
+        } catch (err) {
+          await client.query('ROLLBACK').catch(() => {})
+          // Backstop for the inversions the org lock does not order (a row
+          // locked BEFORE the lock by a concurrent single-row writer — e.g.
+          // invite accept for an existing member vs. a team add of the same
+          // key; architect lens, 2026-10-16). Postgres rolled the victim back
+          // whole, so re-running the batch is the same request again. Never
+          // after COMMIT: that would apply it twice.
+          if (!committed && isDeadlockVictim(err) && attempt < ACCESS_BATCH_ATTEMPTS) continue
+          fail(res, 'Failed to apply access changes', err)
+          return
+        }
+      }
     } finally {
       client.release()
     }

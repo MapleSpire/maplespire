@@ -23,8 +23,10 @@ import {
   objectMap,
   percentile,
   planWriters,
+  persistentWriterActor,
   resolveLoadHandle,
 } from './loadUsersCore.mjs'
+import { createHash } from 'node:crypto'
 import { requestedDocumentShare } from './lib.mjs'
 import {
   closeQaSocket,
@@ -292,4 +294,14 @@ test('fails convergence, backpressure and missing telemetry explicitly', () => {
     ...base,
     serverTransport: { ...base.serverTransport, backpressureDisconnectsDelta: 1 },
   })[0], /backpressure/)
+})
+
+test('D61 QA the persistent actor is bound to its root and its writer, deterministically', () => {
+  const rootA = 'automerge:2nqJYbZSmPLsDLPBHyUqsfsAXvYY', rootB = 'automerge:3xVhUPqAU4RqvAoL5JvH5n6Fy7Fu'
+  const actor = persistentWriterActor(rootA, 0)
+  assert.match(actor, /^[0-9a-f]{32}$/)
+  assert.equal(actor, createHash('sha256').update('maplespire-load-writer:' + rootA + ':0').digest('hex').slice(0, 32), 'derivation pinned')
+  assert.equal(persistentWriterActor(rootA, 0), actor, 'stable across cold Repos of one pass')
+  assert.notEqual(persistentWriterActor(rootB, 0), actor, 'a new root (a new pass) never inherits an actor')
+  assert.notEqual(persistentWriterActor(rootA, 1), actor, 'two writers never share an actor')
 })

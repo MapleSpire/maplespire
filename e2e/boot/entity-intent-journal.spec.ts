@@ -206,6 +206,17 @@ test.describe('entity-intent journal — crash before flush', () => {
     const reopenedContext = await chromium.launchPersistentContext(userDataDir, { baseURL })
     await reopenedContext.addInitScript(flags)
     const reopened = reopenedContext.pages()[0] ?? await reopenedContext.newPage()
+    // What the replay asks its server durability witness, and what comes back.
+    const witnessAnswers: Array<{ asked: { landscapeId: string | null; versionId: string | null }; echo: unknown }> = []
+    reopened.on('response', async (response) => {
+      const url = new URL(response.url())
+      if (url.pathname !== '/api/model/durability-witness' || !response.ok()) return
+      const body = await response.json().catch(() => ({})) as { landscapeId?: unknown; versionId?: unknown }
+      witnessAnswers.push({
+        asked: { landscapeId: url.searchParams.get('landscapeId'), versionId: url.searchParams.get('versionId') },
+        echo: { landscapeId: body.landscapeId, versionId: body.versionId },
+      })
+    })
     await signIn(reopened)
     await openModelObjects(reopened)
 
@@ -222,6 +233,17 @@ test.describe('entity-intent journal — crash before flush', () => {
         return (w.__bridgeDebug?.().editsObj ?? 0) >= 1
       }, createdId), { timeout: 30_000 })
       .toBe(true)
+
+    // The crashed entity is in no overlay, so the replay asked the server
+    // witness about it — and must have asked about the CONCRETE version this
+    // tab booted, never the `current` alias. The route echoes the version it
+    // resolved; an alias request could never match its own echo, and before
+    // this was fixed every answer a `current` tab got was thrown away.
+    await expect.poll(() => witnessAnswers.length, { timeout: 30_000 }).toBeGreaterThan(0)
+    for (const answer of witnessAnswers) {
+      expect(answer.asked.versionId, 'the witness is asked about a concrete version').not.toBe('current')
+      expect(answer.echo, 'the server answered about exactly what was asked').toEqual(answer.asked)
+    }
 
     // And it must become DURABLE without any further user action: the badge
     // may only claim ready once the journal drained into the overlay doc.

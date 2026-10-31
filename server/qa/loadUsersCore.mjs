@@ -12,6 +12,35 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU Affero General Public License for more details.
 
+import { createHash } from 'node:crypto'
+import * as A from '@automerge/automerge'
+
+/** D61: the actor a load writer keeps for as long as its root lives. */
+export function persistentWriterActor(root, writer) {
+  return createHash('sha256').update(`maplespire-load-writer:${root}:${writer}`).digest('hex').slice(0, 32)
+}
+
+/**
+ * D61: a cold Repo adopts its writer's persistent actor once the document is
+ * ready. The clone keeps the full history, so the actor's next change continues
+ * its sequence.
+ *
+ * NOT loud in every case (QA lens, 2026-10-21, automerge 3.2.6 / repo
+ * 2.6.0-alpha.2): if the actor's previous change reached a former owner but not
+ * the current one, the next cold writer reuses that (actor, seq). The current
+ * owner's sync rejects it as an unhandledRejection the server only logs, and the
+ * former holder diverges silently; pure Automerge throws `duplicate seq` on
+ * merge/load. In the gate that needs a change lost on a failover first, which
+ * already fails convergence or lost-edits for that cycle — so it cannot turn a
+ * failing pass into a PASS; soak workspaces are fresh per pass.
+ */
+export function adoptPersistentWriterActor(handle, root, writer) {
+  const actor = persistentWriterActor(root, writer)
+  handle.update(doc => A.clone(doc, { actor }))
+  if (A.getActorId(handle.doc()) !== actor) throw new Error('persistent writer actor was not adopted')
+  return actor
+}
+
 export function objectMap(document) {
   if (document?.model?.objects && typeof document.model.objects === 'object') return document.model.objects
   if (document?.objects && typeof document.objects === 'object') return document.objects

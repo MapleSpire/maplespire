@@ -15,7 +15,9 @@
 /**
  * An admin repointed this landscape's default version while the tab was open,
  * and the tab was HELD on the version it was already editing instead of being
- * carried to the new one, because it had unsaved work here.
+ * carried to the new one — because it had unsaved work here, or because this
+ * session booted from its cached root after the new default's did not arrive
+ * (`notice.reason`; the button is then a retry of that boot).
  *
  * This must not be silent. The ref is untouched (still `'current'`, nothing in
  * localStorage, same address bar); only the TRANSPORT was re-pointed, so the tab
@@ -59,6 +61,7 @@ export function WorkspaceRepointBanner() {
     <>
       <div
         data-testid="workspace-repoint-banner"
+        data-reason={notice.reason}
         role="status"
         aria-live="polite"
         className={cn(
@@ -68,7 +71,9 @@ export function WorkspaceRepointBanner() {
       >
         <GitBranch className="h-3.5 w-3.5 shrink-0" />
         <span className="truncate text-[12.5px] font-medium">
-          {t('workspace.repointed.message')}
+          {notice.reason === 'boot-fallback'
+            ? t('workspace.repointed.messageBootFallback')
+            : t('workspace.repointed.message')}
         </span>
         <button
           data-testid="workspace-repoint-follow"

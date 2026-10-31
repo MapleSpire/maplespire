@@ -22,6 +22,9 @@
 //   --writers W            only users with global index < W write; the others
 //                          connect, hold the document and must still converge.
 //                          Default: every user writes (the historical shape).
+//   --writerActors M       `fresh` (default): every cold Repo writes under a new
+//                          actor; `persistent`: writer w keeps one actor derived
+//                          from the root URL for as long as the root lives (D61).
 //   --objectAssignment A   `shared` (default): every writer writes every object;
 //                          `per-writer`: writer w writes object ids[w % objects]
 //                          only, so writers ≤ objects means no contended object.
@@ -52,7 +55,9 @@ const o = args({
   maxEventLoopP99: null,
   writers: null,
   objectAssignment: 'shared',
+  writerActors: 'fresh',
 })
+if (!['fresh', 'persistent'].includes(o.writerActors)) throw new Error('--writerActors must be fresh or persistent')
 const totalUsers = o.totalUsers ?? o.users
 if (!Number.isInteger(o.userOffset) || o.userOffset < 0
   || !Number.isInteger(totalUsers) || totalUsers < o.users
@@ -91,7 +96,7 @@ for (let i = 0; i < o.users; i++) {
   // exact document it is about to request under selective sync.
   // Own partial initialization too, before either add or connect can reject.
   const user = await cohort.add(o.userOffset + i, { rootUrl, ids, totalUsers, writers,
-    objectAssignment: o.objectAssignment, rounds: o.rounds, runBatchPrefix })
+    objectAssignment: o.objectAssignment, writerActors: o.writerActors, rounds: o.rounds, runBatchPrefix })
   // Three 10 s resolution attempts plus retry/cache work must fit inside the
   // transport deadline; the outer fleet-admission deadline remains unchanged.
   const connected = await cohort.call(user, 'connect', { phase: 'connect' }, {}, { timeoutMs: 35_000 })

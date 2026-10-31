@@ -111,5 +111,5 @@ and register it in `src/lib/import/registry.ts`. The UI is source-agnostic.
 
 - `npx vitest run` — parser, mapper, layout, metrics, import, and store tests,
   including real-world fixtures (`src/lib/structurizr/fixtures/*.dsl`).
-- Visual previews: `GEN_PREVIEW=1 npx vitest run src/lib/layout/genPreview.test.ts`
+- Visual previews: `npm run gen:layout-preview` (writes SVGs to `preview/`)
   writes SVGs of every generated diagram to `preview/` (open `preview/index.html`).

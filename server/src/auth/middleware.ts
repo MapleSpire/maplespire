@@ -13,7 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import type { NextFunction, Request, RequestHandler, Response } from 'express'
-import { clearSessionCookie, readSessionCookie, verifySession, type SessionClaims } from './tokens.js'
+import { clearSessionCookie, readSessionCookie, rememberSessionEnded, verifySession, type SessionClaims } from './tokens.js'
 import { AsyncSingleFlight } from '../performance/asyncSingleFlight.js'
 
 /**
@@ -192,6 +192,7 @@ export function requireAuth(options: RequireAuthOptions = {}): RequestHandler {
               next()
               return
             }
+            rememberSessionEnded(res)
             clearSessionCookie(res)
             res.status(401).json({ error: 'Session permissions changed; sign in again', code: 'session_stale' })
             return

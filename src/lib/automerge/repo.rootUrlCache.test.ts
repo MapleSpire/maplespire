@@ -49,6 +49,13 @@ import {
   __setWorkspaceNetworkRouteForTest,
 } from './repo'
 import { DocumentTemporarilyUnavailableError } from './documentResolution'
+import {
+  __resetResolvedWorkspacesForTest,
+  adoptBindingAsBasis,
+  documentsWorkspaceFor,
+  rememberResolvedWorkspace,
+  resolvedWorkspaceFor,
+} from './workspaceBinding'
 import { workspaceRefKey, type WorkspaceRef } from './workspace'
 import type { RootDoc } from './types'
 
@@ -175,5 +182,263 @@ describe('root url offline cache (materialized-only contract)', () => {
     await getRootHandle(ref)
     // The abandoned preference no longer short-circuits the server.
     expect(fetches).toBe(1)
+  }, 15_000)
+})
+
+/**
+ * The durability witness asks about `documentsWorkspaceFor(ref,
+ * rootHandle.url)` — the bridge composes exactly that, with the root handle its
+ * session holds. The basis is written HERE, by the real fetchRootUrl, beside
+ * the url it came with. A `current` tab that fetched its root online must get
+ * its concrete version; one that booted from the cache must get nothing, even
+ * with an older basis still on record.
+ */
+describe('the root fetch names the documents\' workspace for the durability witness', () => {
+  afterEach(() => __resetResolvedWorkspacesForTest())
+
+  function useAlias(landscapeId: string): WorkspaceRef {
+    const ref: WorkspaceRef = { landscapeId, versionId: 'current' }
+    cleanups.push(() => {
+      forgetWorkspaceHandles(ref)
+      localStorage.removeItem(cacheKeyOf(ref))
+    })
+    return ref
+  }
+
+  /** Boot the root as the bridge does, then ask what the bridge asks. */
+  async function bootAndName(ref: WorkspaceRef): Promise<WorkspaceRef | null> {
+    const rootHandle = await getRootHandle(ref)
+    return documentsWorkspaceFor(ref, rootHandle.url)
+  }
+
+  it('an online root fetch names the concrete version beside the root it booted', async () => {
+    const ref = useAlias('dw-online')
+    const handle = repo.create<RootDoc>({ modelUrl: '', shardUrls: [] })
+    __setWorkspaceNetworkRouteForTest(async () => undefined)
+    __setRootUrlFetchForTest(async () => jsonOk({ url: handle.url, landscapeId: 'dw-online', versionId: 'v-7' }))
+
+    expect(await bootAndName(ref)).toEqual({ landscapeId: 'dw-online', versionId: 'v-7' })
+  }, 15_000)
+
+  it('a server that reports no key leaves the witness without a workspace', async () => {
+    const ref = useAlias('dw-legacy')
+    const handle = repo.create<RootDoc>({ modelUrl: '', shardUrls: [] })
+    __setWorkspaceNetworkRouteForTest(async () => undefined)
+    __setRootUrlFetchForTest(async () => jsonOk({ url: handle.url, landscapeId: null, versionId: null }))
+
+    expect(await bootAndName(ref)).toBeNull()
+    // …and records NO basis at all. The witness above is also saved by its
+    // landscape check, but the repoint detector (`resolvedWorkspaceFor`) is
+    // not: a recorded {null, null} would read every socket binding as a
+    // repoint. The server answers keyless on every legacy fallback.
+    expect(resolvedWorkspaceFor(ref)).toBeNull()
+  }, 15_000)
+
+  it('a session booted from the PREFERRED cached root gets nothing, though an older basis is on record', async () => {
+    const ref = useAlias('dw-preferred')
+    const fetched = repo.create<RootDoc>({ modelUrl: '', shardUrls: [] })
+    const cached = repo.create<RootDoc>({ modelUrl: '', shardUrls: [] })
+    __setWorkspaceNetworkRouteForTest(async () => undefined)
+    __setRootUrlFetchForTest(async () => jsonOk({ url: fetched.url, landscapeId: 'dw-preferred', versionId: 'v-7' }))
+    // Control: the online session HAD a witness workspace.
+    expect(await bootAndName(ref)).toEqual({ landscapeId: 'dw-preferred', versionId: 'v-7' })
+
+    // Another tab materialized a different root under the same key; the boot
+    // fallback re-enters from it.
+    localStorage.setItem(cacheKeyOf(ref), cached.url)
+    forgetWorkspaceHandles(ref)
+    preferCachedRootForNextResolve(ref)
+
+    expect(await bootAndName(ref)).toBeNull()
+    expect(lastAttemptedRootUrlFor(ref)).toBe(cached.url)
+  }, 15_000)
+
+  it('a session that fell back to the cached root after a FAILED fetch gets nothing', async () => {
+    const ref = useAlias('dw-offline')
+    const fetched = repo.create<RootDoc>({ modelUrl: '', shardUrls: [] })
+    const cached = repo.create<RootDoc>({ modelUrl: '', shardUrls: [] })
+    __setWorkspaceNetworkRouteForTest(async () => undefined)
+    __setRootUrlFetchForTest(async () => jsonOk({ url: fetched.url, landscapeId: 'dw-offline', versionId: 'v-7' }))
+    expect(await bootAndName(ref)).toEqual({ landscapeId: 'dw-offline', versionId: 'v-7' })
+
+    localStorage.setItem(cacheKeyOf(ref), cached.url)
+    forgetWorkspaceHandles(ref)
+    __setRootUrlFetchForTest(async () => { throw new TypeError('Failed to fetch') })
+
+    expect(await bootAndName(ref)).toBeNull()
+    expect(lastAttemptedRootUrlFor(ref)).toBe(cached.url)
+  }, 15_000)
+})
+
+/**
+ * A LATER page that boots the cached root without the server. Measured
+ * 2026-10-28: such a boot knew nothing about its version, the first socket
+ * binding was adopted as the basis, and a repoint made while the tab was away
+ * went undetected — the reads were answered about the new default and the
+ * documents were refused `workspace-mismatch`. The key the root fetch reported
+ * is now persisted beside the materialized root and restored for that root.
+ *
+ * Every test here drops the in-memory basis between the two boots
+ * (`__resetResolvedWorkspacesForTest`), as a page load does: otherwise the
+ * first boot's `root-fetch` basis, beside the same url, answers on its own and
+ * the test passes with the restore deleted.
+ */
+describe('a cached-root boot names the version that root was fetched for', () => {
+  afterEach(() => __resetResolvedWorkspacesForTest())
+
+  function aliasRef(landscapeId: string): WorkspaceRef {
+    const ref: WorkspaceRef = { landscapeId, versionId: 'current' }
+    cleanups.push(() => {
+      forgetWorkspaceHandles(ref)
+      localStorage.removeItem(cacheKeyOf(ref))
+      localStorage.removeItem(`${cacheKeyOf(ref)}:workspace`)
+    })
+    return ref
+  }
+
+  async function bootAndName(ref: WorkspaceRef): Promise<WorkspaceRef | null> {
+    const rootHandle = await getRootHandle(ref)
+    return documentsWorkspaceFor(ref, rootHandle.url)
+  }
+
+  /** An online boot that materializes `root`, then a fresh page. */
+  async function materializeOnlineThenReload(ref: WorkspaceRef, url: string, versionId: string | null): Promise<void> {
+    __setWorkspaceNetworkRouteForTest(async () => undefined)
+    __setRootUrlFetchForTest(async () => jsonOk({ url, landscapeId: versionId ? ref.landscapeId : null, versionId }))
+    await getRootHandle(ref)
+    expect(cachedRootUrlFor(ref)).toBe(url)
+    forgetWorkspaceHandles(ref)
+    __resetResolvedWorkspacesForTest()
+  }
+
+  it('offline: the failed fetch falls back to the cached root AND its version, as a root-cache basis', async () => {
+    const ref = aliasRef('rc-offline')
+    const root = repo.create<RootDoc>({ modelUrl: '', shardUrls: [] })
+    await materializeOnlineThenReload(ref, root.url, 'v-1')
+    __setRootUrlFetchForTest(async () => { throw new TypeError('Failed to fetch') })
+
+    expect(await bootAndName(ref)).toEqual({ landscapeId: 'rc-offline', versionId: 'v-1' })
+    // The repoint detector compares the first binding against THIS, instead of
+    // adopting the binding (bridge.ts's self-arm runs only with no basis).
+    expect(resolvedWorkspaceFor(ref)).toEqual({ landscapeId: 'rc-offline', versionId: 'v-1' })
+  }, 15_000)
+
+  it('the boot fallback: the preferred cached root comes back with its version too', async () => {
+    const ref = aliasRef('rc-preferred')
+    const root = repo.create<RootDoc>({ modelUrl: '', shardUrls: [] })
+    await materializeOnlineThenReload(ref, root.url, 'v-1')
+    let fetches = 0
+    __setRootUrlFetchForTest(async () => { fetches += 1; throw new Error('must not be asked') })
+    preferCachedRootForNextResolve(ref)
+
+    expect(await bootAndName(ref)).toEqual({ landscapeId: 'rc-preferred', versionId: 'v-1' })
+    expect(fetches).toBe(0)
+  }, 15_000)
+
+  it('a record stored beside ANOTHER root is not restored for this one', async () => {
+    const ref = aliasRef('rc-other-root')
+    const first = repo.create<RootDoc>({ modelUrl: '', shardUrls: [] })
+    const other = repo.create<RootDoc>({ modelUrl: '', shardUrls: [] })
+    await materializeOnlineThenReload(ref, first.url, 'v-1')
+    // Another tab (an older build) cached a different root, and wrote no key.
+    localStorage.setItem(cacheKeyOf(ref), other.url)
+    __setRootUrlFetchForTest(async () => { throw new TypeError('Failed to fetch') })
+
+    expect(await bootAndName(ref)).toBeNull()
+    expect(resolvedWorkspaceFor(ref)).toBeNull()
+  }, 15_000)
+
+  it('a server that reported no key stores no record, so the cached boot names nothing', async () => {
+    const ref = aliasRef('rc-keyless')
+    const root = repo.create<RootDoc>({ modelUrl: '', shardUrls: [] })
+    await materializeOnlineThenReload(ref, root.url, null)
+    expect(localStorage.getItem(`${cacheKeyOf(ref)}:workspace`)).toBeNull()
+    __setRootUrlFetchForTest(async () => { throw new TypeError('Failed to fetch') })
+
+    expect(await bootAndName(ref)).toBeNull()
+  }, 15_000)
+
+  it('a record naming another landscape, or no version, or not JSON, is ignored', async () => {
+    const ref = aliasRef('rc-garbage')
+    const root = repo.create<RootDoc>({ modelUrl: '', shardUrls: [] })
+    localStorage.setItem(cacheKeyOf(ref), root.url)
+    __setWorkspaceNetworkRouteForTest(async () => undefined)
+    __setRootUrlFetchForTest(async () => { throw new TypeError('Failed to fetch') })
+    const records = [
+      JSON.stringify({ rootUrl: root.url, landscapeId: 'someone-else', versionId: 'v-1' }),
+      JSON.stringify({ rootUrl: root.url, landscapeId: 'rc-garbage', versionId: '' }),
+      JSON.stringify({ rootUrl: root.url, landscapeId: 'rc-garbage' }),
+      '{not json',
+    ]
+    for (const record of records) {
+      localStorage.setItem(`${cacheKeyOf(ref)}:workspace`, record)
+      forgetWorkspaceHandles(ref)
+      __resetResolvedWorkspacesForTest()
+      expect(await bootAndName(ref), record).toBeNull()
+      expect(resolvedWorkspaceFor(ref), record).toBeNull()
+    }
+    // Control: the same harness with a well-formed record restores it.
+    localStorage.setItem(`${cacheKeyOf(ref)}:workspace`, JSON.stringify({ rootUrl: root.url, landscapeId: 'rc-garbage', versionId: 'v-1' }))
+    forgetWorkspaceHandles(ref)
+    __resetResolvedWorkspacesForTest()
+    expect(await bootAndName(ref)).toEqual({ landscapeId: 'rc-garbage', versionId: 'v-1' })
+  }, 15_000)
+
+  it('the restore REPLACES a basis already in memory — a stale root fetch, or a self-armed binding', async () => {
+    // A Retry (or any re-resolve after forgetWorkspaceHandles) keeps the module
+    // state: a basis for another root, or a binding adopted meanwhile, must not
+    // outlive the cached boot, or the detector compares against the wrong version.
+    for (const stale of ['root-fetch', 'socket-binding'] as const) {
+      const ref = aliasRef(`rc-replace-${stale}`)
+      const root = repo.create<RootDoc>({ modelUrl: '', shardUrls: [] })
+      await materializeOnlineThenReload(ref, root.url, 'v-1')
+      if (stale === 'root-fetch') {
+        rememberResolvedWorkspace(ref, { landscapeId: ref.landscapeId, versionId: 'v-2' }, { from: 'root-fetch', rootUrl: 'automerge:elsewhere' })
+      } else {
+        adoptBindingAsBasis(ref, { landscapeId: ref.landscapeId, versionId: 'v-2' })
+      }
+      __setRootUrlFetchForTest(async () => { throw new TypeError('Failed to fetch') })
+
+      expect(await bootAndName(ref), stale).toEqual({ landscapeId: ref.landscapeId, versionId: 'v-1' })
+      expect(resolvedWorkspaceFor(ref), stale).toEqual({ landscapeId: ref.landscapeId, versionId: 'v-1' })
+    }
+  }, 15_000)
+
+  it('the record follows the root: a NEW root materializing for the ref replaces it', async () => {
+    // After a follow to V2 the cached root is V2's; a record left at V1's url
+    // would miss the url check and every later cached boot would self-arm again.
+    const ref = aliasRef('rc-refresh')
+    const first = repo.create<RootDoc>({ modelUrl: '', shardUrls: [] })
+    const second = repo.create<RootDoc>({ modelUrl: '', shardUrls: [] })
+    await materializeOnlineThenReload(ref, first.url, 'v-1')
+    await materializeOnlineThenReload(ref, second.url, 'v-2')
+    __setRootUrlFetchForTest(async () => { throw new TypeError('Failed to fetch') })
+
+    const rootHandle = await getRootHandle(ref)
+    expect(rootHandle.url).toBe(second.url)
+    expect(documentsWorkspaceFor(ref, rootHandle.url)).toEqual({ landscapeId: 'rc-refresh', versionId: 'v-2' })
+  }, 15_000)
+
+  it('a concrete ref names its own version: nothing is written beside its root', async () => {
+    const ref = useRef('rc-concrete')
+    const root = repo.create<RootDoc>({ modelUrl: '', shardUrls: [] })
+    cleanups.push(() => localStorage.removeItem(`${cacheKeyOf(ref)}:workspace`))
+    __setWorkspaceNetworkRouteForTest(async () => undefined)
+    __setRootUrlFetchForTest(async () => jsonOk({ url: root.url, landscapeId: 'rc-concrete', versionId: 'v1' }))
+    await getRootHandle(ref)
+    expect(cachedRootUrlFor(ref)).toBe(root.url) // liveness: the root did materialize
+    expect(localStorage.getItem(`${cacheKeyOf(ref)}:workspace`)).toBeNull()
+  }, 15_000)
+
+  it('a basis self-armed from a binding is never written down as the root\'s version', async () => {
+    const ref = aliasRef('rc-self-armed')
+    const root = repo.create<RootDoc>({ modelUrl: '', shardUrls: [] })
+    localStorage.setItem(cacheKeyOf(ref), root.url)
+    __setWorkspaceNetworkRouteForTest(async () => undefined)
+    __setRootUrlFetchForTest(async () => { throw new TypeError('Failed to fetch') })
+    // The bridge's self-arm, landing before the root materializes.
+    adoptBindingAsBasis(ref, { landscapeId: 'rc-self-armed', versionId: 'v-repointed' })
+    await getRootHandle(ref)
+    expect(localStorage.getItem(`${cacheKeyOf(ref)}:workspace`)).toBeNull()
   }, 15_000)
 })

@@ -18,6 +18,8 @@ import { dirname, resolve } from 'node:path'
 import WebSocket from 'ws'
 import { createObservationPauseTransport, identifyObservationCells, observationDocker, observationOptions, startObservation } from './sync-cell-redis-pause-observe.mjs'
 import { kubernetesRedisOptions } from '../qa/kubernetesRedis/lab.mjs'
+import { readFileSync } from 'node:fs'
+import { assertBenchSession, benchRuntime, benchSessionFile, runComposeSync } from './sync-bench-runtime.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const composeFile = resolve(here, '../../infra/compose/sync-cell-failover.yml')
@@ -58,7 +60,12 @@ const cells = [
   { service: 'sync-cell-b', baseUrl: `http://127.0.0.1:${cellBPort}` },
 ]
 
+// B5.16c: SYNC_BENCH_RUNTIME=kubernetes runs the same verbs against the
+// kubernetes-runtime module on a local cluster (sync-bench-runtime.mjs).
+const runtime = benchRuntime()
+
 function compose(...args) {
+  if (runtime) return runComposeSync(runtime, args)
   return execFileSync(
     'docker',
     ['compose', '-p', project, '-f', composeFile, ...args],
@@ -197,7 +204,16 @@ function expectRejectedWorkspace(workspace, { cookie, expectedStatus, label }) {
   })
 }
 
+/** B5.16c: the module refuses AUTH_DEV_LOGIN in production, so a Kubernetes
+ *  run is handed a session established by the ordinary sign-up and login. */
+async function sessionFromFile(cell, file) {
+  const { cookie } = JSON.parse(readFileSync(file, 'utf8'))
+  return { cookie, ...assertBenchSession(await json(`${cell.baseUrl}/api/auth/me`, { cookie })) }
+}
+
 async function login(cell) {
+  const sessionFile = benchSessionFile(runtime)
+  if (sessionFile) return sessionFromFile(cell, sessionFile)
   const response = await fetch(`${cell.baseUrl}/api/auth/dev-login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

@@ -1,0 +1,140 @@
+{
+  "spotlight": {
+    "ariaLabel": "Rechercher",
+    "placeholder": "Rechercher des diagrammes, objets, décisions et actions",
+    "placeholderScoped": "Rechercher dans {{scope}}",
+    "clear": "Effacer la recherche",
+    "filterResults": "Filtrer les résultats",
+    "emptyHint": "Vérifiez l’orthographe ou essayez un terme plus large. Tapez ? pour les astuces de recherche.",
+    "partialNotice": "Seul ce que cet onglet a chargé a été cherché : la recherche dans tout l’espace de travail est indisponible pour le moment.",
+    "empty": {
+      "title": "Aucun résultat pour « {{query}} »",
+      "scoped": "Rien ne correspond dans {{scope}}. Retirez le filtre pour tout rechercher."
+    },
+    "scopes": {
+      "diagrams": "Diagrammes",
+      "objects": "Objets",
+      "decisions": "Décisions",
+      "actions": "Actions"
+    },
+    "sections": {
+      "top": "Meilleur résultat",
+      "objects": "Objets du modèle",
+      "diagrams": "Diagrammes",
+      "flows": "Flux",
+      "decisions": "Décisions d’architecture",
+      "connections": "Connexions",
+      "actions": "Actions",
+      "recent": "Récents",
+      "tips": "Astuces de recherche",
+      "suggestions": "Suggestions",
+      "fixes": "Vouliez-vous dire"
+    },
+    "kinds": {
+      "system": "Système",
+      "app": "Application",
+      "store": "Stockage",
+      "component": "Composant",
+      "actor": "Acteur",
+      "group": "Groupe",
+      "diagram": "Diagramme",
+      "flow": "Flux",
+      "adr": "Décision d’architecture",
+      "connection": "Connexion",
+      "page": "Action",
+      "tip": "Astuce de recherche",
+      "suggestion": "Valeur de filtre"
+    },
+    "actions": {
+      "open": "Ouvrir",
+      "run": "Exécuter",
+      "use": "Utiliser",
+      "reveal": "Afficher dans le modèle",
+      "showConnections": "Afficher dans les connexions",
+      "newTab": "Ouvrir dans un nouvel onglet"
+    },
+    "fields": {
+      "technology": "Technologie",
+      "scope": "Portée",
+      "status": "Statut",
+      "domain": "Domaine",
+      "tags": "Étiquettes",
+      "appearsIn": "Présent dans",
+      "connections": "Connexions",
+      "from": "De",
+      "to": "Vers",
+      "level": "Niveau",
+      "contents": "Contenu",
+      "diagram": "Diagramme",
+      "steps": "Étapes",
+      "id": "ID",
+      "updated": "Mis à jour",
+      "example": "Exemple",
+      "query": "Requête",
+      "alsoWritten": "S’écrit aussi"
+    },
+    "values": {
+      "internal": "Interne",
+      "external": "Externe",
+      "live": "En service",
+      "draft": "Brouillon",
+      "down": "En panne",
+      "unstable": "Instable",
+      "inProgress": "En cours",
+      "approved": "Approuvée",
+      "rejected": "Rejetée",
+      "context": "Contexte",
+      "container": "Conteneur",
+      "component": "Composant"
+    },
+    "counts": {
+      "diagrams_one": "{{count}} diagramme",
+      "diagrams_other": "{{count}} diagrammes",
+      "steps_one": "{{count}} étape",
+      "steps_other": "{{count}} étapes",
+      "contents": "{{objects}} objets · {{connections}} connexions",
+      "in_one": "{{count}} entrante",
+      "in_other": "{{count}} entrantes",
+      "out_one": "{{count}} sortante",
+      "out_other": "{{count}} sortantes"
+    },
+    "tipMeta": "Syntaxe de recherche",
+    "suggestionMeta": "Valeur pour {{key}}:",
+    "suggestionHint": "Appuyez sur ↵ pour ajouter ce filtre, puis continuez à taper pour affiner les résultats.",
+    "fix": {
+      "key": "{{key}}:",
+      "keyHint": "« {{typed}}: » n’est pas un filtre. Choisissez cette ligne pour utiliser {{key}}: à la place.",
+      "value": "{{key}}:",
+      "valueHint": "« {{value}} » n’est pas une valeur de {{key}}. Essayez : {{expected}}."
+    },
+    "tips": {
+      "kind": "Un seul genre de résultat : system, app, store, component, actor, group, diagram, flow, adr, connection ou page (genre: et les noms français fonctionnent aussi). kind:object désigne tout objet C4 ; les valeurs s’abrègent (kind:sys) ou se combinent (kind:app,store).",
+      "tag": "Les objets et connexions qui portent une étiquette (étiquette: fonctionne aussi). Tapez tag: pour choisir parmi les étiquettes de ce paysage.",
+      "tech": "Tout ce qui utilise une technologie, d’après son nom : tech:postgres trouve PostgreSQL.",
+      "in": "Les objets, groupes, connexions et flux placés sur un diagramme dont le nom correspond (dans: fonctionne aussi).",
+      "status": "Les objets par statut (live, draft, down, unstable) ou les décisions par statut (in-progress, approved, rejected). statut: fonctionne aussi.",
+      "phrase": "Les guillemets gardent les mots ensemble et dans l’ordre.",
+      "exclude": "Un signe moins retire des résultats : -legacy masque tout ce qui mentionne legacy. NOT legacy fait de même.",
+      "or": "OR (en majuscules) accepte l’un ou l’autre. Sans lui, tous les mots doivent correspondre.",
+      "has": "Seulement les résultats qui ont une description, un diagramme, une technologie ou une étiquette.",
+      "from": "Les connexions par extrémité (de: et vers: fonctionnent aussi). Combinez from: et to: pour trouver un lien précis."
+    },
+    "commands": {
+      "goDiagrams": { "title": "Tous les diagrammes", "keywords": "diagrammes liste parcourir grille", "description": "Parcourir tous les diagrammes de ce paysage." },
+      "goObjects": { "title": "Objets du modèle", "keywords": "objets tableau modèle inventaire", "description": "Le tableau de tous les objets du modèle." },
+      "goConnections": { "title": "Connexions du modèle", "keywords": "connexions liens relations tableau", "description": "Le tableau de toutes les connexions du modèle." },
+      "goDependencies": { "title": "Dépendances", "keywords": "dépendances impact graphe amont aval", "description": "Ce dont un objet dépend, et ce qui dépend de lui." },
+      "goViewer": { "title": "Visionneuse du modèle", "keywords": "visionneuse vue d’ensemble grille 3d plateau", "description": "Tout le modèle, niveau par niveau, sans édition." },
+      "goDecisions": { "title": "Décisions d’architecture", "keywords": "adr décisions registre", "description": "Vos décisions d’architecture." },
+      "goDrafts": { "title": "Brouillons", "keywords": "brouillons branches versions fusion", "description": "Le travail en cours à relire et fusionner." },
+      "newDiagram": { "title": "Créer un diagramme", "keywords": "nouveau ajouter vierge diagramme", "description": "Commencer un diagramme vierge dans ce paysage." },
+      "view3d": { "title": "Passer en vue 3D", "keywords": "3d trois dimensions plateau", "description": "Afficher ce diagramme comme un plateau 3D." },
+      "view2d": { "title": "Passer en vue 2D", "keywords": "2d plan canevas", "description": "Afficher ce diagramme sur le canevas plat." },
+      "history": { "title": "Ouvrir l’historique", "keywords": "historique annuler restaurer versions", "description": "Remonter dans les modifications de ce paysage." },
+      "share": { "title": "Partager cette vue", "keywords": "partager lien exporter intégrer", "description": "Partager ou exporter la vue actuelle." },
+      "themeDark": { "title": "Passer en mode sombre", "keywords": "thème apparence sombre nuit", "description": "Changer l’apparence de tout l’espace de travail." },
+      "themeLight": { "title": "Passer en mode clair", "keywords": "thème apparence clair jour", "description": "Changer l’apparence de tout l’espace de travail." },
+      "settings": { "title": "Ouvrir les paramètres", "keywords": "paramètres préférences options réglages", "description": "Préférences de l’espace de travail, d’apparence et de langue." }
+    }
+  }
+}

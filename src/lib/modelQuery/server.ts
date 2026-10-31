@@ -14,7 +14,7 @@
 
 import { useModelStore } from '../../stores/modelStore'
 import { connectionRowsFromStore, pickerEntriesFromStore, modelObjectRowsFromStore } from './heavyViews'
-import { withWorkspaceParams } from './workspaceParams'
+import { withWorkspaceParams, workspaceSearchParamsFor } from './workspaceParams'
 import { workspaceApiFetch } from '../api/http'
 import type {
   ConnectionPageResult,
@@ -32,7 +32,8 @@ import type {
 } from './types'
 import type { C4Object, Group, Connection, Diagram } from '../../types'
 import { warnWholeModelRead } from './wholeModelGuard'
-import { currentWorkspaceRef, workspaceRefKey } from '../automerge/workspace'
+import { currentWorkspaceRef, workspaceRefKey, type WorkspaceRef } from '../automerge/workspace'
+import { documentsWorkspaceFor } from '../automerge/workspaceBinding'
 import { getModelReadCacheWorker } from './workerClient'
 import { scheduleDerivedCacheMaintenance } from '../offline/cacheRetention'
 import { pinnedCacheNeedsRefresh, shouldCacheBoundedServerPage } from './cacheGenerationPolicy'
@@ -419,37 +420,60 @@ export interface DurabilityWitnessResult {
  * (HTTP 431) and past nginx's 8 KB default, and a failed witness call defers
  * EVERY stamped intent — the journal would never drain on exactly the large
  * post-crash journals the batching exists for. A JSON body has no such cliff.
+ *
+ * `journal` names whose intents are being replayed: the bridge's ref and the
+ * root url its session booted. The witness is asked about exactly the
+ * CONCRETE workspace those documents belong to (`documentsWorkspaceFor`), and
+ * an answer about any other workspace is discarded. When that workspace cannot
+ * be named there is no witness and no request.
  */
 export async function fetchDurabilityWitness(
+  journal: { ref: WorkspaceRef; bootedRootUrl: string | null },
   objectIds: readonly string[],
   connectionIds: readonly string[],
 ): Promise<DurabilityWitnessResult> {
-  const requested = currentWorkspaceRef()
+  // Never the alias. The server resolves `current` to whatever the default is
+  // NOW (`canonicalWorkspaceKey`), which after a repoint is not the version
+  // these documents belong to; and its echo is that concrete version, so a
+  // `current` request could never be matched against what was asked.
+  const asked = documentsWorkspaceFor(journal.ref, journal.bootedRootUrl)
+  if (!asked) return { absenceProvable: false, objects: new Map(), connections: new Map() }
   const body = await postJson<{
     landscapeId?: string
     versionId?: string
     absenceProvable: boolean
     objects: Record<string, C4Object>
     connections: Record<string, Connection>
-  }>(`/api/model/durability-witness?${withWorkspaceParams('')}`, {
+  }>(`/api/model/durability-witness?${workspaceSearchParamsFor(asked)}`, {
     objects: objectIds,
     connections: connectionIds,
   })
-  // The server echoes the workspace it RESOLVED. ensureWorkspace redirects
-  // static/sparse-draft workspaces to their BASE version's read model, and a
+  // The server echoes the workspace whose read model answered: for a sparse
+  // draft, its BASE version (`staticReadModelQueryWorkspaceIfPresent`). A
   // witness answering for another workspace is unusable in BOTH directions:
   // the base's values could equality-acknowledge a draft's own intents
   // (presence poisoning — the losing direction), and its quiet healthy state
-  // would "prove" absences that never could appear there. On any mismatch the
-  // WHOLE payload is discarded — no proof, no values.
-  if (body.landscapeId !== requested.landscapeId || body.versionId !== requested.versionId) {
+  // would "prove" absences that never could appear there. Anything but an
+  // exact echo discards the WHOLE payload — no proof, no values.
+  if (body.landscapeId !== asked.landscapeId || body.versionId !== asked.versionId) {
+    return { absenceProvable: false, objects: new Map(), connections: new Map() }
+  }
+  // Both maps or nothing. `durabilityWitnessPayload` always sends both; a
+  // payload missing one is malformed, and reading the gap as an empty map
+  // would turn `absenceProvable: true` into a proof that every asked id of
+  // that family is absent.
+  if (!isPlainRecord(body.objects) || !isPlainRecord(body.connections)) {
     return { absenceProvable: false, objects: new Map(), connections: new Map() }
   }
   return {
     // Strict === true: an older server (no field) or a malformed payload must
     // read as "absence not provable", never as a proof.
     absenceProvable: body.absenceProvable === true,
-    objects: new Map(Object.entries(body.objects ?? {})),
-    connections: new Map(Object.entries(body.connections ?? {})),
+    objects: new Map(Object.entries(body.objects)),
+    connections: new Map(Object.entries(body.connections)),
   }
+}
+
+function isPlainRecord(value: unknown): boolean {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
