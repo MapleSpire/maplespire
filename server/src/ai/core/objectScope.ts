@@ -15,14 +15,14 @@
 /**
  * Server copy of the per-diagram scope rule in `src/lib/diagrams/objectScope.ts`
  * (the server does not import client source). Same order, first match wins:
- * diagram override → C4 boundary rule (drill-down `parentObjectId`) → the
- * object's default scope → internal. `src/lib/diagrams/objectScope.test.ts`
+ * diagram override → C4 boundary rule (drill-down `parentObjectId`; actors
+ * exempt) → the object's default scope → internal. `src/lib/diagrams/objectScope.test.ts`
  * runs ONE case table through both copies, so a drift between them goes red.
  */
 export type ObjectScope = 'internal' | 'external'
 export type ScopeSource = 'diagram' | 'boundary' | 'default'
 
-interface ScopeObject { id: string; parentId?: string; scope?: string }
+interface ScopeObject { id: string; type?: string; parentId?: string; scope?: string }
 interface ScopeDiagram { parentObjectId?: unknown; objectScopes?: unknown }
 
 const MAX_DEPTH = 64
@@ -36,7 +36,7 @@ export function resolveObjectScope(
   const override = overrides?.[object.id]
   if (override === 'internal' || override === 'external') return { scope: override, source: 'diagram' }
   const focusId = typeof diagram.parentObjectId === 'string' ? diagram.parentObjectId : undefined
-  if (focusId && !insideFocus(object, focusId, objectById)) return { scope: 'external', source: 'boundary' }
+  if (focusId && object.type !== 'actor' && !insideFocus(object, focusId, objectById)) return { scope: 'external', source: 'boundary' }
   return { scope: object.scope === 'external' ? 'external' : 'internal', source: 'default' }
 }
 

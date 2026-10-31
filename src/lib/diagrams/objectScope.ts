@@ -21,7 +21,10 @@ import type { C4Object, Diagram, ObjectScope } from '../../types'
  *
  *   1. the diagram's explicit override (`diagram.objectScopes[id]`);
  *   2. the C4 boundary rule — on a drill-down diagram (`parentObjectId` set),
- *      an object that is neither the focus nor nested under it is external;
+ *      an object that is neither the focus nor nested under it is external.
+ *      Actors are exempt: C4's own container and component examples keep the
+ *      people outside the boundary coloured, and grey only external SYSTEMS
+ *      (owner decision 2026-10-31);
  *   3. the object's default scope (`C4Object.scope`);
  *   4. internal.
  *
@@ -77,15 +80,19 @@ export function isInsideFocus(
   return false // no parent, or a capped walk (parent cycle)
 }
 
+/** The fields the rule reads. `type` is required so a caller cannot drop it
+ * and silently grey the actors (see rule 2). */
+export type ScopeObject = Pick<C4Object, 'id' | 'type' | 'scope' | 'parentId'>
+
 export function resolveObjectScope(
-  object: Pick<C4Object, 'id' | 'scope' | 'parentId'>,
+  object: ScopeObject,
   diagram: ScopeDiagram | undefined,
   parentOf?: ParentOf,
 ): ResolvedScope {
   const override = diagram?.objectScopes?.[object.id]
   if (override === 'internal' || override === 'external') return { scope: override, source: 'diagram' }
   const focusId = diagram?.parentObjectId
-  if (focusId && !isInsideFocus(object, focusId, parentOf)) return { scope: 'external', source: 'boundary' }
+  if (focusId && object.type !== 'actor' && !isInsideFocus(object, focusId, parentOf)) return { scope: 'external', source: 'boundary' }
   return { scope: object.scope === 'external' ? 'external' : 'internal', source: 'default' }
 }
 
@@ -101,7 +108,7 @@ export function parentLookup(get: (id: string) => Pick<C4Object, 'parentId'> | u
 /** The display copy of an object for one diagram, with `scope` replaced by its
  * effective value. Returns the same reference when nothing changes, so memoised
  * consumers (engine diffing, useShallow) see no churn. */
-export function withEffectiveScope<T extends Pick<C4Object, 'id' | 'scope' | 'parentId'>>(
+export function withEffectiveScope<T extends ScopeObject>(
   object: T,
   diagram: ScopeDiagram | undefined,
   parentOf?: ParentOf,

@@ -45,7 +45,7 @@ const o = (id: string, parentId?: string, scope: 'internal' | 'external' = 'inte
   ({ id, name: id, type: parentId ? 'app' : 'system', scope, ...(parentId ? { parentId } : {}) })
 const MODEL: ObjectInput[] = [
   o('shop'), o('web', 'shop'), o('api', 'shop'), o('auth', 'api'),
-  o('bank'), o('ledger', 'bank'), o('stripe', undefined, 'external'), o('customer'),
+  o('bank'), o('ledger', 'bank'), o('stripe', undefined, 'external'), { ...o('customer'), type: 'actor' },
 ]
 const d = (id: string, objectIds: string[], over: Partial<DiagramInput> = {}): DiagramInput =>
   ({ id, name: id, type: 'landscape', objectIds, connectionIds: [], groupIds: [], ...over })
@@ -68,7 +68,7 @@ suite('derived per-diagram scope usage (Postgres integration, txn-isolated)', ()
   const usage = async () => {
     // Every object is a root or reached through search; a filter-only search
     // pages every object, with the metrics the table shows.
-    const page = await roObjectSearchPage(client, WS, { filter: { types: ['system', 'app'] }, limit: 50 })
+    const page = await roObjectSearchPage(client, WS, { filter: { types: ['system', 'app', 'actor'] }, limit: 50 })
     return new Map(page.items.map((row) => [row.id, { external: row.externalDiagramCount, total: row.diagramCount }]))
   }
 
@@ -81,6 +81,8 @@ suite('derived per-diagram scope usage (Postgres integration, txn-isolated)', ()
     expect(byId.get('ledger')).toEqual({ external: 1, total: 1 })
     expect(byId.get('stripe')).toEqual({ external: 2, total: 2 })
     expect(byId.get('shop')).toEqual({ external: 0, total: 1 })
+    // An actor is exempt from the boundary: internal on shop's view too.
+    expect(byId.get('customer')).toEqual({ external: 0, total: 2 })
   })
 
   it('the focus is inside its own drill-down, and a TWO-step ancestry outside the focus is external', async () => {
@@ -136,9 +138,9 @@ suite('derived per-diagram scope usage (Postgres integration, txn-isolated)', ()
       LANDSCAPE, SHOP_CONTAINERS, API_COMPONENTS,
     ])
     const external = await roObjectSearchPage(client, WS, { filter: { externalOnSomeDiagram: true }, limit: 50 })
-    expect(external.items.map((row) => row.id).sort()).toEqual(['bank', 'customer', 'ledger', 'stripe', 'web'])
+    expect(external.items.map((row) => row.id).sort()).toEqual(['bank', 'ledger', 'stripe', 'web'])
     const never = await roObjectSearchPage(client, WS, { filter: { externalOnSomeDiagram: false }, limit: 50 })
-    expect(never.items.map((row) => row.id).sort()).toEqual(['api', 'auth', 'g1', 'shop'])
+    expect(never.items.map((row) => row.id).sort()).toEqual(['api', 'auth', 'customer', 'g1', 'shop'])
     // A group has no scope: its external count is always 0.
     expect(never.items.find((row) => row.id === 'g1')?.externalDiagramCount).toBe(0)
   })

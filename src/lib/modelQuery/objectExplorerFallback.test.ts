@@ -498,14 +498,16 @@ describe('resident tier — "external in N of M diagrams" and its filter', () =>
 
   it('serves the count on tree pages too', async () => {
     const roots = await residentObjectTreePage({ diagramId: 'landscape', limit: 50 })
-    // (bank is in group g1, so it is not a root row; customer is.)
-    expect(roots.items.find((row) => row.id === 'customer')).toMatchObject({ diagramCount: 2, externalDiagramCount: 1 })
+    // (bank is in group g1, so it is not a root row; customer and stripe are.)
+    // customer is an actor, exempt from the boundary rule on shop's view.
+    expect(roots.items.find((row) => row.id === 'customer')).toMatchObject({ diagramCount: 2, externalDiagramCount: 0 })
+    expect(roots.items.find((row) => row.id === 'stripe')).toMatchObject({ diagramCount: 2, externalDiagramCount: 2 })
   })
 
   it('filters "external on some diagram" both ways; a group is never external', async () => {
     const external = await residentObjectSearchPage({ filter: { externalOnSomeDiagram: true }, limit: 50 })
-    expect(external.items.map((row) => row.id).sort()).toEqual(['bank', 'customer', 'ledger', 'stripe', 'web'])
+    expect(external.items.map((row) => row.id).sort()).toEqual(['bank', 'ledger', 'stripe', 'web'])
     const never = await residentObjectSearchPage({ filter: { externalOnSomeDiagram: false }, limit: 50 })
-    expect(never.items.map((row) => row.id).sort()).toEqual(['api', 'auth', 'g1', 'shop'])
+    expect(never.items.map((row) => row.id).sort()).toEqual(['api', 'auth', 'customer', 'g1', 'shop'])
   })
 })

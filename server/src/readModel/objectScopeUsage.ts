@@ -31,6 +31,7 @@
  * the focus — its `parent_id` chain never reaches the focus. Inside must be
  * proven, exactly as `isInsideFocus` does: a chain that reaches a root, runs
  * into a missing object, or passes the depth cap (a cycle) counts as outside.
+ * Actors are exempt from the boundary walk, as in both resolvers.
  */
 
 /** The ancestor walk's cap, same as `MAX_DEPTH` in both resolver copies. */
@@ -47,7 +48,7 @@ export function externalOnDiagramSql(m: string, d: string, o: string): string {
   return `(CASE
     WHEN ${override} IN ('internal', 'external') THEN ${override} = 'external'
     WHEN ${o}.scope = 'external' THEN true
-    WHEN ${d}.parent_object_id IS NULL OR ${o}.id = ${d}.parent_object_id THEN false
+    WHEN ${d}.parent_object_id IS NULL OR ${o}.id = ${d}.parent_object_id OR ${o}.type = 'actor' THEN false
     ELSE NOT EXISTS (
       WITH RECURSIVE walk(cursor, depth) AS (
         -- NULLIF: an empty parentId is a root to the JS resolvers (falsy).

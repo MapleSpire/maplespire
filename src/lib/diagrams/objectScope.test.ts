@@ -23,9 +23,9 @@ import * as server from '../../../server/src/ai/core/objectScope.js'
  * source). Same shape as `documentResolution.conformance.test.ts`: a drift
  * between the copies goes red here, and the case says which answer is right.
  */
-type Obj = Pick<C4Object, 'id' | 'scope' | 'parentId'>
-const obj = (id: string, parentId?: string, scope: ObjectScope = 'internal'): Obj =>
-  parentId ? { id, parentId, scope } : { id, scope }
+type Obj = Pick<C4Object, 'id' | 'type' | 'scope' | 'parentId'>
+const obj = (id: string, parentId?: string, scope: ObjectScope = 'internal', type: C4Object['type'] = 'system'): Obj =>
+  parentId ? { id, type, parentId, scope } : { id, type, scope }
 
 // shop (system) ⊃ web, api (apps) ⊃ auth (component); bank (system) ⊃ ledger
 const model = [
@@ -36,7 +36,8 @@ const model = [
   obj('bank'),
   obj('ledger', 'bank'),
   obj('stripe', undefined, 'external'),
-  obj('customer'),
+  obj('customer', undefined, 'internal', 'actor'),
+  obj('partner', undefined, 'external', 'actor'),
   obj('stripe-api', 'shop', 'external'),
   obj('orphan', 'not-loaded'),
   obj('cyc-a', 'cyc-b'),
@@ -54,7 +55,9 @@ const CASES: Case[] = [
   ['a direct child of the focus is inside', 'web', { parentObjectId: 'shop' }, 'internal', 'default'],
   ['a grandchild of the focus is inside', 'auth', { parentObjectId: 'shop' }, 'internal', 'default'],
   ['another root system is outside (C4 level 2)', 'bank', { parentObjectId: 'shop' }, 'external', 'boundary'],
-  ['a person with no parent is outside', 'customer', { parentObjectId: 'shop' }, 'external', 'boundary'],
+  ['an actor outside the focus is exempt from the boundary rule', 'customer', { parentObjectId: 'shop' }, 'internal', 'default'],
+  ["an exempt actor keeps an external default", 'partner', { parentObjectId: 'shop' }, 'external', 'default'],
+  ['an override still applies to an actor', 'customer', { parentObjectId: 'shop', objectScopes: { customer: 'external' } }, 'external', 'diagram'],
   ["a sibling system's child is outside", 'ledger', { parentObjectId: 'shop' }, 'external', 'boundary'],
   ['a sibling container is outside a component view', 'web', { parentObjectId: 'api' }, 'external', 'boundary'],
   ["the focus's own parent is outside its component view", 'shop', { parentObjectId: 'api' }, 'external', 'boundary'],

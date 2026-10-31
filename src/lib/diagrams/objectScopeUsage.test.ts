@@ -17,15 +17,15 @@ import type { C4Object, ObjectScope } from '../../types'
 import { parentLookup } from './objectScope'
 import { scopeUsageOf, type ScopeUsageDiagram } from './objectScopeUsage'
 
-type Obj = Pick<C4Object, 'id' | 'scope' | 'parentId'>
-const obj = (id: string, parentId?: string, scope: ObjectScope = 'internal'): Obj =>
-  parentId ? { id, parentId, scope } : { id, scope }
+type Obj = Pick<C4Object, 'id' | 'type' | 'scope' | 'parentId'>
+const obj = (id: string, parentId?: string, scope: ObjectScope = 'internal', type: C4Object['type'] = 'system'): Obj =>
+  parentId ? { id, type, parentId, scope } : { id, type, scope }
 
 // Same model as the server twin (server/src/readModel/objectScopeUsage.integration.test.ts):
 // shop ⊃ web, api ⊃ auth; bank ⊃ ledger; stripe external by default.
 const model = [
   obj('shop'), obj('web', 'shop'), obj('api', 'shop'), obj('auth', 'api'),
-  obj('bank'), obj('ledger', 'bank'), obj('stripe', undefined, 'external'), obj('customer'),
+  obj('bank'), obj('ledger', 'bank'), obj('stripe', undefined, 'external'), obj('customer', undefined, 'internal', 'actor'),
 ]
 const byId = new Map(model.map((o) => [o.id, o]))
 const parentOf = parentLookup((id) => byId.get(id))
@@ -51,6 +51,8 @@ describe('scopeUsageOf', () => {
     expect(usageOf('ledger', all)).toEqual({ external: 1, total: 1 })
     // An external default stays external everywhere.
     expect(usageOf('stripe', all)).toEqual({ external: 2, total: 2 })
+    // An actor is exempt from the boundary: internal on shop's view too.
+    expect(usageOf('customer', all)).toEqual({ external: 0, total: 2 })
   })
 
   it('the focus is inside its own drill-down; a two-step ancestry outside the focus is external', () => {

@@ -12,8 +12,8 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU Affero General Public License for more details.
 
-import type { C4Object, Diagram } from '../../types'
-import { resolveObjectScope, type ParentOf } from './objectScope'
+import type { Diagram } from '../../types'
+import { resolveObjectScope, type ParentOf, type ScopeObject } from './objectScope'
 
 /**
  * Derived scope usage of one object across the whole model: on how many of the
@@ -34,7 +34,7 @@ export interface ObjectScopeUsage {
 }
 
 export type ScopeUsageDiagram = Pick<Diagram, 'objectIds' | 'parentObjectId' | 'objectScopes'>
-type ScopeUsageObject = Pick<C4Object, 'id' | 'scope' | 'parentId'>
+type ScopeUsageObject = ScopeObject
 
 /** Scope usage of ONE object over the diagrams that show it (the caller's
  * membership index — e.g. `DiagramIndex.objectToDiagramIds` — so a page of
