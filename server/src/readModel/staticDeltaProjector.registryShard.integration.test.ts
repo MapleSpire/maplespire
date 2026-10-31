@@ -642,6 +642,49 @@ describe.skipIf(!CONNECTION)('#41 — la revue : ce que les fixtures posées à 
     ).toBe('org-nouveau')
   })
 
+  it('scope overrides — on the static plane the DiagramDoc owns them; a stale meta never resurrects a cleared one', async () => {
+    // Model Objects counts "external in N of M diagrams" from
+    // ro_diagrams.data.objectScopes. A summary workspace's client never
+    // rewrites an existing diagram's meta, so the meta copy (e.g. one an AI
+    // tool mirrored) can be older than the doc. QA mutant M1 (projectDiagram
+    // back to a plain spread) and the registry-merge twin were GREEN before.
+    const scopesOf = async () => (await database.pool.query<{ scopes: unknown }>(
+      `SELECT data->'objectScopes' AS scopes FROM ro_diagrams
+       WHERE landscape_id = $1 AND version_id = $2 AND id = 'dg-s'`,
+      [LANDSCAPE, VERSION],
+    )).rows[0]?.scopes ?? null
+    const projectDoc = async (handle: DocHandle<unknown>) => {
+      const internal = projector as unknown as {
+        project(descriptor: Record<string, unknown>, handle: DocHandle<unknown>): Promise<void>
+      }
+      await internal.project({ ...descriptorFor(handle.documentId, 'diagram'), entityId: 'dg-s' }, handle)
+    }
+
+    const head = writeHead({ 'dg-s': { ...meta('dg-s'), objectScopes: { bank: 'external' } } })
+    await project(head)
+    const doc = repo.create<Record<string, unknown>>({
+      name: 'dg-s', type: 'context', objectIds: ['bank'], connectionIds: [], groupIds: [],
+      objectScopes: { bank: 'external' },
+    })
+    await projectDoc(doc)
+    expect(await scopesOf()).toEqual({ bank: 'external' })
+
+    // The user clears it in the browser: only the DiagramDoc changes.
+    doc.change((d) => { delete d.objectScopes })
+    await projectDoc(doc)
+    expect(await scopesOf(), 'the doc projection kept a cleared override').toBeNull()
+
+    // A sibling edit re-projects the shard, whose meta still carries the old copy.
+    head.change((s) => { (s.diagrams['dg-s'] as Record<string, unknown>).name = 'renamed' })
+    await project(head)
+    expect(await scopesOf(), 'the stale meta resurrected the cleared override').toBeNull()
+    const { rows } = await database.pool.query<{ name: string }>(
+      `SELECT data->>'name' AS name FROM ro_diagrams WHERE landscape_id = $1 AND version_id = $2 AND id = 'dg-s'`,
+      [LANDSCAPE, VERSION],
+    )
+    expect(rows[0]?.name).toBe('renamed')
+  })
+
   it('q3 — la CLE de la carte est identite, celle par laquelle le pont supprime', async () => {
     // Three parties addressed a write-head entry three ways: the bridge deletes
     // by KEY, fsck reads `Object.keys`, and this projection read `meta.id`. They

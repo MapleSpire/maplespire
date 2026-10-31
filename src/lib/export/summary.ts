@@ -17,6 +17,7 @@ import type { ExportBundle, SummaryScope, SummarySlice } from './types'
 import i18n from '../i18n'
 import { orderedTechnologyUsages } from '../technologyUsage'
 import { referencedTagSnapshots } from '../tags/assignments'
+import { parentLookup, withEffectiveScope } from '../diagrams/objectScope'
 
 /** Pick the slice of the bundle a summary covers. `pickId` names the domain /
  * object / diagram when the scope needs one; ignored for `landscape`. */
@@ -54,7 +55,11 @@ export function sliceForSummary(bundle: ExportBundle, scope: SummaryScope, pickI
   } else if (scope === 'diagram' && pickId) {
     const diagram = bundle.diagrams.find((d) => d.id === pickId)
     const ids = new Set(diagram?.objectIds ?? [])
-    objects = bundle.objects.filter((o) => ids.has(o.id))
+    // A diagram summary reports each object's scope ON that diagram; the other
+    // scopes have no diagram and report the object's default.
+    const byId = new Map(bundle.objects.map((o) => [o.id, o]))
+    const parentOf = parentLookup((id) => byId.get(id))
+    objects = bundle.objects.filter((o) => ids.has(o.id)).map((o) => withEffectiveScope(o, diagram, parentOf))
     flows = bundle.flowsByDiagram[pickId] ?? []
     scopeLabel = i18n.t('exportEngine.scope.diagram', { name: diagram?.name ?? i18n.t('exportEngine.scope.unknown') })
   }

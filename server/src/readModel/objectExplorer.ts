@@ -22,6 +22,7 @@ import {
 } from './cursor.js'
 import { servedRowsChangedBy, type ServedRowChanges } from './servedRowDigest.js'
 import type { ReadModelChangePayload } from './changeFeed.js'
+import { externalOnDiagramSql, externalOnSomeDiagramSql } from './objectScopeUsage.js'
 
 const MAX_PAGE = 50
 const MAX_HIERARCHY_DEPTH = 64
@@ -35,6 +36,9 @@ export interface ObjectExplorerFilter {
   teamIds?: string[]
   hasDescription?: boolean
   inDiagram?: boolean
+  /** Objects that resolve external on at least one diagram they appear on
+   * (false: on none). Per-diagram scope, `objectScopeUsage.ts`. */
+  externalOnSomeDiagram?: boolean
   domainId?: string
 }
 
@@ -61,6 +65,9 @@ export interface ObjectExplorerRow {
   componentCount: number
   connectionCount: number
   diagramCount: number
+  /** Of `diagramCount`, the diagrams on which the object resolves external
+   * (override, C4 boundary rule, default). Always 0 for a group. */
+  externalDiagramCount: number
   inDiagram: boolean
   breadcrumb: Array<{ id: string; name: string }>
   matchKind?: 'exact' | 'prefix' | 'word_prefix' | 'contains' | 'filter'
@@ -98,10 +105,11 @@ interface ExplorerMetrics {
   componentCount: number
   connectionCount: number
   diagramCount: number
+  externalDiagramCount: number
 }
 
 function emptyMetrics(): ExplorerMetrics {
-  return { appCount: 0, storeCount: 0, componentCount: 0, connectionCount: 0, diagramCount: 0 }
+  return { appCount: 0, storeCount: 0, componentCount: 0, connectionCount: 0, diagramCount: 0, externalDiagramCount: 0 }
 }
 
 async function metricsForRows(
@@ -148,13 +156,19 @@ async function metricsForRows(
        ) endpoints GROUP BY endpoint_id`,
       [key.landscapeId, key.versionId, allIds],
     ),
-    db.query<{ kind: 'object' | 'group'; id: string; diagram_count: string | number }>(
-      `SELECT 'object'::text AS kind, object_id AS id, count(*) AS diagram_count
-       FROM ro_diagram_objects
-       WHERE landscape_id = $1 AND version_id = $2 AND object_id = ANY($3::text[])
-       GROUP BY object_id
+    db.query<{ kind: 'object' | 'group'; id: string; diagram_count: string | number; external_count: string | number }>(
+      // LEFT JOINs: the total stays exactly the membership count it always
+      // was; a membership row whose diagram or object row is missing simply
+      // has no override / focus / default to make it external.
+      `SELECT 'object'::text AS kind, m.object_id AS id, count(*) AS diagram_count,
+              count(*) FILTER (WHERE o.id IS NOT NULL AND ${externalOnDiagramSql('m', 'd', 'o')}) AS external_count
+       FROM ro_diagram_objects m
+       LEFT JOIN ro_diagrams d ON d.landscape_id = m.landscape_id AND d.version_id = m.version_id AND d.id = m.diagram_id
+       LEFT JOIN ro_objects o ON o.landscape_id = m.landscape_id AND o.version_id = m.version_id AND o.id = m.object_id
+       WHERE m.landscape_id = $1 AND m.version_id = $2 AND m.object_id = ANY($3::text[])
+       GROUP BY m.object_id
        UNION ALL
-       SELECT 'group'::text AS kind, group_id AS id, count(*) AS diagram_count
+       SELECT 'group'::text AS kind, group_id AS id, count(*) AS diagram_count, 0 AS external_count
        FROM ro_diagram_groups
        WHERE landscape_id = $1 AND version_id = $2 AND group_id = ANY($4::text[])
        GROUP BY group_id`,
@@ -175,7 +189,10 @@ async function metricsForRows(
   }
   for (const metric of diagrams.rows) {
     const value = result.get(`${metric.kind}:${metric.id}`)
-    if (value) value.diagramCount = Number(metric.diagram_count)
+    if (value) {
+      value.diagramCount = Number(metric.diagram_count)
+      value.externalDiagramCount = Number(metric.external_count)
+    }
   }
   return result
 }
@@ -708,6 +725,8 @@ export async function roObjectSearchPage(
     query, diagramId: opts.diagramId ?? null, types, scope: filter.scope ?? null, technologyIds,
     tagIds, statuses, teamIds, hasDescription: filter.hasDescription ?? null,
     inDiagram: filter.inDiagram ?? null, domainId: filter.domainId ?? null,
+    // Only when set: an absent facet keeps every pre-existing cursor's hash.
+    ...(filter.externalOnSomeDiagram !== undefined ? { externalOnSomeDiagram: filter.externalOnSomeDiagram } : {}),
   })
   const after = opts.after
     ? decodeReadModelCursor<ExplorerCursor>(opts.after, { kind: 'object-search', queryHash })
@@ -764,6 +783,12 @@ export async function roObjectSearchPage(
         AND membership.group_id = g.id)`
     objectWhere.push(filter.inDiagram ? objectExists : `NOT ${objectExists}`)
     groupWhere.push(filter.inDiagram ? groupExists : `NOT ${groupExists}`)
+  }
+  if (filter.externalOnSomeDiagram !== undefined) {
+    const external = externalOnSomeDiagramSql('o')
+    objectWhere.push(filter.externalOnSomeDiagram ? external : `NOT ${external}`)
+    // Scope is an object property; a group is never external.
+    if (filter.externalOnSomeDiagram) groupWhere.push('false')
   }
   if (filter.domainId) {
     objectWhere.push(`o.domain_id = ${add(filter.domainId)}`)

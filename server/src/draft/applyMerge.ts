@@ -46,6 +46,7 @@ import {
 } from '../overlaySegments.js'
 import type { AutomergeResidencyLeases } from '../automergeResidency.js'
 import { findReadyDocument, syncedHandle } from '../automergeRepoCompat.js'
+import { syncStubObjectScopes } from '../ai/core/stubObjectScopes.js'
 
 /**
  * Merge a draft into the live model.
@@ -102,7 +103,7 @@ const MODEL_KEY: Partial<Record<ChangeCollection, keyof FullModel>> = {
 const INLINE_COLLECTIONS: ChangeCollection[] = ['group', 'domain', 'tag', 'decisionRecord']
 /** DiagramDoc keys that are NOT scalar settings (handled separately) — used to
  * wholesale-replace settings so a field the draft REMOVED is actually cleared. */
-const DIAGRAM_NON_SETTINGS = new Set(['objectIds', 'connectionIds', 'groupIds', 'layouts', 'flows', 'comments', 'checkpoints'])
+const DIAGRAM_NON_SETTINGS = new Set(['objectIds', 'connectionIds', 'groupIds', 'layouts', 'flows', 'comments', 'checkpoints', 'objectScopes'])
 
 /**
  * Claim-at-write context, plus the scope that fences the creation: every document the changeset CREATES on the parent — diagram copies,
@@ -194,8 +195,8 @@ async function findOrCreateRegistryShard(
     })
   }
   rootHandle.change((r) => {
-    const urls = (r.shardUrls ?? (r.shardUrls = [])) as string[]
-    urls.push(fresh.url)
+    if (!r.shardUrls) r.shardUrls = []
+    r.shardUrls.push(fresh.url)
   })
   return fresh
 }
@@ -213,8 +214,10 @@ async function findRegistryShardWithDiagram(
   return null
 }
 
-/** Build a registry stub (denormalized) from the draft's diagram meta + a new docUrl. */
-function stubFrom(dmeta: Record<string, unknown>, docUrl: string): Record<string, unknown> {
+/** Build a registry stub (denormalized) from the draft's diagram meta + a new docUrl.
+ * `docScopes` is the COPIED DiagramDoc's `objectScopes`: the doc is the
+ * authority, and the stub's copy feeds "external in N of M diagrams". */
+function stubFrom(dmeta: Record<string, unknown>, docUrl: string, docScopes: unknown): Record<string, unknown> {
   const stub: Record<string, unknown> = {
     id: dmeta.id,
     name: dmeta.name,
@@ -225,6 +228,7 @@ function stubFrom(dmeta: Record<string, unknown>, docUrl: string): Record<string
     groupIds: dmeta.groupIds ?? [],
   }
   if (dmeta.parentObjectId !== undefined) stub.parentObjectId = dmeta.parentObjectId
+  syncStubObjectScopes(stub, docScopes)
   return stub
 }
 
@@ -263,7 +267,10 @@ export async function applyChangeset(
       for (const ch of changes) {
         const key = MODEL_KEY[ch.collection]
         if (!key) continue
-        const coll = m[key] ?? (m[key] = {})
+        // Assign, then RE-READ: `m[key] ?? (m[key] = {})` yields the plain `{}`,
+        // not the proxy the document now holds, and every write into it is lost.
+        if (!m[key]) m[key] = {}
+        const coll = m[key]
         if (ch.kind === 'deleted') delete coll[ch.id]
         else {
           const v = (theirs[key] as Record<string, unknown>)[ch.id]
@@ -278,11 +285,13 @@ export async function applyChangeset(
       for (const ch of changes) {
         if (!INLINE_COLLECTIONS.includes(ch.collection)) continue
         const key = MODEL_KEY[ch.collection]!
-        const coll = (m[key] as Record<string, unknown>) ?? (m[key] = {})
+        if (!m[key]) m[key] = {}
+        const coll = m[key] as Record<string, unknown>
         if (ch.kind === 'deleted') {
           delete coll[ch.id]
           if (ch.collection === 'decisionRecord' && m.decisionRecordShardUrls?.length) {
-            const deleted = m.deletedDecisionRecordIds ?? (m.deletedDecisionRecordIds = [])
+            if (!m.deletedDecisionRecordIds) m.deletedDecisionRecordIds = []
+            const deleted = m.deletedDecisionRecordIds
             if (!deleted.includes(ch.id)) deleted.push(ch.id)
           }
         } else {
@@ -330,7 +339,8 @@ export async function applyChangeset(
       }
       if (deletes.length) {
         metaHandle.change((m) => {
-          const arr = (m[tombField] ?? (m[tombField] = [])) as string[]
+          if (!m[tombField]) m[tombField] = []
+          const arr = m[tombField] as string[]
           const have = new Set(arr)
           for (const ch of deletes) if (!have.has(ch.id)) { arr.push(ch.id); have.add(ch.id) }
         })
@@ -364,6 +374,7 @@ export async function applyChangeset(
     id: string
     dmeta: Record<string, unknown>
     handle: DocHandle<Record<string, unknown>>
+    scopes: unknown
   }> = []
   for (const ch of diagramChanges.filter((c) => c.kind === 'created')) {
     if (await findRegistryShardWithDiagram(repo, shardUrls, ch.id)) continue // dedupe (idempotent)
@@ -376,7 +387,7 @@ export async function applyChangeset(
     await docHandle.whenReady()
     track(docHandle)
     await repo.flush([docHandle.documentId])
-    createdCopies.push({ id: ch.id, dmeta, handle: docHandle })
+    createdCopies.push({ id: ch.id, dmeta, handle: docHandle, scopes: copy.objectScopes })
   }
   if (createdCopies.length > 0 && options.claim) {
     await notifyWorkspaceDocumentsCreated({
@@ -389,7 +400,7 @@ export async function applyChangeset(
     const shard = track(await findOrCreateRegistryShard(repo, rootHandle, options.claim))
     track(rootHandle)
     shard.change((s) => {
-      s.diagrams[created.id] = stubFrom(created.dmeta, created.handle.url)
+      s.diagrams[created.id] = stubFrom(created.dmeta, created.handle.url, created.scopes)
     })
   }
 
@@ -434,7 +445,7 @@ export async function applyChangeset(
       }
       const shard = track(await findOrCreateRegistryShard(repo, rootHandle, options.claim))
       track(rootHandle)
-      shard.change((s) => { s.diagrams[id] = stubFrom(dmeta, docHandle.url) })
+      shard.change((s) => { s.diagrams[id] = stubFrom(dmeta, docHandle.url, copy.objectScopes) })
       continue
     }
     const doc = track(await find<DiagramDocLike>(repo, curUrl))
@@ -445,17 +456,31 @@ export async function applyChangeset(
         for (const k of Object.keys(d)) {
           if (!DIAGRAM_NON_SETTINGS.has(k) && !(k in td.settings)) delete d[k]
         }
-        for (const [k, v] of Object.entries(td.settings)) d[k] = v
+        for (const [k, v] of Object.entries(td.settings)) if (k !== 'objectScopes') d[k] = v
+        // Per-diagram scope overrides merge KEY BY KEY into the existing map,
+        // never replace or delete it: a deleted or replaced Automerge map drops
+        // a peer's concurrent override. Absent in the draft = no overrides.
+        // Only create the map when the draft actually carries overrides (an
+        // unrelated settings merge creating `{}` would race a peer's first one).
+        const draftScopes = (td.settings.objectScopes ?? {}) as Record<string, unknown>
+        if (!d.objectScopes && Object.keys(draftScopes).length) d.objectScopes = {}
+        const liveScopes = d.objectScopes as Record<string, unknown> | undefined
+        if (liveScopes) {
+          for (const k of Object.keys(liveScopes)) if (!(k in draftScopes)) delete liveScopes[k]
+          for (const [k, v] of Object.entries(draftScopes)) if (liveScopes[k] !== v) liveScopes[k] = v
+        }
         d.objectIds = td.objectIds
         d.connectionIds = td.connectionIds
         d.groupIds = td.groupIds
       }
-      const layouts = (d.layouts ?? (d.layouts = {})) as Record<string, unknown>
+      if (!d.layouts) d.layouts = {}
+      const layouts = d.layouts
       for (const ch of layoutByDiag.get(id) ?? []) {
         if (ch.kind === 'deleted') delete layouts[ch.id]
         else { const v = td.layouts?.[ch.id]; if (v !== undefined) layouts[ch.id] = v }
       }
-      const flows = (d.flows ?? (d.flows = {})) as Record<string, unknown>
+      if (!d.flows) d.flows = {}
+      const flows = d.flows
       for (const ch of flowByDiag.get(id) ?? []) {
         if (ch.kind === 'deleted') delete flows[ch.id]
         else { const v = td.flows?.[ch.id]; if (v !== undefined) flows[ch.id] = v }
@@ -479,6 +504,9 @@ export async function applyChangeset(
           // else the denormalized stub (read by the projector) drifts from the doc.
           if (dmeta.parentObjectId !== undefined) stub.parentObjectId = dmeta.parentObjectId
           else if ('parentObjectId' in stub) delete stub.parentObjectId
+          // From the doc just written (`td.settings` carries the overrides),
+          // not `dmeta`: the stub copy must follow clears as well as sets.
+          syncStubObjectScopes(stub as unknown as Record<string, unknown>, td.settings.objectScopes)
         })
       }
     }

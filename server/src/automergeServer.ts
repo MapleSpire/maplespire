@@ -345,6 +345,7 @@ function starterDiagramDoc(name: string): Record<string, unknown> {
     connectionIds: [],
     groupIds: [],
     layouts: {},
+    objectScopes: {},
     comments: {},
     flows: {},
     checkpoints: [],
@@ -424,10 +425,14 @@ export async function createEmptyRoot(
   // browser gets a ModelMeta with no write heads and cannot durably hold an
   // object. `buildModelMeta` makes the heads impossible to omit. The single
   // object/connection shard doubles as the persistent edits overlay (kept last
-  // in its shard-url list).
-  const objectShard = create({ objects: {} })
+  // in its shard-url list). `writeBatchIds` from birth: the client's first push
+  // created it lazily, so two people's first edits on a new landscape each
+  // created a list and Automerge kept one — the other batch id vanished
+  // (`server/qa/loadUsersCore.mjs` records the fresh head's shape, T-G1c; the
+  // one-list-survives merge is measured in modelMeta.test.ts).
+  const objectShard = create({ objects: {}, writeBatchIds: [] as string[] })
   await objectShard.whenReady()
-  const connectionShard = create({ connections: {} })
+  const connectionShard = create({ connections: {}, writeBatchIds: [] as string[] })
   await connectionShard.whenReady()
   const metaHandle = create(buildModelMeta({
     objectWriteHead: objectShard.url,

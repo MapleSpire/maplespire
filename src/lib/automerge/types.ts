@@ -22,6 +22,7 @@ import type {
   Comment,
   Flow,
   Diagram,
+  ObjectScope,
 } from '../../types'
 
 /**
@@ -66,6 +67,14 @@ export interface DiagramMeta {
   connectionIds: string[]
   /** Denormalised composition — ids of groups visible in this diagram. */
   groupIds: string[]
+  /** Denormalised — the diagram's per-object internal/external overrides
+   * (`Diagram.objectScopes`; absent when it has none). Copied here so the
+   * derived "external in N of M diagrams" usage resolves from layout-less stubs
+   * and from `ro_diagrams.data` without loading every DiagramDoc. Kept like the
+   * composition: the store is authoritative for the active diagram, the
+   * existing meta (minus deleted objects) for every other one. A map that
+   * exists is emptied, never deleted: a concurrent put inside it would be lost. */
+  objectScopes?: Record<string, ObjectScope>
 }
 
 export interface RootModel {

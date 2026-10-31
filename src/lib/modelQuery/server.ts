@@ -158,6 +158,7 @@ function cacheExplorerWorkingSet(workspaceKey: string, page: ObjectExplorerPage)
         componentCount: row.componentCount,
         connectionCount: row.connectionCount,
         diagramCount: row.diagramCount,
+        ...(row.externalDiagramCount !== undefined ? { externalDiagramCount: row.externalDiagramCount } : {}),
         inDiagram: row.inDiagram,
         breadcrumb: row.breadcrumb,
         searchText: row.name,
@@ -261,6 +262,9 @@ export const serverModelQuery: ModelQuery = {
     if (opts.filter?.teamIds?.length) params.set('teamIds', opts.filter.teamIds.join(','))
     if (opts.filter?.hasDescription !== undefined) params.set('hasDescription', String(opts.filter.hasDescription))
     if (opts.filter?.inDiagram !== undefined) params.set('inDiagram', String(opts.filter.inDiagram))
+    if (opts.filter?.externalOnSomeDiagram !== undefined) {
+      params.set('externalOnSomeDiagram', String(opts.filter.externalOnSomeDiagram))
+    }
     if (opts.domainId) params.set('domainId', opts.domainId)
     const page = await getJson<ObjectExplorerPage>(`/api/model/objects/search?${params.toString()}`, signal)
     cacheExplorerWorkingSet(workspaceKey, page)

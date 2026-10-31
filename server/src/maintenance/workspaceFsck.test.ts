@@ -18,6 +18,8 @@ import { FSCK_CHECKS, REGISTRY_HEAD_PROJECTION_GRACE_MS, checkWorkspaceStructure
 import { OVERLAY_WRITE_HEAD_VERSION, buildModelMeta } from '../modelMeta.js'
 import { OVERLAY_SEGMENT_SIZE } from '../overlaySegments.js'
 import { OVERLAY_CHAIN_FOLD_MIN } from '../readModel/overlayChainFold.js'
+import * as Automerge from '@automerge/automerge'
+import { hiddenListEntries } from './containerConflicts.js'
 
 // GENERATED, never hand-written. A hand-typed base58 string fails the
 // base58check digest, `isValidAutomergeUrl` rejects it, and every reference is
@@ -55,6 +57,9 @@ function healthyMeta(overrides: Record<string, unknown> = {}) {
     // literal — is the same keystroke as the repair for a genuine drift. A
     // fixture that means "current" should say "current".
     editsOverlayWriteHeadVersion: OVERLAY_WRITE_HEAD_VERSION,
+    // What `buildModelMeta` always emits; `model-containers-present` reports an
+    // ordinary meta without them, so a "healthy" fixture must carry them.
+    groups: {}, domains: {}, tagSnapshots: {},
     ...overrides,
   }
 }
@@ -187,8 +192,13 @@ describe('workspace fsck — the document-graph invariants', () => {
     // `overlay-head-bounded` that can never run anywhere.
     const result = checkWorkspaceStructure(staticInput())
     expect(result.findings).toEqual([])
-    expect([...result.checksRun].sort()).toEqual(Object.keys(FSCK_CHECKS).sort())
-    expect(result.checksSkipped).toEqual([])
+    // The ONE check that does not apply here, and the mirror of the ordinary
+    // fixture's `overlay-head-bounded`: `model-containers-present` reads what
+    // the ORDINARY projector refuses, and this plane reads those maps `?? {}`.
+    expect(result.checksSkipped.map((entry) => entry.check)).toEqual(['model-containers-present'])
+    expect(result.checksSkipped[0]!.reason).toMatch(/^static workspace/)
+    expect([...result.checksRun, 'model-containers-present'].sort()).toEqual(Object.keys(FSCK_CHECKS).sort())
+    expect(fsckStatusOf(result.findings, result.checksSkipped)).toBe('clean')
   })
 
   describe('diagram-doc-url — a registry meta that names no document', () => {
@@ -270,7 +280,7 @@ describe('workspace fsck — the document-graph invariants', () => {
     expect(result.checksRun).toContain('diagram-doc-url')
     expect(result.checksSkipped.map((s) => s.check)).toEqual([
       'write-head-writable',
-      'model-write-head', 'write-head-version', 'overlay-chain-bounded',
+      'model-write-head', 'write-head-version', 'model-containers-present', 'container-conflict', 'overlay-chain-bounded',
       // A monolith has no overlay WRITE HEAD either, for the same reason
       // it has no chain: nothing names one. Both skips carry the
       // "monolith workspace" prefix, so the run stays COMPLETE.
@@ -1696,5 +1706,177 @@ describe('overlay-segment-bounded — the size of a LISTED segment (A11)', () =>
     const result = checkWorkspaceStructure(healthyInput({ overlaySegmentSizes: undefined }))
     expect(result.checksRun).not.toContain('overlay-segment-bounded')
     expect(fsckStatusOf(result.findings, result.checksSkipped)).toBe('incomplete')
+  })
+})
+
+describe('model-containers-present — the maps whose absence a projector refuses', () => {
+  const containerFindings = (input: Parameters<typeof checkWorkspaceStructure>[0]) =>
+    checkWorkspaceStructure(input).findings.filter((finding) => finding.check === 'model-containers-present')
+
+  it('a ModelMeta built by `buildModelMeta` holds every map it checks — the producer and the check agree', () => {
+    const built = buildModelMeta({ objectWriteHead: OBJ_HEAD, connectionWriteHead: CONN_HEAD })
+    const result = checkWorkspaceStructure(healthyInput({ modelMeta: built }))
+    expect(result.checksRun).toContain('model-containers-present')
+    expect(result.findings.filter((finding) => finding.check === 'model-containers-present')).toEqual([])
+  })
+
+  it('reports an ORDINARY ModelMeta without `groups` — the one meta map the projector refuses', () => {
+    const meta = healthyMeta()
+    delete (meta as Record<string, unknown>).groups
+    const found = containerFindings(healthyInput({ modelMeta: meta }))
+    expect(found).toHaveLength(1)
+    expect(found[0]).toMatchObject({ severity: 'degraded', documentUrl: META })
+    expect(found[0]!.detail).toContain('`groups` map')
+  })
+
+  it('does NOT report `domains` or `tagSnapshots`: nothing in the read model reads them, and old metas carry `tags`', () => {
+    // Reviewer lens: metas from before 2026-07-18 legitimately lack
+    // `tagSnapshots`; reporting them would block promotion on healthy workspaces.
+    const meta = healthyMeta()
+    delete (meta as Record<string, unknown>).domains
+    delete (meta as Record<string, unknown>).tagSnapshots
+    const result = checkWorkspaceStructure(healthyInput({ modelMeta: { ...meta, tags: {} } }))
+    expect(result.checksRun).toContain('model-containers-present')
+    expect(result.findings.filter((finding) => finding.check === 'model-containers-present')).toEqual([])
+  })
+
+  it('a non-map in `groups` is reported too — only a by-id map is what the projector reads', () => {
+    const found = containerFindings(healthyInput({ modelMeta: healthyMeta({ groups: [] }) }))
+    expect(found).toHaveLength(1)
+    expect(found[0]!.detail).toContain('`groups` map')
+  })
+
+  it('does not apply to a STATIC workspace (its plane reads these maps `?? {}`), and the run stays clean', () => {
+    const meta = healthyMeta()
+    delete (meta as Record<string, unknown>).groups
+    const result = checkWorkspaceStructure(staticInput({
+      modelMeta: meta,
+      overlayWriteHeads: [
+        { field: 'editsObjectShardUrl', url: OBJ_HEAD, entities: 0, batches: 0, quietForMs: 10, bytes: 90, entityMapPresent: false },
+      ],
+    }))
+    expect(result.checksSkipped.find((entry) => entry.check === 'model-containers-present')?.reason).toMatch(/^static workspace/)
+    expect(result.findings.filter((finding) => finding.check === 'model-containers-present')).toEqual([])
+    expect(fsckStatusOf(result.findings, result.checksSkipped)).toBe('clean')
+  })
+
+  it('reports a current head without its own entity map, and only that head', () => {
+    const found = containerFindings(healthyInput({
+      overlayWriteHeads: [
+        { field: 'editsObjectShardUrl', url: OBJ_HEAD, entities: 0, batches: 0, quietForMs: 10, bytes: 90, entityMapPresent: true },
+        { field: 'editsConnectionShardUrl', url: CONN_HEAD, entities: 0, batches: 0, quietForMs: 10, bytes: 90, entityMapPresent: false },
+      ],
+    }))
+    expect(found).toHaveLength(1)
+    expect(found[0]).toMatchObject({ documentUrl: CONN_HEAD, severity: 'degraded' })
+    expect(found[0]!.detail).toContain('`connections` map')
+  })
+
+  it('an UNRESOLVED head (`null`) is not this check\'s finding — `overlay-head-bounded` owns unmeasurable', () => {
+    const found = containerFindings(healthyInput({
+      overlayWriteHeads: [
+        { field: 'editsObjectShardUrl', url: OBJ_HEAD, entities: null, batches: null, quietForMs: null, bytes: null, entityMapPresent: null },
+      ],
+    }))
+    expect(found).toEqual([])
+  })
+
+  it('a monolith does not apply and the run stays complete; an unresolved ModelMeta is incomplete', () => {
+    const monolith = checkWorkspaceStructure(healthyInput({ root: { modelUrl: generateAutomergeUrl(), shardUrls: [REGISTRY] }, modelMeta: undefined }))
+    expect(monolith.checksSkipped.find((entry) => entry.check === 'model-containers-present')?.reason)
+      .toMatch(/^monolith workspace/)
+    const unresolved = checkWorkspaceStructure(healthyInput({ modelMeta: undefined, modelMetaUnresolved: true }))
+    expect(unresolved.checksSkipped.find((entry) => entry.check === 'model-containers-present')?.reason)
+      .toBe('the ModelMeta did not resolve')
+    expect(fsckStatusOf(unresolved.findings, unresolved.checksSkipped)).toBe('incomplete')
+  })
+
+  it('measureOverlayWriteHeads tells an absent map from an empty one, and an unresolved head from both', async () => {
+    const meta = { editsObjectShardUrl: OBJ_HEAD, editsConnectionShardUrl: CONN_HEAD }
+    const measured = await measureOverlayWriteHeads(meta, async (target) => (
+      target === OBJ_HEAD ? { objects: {} } : { writeBatchIds: [] }
+    ), async () => null, async () => null)
+    expect(measured.map((head) => [head.entities, head.entityMapPresent])).toEqual([[0, true], [0, false]])
+    const unresolved = await measureOverlayWriteHeads(meta, async () => undefined, async () => null, async () => null)
+    expect(unresolved.map((head) => head.entityMapPresent)).toEqual([null, null])
+    // A LIST in the slot is not a map (QA lens, mutant F9).
+    const listed = await measureOverlayWriteHeads(meta, async () => ({ objects: [], connections: [] }), async () => null, async () => null)
+    expect(listed.map((head) => head.entityMapPresent)).toEqual([false, false])
+  })
+
+  it('names the head\'s own collection in the detail', () => {
+    const found = containerFindings(healthyInput({
+      overlayWriteHeads: [
+        { field: 'editsObjectShardUrl', url: OBJ_HEAD, entities: 0, batches: 0, quietForMs: 10, bytes: 90, entityMapPresent: false },
+      ],
+    }))
+    expect(found[0]!.detail).toContain('`objects` map')
+  })
+})
+
+/** Two peers create `field` lazily and push one id each; the merge conflicts the key. */
+function lazilyConflicted(field: string, base: Record<string, unknown> = { marker: 1 }) {
+  const start = Automerge.from<Record<string, unknown>>(base)
+  const push = (actor: string, id: string) => Automerge.change(Automerge.clone(start, { actor }), (d) => {
+    if (!d[field]) d[field] = []
+    ;(d[field] as string[]).push(id)
+  })
+  return Automerge.merge(push('aaaaaa', `${field}-a`), push('bbbbbb', `${field}-b`))
+}
+
+describe('container-conflict — a list whose losing concurrent copy hides entries', () => {
+  const conflictFindings = (input: Parameters<typeof checkWorkspaceStructure>[0]) =>
+    checkWorkspaceStructure(input).findings.filter((finding) => finding.check === 'container-conflict')
+
+  it('the measurement: a lazily conflicted list hides one entry, and healing it clears the count', () => {
+    const doc = lazilyConflicted('deletedObjectIds')
+    expect(hiddenListEntries(doc, 'deletedObjectIds')).toHaveLength(1)
+    const healed = Automerge.change(doc, (d) => {
+      for (const entry of hiddenListEntries(doc, 'deletedObjectIds')) (d.deletedObjectIds as string[]).push(entry as string)
+    })
+    // The conflict stays (by design); what it hides does not.
+    expect(Object.keys(Automerge.getConflicts(healed, 'deletedObjectIds') ?? {})).toHaveLength(2)
+    expect(hiddenListEntries(healed, 'deletedObjectIds')).toEqual([])
+    // A plain object has no conflicts to read: zero, not a throw.
+    expect(hiddenListEntries({ deletedObjectIds: ['x'] }, 'deletedObjectIds')).toEqual([])
+  })
+
+  it('reports a head hiding batch ids as sync-stall, and only that head', () => {
+    const found = conflictFindings(healthyInput({
+      overlayWriteHeads: [
+        { field: 'editsObjectShardUrl', url: OBJ_HEAD, entities: 0, batches: 0, quietForMs: 10, bytes: 90, entityMapPresent: true, hiddenBatchIds: 0 },
+        { field: 'editsConnectionShardUrl', url: CONN_HEAD, entities: 0, batches: 1, quietForMs: 10, bytes: 90, entityMapPresent: true, hiddenBatchIds: 1 },
+      ],
+    }))
+    expect(found.map((finding) => [finding.severity, finding.documentUrl])).toEqual([['sync-stall', CONN_HEAD]])
+    expect(found[0]!.detail).toContain('editsConnectionShardUrl.writeBatchIds')
+  })
+
+  it('does NOT report a conflicted tombstone list: a hidden id may be one compaction or undo removed on purpose', () => {
+    // Reviewer lens round 2: after the client re-pushes its session tombstones
+    // into the winner and compaction splices them out of it, the losing copy
+    // still holds them — a permanent false data-loss if reported.
+    const meta = lazilyConflicted('deletedObjectIds', healthyMeta())
+    expect(hiddenListEntries(meta, 'deletedObjectIds')).toHaveLength(1)
+    const result = checkWorkspaceStructure(healthyInput({ modelMeta: meta }))
+    expect(result.checksRun).toContain('container-conflict')
+    expect(result.findings.filter((finding) => finding.check === 'container-conflict')).toEqual([])
+  })
+
+  it('measureOverlayWriteHeads counts the batch ids a conflicted head hides', async () => {
+    const meta = { editsObjectShardUrl: OBJ_HEAD, editsConnectionShardUrl: CONN_HEAD }
+    const conflicted = lazilyConflicted('writeBatchIds', { objects: {} })
+    const measured = await measureOverlayWriteHeads(meta, async (target) => (
+      target === OBJ_HEAD ? conflicted : { connections: {}, writeBatchIds: ['x'] }
+    ), async () => null, async () => null)
+    expect(measured.map((head) => head.hiddenBatchIds)).toEqual([1, 0])
+  })
+
+  it('does not apply to a monolith; an unresolved ModelMeta is incomplete', () => {
+    const monolith = checkWorkspaceStructure(healthyInput({ root: { modelUrl: generateAutomergeUrl(), shardUrls: [REGISTRY] }, modelMeta: undefined }))
+    expect(monolith.checksSkipped.find((entry) => entry.check === 'container-conflict')?.reason).toMatch(/^monolith workspace/)
+    const unresolved = checkWorkspaceStructure(healthyInput({ modelMeta: undefined, modelMetaUnresolved: true }))
+    expect(unresolved.checksSkipped.find((entry) => entry.check === 'container-conflict')?.reason)
+      .toBe('the ModelMeta did not resolve')
   })
 })

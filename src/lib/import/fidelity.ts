@@ -456,7 +456,8 @@ function measureElements(
   const weaklyMatchedIds: string[] = []
 
   for (const el of source.elements) {
-    const tally = (byKind[el.kind] ??= { expected: 0, matched: 0, missingIds: [] })
+    byKind[el.kind] ??= { expected: 0, matched: 0, missingIds: [] }
+    const tally = byKind[el.kind]!
     tally.expected += 1
     const target = correlation.targetBySourceId.get(el.id)
     if (!target) {

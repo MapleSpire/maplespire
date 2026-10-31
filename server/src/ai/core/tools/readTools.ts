@@ -23,6 +23,7 @@ import {
   type CommentView, type FlowView,
 } from './shapes.js'
 import { ICON_COUNT, listIconPacks, searchIcons } from './icons.js'
+import { resolveObjectScope } from '../objectScope.js'
 
 /**
  * Read tools — list/detail over the workspace model: objects, domains,
@@ -58,6 +59,8 @@ function objRow(ctx: Awaited<ReturnType<AiToolCtx['session']['snapshot']>>, o: R
       .filter(Boolean)
       .map((owner) => ({ id: owner!.id, kind: owner!.kind, name: owner!.name, email: owner!.email })),
     links: o.links ?? [],
+    // The DEFAULT scope; a diagram can override it (get_diagram reports the
+    // per-diagram value). Field name kept: tools and tests read `scope`.
     scope: o.scope,
     status: o.status,
   }
@@ -290,9 +293,13 @@ export const readTools: AiToolDef[] = [
       return {
         id: d.id,
         settings: detail?.settings ?? { name: d.meta.name, type: d.meta.type },
+        // `scope` is the object's scope ON THIS diagram (override, then the C4
+        // boundary rule, then its default) — get_model_object reports the default.
         objects: objIds.map((id) => {
           const o = objects(m)[id]
-          return o ? { id, type: o.type, name: o.name } : { id, missing: true }
+          if (!o) return { id, missing: true }
+          const { scope, source } = resolveObjectScope(o, detail?.settings ?? d.meta, (oid) => objects(m)[oid])
+          return { id, type: o.type, name: o.name, scope, scopeSource: source }
         }),
         connections: connIds.map((id) => {
           const c = connections(m)[id]

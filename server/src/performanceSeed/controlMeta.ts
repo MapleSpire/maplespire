@@ -25,6 +25,8 @@ export interface PerformanceControlMetaInput extends Record<string, unknown> {
   editsOverlayWriteHeadVersion?: number
   deletedObjectIds?: string[]
   deletedConnectionIds?: string[]
+  deletedDecisionRecordIds?: string[]
+  deletedDiagramIds?: string[]
 }
 
 export interface PerformanceOverlaySnapshots {
@@ -147,6 +149,12 @@ export function toPerformanceControlMeta(
     editsObjectShardUrls: objectOverlays,
     editsConnectionShardUrls: connectionOverlays,
     editsOverlayWriteHeadVersion: OVERLAY_WRITE_HEAD_VERSION,
+    // Every tombstone list from birth, as `buildModelMeta` does (see there for
+    // the concurrent-creation loss it closes). Kept when the source has one.
+    deletedObjectIds: plain.deletedObjectIds ?? [],
+    deletedConnectionIds: plain.deletedConnectionIds ?? [],
+    deletedDecisionRecordIds: plain.deletedDecisionRecordIds ?? [],
+    deletedDiagramIds: plain.deletedDiagramIds ?? [],
     ...(objectOverlays.length > 0
       ? { editsObjectShardUrl: objectOverlays[objectOverlays.length - 1] }
       : {}),

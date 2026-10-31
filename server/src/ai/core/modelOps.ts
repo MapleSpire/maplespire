@@ -24,6 +24,7 @@ import {
 import { createClaimedDocument, type WorkspaceKey } from '../../rbac/docScope.js'
 import type { SealedRepo } from '../../rbac/sealedRepo.js'
 import { findReadyDocument } from '../../automergeRepoCompat.js'
+import { syncStubObjectScopes } from './stubObjectScopes.js'
 
 /**
  * Server-side reads + writes on a workspace root for the AI tools — the same
@@ -126,7 +127,10 @@ export async function upsertModelEntities(
     if (!root.modelUrl || !isValidAutomergeUrl(root.modelUrl)) throw new Error('workspace has no model document')
     const model = await find<ModelDocLike>(repo, root.modelUrl)
     model.change((m) => {
-      const c = m[coll] ?? (m[coll] = {})
+      // Assign, then RE-READ: `m[coll] ?? (m[coll] = {})` yields the plain `{}`,
+      // not the proxy the document now holds, and every write into it is lost.
+      if (!m[coll]) m[coll] = {}
+      const c = m[coll]
       for (const id of ids) c[id] = values[id] as Record<string, unknown>
     })
     return
@@ -180,7 +184,8 @@ export async function deleteModelEntities(
   const meta = await find<MetaLike>(repo, root.modelMetaUrl!)
   const tombField = coll === 'objects' ? 'deletedObjectIds' : 'deletedConnectionIds'
   meta.change((m) => {
-    const arr = (m[tombField] ?? (m[tombField] = [])) as string[]
+    if (!m[tombField]) m[tombField] = []
+    const arr = m[tombField] as string[]
     const have = new Set(arr)
     for (const id of ids) if (!have.has(id)) { arr.push(id); have.add(id) }
   })
@@ -212,8 +217,9 @@ export async function upsertInlineEntities(
   if (!target || !isValidAutomergeUrl(target)) throw new Error('workspace has no model document')
   const handle = await find<MetaLike>(repo, target)
   handle.change((m) => {
-    const c = (m[coll] as Record<string, unknown>) ?? (m[coll] = {})
-    for (const id of ids) (c as Record<string, unknown>)[id] = values[id]
+    if (!m[coll]) m[coll] = {}
+    const c = m[coll] as Record<string, unknown>
+    for (const id of ids) c[id] = values[id]
   })
 }
 
@@ -273,8 +279,8 @@ async function findOrCreateRegistryShard(
     repo, workspace, root.url, { diagrams: {} },
   )
   root.change((r) => {
-    const urls = (r.shardUrls ?? (r.shardUrls = [])) as string[]
-    urls.push(fresh.url)
+    if (!r.shardUrls) r.shardUrls = []
+    r.shardUrls.push(fresh.url)
   })
   await repo.flush([root.documentId])
   return fresh
@@ -331,6 +337,8 @@ export async function createDiagramDoc(
     connectionIds: input.connectionIds ?? [],
     groupIds: input.groupIds ?? [],
     layouts: input.layouts ?? {},
+    // Created with the diagram so no two peers ever create it concurrently.
+    objectScopes: {},
     flows: {},
     comments: {},
     checkpoints: [],
@@ -375,6 +383,10 @@ export interface UpdateDiagramInput {
   /** Per-entity {position,size} overrides on this diagram, keyed by entity id. */
   layoutUpserts?: Record<string, unknown>
   layoutDeletes?: string[]
+  /** Per-diagram internal/external overrides (`objectScopes`), keyed by object
+   * id; `null` clears the override so the object resolves from the C4 boundary
+   * rule and then its default scope. */
+  scopeUpserts?: Record<string, 'internal' | 'external' | null>
 }
 
 function addUnique(arr: string[], ids: string[]): void {
@@ -419,19 +431,41 @@ export async function updateDiagramDoc(
         else d[k] = v
       }
     }
-    const objectIds = (d.objectIds ?? (d.objectIds = [])) as string[]
+    // Assign, then RE-READ (see upsertModelEntities): the assignment's value is
+    // the plain array, not the document's list.
+    if (!d.objectIds) d.objectIds = []
+    const objectIds = d.objectIds
     if (patch.addObjectIds?.length) addUnique(objectIds, patch.addObjectIds)
     if (patch.removeObjectIds?.length) removeAll(objectIds, patch.removeObjectIds)
-    const connectionIds = (d.connectionIds ?? (d.connectionIds = [])) as string[]
+    if (!d.connectionIds) d.connectionIds = []
+    const connectionIds = d.connectionIds
     if (patch.addConnectionIds?.length) addUnique(connectionIds, patch.addConnectionIds)
     if (patch.removeConnectionIds?.length) removeAll(connectionIds, patch.removeConnectionIds)
-    const groupIds = (d.groupIds ?? (d.groupIds = [])) as string[]
+    if (!d.groupIds) d.groupIds = []
+    const groupIds = d.groupIds
     if (patch.addGroupIds?.length) addUnique(groupIds, patch.addGroupIds)
     if (patch.removeGroupIds?.length) removeAll(groupIds, patch.removeGroupIds)
     if (layoutUpserts || patch.layoutDeletes?.length) {
-      const layouts = (d.layouts ?? (d.layouts = {})) as Record<string, unknown>
+      if (!d.layouts) d.layouts = {}
+      const layouts = d.layouts
       for (const [k, v] of Object.entries(layoutUpserts ?? {})) layouts[k] = v
       for (const k of patch.layoutDeletes ?? []) delete layouts[k]
+    }
+    const scopeEntries = Object.entries(patch.scopeUpserts ?? {})
+    // Only a write that SETS an override may create the map on an older
+    // diagram; a clear on a map-less diagram has nothing to do (creating `{}`
+    // there would race a peer's concurrent first override and could hide it).
+    if (scopeEntries.some(([, v]) => v !== null) || (scopeEntries.length && d.objectScopes)) {
+      // Assign THEN re-read: the value of `d.x = {}` is the plain object, not the
+      // Automerge proxy, and writes into it are silently dropped.
+      if (!d.objectScopes) d.objectScopes = {}
+      const scopes = d.objectScopes as Record<string, unknown>
+      for (const [k, v] of scopeEntries) {
+        if (v === null) delete scopes[k]
+        else scopes[k] = v
+      }
+      // Never delete the emptied map: a peer's concurrent write into it would
+      // be lost with it.
     }
   })
 
@@ -447,6 +481,7 @@ export async function updateDiagramDoc(
     stub.groupIds = clonePlain((doc.groupIds ?? []) as string[])
     if (doc.parentObjectId !== undefined) stub.parentObjectId = doc.parentObjectId
     else if ('parentObjectId' in stub) delete stub.parentObjectId
+    syncStubObjectScopes(stub as unknown as Record<string, unknown>, doc.objectScopes)
   })
   return true
 }
@@ -498,6 +533,9 @@ export async function stripIdsFromAllDiagrams(
           }
           const layouts = d.layouts as Record<string, unknown> | undefined
           if (layouts) for (const dropId of ids) delete layouts[dropId]
+          // Per-diagram scope overrides: drop the keys, keep the map.
+          const objectScopes = d.objectScopes as Record<string, unknown> | undefined
+          if (objectScopes) for (const dropId of ids) delete objectScopes[dropId]
         })
       }
       touched?.add(shard.documentId)
@@ -541,8 +579,8 @@ export async function mutateComment(
     ok = true
     if (mutation.resolve !== undefined) comment.resolved = mutation.resolve
     if (mutation.reply) {
-      const replies = (comment.replies ?? (comment.replies = [])) as unknown[]
-      replies.push(
+      if (!comment.replies) comment.replies = []
+      ;(comment.replies as unknown[]).push(
         clonePlain({
           id: newEntityId(),
           text: mutation.reply.text,

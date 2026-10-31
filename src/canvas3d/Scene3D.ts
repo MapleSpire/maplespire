@@ -9018,12 +9018,13 @@ export class Scene3D {
           const sp = spots[j]
           const g = scaleAbout({ x: sp.x - s.w / 2, y: sp.z - s.h / 2, w: s.w, h: s.h }, s.k, sp.anchor)
           const y = sp.lift + 0.4
-          c = corners[j] = [
+          c = [
             screen(g.x, y, g.y, true),
             screen(g.x + g.w, y, g.y, true),
             screen(g.x + g.w, y, g.y + g.h, true),
             screen(g.x, y, g.y + g.h, true),
           ]
+          corners[j] = c
         }
         return c
       }

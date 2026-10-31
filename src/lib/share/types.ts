@@ -45,6 +45,10 @@ export interface ShareDiagram {
    * viewer's 3D toggle resolves through it exactly like the editor. */
   layouts3d?: Record<string, { position: Position; size: Size }>
   sceneDecor?: Diagram['sceneDecor']
+  /** Per-diagram internal/external. Baked at share time to the RESOLVED scope of
+   * every object on the diagram (`bakeShareScopes`): the slice drops ancestors
+   * that are not on the diagram, so the viewer cannot run the boundary rule. */
+  objectScopes?: Diagram['objectScopes']
 }
 
 /** The payload POSTed at share time and fetched by the viewer. Model entities are

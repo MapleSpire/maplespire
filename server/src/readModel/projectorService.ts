@@ -152,7 +152,7 @@ interface ModelLike {
   groups?: Record<string, GroupInput>
 }
 /** `writeBatchIds` is the client's own list of the write batches it put into
- * this head (`bridge.ts`, `(s.writeBatchIds ??= []).push(batchId)`), the ids it
+ * this head (`bridge.ts` `writeEditsShards`, pushed in place), the ids it
  * later asks `/api/model/overlay-batches/status` about. */
 interface ObjShardLike { objects?: Record<string, ObjectInput>; writeBatchIds?: string[] }
 interface ConnShardLike { connections?: Record<string, ConnectionInput>; writeBatchIds?: string[] }

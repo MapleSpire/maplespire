@@ -225,6 +225,24 @@ describe('concurrency: the splice keeps a peer’s work, a whole-record write do
     expect(view(Automerge.merge(Automerge.clone(one), two)).links).toEqual(['l1'])
   })
 
+  it('a meta WITHOUT decisionRecords keeps the seeded record and the removal', () => {
+    // `meta.decisionRecords ?? (meta.decisionRecords = {})` handed back the
+    // plain `{}`, so the seed and the splice landed on a detached object, the
+    // document kept an empty map, and the result still said 'removed'.
+    const b = Automerge.from<Record<string, unknown>>({ marker: 1 })
+    const baseline = new Map([[
+      'adr-1', record('adr-1', [link('l1', 'diagram', 'dg-live'), link('l2', 'diagram', 'dg-gone')]),
+    ]])
+    let results: ReturnType<typeof removeDecisionRecordLinks> = []
+    const after = Automerge.change(b, (d) => {
+      results = removeDecisionRecordLinks(
+        d as MetaLike, [{ adrId: 'adr-1', targetId: 'dg-gone', types: ['diagram'] }], baseline,
+      )
+    })
+    expect(results[0]).toMatchObject({ outcome: 'removed', removed: 1 })
+    expect(view(after as Automerge.Doc<Doc>)).toEqual({ content: 'BASE', links: ['l1'] })
+  })
+
   it('records no new change when there was nothing to remove', () => {
     // The head check is what lets the caller assert an effect instead of an
     // intention.

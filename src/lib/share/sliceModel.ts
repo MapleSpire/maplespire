@@ -12,7 +12,8 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU Affero General Public License for more details.
 
-import type { C4Object, Connection, Group, Tag, Diagram } from '../../types'
+import type { C4Object, Connection, Group, Tag, Diagram, ObjectScope } from '../../types'
+import { parentLookup, resolveObjectScope } from '../diagrams/objectScope'
 import type { ShareDiagram, ShareSnapshot } from './types'
 
 /** The model fields a share may reference. Deliberately NO comments / decision
@@ -50,7 +51,27 @@ export function toShareDiagram(dg: Diagram): ShareDiagram {
   if (dg.layouts3d !== undefined) sd.layouts3d = dg.layouts3d
   // Scene decoration rides too — the shared link shows the dressed board.
   if (dg.sceneDecor !== undefined) sd.sceneDecor = dg.sceneDecor
+  if (dg.objectScopes !== undefined) sd.objectScopes = { ...dg.objectScopes }
   return sd
+}
+
+/**
+ * Freeze each shared diagram's internal/external to the value the editor shows,
+ * resolved against the FULL model. Must run before slicing drops the ancestors
+ * the C4 boundary rule walks; afterwards every object on a shared diagram has an
+ * explicit entry, so the viewer never resolves anything itself.
+ */
+export function bakeShareScopes(diagrams: ShareDiagram[], objects: readonly C4Object[]): void {
+  const byId = new Map(objects.map((o) => [o.id, o]))
+  const parentOf = parentLookup((id) => byId.get(id))
+  for (const d of diagrams) {
+    const scopes: Record<string, ObjectScope> = {}
+    for (const id of d.objectIds) {
+      const object = byId.get(id)
+      if (object) scopes[id] = resolveObjectScope(object, d, parentOf).scope
+    }
+    d.objectScopes = scopes
+  }
 }
 
 /**

@@ -16,7 +16,7 @@
       "filter": {
         "open": "Filter model objects",
         "type": "Type",
-        "scope": "Scope",
+        "scope": "Default scope",
         "technology": "Technology",
         "technologyLoading": "Loading technologies…",
         "technologyEmpty": "No selectable technologies",

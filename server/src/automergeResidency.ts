@@ -508,7 +508,7 @@ export class AutomergeResidencyLeases {
       const metrics = documents[handle.documentId]
       const peers = metrics?.peers.length ?? 0
       const numOps = metrics?.size.numOps ?? 0
-      const bucket = byType[type] ??= {
+      byType[type] ??= {
         handles: 0,
         activePeerDocuments: 0,
         peerReferences: 0,
@@ -517,6 +517,7 @@ export class AutomergeResidencyLeases {
         numChanges: 0,
         durableChunkBytes: 0,
       }
+      const bucket = byType[type]
       // `bucket` is a per-type tally in this snapshot, not a Repo. The rule
       // keys on the property NAME, so it cannot tell; saying so here is
       // cheaper than narrowing the rule and letting an aliased `repo` through.

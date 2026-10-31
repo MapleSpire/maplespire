@@ -104,6 +104,7 @@ export function ModelObjectsView() {
   const activeCount =
     filter.types.length +
     (filter.scope ? 1 : 0) +
+    (filter.externalOnSomeDiagram !== undefined ? 1 : 0) +
     (filter.statuses?.length ?? (filter.status ? 1 : 0)) +
     filter.tagIds.length +
     (filter.technologyIds?.length ?? 0) +
@@ -173,7 +174,7 @@ export function ModelObjectsView() {
   const clearFilters = () => {
     setFilter({
       types: [], scope: undefined, status: undefined, statuses: [], tagIds: [],
-      technologyIds: [], teamIds: [], inDiagram: undefined, hasDescription: undefined,
+      technologyIds: [], teamIds: [], inDiagram: undefined, externalOnSomeDiagram: undefined, hasDescription: undefined,
     })
     setDomainId(null)
   }
@@ -210,6 +211,21 @@ export function ModelObjectsView() {
               {scope === 'internal' ? t('dataViewsB.view.scope.internal') : t('dataViewsB.view.scope.external')}
             </button>
           ))}
+        </div>
+      </div>
+      <div className="border-t border-line-soft py-2.5">
+        {/* The DERIVED scope: external on at least one diagram it appears on
+            (override, C4 boundary rule, or default) — not the default above. */}
+        <div className="mb-2 text-[11px] font-semibold text-fg-secondary">{t('dataViewsB.view.filters.scopeOnDiagrams')}</div>
+        <div className="flex flex-wrap gap-1.5">
+          <button
+            data-testid="mo-filter-external-on-some-diagram"
+            aria-pressed={filter.externalOnSomeDiagram === true}
+            onClick={() => setFilter({ externalOnSomeDiagram: filter.externalOnSomeDiagram ? undefined : true })}
+            className={chip(filter.externalOnSomeDiagram === true)}
+          >
+            {t('dataViewsB.view.filters.externalOnSomeDiagram')}
+          </button>
         </div>
       </div>
       <div className="border-t border-line-soft py-2.5">

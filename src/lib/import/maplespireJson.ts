@@ -13,12 +13,23 @@
 // GNU Affero General Public License for more details.
 
 import type {
-  C4Object, C4Type, Connection, Diagram, Domain, Flow, Group, Tag,
+  C4Object, C4Type, Connection, Diagram, Domain, Flow, Group, ObjectScope, Tag,
   TechnologyRole, TechnologyShapeType, TechnologyUsage,
 } from '../../types'
 import { generateId } from '../utils'
 import { sanitizeSceneDecor } from '../../canvas3d/decor/decorSpec'
 import { defaultShapeSize } from '../shapeDefaults'
+
+/** Keep only `'internal'|'external'` entries for objects on the diagram. */
+function sanitizeObjectScopes(raw: unknown, objectIds: readonly string[]): Record<string, ObjectScope> | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined
+  const onDiagram = new Set(objectIds)
+  const out: Record<string, ObjectScope> = {}
+  for (const [id, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (onDiagram.has(id) && (value === 'internal' || value === 'external')) out[id] = value
+  }
+  return Object.keys(out).length ? out : undefined
+}
 
 /**
  * Parse + plan an import of a `maplespire-model` JSON export (the Share →
@@ -250,6 +261,12 @@ export function parseMapleSpireJson(text: string): MapleSpireExport {
       const sceneDecor = sanitizeSceneDecor(d.sceneDecor)
       if (sceneDecor) dg.sceneDecor = sceneDecor
       else delete dg.sceneDecor
+      // Per-diagram scope overrides are untrusted too: keep only known values
+      // for objects on this diagram (a non-object here would make the store's
+      // override write throw).
+      const objectScopes = sanitizeObjectScopes(d.objectScopes, dg.objectIds)
+      if (objectScopes) dg.objectScopes = objectScopes
+      else delete dg.objectScopes
       return dg
     })
 

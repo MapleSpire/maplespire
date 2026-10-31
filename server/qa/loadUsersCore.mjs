@@ -21,7 +21,10 @@ export function objectMap(document) {
 /**
  * Appends a stable batch id to an overlay WRITE HEAD, creating the list the way
  * the client does (`src/lib/automerge/bridge.ts`, the flush path:
- * `(s.writeBatchIds ??= []).push(batchId)`).
+ * `if (!s.writeBatchIds) s.writeBatchIds = []` then a push through the
+ * re-read list). Until 2026-10-22 the client wrote
+ * `(s.writeBatchIds ??= []).push(batchId)`, which pushes onto the detached
+ * literal: on the fresh head below its first batch id was lost.
  *
  * MEASURED, not reasoned (during load-gate qualification): a
  * workspace created by `createEmptyRoot` carries a head of shape `{ objects: {} }`

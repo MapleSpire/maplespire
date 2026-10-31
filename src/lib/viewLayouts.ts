@@ -14,6 +14,7 @@
 
 import type { C4Object, Connection, Diagram, Group } from '../types'
 import { resolveLowerRouting } from './diagrams/lowerRouting'
+import { parentLookup, withEffectiveScope, type ParentOf } from './diagrams/objectScope'
 
 /**
  * Resolving a diagram's VISUAL layer for the canvas: the model is shared between
@@ -58,29 +59,39 @@ export function resolveConnectionFor3d(c: Connection): Connection {
  * `Diagram` and the share viewer's `ShareDiagram`. */
 export type DiagramLayoutSource = Pick<
   Diagram,
-  'objectIds' | 'connectionIds' | 'groupIds' | 'layouts' | 'layouts3d' | 'lowerRouting'
+  'objectIds' | 'connectionIds' | 'groupIds' | 'layouts' | 'layouts3d' | 'lowerRouting' | 'parentObjectId' | 'objectScopes'
 >
 
 /** A diagram's composition with per-item layout merged onto positions/sizes —
  * exactly what the canvas engine consumes. `space: '3d'` resolves through the
- * 3D layer (3D ?? 2D) for shapes, groups AND connection routing. */
+ * 3D layer (3D ?? 2D) for shapes, groups AND connection routing. Each object's
+ * `scope` is replaced by its EFFECTIVE scope on this diagram (objectScope.ts);
+ * `parentOf` defaults to a lookup over `objects`. */
 export function filterAndMergeDiagramData(
   diagram: DiagramLayoutSource | undefined,
   objects: C4Object[],
   connections: Connection[],
   groups: Group[],
-  space: '2d' | '3d' = '2d'
+  space: '2d' | '3d' = '2d',
+  parentOf?: ParentOf,
 ) {
   const use3d = space === '3d'
   const layoutOf = (id: string) => (use3d ? diagram?.layouts3d?.[id] : undefined) ?? diagram?.layouts?.[id]
   const diagramObjectIds = new Set(diagram?.objectIds ?? [])
   const diagramConnectionIds = new Set(diagram?.connectionIds ?? [])
   const diagramGroupIds = new Set(diagram?.groupIds ?? [])
+  // The ancestor index is only needed for a drill-down diagram's boundary rule.
+  let lookup = parentOf
+  if (!lookup && diagram?.parentObjectId) {
+    const byId = new Map(objects.map((o) => [o.id, o]))
+    lookup = parentLookup((id) => byId.get(id))
+  }
   const filteredObjects = objects
     .filter((o) => diagramObjectIds.has(o.id))
     .map((o) => {
       const layout = layoutOf(o.id)
-      return layout ? { ...o, position: layout.position, size: layout.size } : o
+      const placed = layout ? { ...o, position: layout.position, size: layout.size } : o
+      return withEffectiveScope(placed, diagram, lookup)
     })
   // A lower's routing is the diagram's (`lowerRouting`), merged first so the
   // 3D read rule then applies to it like to any connection.

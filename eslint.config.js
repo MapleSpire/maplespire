@@ -21,6 +21,7 @@ import { defineConfig, globalIgnores } from 'eslint/config'
 import { EVIDENCE_ROOT_DIRECTORIES, hasLicenseHeader } from './scripts/license-header.mjs'
 import { createNoBareEnvNumberRule } from './scripts/env-knobs.mjs'
 import { DECLARED_BARE_ENV_PARSES } from './scripts/env-knob-declarations.mjs'
+import { noDetachedContainerWriteRule } from './scripts/detached-container-write.mjs'
 
 // ── Local rule: keep spacing on the 4px scale ──────────────────────────────────
 // Flags arbitrary Tailwind spacing utilities (margin / padding / gap / space-*),
@@ -81,6 +82,12 @@ const localRules = {
     //     the guard. Weakening that guard in place keeps the label and stays
     //     green; only the membership is pinned.
     'no-bare-env-number': createNoBareEnvNumberRule(DECLARED_BARE_ENV_PARSES),
+    // `d.f ?? (d.f = {})` / `(d.f ??= [])` hand back the plain literal, not the
+    // Automerge proxy, so a write into them is silently dropped when `d.f` was
+    // absent. Its own rule id, not a `no-restricted-syntax` selector: that id is
+    // switched off in every test file and both repo seams (see the NOTE below).
+    // Implementation, measurement and limits: `scripts/detached-container-write.mjs`.
+    'no-detached-container-write': noDetachedContainerWriteRule,
     'no-arbitrary-spacing': {
       meta: {
         type: 'problem',
@@ -130,6 +137,7 @@ export default defineConfig([
     rules: {
       'local/license-header': 'error',
       'local/no-bare-env-number': 'error',
+      'local/no-detached-container-write': 'error',
     },
   },
   {

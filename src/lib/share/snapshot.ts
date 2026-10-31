@@ -20,7 +20,7 @@ import { diagramDocToDiagram, diagramDocFlows, rootModelToSlice, mergeShards, ty
 import { getActiveDiagramHandle } from '../automerge/bridge'
 import { getModelHandle, getRegistryShardHandles, findDiagramHandle, getRootHandle } from '../automerge/repo'
 import { useModelStore } from '../../stores/modelStore'
-import { toShareDiagram, sliceModelForShare } from './sliceModel'
+import { bakeShareScopes, toShareDiagram, sliceModelForShare } from './sliceModel'
 import { pageAllComplete } from '../modelQuery/pageAllComplete'
 import { workspaceSearchParams } from '../modelQuery/workspaceParams'
 import type { ShareSnapshot, ShareDiagram } from './types'
@@ -145,6 +145,7 @@ export async function buildShareSnapshot(opts: BuildSnapshotOptions): Promise<Sh
   }
 
   const fullModel = await fullModelForShare(opts.limitToDiagram)
+  bakeShareScopes(diagrams, fullModel.objects)
   const model = sliceModelForShare(diagrams, {
     objects: fullModel.objects,
     connections: fullModel.connections,

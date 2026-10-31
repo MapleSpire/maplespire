@@ -16,7 +16,7 @@
       "filter": {
         "open": "Filtrer les objets du modèle",
         "type": "Type",
-        "scope": "Portée",
+        "scope": "Portée par défaut",
         "technology": "Technologie",
         "technologyLoading": "Chargement des technologies…",
         "technologyEmpty": "Aucune technologie sélectionnable",

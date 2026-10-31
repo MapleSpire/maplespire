@@ -1637,6 +1637,7 @@ if (READ_MODEL_ENABLED) {
     const scope = typeof req.query.scope === 'string' ? req.query.scope.slice(0, 32) : undefined
     const hasDescription = boolParam(req.query.hasDescription)
     const inDiagram = boolParam(req.query.inDiagram)
+    const externalOnSomeDiagram = boolParam(req.query.externalOnSomeDiagram)
     const domainId = typeof req.query.domainId === 'string' ? req.query.domainId.slice(0, 256) : undefined
     const queryError = objectSearchQueryError(query)
     if (queryError) {
@@ -1646,7 +1647,7 @@ if (READ_MODEL_ENABLED) {
     res.json(await roObjectSearchPage(pool, key, {
       query,
       diagramId: typeof req.query.diagramId === 'string' ? req.query.diagramId.slice(0, 256) : null,
-      filter: { types, technologyIds, tagIds, statuses, teamIds, scope, hasDescription, inDiagram, domainId },
+      filter: { types, technologyIds, tagIds, statuses, teamIds, scope, hasDescription, inDiagram, externalOnSomeDiagram, domainId },
       after: typeof req.query.after === 'string' ? req.query.after : null,
       limit: intParam(req.query.limit, 50),
     }))

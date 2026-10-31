@@ -128,17 +128,20 @@ export function removeDecisionRecordLinks(
       continue
     }
 
-    const records = meta.decisionRecords ?? (meta.decisionRecords = {})
-    let record = records[adrId]
+    let record = meta.decisionRecords?.[adrId]
     if (!record) {
       const baseline = baselineById.get(adrId)
       if (!baseline) {
         results.push({ adrId, targetId, outcome: 'absent', removed: 0 })
         continue
       }
+      // Assign, then RE-READ: `meta.decisionRecords ?? (meta.decisionRecords = {})`
+      // yields the plain `{}`, not the document's map, so the seed and the
+      // splice below would land on a detached object while reporting 'removed'.
+      if (!meta.decisionRecords) meta.decisionRecords = {}
       // The one whole-record write, and only because there is nothing to splice.
-      records[adrId] = clonePlain(baseline)
-      record = records[adrId]
+      meta.decisionRecords[adrId] = clonePlain(baseline)
+      record = meta.decisionRecords[adrId]
     }
 
     const related = record.related

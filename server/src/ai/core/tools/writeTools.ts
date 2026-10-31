@@ -173,7 +173,8 @@ export const writeTools: AiToolDef[] = [
       parentId: z.string().optional().describe('Containing object id (e.g. the system an app belongs to)'),
       icon: z.string().optional()
         .describe('Icon catalog name (find the EXACT name with search_icons; must be compatible with the object type)'),
-      scope: z.enum(['internal', 'external']).optional().describe('Default internal'),
+      scope: z.enum(['internal', 'external']).optional()
+        .describe('DEFAULT scope used on diagrams that do not override it (default internal). Use set_object_scope_on_diagram for one diagram.'),
       status: objectStatus.optional().describe('Default live'),
       addToDiagramId: z.string().optional().describe('Also place the new object on this diagram'),
       position: z.object({ x: z.number(), y: z.number() }).optional()
@@ -254,7 +255,8 @@ export const writeTools: AiToolDef[] = [
       type: objectType.optional(),
       domainId: z.string().nullable().optional(),
       parentId: z.string().nullable().optional(),
-      scope: z.enum(['internal', 'external']).optional(),
+      scope: z.enum(['internal', 'external']).optional()
+        .describe('DEFAULT scope (diagrams can override it — see set_object_scope_on_diagram)'),
       status: objectStatus.optional(),
       icon: z.string().nullable().optional()
         .describe('Icon catalog name (search_icons for exact names); null clears the icon'),
@@ -321,6 +323,32 @@ export const writeTools: AiToolDef[] = [
         updated: { id: input.id, name: next.name },
         ...(namingWarning ? { namingWarning } : {}),
       })
+    },
+  }),
+  defineAiTool({
+    name: 'set_object_scope_on_diagram',
+    title: 'Set object scope on a diagram',
+    description:
+      'Mark objects internal or external ON ONE DIAGRAM, overriding their default scope there. Pass scope=null to clear the override: the object then follows the C4 boundary rule (on a drill-down diagram, anything outside the drilled-into element is external) and then its default scope.',
+    mode: 'write',
+    schema: z.object({
+      diagramId: z.string(),
+      objectIds: z.array(z.string()).min(1),
+      scope: z.enum(['internal', 'external']).nullable(),
+    }),
+    execute: async (ctx, input) => {
+      const m = await ctx.session.snapshot()
+      const diagram = m.diagrams[input.diagramId]
+      if (!diagram) throw new AiToolError(`no diagram with id "${input.diagramId}" — see list_diagrams`, 404)
+      const onDiagram = new Set(diagram.detail?.objectIds ?? ((diagram.meta.objectIds as string[] | undefined) ?? []))
+      const missing = input.objectIds.filter((id) => !onDiagram.has(id))
+      if (missing.length) {
+        throw new AiToolError(`not on diagram "${input.diagramId}": ${missing.join(', ')}`, 404)
+      }
+      const scopeUpserts = Object.fromEntries(input.objectIds.map((id) => [id, input.scope]))
+      const ok = await updateDiagramDoc(ctx.repo, ctx.rootUrl, input.diagramId, { scopeUpserts })
+      if (!ok) throw new AiToolError(`could not open diagram "${input.diagramId}"`, 404)
+      return done(ctx, { diagramId: input.diagramId, objectIds: input.objectIds, scope: input.scope })
     },
   }),
   defineAiTool({

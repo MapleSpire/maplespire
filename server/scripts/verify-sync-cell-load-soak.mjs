@@ -913,9 +913,10 @@ export function isQualificationObjectId(objectId) {
 }
 
 export function appendQualificationObjectTombstones(meta, discoveredIds) {
-  const tombstones = Array.isArray(meta.deletedObjectIds)
-    ? meta.deletedObjectIds
-    : (meta.deletedObjectIds = [])
+  // Create, then re-read: the VALUE of `(meta.deletedObjectIds = [])` is the
+  // detached literal, so on an Automerge draft its pushes were lost.
+  if (!Array.isArray(meta.deletedObjectIds)) meta.deletedObjectIds = []
+  const tombstones = meta.deletedObjectIds
   const known = new Set(tombstones)
   const appended = []
   for (const id of discoveredIds) {

@@ -83,8 +83,12 @@ async function main(): Promise<void> {
   // and boots RESIDENT — online and offline — so a "boot" e2e run against this
   // seed silently exercised the resident app (measured 2026-10-16:
   // `boot-from-server refused (no overlay write heads and no overlay content)`).
-  const objectWriteHead = repo.create({ objects: {}, writeHeadVersion: OVERLAY_WRITE_HEAD_VERSION }).url
-  const connectionWriteHead = repo.create({ connections: {}, writeHeadVersion: OVERLAY_WRITE_HEAD_VERSION }).url
+  const objectWriteHead = repo.create({
+    objects: {}, writeHeadVersion: OVERLAY_WRITE_HEAD_VERSION, writeBatchIds: [] as string[],
+  }).url
+  const connectionWriteHead = repo.create({
+    connections: {}, writeHeadVersion: OVERLAY_WRITE_HEAD_VERSION, writeBatchIds: [] as string[],
+  }).url
 
   // Through `buildModelMeta`, never a literal: the literal this replaces had no
   // write heads AND spelled the tag map `tags` keyed by a nonexistent `id`,

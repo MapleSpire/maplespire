@@ -1002,6 +1002,59 @@ describe('T6 — deleting a server-owned diagram under a summary registry', () =
     expect(other.name).toBe('Other')
   })
 
+  it('a NON-active meta keeps its per-diagram scope overrides through a flush, and loses only a deleted object\'s', async () => {
+    // The registry meta's `objectScopes` copy is what Model Objects counts
+    // "external in N of M diagrams" from (resident stubs, ro_diagrams.data).
+    // For a non-active diagram the store holds a STUB, which is not
+    // authoritative: the flush must keep the existing meta's overrides, minus
+    // the objects deleted this session. QA lens mutants R1/R4/R6 (buildMeta
+    // never writes them / the non-active branch drops `existing.objectScopes` /
+    // no strip) were all GREEN before this test.
+    localStorage.setItem('maplespire:bootFromServer', 'true')
+    const fixture = summaryFixture({ summaryOnly: false })
+    const classicShard = fixture.registryBase
+    classicShard.change((shard: any) => {
+      shard.diagrams['dg-other'] = {
+        id: 'dg-other', name: 'Other', type: 'container', docUrl: '',
+        objectIds: ['o-a', 'o-b'], connectionIds: [], groupIds: [],
+        objectScopes: { 'o-a': 'external', 'o-b': 'internal' },
+      }
+      shard.diagrams['dg-trigger'] = {
+        id: 'dg-trigger', name: 'Trigger', type: 'container', docUrl: '',
+        objectIds: [], connectionIds: [], groupIds: [],
+      }
+    })
+    wire(fixture)
+    const { startBridge, isRegistrySummaryOnlyActive } = await import('./bridge')
+    await startBridge({ landscapeId: 'ordinary-bfs-scopes', versionId: 'current' })
+    expect(isRegistrySummaryOnlyActive()).toBe(false)
+
+    // The store's stub of dg-other deliberately carries NO overrides: if the
+    // flush took them from the stub, the meta would lose them.
+    useModelStore.setState({
+      diagrams: [
+        { id: 'dg-other', name: 'Other', type: 'container', objectIds: ['o-a', 'o-b'], connectionIds: [], groupIds: [], layouts: {} } as any,
+        { id: 'dg-trigger', name: 'Trigger', type: 'container', objectIds: [], connectionIds: [], groupIds: [], layouts: {} } as any,
+      ],
+      objects: [
+        { id: 'o-a', type: 'app', name: 'A', scope: 'internal' } as any,
+        { id: 'o-b', type: 'app', name: 'B', scope: 'internal' } as any,
+      ],
+    })
+    await settleWrites()
+    useModelStore.getState().updateDiagram('dg-trigger', { name: 'Trigger renamed' })
+    await settleWrites()
+    expect((classicShard.doc()?.diagrams['dg-trigger'] as any).name).toBe('Trigger renamed')
+    expect({ ...(classicShard.doc()?.diagrams['dg-other'] as any).objectScopes })
+      .toEqual({ 'o-a': 'external', 'o-b': 'internal' })
+
+    useModelStore.getState().deleteObject('o-b')
+    await settleWrites()
+    const other = classicShard.doc()?.diagrams['dg-other'] as any
+    expect([...other.objectIds]).toEqual(['o-a'])
+    expect({ ...other.objectScopes }).toEqual({ 'o-a': 'external' })
+  })
+
   it('en mode CLASSIQUE le balayage ignore les tombstones — mais balaye quand même', async () => {
     // `observeRegistryForAbsence` passes `tombstonedIds` only under a
     // summary registry, and `observeRegistryAbsence` strips them from

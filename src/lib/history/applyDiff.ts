@@ -16,6 +16,7 @@ import type { C4Object, Connection, Diagram, Flow, Group, SelectedItem } from '.
 import {
   changedFields,
   deepEqual,
+  diagramFieldValue,
   entityKey,
   resolvedConnectionField,
   CONNECTION_3D_TWINS,
@@ -318,7 +319,7 @@ export function planApply(diff: ModelDiff, direction: Direction, state: ApplySta
       case 'diagramField': {
         const diagram = diagramById.get(change.diagramId)
         if (!diagram) { plan.skipped++; break }
-        const current = (diagram as unknown as Record<string, unknown>)[change.field]
+        const current = diagramFieldValue(change.field, (diagram as unknown as Record<string, unknown>)[change.field])
         if (!deepEqual(current, undo ? change.after : change.before)) { plan.skipped++; break }
         plan.diagramField.push({ diagramId: change.diagramId, field: change.field, value: undo ? change.before : change.after })
         plan.applied.set(key, change)
@@ -400,7 +401,8 @@ export function executePlan(draft: ApplyDraft, plan: ApplyPlan): void {
     const diagram = diagramById.get(diagramId)
     if (!diagram) continue
     if (value) {
-      const map = space === '2d' ? (diagram.layouts ??= {}) : (diagram.layouts3d ??= {})
+      if (space === '2d') { if (!diagram.layouts) diagram.layouts = {} } else if (!diagram.layouts3d) diagram.layouts3d = {}
+      const map = (space === '2d' ? diagram.layouts : diagram.layouts3d)!
       map[id] = { position: { ...value.position }, size: { ...value.size } }
     } else {
       const map = space === '2d' ? diagram.layouts : diagram.layouts3d

@@ -119,10 +119,10 @@ async function main(): Promise<void> {
     + ` (object: ${needObject ? 'MISSING' : 'present'}, connection: ${needConnection ? 'MISSING' : 'present'})`)
   // 1) Children first — only the ones actually missing.
   const objectShard = needObject
-    ? repo.create<{ objects: Record<string, unknown> }>({ objects: {} })
+    ? repo.create<{ objects: Record<string, unknown>; writeBatchIds: string[] }>({ objects: {}, writeBatchIds: [] })
     : null
   const connectionShard = needConnection
-    ? repo.create<{ connections: Record<string, unknown> }>({ connections: {} })
+    ? repo.create<{ connections: Record<string, unknown>; writeBatchIds: string[] }>({ connections: {}, writeBatchIds: [] })
     : null
   const created = [objectShard, connectionShard].filter((shard) => shard !== null)
   // 2) Durable before referenced.

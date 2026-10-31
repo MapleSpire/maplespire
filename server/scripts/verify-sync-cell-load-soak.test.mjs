@@ -1662,6 +1662,19 @@ test('tombstones qualification objects from every phase without touching busines
   assert.deepEqual(appendQualificationObjectTombstones(meta, discovered), [])
 })
 
+test('tombstones persist on an Automerge ModelMeta that has NO deletedObjectIds list', async () => {
+  // The caller runs inside `metaHandle.change`. `(meta.deletedObjectIds = [])`
+  // as a value is the detached literal there, so the pushes used to vanish
+  // while the function still returned the ids as appended.
+  const A = await import('@automerge/automerge')
+  let appended
+  const after = A.change(A.from({ marker: 1 }), (meta) => {
+    appended = appendQualificationObjectTombstones(meta, ['qa-mes7z1-123-baseline01-0', 'business-object'])
+  })
+  assert.deepEqual(appended, ['qa-mes7z1-123-baseline01-0'])
+  assert.deepEqual([...after.deletedObjectIds], ['qa-mes7z1-123-baseline01-0'])
+})
+
 test('summarizes reconnect timing without copying per-peer diagnostic payloads', () => {
   assert.deepEqual(summarizeLoadNetworkDiagnostics([
     {

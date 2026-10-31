@@ -165,7 +165,8 @@ async function buildWorkspace(repo: Repo, name: string): Promise<string> {
     allIds[Math.floor((i * allIds.length) / OVERLAY_EDITS)]!)
   const objectHead = await findReadyDocument<ShardDoc>(repo, meta.editsObjectShardUrl)
   objectHead.change((s) => {
-    const coll = s.objects ?? (s.objects = {})
+    if (!s.objects) s.objects = {}
+    const coll = s.objects
     for (const id of editedIds) coll[id] = object(id, 2)
     for (let i = 0; i < OVERLAY_CREATES; i += 1) {
       const id = `${name}-o-created-${i}`
@@ -174,7 +175,8 @@ async function buildWorkspace(repo: Repo, name: string): Promise<string> {
   })
   const connectionHead = await findReadyDocument<ShardDoc>(repo, meta.editsConnectionShardUrl)
   connectionHead.change((s) => {
-    const coll = s.connections ?? (s.connections = {})
+    if (!s.connections) s.connections = {}
+    const coll = s.connections
     for (let i = 0; i < CONNECTION_EDITS; i += 1) {
       const id = `${name}-c-${i}`
       coll[id] = { id, fromId: allIds[0], toId: allIds[1], label: `edge ${id} r2` }

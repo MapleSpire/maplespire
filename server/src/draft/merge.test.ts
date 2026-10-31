@@ -14,7 +14,7 @@
 
 import { describe, it, expect } from 'vitest'
 import { diffModels, resolveConflicts, conflictKey, type DiffResult, type ChangeCollection, type ChangeKind, type DraftChange, type DraftConflict } from './merge.js'
-import type { FullModel, FullDiagram, DiagramDetail } from './materialize.js'
+import { withoutEmptyObjectScopes, type FullModel, type FullDiagram, type DiagramDetail } from './materialize.js'
 
 // --- builders ---------------------------------------------------------------
 
@@ -109,6 +109,17 @@ describe('diffModels — model collections', () => {
 })
 
 describe('diffModels — diagrams, layouts, flows', () => {
+  it('an empty per-diagram scope map is no change (writers now create it eagerly)', () => {
+    // materialize/sparse strip `objectScopes: {}` from settings, so a diagram
+    // written once since the field appeared does not read as edited.
+    const withEmpty = withoutEmptyObjectScopes({ name: 'D', objectScopes: {} })
+    const base = fm({ diagrams: { D: diag('D', detail({ settings: { name: 'D' } })) } })
+    const theirs = fm({ diagrams: { D: diag('D', detail({ settings: withEmpty })) } })
+    expect(withEmpty).toEqual({ name: 'D' })
+    expect(diffModels(base, base, theirs).changes).toEqual([])
+    expect(withoutEmptyObjectScopes({ objectScopes: { a: 'external' } })).toEqual({ objectScopes: { a: 'external' } })
+  })
+
   it('layout move surfaces as a per-diagram layout change (diagram counted)', () => {
     const base = fm({ diagrams: { D: diag('D', detail({ objectIds: ['a'], layouts: { a: { position: { x: 0, y: 0 }, size: { width: 1, height: 1 } } } })) } })
     const theirs = fm({ diagrams: { D: diag('D', detail({ objectIds: ['a'], layouts: { a: { position: { x: 9, y: 9 }, size: { width: 1, height: 1 } } } })) } })

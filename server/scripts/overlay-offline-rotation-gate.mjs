@@ -213,8 +213,12 @@ try {
   const baselineBatchId = `gate-baseline-${baselineToken}`
   onlineHandle.change((doc) => {
     doc.writeHeadVersion = 2
-    ;(doc.writeBatchIds ??= []).push(baselineBatchId)
-    ;(doc.objects ??= {})[entityId] = {
+    // Statement form, then re-read: the VALUE of `??=` is the plain literal,
+    // not the Automerge list/map, so a write through it is lost when absent.
+    doc.writeBatchIds ??= []
+    doc.writeBatchIds.push(baselineBatchId)
+    doc.objects ??= {}
+    doc.objects[entityId] = {
       id: entityId,
       type: 'component',
       name: 'Offline rotation gate',
@@ -242,8 +246,9 @@ try {
     const object = doc.objects[entityId]
     object.description = 'online-current-value'
     object.properties.onlineMarker = onlineMarker
+    doc.writeBatchIds ??= []
     for (let index = 0; index < 32; index += 1) {
-      ;(doc.writeBatchIds ??= []).push(`gate-rotate-${baselineToken}-${index}`)
+      doc.writeBatchIds.push(`gate-rotate-${baselineToken}-${index}`)
     }
   })
   const finalRotationBatchId = `gate-rotate-${baselineToken}-31`
@@ -265,7 +270,8 @@ try {
       object.properties.offlineCounter = index
       if (index === mutationCount - 1) {
         object.description = 'offline-conflicting-value'
-        ;(doc.writeBatchIds ??= []).push(offlineBatchId)
+        doc.writeBatchIds ??= []
+        doc.writeBatchIds.push(offlineBatchId)
       }
     })
   }

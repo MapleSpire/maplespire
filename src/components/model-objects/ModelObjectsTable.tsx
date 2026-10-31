@@ -44,6 +44,7 @@ import { useVirtualRows } from '../common/VirtualList'
 import { canReparentObject } from '../../lib/modelHierarchy'
 import { useObjectExplorer, type ExplorerVisualRow } from '../diagram/useObjectExplorer'
 import { defaultShapeSize } from '../../lib/shapeDefaults'
+import { showsExternalUsage } from './externalUsage'
 
 const typeIcons: Record<string, React.ElementType> = {
   actor: User,
@@ -117,6 +118,7 @@ function explorerRowsToTableRows(explorerRows: ExplorerVisualRow[], searchMode: 
       componentCount: row.componentCount,
       connectionCount: row.connectionCount,
       diagramCount: row.diagramCount,
+      externalDiagramCount: row.externalDiagramCount,
       domainId: row.domainId,
       isGroup: row.kind === 'group',
       parentId: row.parentId ?? undefined,
@@ -607,6 +609,15 @@ export function ModelObjectsTable({
                       <span className="shrink-0 text-[10px] text-fg-muted bg-surface-200 px-1.5 py-0.5 rounded capitalize max-[1080px]:hidden">{row.type}</span>
                       {row.scope && (
                         <span className="shrink-0 text-[10px] text-fg-subtle max-[920px]:hidden">{row.scope}</span>
+                      )}
+                      {showsExternalUsage(row) && (
+                        <span
+                          data-testid={`mo-external-usage-${row.id}`}
+                          title={t('dataViewsB.table.externalUsageHint', { scope: row.scope })}
+                          className="shrink-0 rounded bg-surface-200 px-1.5 py-0.5 text-[10px] text-fg-muted max-[920px]:hidden"
+                        >
+                          {t('dataViewsB.table.externalUsage', { external: row.externalDiagramCount, count: row.diagramCount })}
+                        </span>
                       )}
                     </div>
                   </td>

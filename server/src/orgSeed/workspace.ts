@@ -49,11 +49,11 @@ export async function createSeedWorkspaceRoot(
   await monolith.whenReady()
   const objectShard = track(repo.create({ objects: objectsById }))
   await objectShard.whenReady()
-  const objectOverlay = track(repo.create({ objects: {}, writeHeadVersion: 1 }))
+  const objectOverlay = track(repo.create({ objects: {}, writeHeadVersion: 1, writeBatchIds: [] as string[] }))
   await objectOverlay.whenReady()
   const connectionShard = track(repo.create({ connections: connectionsById }))
   await connectionShard.whenReady()
-  const connectionOverlay = track(repo.create({ connections: {}, writeHeadVersion: 1 }))
+  const connectionOverlay = track(repo.create({ connections: {}, writeHeadVersion: 1, writeBatchIds: [] as string[] }))
   await connectionOverlay.whenReady()
   // Always build ModelMeta through `buildModelMeta`, never a literal, so the
   // protocol version and head ordering stay defined in one place.

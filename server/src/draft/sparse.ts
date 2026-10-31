@@ -28,7 +28,7 @@ import { copyRootShape } from '../rootShape.js'
 import type { WorkspaceKey } from '../readModel/projector.js'
 import { registerStaticReadModelDocuments } from '../readModel/staticWorkspace.js'
 import type { Queryable } from '../readModel/types.js'
-import type { FullDiagram, FullModel, DiagramDetail } from './materialize.js'
+import { withoutEmptyObjectScopes, type FullDiagram, type FullModel, type DiagramDetail } from './materialize.js'
 import {
   isSparseDraftManifest,
   type DraftBaseManifest,
@@ -456,7 +456,7 @@ function splitDiagram(doc: Json): DiagramDetail {
   void comments
   void checkpoints
   return {
-    settings,
+    settings: withoutEmptyObjectScopes(settings),
     objectIds: Array.isArray(objectIds) ? objectIds as string[] : [],
     connectionIds: Array.isArray(connectionIds) ? connectionIds as string[] : [],
     groupIds: Array.isArray(groupIds) ? groupIds as string[] : [],

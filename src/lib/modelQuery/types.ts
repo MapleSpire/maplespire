@@ -132,6 +132,8 @@ export interface ModelObjectRow {
   componentCount: number
   connectionCount: number
   diagramCount: number
+  /** Of `diagramCount`, the diagrams the object resolves external on. */
+  externalDiagramCount?: number
   domainId?: string
   isGroup: boolean
   isInlineAdd?: boolean
@@ -155,6 +157,9 @@ export interface ModelObjectFilter {
   technologyIds?: string[]
   hasDescription?: boolean
   inDiagram?: boolean
+  /** Objects that resolve external on at least one diagram they appear on
+   * (false: on none) — the per-diagram scope, not the default `scope` above. */
+  externalOnSomeDiagram?: boolean
 }
 export interface ModelObjectRowsOpts {
   expandedIds: string[]
@@ -205,6 +210,10 @@ export interface ObjectExplorerRow {
   componentCount: number
   connectionCount: number
   diagramCount: number
+  /** Of `diagramCount`, the diagrams on which the object resolves external
+   * ("external in N of M diagrams"). Absent when the source cannot say — a
+   * worker-cache row written before it existed, an older server. */
+  externalDiagramCount?: number
   inDiagram: boolean
   breadcrumb: Array<{ id: string; name: string }>
   matchKind?: 'exact' | 'prefix' | 'word_prefix' | 'contains' | 'filter'

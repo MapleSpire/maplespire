@@ -14,7 +14,9 @@
 
 import { getDiagramIndex, useModelStore } from '../../stores/modelStore'
 import type { DiagramIndex } from '../../stores/modelStore'
-import type { C4Object, Group, ShapeIconAssignment } from '../../types'
+import type { C4Object, Diagram, Group, ShapeIconAssignment } from '../../types'
+import { parentLookup } from '../diagrams/objectScope'
+import { scopeUsageOf } from '../diagrams/objectScopeUsage'
 import type {
   ObjectExplorerPage,
   ObjectExplorerRow,
@@ -91,6 +93,21 @@ function metrics(
   return { appCount, storeCount, componentCount, connectionCount, diagramCount: diagramIds?.size ?? 0 }
 }
 
+/** Per-diagram scope usage of one resident object, over the diagrams the index
+ * says show it. Store stubs of non-active diagrams carry `parentObjectId` and
+ * `objectScopes` from the registry meta (`metaToStubDiagram`), so this needs
+ * no DiagramDoc. Same membership as `diagramCount` above. */
+function externalDiagramCount(object: C4Object, idx: DiagramIndex): number {
+  const diagramIds = idx.objectToDiagramIds.get(object.id)
+  if (!diagramIds?.size) return 0
+  const diagrams: Diagram[] = []
+  for (const id of diagramIds) {
+    const diagram = idx.diagramById.get(id)
+    if (diagram) diagrams.push(diagram)
+  }
+  return scopeUsageOf(object, diagrams, parentLookup((id) => idx.objectById.get(id))).external
+}
+
 function rowForObject(
   object: C4Object,
   idx: DiagramIndex,
@@ -111,6 +128,7 @@ function rowForObject(
     ...(object.domainId ? { domainId: object.domainId } : {}),
     ...iconFields(object),
     ...metrics(object.id, 'object', children, idx),
+    externalDiagramCount: externalDiagramCount(object, idx),
     inDiagram: inDiagram.has(object.id),
     breadcrumb: [],
   }
@@ -284,6 +302,10 @@ export async function residentObjectSearchPage(opts: ObjectSearchPageOpts): Prom
     if (selectedTeams.size && ![...(object.ownerTeamIds ?? []), ...(object.teamIds ?? [])].some((id) => selectedTeams.has(id))) continue
     if (opts.filter?.hasDescription !== undefined && Boolean(object.description?.trim()) !== opts.filter.hasDescription) continue
     if (opts.filter?.inDiagram !== undefined && diagramObjects.has(object.id) !== opts.filter.inDiagram) continue
+    if (
+      opts.filter?.externalOnSomeDiagram !== undefined
+      && (externalDiagramCount(object, idx) > 0) !== opts.filter.externalOnSomeDiagram
+    ) continue
     if (opts.domainId && object.domainId !== opts.domainId) continue
     const technologyText = Object.values(object.technologyUsages ?? {}).map((usage) => usage.snapshot.name).join(' ')
     const value = score(object.name, `${object.name} ${object.description ?? ''} ${technologyText}`)
@@ -293,8 +315,10 @@ export async function residentObjectSearchPage(opts: ObjectSearchPageOpts): Prom
     row.matchKind = query ? value === 4 ? 'exact' : value === 3 ? 'prefix' : value === 2 ? 'word_prefix' : 'contains' : 'filter'
     rows.push({ ...row, score: value })
   }
+  // A group has no scope, so it is never "external on some diagram" — same as
+  // the server, which drops groups for `true` and keeps them for `false`.
   const groupOnlyFiltersSupported = !opts.filter?.scope && !selectedStatuses.size && !selectedTeams.size
-    && opts.filter?.hasDescription === undefined
+    && opts.filter?.hasDescription === undefined && opts.filter?.externalOnSomeDiagram !== true
   if (groupOnlyFiltersSupported && (!types.size || types.has('group'))) {
     for (const group of state.groups) {
       const groupTechnologies = Object.values(group.technologyUsages ?? {}).map((usage) => usage.technologyId)

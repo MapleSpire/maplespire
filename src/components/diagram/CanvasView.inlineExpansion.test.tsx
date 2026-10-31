@@ -334,3 +334,30 @@ describe('CanvasView ↔ lower routing wire', () => {
     expect(fed).toMatchObject({ fromAnchor: 4, toAnchor: 10, lockedToAnchors: true })
   })
 })
+
+// Per-diagram scope (2026-10-21): CanvasView has its OWN merge (not
+// viewLayouts'), so the engine sees the effective scope only if that merge
+// applies it — the override, and the boundary rule through an ancestor that is
+// not on the diagram (resolved against the whole resident model).
+describe('CanvasView draws the per-diagram scope', () => {
+  it('hands the engine the effective scope, not the model default', () => {
+    useModelStore.setState({
+      objects: [
+        obj('sys'), { ...obj('host'), parentId: 'sys' },
+        obj('bank'), { ...obj('peer', 400), parentId: 'bank' },
+        { ...obj('ovr', 800), parentId: 'sys' },
+      ],
+      diagrams: [{
+        ...diagram('A', ['host', 'peer', 'ovr']),
+        parentObjectId: 'sys',
+        objectScopes: { ovr: 'external' },
+      } as Diagram],
+      currentDiagramId: 'A',
+    })
+    render(<CanvasView />)
+    const drawn = new Map((engine.setData.at(-1)![0] as C4Object[]).map((o) => [o.id, o.scope]))
+    expect(Object.fromEntries(drawn)).toEqual({ host: 'internal', peer: 'external', ovr: 'external' })
+    // The model objects keep their default.
+    expect(useModelStore.getState().objects.every((o) => o.scope === 'internal')).toBe(true)
+  })
+})

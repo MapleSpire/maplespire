@@ -98,6 +98,12 @@ export const REFERENCE_REGISTRY: readonly ReferenceDescriptor[] = [
     note: 'The 3D layer of diagram.layouts, swept by the same writers.',
   },
   {
+    id: 'diagram.objectScopes',
+    source: 'diagram', field: 'objectScopes', target: 'object',
+    cardinality: 'many', policy: 'eager', windowedTarget: false,
+    note: 'Per-diagram internal/external overrides, swept with layouts by deleteObject, deleteSelectedItems and the server stripIdsFromAllDiagrams: a stale key would re-apply an old override when the same id comes back. Keys are deleted, the map never is (a deleted Automerge map drops a peer\'s concurrent write).',
+  },
+  {
     id: 'diagram.parentObjectId',
     source: 'diagram', field: 'parentObjectId', target: 'object',
     cardinality: 'one', policy: 'lazy3', windowedTarget: false,

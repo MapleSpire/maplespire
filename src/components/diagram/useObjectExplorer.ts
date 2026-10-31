@@ -158,11 +158,12 @@ export function useObjectExplorer({
   const hasFilters = Boolean(
     filters.types?.length || filters.scope || filters.technologyIds?.length || filters.tagIds?.length
     || filters.statuses?.length || filters.status || filters.teamIds?.length
-    || filters.hasDescription !== undefined || filters.inDiagram !== undefined || filters.domainId,
+    || filters.hasDescription !== undefined || filters.inDiagram !== undefined
+    || filters.externalOnSomeDiagram !== undefined || filters.domainId,
   )
   const searchMode = hasFilters || debouncedQuery.length >= 2
   const searchTooShort = !hasFilters && query.trim().length === 1
-  const queryContractKey = `${debouncedQuery}\u0001${filters.scope ?? ''}\u0001${typeKey}\u0001${technologyKey}\u0001${tagKey}\u0001${statusKey}\u0001${teamKey}\u0001${filters.hasDescription ?? ''}\u0001${filters.inDiagram ?? ''}\u0001${filters.domainId ?? ''}\u0001${diagramId ?? ''}`
+  const queryContractKey = `${debouncedQuery}\u0001${filters.scope ?? ''}\u0001${typeKey}\u0001${technologyKey}\u0001${tagKey}\u0001${statusKey}\u0001${teamKey}\u0001${filters.hasDescription ?? ''}\u0001${filters.inDiagram ?? ''}\u0001${filters.externalOnSomeDiagram ?? ''}\u0001${filters.domainId ?? ''}\u0001${diagramId ?? ''}`
 
   const commitTreePages = useCallback((updater: (previous: Record<string, TreePageState>) => Record<string, TreePageState>) => {
     const next = updater(treePagesRef.current)

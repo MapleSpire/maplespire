@@ -116,6 +116,18 @@ export const CONNECTION_3D_TWINS: Readonly<Record<string, string>> = {
 }
 
 const DIAGRAM_STRUCTURAL_FIELDS = new Set(['id', 'objectIds', 'connectionIds', 'groupIds', 'layouts', 'layouts3d'])
+
+/**
+ * A diagram field as undo/redo compares and restores it. `objectScopes` reads
+ * absent as `{}`: the write path never deletes the scope map (a deleted
+ * Automerge map drops a peer's concurrent override) and treats an ABSENT store
+ * value as "leave the document's map alone" (objectScopesForWrite), so undoing
+ * the first override must restore `{}` — an empty map the write path persists —
+ * never `undefined`, which it would ignore and the next projection would undo.
+ */
+export function diagramFieldValue(field: string, value: unknown): unknown {
+  return field === 'objectScopes' && value === undefined ? {} : value
+}
 /** View-only or membership fields of a group that are not compared field-wise. */
 const GROUP_SKIPPED_FIELDS = new Set(['objectIds', 'innerWrapperIds'])
 
@@ -314,8 +326,8 @@ export function diffModel(before: DiffableState, after: DiffableState): ModelDif
       diffLayouts(out, b, a)
       for (const field of new Set([...Object.keys(b), ...Object.keys(a)])) {
         if (DIAGRAM_STRUCTURAL_FIELDS.has(field)) continue
-        const bv = (b as unknown as Record<string, unknown>)[field]
-        const av = (a as unknown as Record<string, unknown>)[field]
+        const bv = diagramFieldValue(field, (b as unknown as Record<string, unknown>)[field])
+        const av = diagramFieldValue(field, (a as unknown as Record<string, unknown>)[field])
         if (deepEqual(bv, av)) continue
         out.set(diagramFieldKey(diagramId, field), { type: 'diagramField', diagramId, field, before: bv, after: av })
       }

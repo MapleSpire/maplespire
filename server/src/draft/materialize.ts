@@ -167,13 +167,28 @@ async function materializeDoc<T extends object>(
   }
 }
 
+/**
+ * An empty per-diagram scope map is the same as none. Diagram writers create
+ * `objectScopes: {}` eagerly (so no two peers create it concurrently), and a
+ * diagram that has never been written since has no key: without this, a draft
+ * would report a settings change for every such diagram.
+ */
+export function withoutEmptyObjectScopes(settings: Record<string, unknown>): Record<string, unknown> {
+  const scopes = settings.objectScopes
+  if (scopes && typeof scopes === 'object' && !Array.isArray(scopes) && Object.keys(scopes).length === 0) {
+    const { objectScopes: _empty, ...rest } = settings
+    return rest
+  }
+  return settings
+}
+
 /** Partition a DiagramDoc into its diff dimensions (drops comments + checkpoints). */
 function splitDiagramDoc(doc: DiagramDocLike): DiagramDetail {
   const { objectIds, connectionIds, groupIds, layouts, flows, comments, checkpoints, ...settings } = doc
   void comments
   void checkpoints
   return {
-    settings: settings as Record<string, unknown>,
+    settings: withoutEmptyObjectScopes(settings as Record<string, unknown>),
     objectIds: objectIds ?? [],
     connectionIds: connectionIds ?? [],
     groupIds: groupIds ?? [],

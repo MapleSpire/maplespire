@@ -2221,24 +2221,56 @@ export interface RepairSummaryFlagOptions {
   onProgress?: (message: string) => void
 }
 
-async function readAllowListEntries(
-  db: Queryable,
-  key: WorkspaceKey,
-): Promise<{ documentId: string; kind: string }[]> {
-  const { rows } = await db.query<{ document_id: string; kind: string }>(
-    `SELECT document_id, kind FROM read_model_static_documents
-      WHERE landscape_id = $1 AND version_id = $2`,
+/**
+ * The repair's four SQL facts, read in ONE statement so they share one
+ * snapshot. They used to be four `pool.query` calls under `Promise.all`, i.e.
+ * four snapshots on four clients in no fixed order: a demotion committing
+ * between them (its DELETE of the static row CASCADEs to the allow-list) left a
+ * plan with the static row present and the allow-list empty. That plan refused
+ * as `write-head-not-writable` + `allow-list-incomplete` (or `write-head-missing`
+ * when the root names no head) — blaming a defect the workspace never had, and
+ * never reaching the under-lock re-read that names what actually happened
+ * (`witness-moved`). Measured 2026-10-22: the integration test "a flag repair
+ * whose static row vanishes…" went red that way once in a loaded `ci-local
+ * --static` run, and 0 times in 58 local runs of the old shape (30 idle, 28
+ * under 14 CPU hogs); with the test's proxy holding the other reads until the
+ * row has moved, the old shape was red 5/5 and this one green 25/25 under load.
+ * Still a refusal either way: a torn plan could not pass where a whole one
+ * would block, because each mover commits the static row and the allow-list
+ * together.
+ */
+async function readRepairFacts(db: Queryable, key: WorkspaceKey): Promise<{
+  staticSource: string | null
+  allowList: { documentId: string; kind: string }[]
+  admitted: Set<string>
+  diagramCount: number
+}> {
+  const { rows } = await db.query<{
+    static_source: string | null
+    allow_list: { documentId: string; kind: string }[]
+    admitted: string[]
+    diagram_count: string
+  }>(
+    `SELECT
+       (SELECT source FROM read_model_static_workspaces
+         WHERE landscape_id = $1 AND version_id = $2) AS static_source,
+       (SELECT coalesce(json_agg(json_build_object('documentId', document_id, 'kind', kind)), '[]'::json)
+          FROM read_model_static_documents
+         WHERE landscape_id = $1 AND version_id = $2) AS allow_list,
+       (SELECT coalesce(json_agg(document_id), '[]'::json)
+          FROM automerge_document_workspace
+         WHERE landscape_id = $1 AND version_id = $2) AS admitted,
+       (SELECT count(*)::text FROM ro_diagrams
+         WHERE landscape_id = $1 AND version_id = $2) AS diagram_count`,
     [key.landscapeId, key.versionId],
   )
-  return rows.map((row) => ({ documentId: row.document_id, kind: row.kind }))
-}
-
-async function readDiagramCount(db: Queryable, key: WorkspaceKey): Promise<number> {
-  const { rows } = await db.query<{ n: string }>(
-    `SELECT count(*)::text AS n FROM ro_diagrams WHERE landscape_id = $1 AND version_id = $2`,
-    [key.landscapeId, key.versionId],
-  )
-  return Number(rows[0]?.n ?? '0')
+  const row = rows[0]
+  return {
+    staticSource: row?.static_source ?? null,
+    allowList: row?.allow_list ?? [],
+    admitted: new Set(row?.admitted ?? []),
+    diagramCount: Number(row?.diagram_count ?? '0'),
+  }
 }
 
 /**
@@ -2314,12 +2346,7 @@ export async function repairSummaryFlag(options: RepairSummaryFlagOptions): Prom
     return report
   }
 
-  const [staticSource, allowList, admitted, diagramCount] = await Promise.all([
-    readStaticSource(db, workspace),
-    readAllowListEntries(db, workspace),
-    readAdmittedIds(db, workspace),
-    readDiagramCount(db, workspace),
-  ])
+  const { staticSource, allowList, admitted, diagramCount } = await readRepairFacts(db, workspace)
   const summaryOnly = root.registrySummaryOnly === true
   const rootWriteHeadUrl = oneUrl(root.registryWriteUrl)
 

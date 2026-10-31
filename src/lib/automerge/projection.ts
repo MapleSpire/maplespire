@@ -22,6 +22,7 @@ import type {
   Comment,
   Flow,
   Diagram,
+  ObjectScope,
 } from '../../types'
 import type {
   RootModel,
@@ -198,6 +199,8 @@ export interface DiagramComposition {
   objectIds: string[]
   connectionIds: string[]
   groupIds: string[]
+  /** Per-object scope overrides, preserved and stripped like the arrays. */
+  objectScopes?: Record<string, ObjectScope>
 }
 
 /**
@@ -224,11 +227,20 @@ export function stripDeletedFromComposition(
   deletedConnectionIds: ReadonlySet<string>,
   deletedGroupIds: ReadonlySet<string> = EMPTY_IDS
 ): DiagramComposition {
-  return {
+  const stripped: DiagramComposition = {
     objectIds: omitIds(composition.objectIds, deletedObjectIds),
     connectionIds: omitIds(composition.connectionIds, deletedConnectionIds),
     groupIds: omitIds(composition.groupIds, deletedGroupIds),
   }
+  if (composition.objectScopes) stripped.objectScopes = omitKeys(composition.objectScopes, deletedObjectIds)
+  return stripped
+}
+
+/** Drop `remove` keys from `map`, returning the SAME reference when none was present. */
+function omitKeys<T>(map: Record<string, T>, remove: ReadonlySet<string>): Record<string, T> {
+  if (remove.size === 0) return map
+  if (!Object.keys(map).some((key) => remove.has(key))) return map
+  return Object.fromEntries(Object.entries(map).filter(([key]) => !remove.has(key)))
 }
 
 const EMPTY_IDS: ReadonlySet<string> = new Set<string>()
@@ -256,6 +268,10 @@ export function metaToStubDiagram(meta: DiagramMeta): Diagram {
   // Preserve the drill-down parent so getRelatedDiagrams can match this stub to
   // the object it details even while another diagram is the active one.
   if (meta.parentObjectId !== undefined) stub.parentObjectId = meta.parentObjectId
+  // Scope overrides ride along so model-wide pages can count "external in N
+  // of M diagrams" without opening the DiagramDoc. Copied: `meta` may be an
+  // Automerge doc view.
+  if (meta.objectScopes && Object.keys(meta.objectScopes).length > 0) stub.objectScopes = { ...meta.objectScopes }
   return stub
 }
 
@@ -305,6 +321,10 @@ export function diagramToDiagramDoc(
   flows: readonly Flow[],
   checkpoints: readonly Checkpoint[] = []
 ): DiagramDoc {
+  // `objectScopes` passes through as the store holds it. Its create/delete
+  // rules (map at birth, never deleted, never created by an unrelated write)
+  // are applied by the callers: `withObjectScopesAtBirth` at creation and
+  // `objectScopesForWrite` on every later write — see diagramViewWrite.ts.
   const { id: _id, layouts, lowerRouting, ...fields } = diagram
   return {
     ...fields,

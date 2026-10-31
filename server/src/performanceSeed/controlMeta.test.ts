@@ -21,6 +21,21 @@ import {
 import { OVERLAY_WRITE_HEAD_VERSION } from '../modelMeta.js'
 
 describe('toPerformanceControlMeta', () => {
+  it('KEEPS every tombstone list the source carries, and creates each one the source lacks', () => {
+    // Each list now has its own line after the `...plain` spread, so a line
+    // that discarded the source would ERASE its tombstones on every re-run
+    // (realignPerformanceFixture, slim-performance-model-meta) and bring the
+    // deleted entities back. QA lens, mutants PC1/PC2/PC6/PC7.
+    const kept = toPerformanceControlMeta({
+      deletedObjectIds: ['o'], deletedConnectionIds: ['c'], deletedDecisionRecordIds: ['a'], deletedDiagramIds: ['d'],
+    })
+    expect([kept.deletedObjectIds, kept.deletedConnectionIds, kept.deletedDecisionRecordIds, kept.deletedDiagramIds])
+      .toEqual([['o'], ['c'], ['a'], ['d']])
+    const created = toPerformanceControlMeta({})
+    expect([created.deletedObjectIds, created.deletedConnectionIds, created.deletedDecisionRecordIds, created.deletedDiagramIds])
+      .toEqual([[], [], [], []])
+  })
+
   it('removes immutable shard routes while preserving ordered editable control state', () => {
     const compact = toPerformanceControlMeta({
       objectShardUrls: ['base-o-1', 'base-o-2', 'overlay-o'],

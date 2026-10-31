@@ -129,4 +129,32 @@ describe('bounded overlay segments', () => {
       `the segment was advertised before it was claimed; saw ${JSON.stringify(events)}`,
     ).toBeLessThan(advertiseAt)
   })
+
+  // `x ?? (x = [])` / `?? (x = {})` yield the plain value the assignment was
+  // given, not the document's proxy, so a write into it was silently dropped
+  // whenever the field was absent (older ModelMeta, partial imports).
+  it('a ModelMeta WITHOUT objectShardUrls still lists the segment it creates', async () => {
+    const repo = new Repo({})
+    const meta = repo.create<OverlayMetaLike>({})
+    await meta.whenReady()
+    await writeOverlayEntities(repo, meta, 'objects', { a: { id: 'a' } })
+
+    const urls = overlaySegmentUrls(meta.doc(), 'objects')
+    expect(urls).toHaveLength(1)
+    expect(meta.doc()?.objectShardUrls).toEqual(urls)
+  })
+
+  it('a current segment WITHOUT its collection map still receives the write', async () => {
+    const repo = new Repo({})
+    const segment = repo.create<Record<string, unknown>>({ marker: 1 })
+    await segment.whenReady()
+    const meta = repo.create<OverlayMetaLike>({
+      objectShardUrls: [segment.url], editsObjectShardUrl: segment.url, editsObjectShardUrls: [segment.url],
+    })
+    await meta.whenReady()
+    await writeOverlayEntities(repo, meta, 'objects', { a: { id: 'a', name: 'A' } })
+
+    expect(overlaySegmentUrls(meta.doc(), 'objects')).toEqual([segment.url])
+    expect(segment.doc()?.objects).toEqual({ a: { id: 'a', name: 'A' } })
+  })
 })

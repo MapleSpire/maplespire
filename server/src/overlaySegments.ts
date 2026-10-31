@@ -137,9 +137,13 @@ async function createSegment(
   // `onDocumentTouched`; the sealed `modelOps` caller passes `undefined`.
   // Created through the caller's scope when it has one (see
   // `OverlaySegmentClaim.scope`); synchronous either way.
+  // `writeBatchIds` from birth: every writer pushes its batch id there, and two
+  // writers creating the list lazily on a fresh head hide one batch id (see
+  // `buildModelMeta`'s tombstone lists, the same loss).
+  const initial = { [collection]: {}, writeBatchIds: [] } as unknown as ShardDoc
   const handle = claim?.scope
-    ? claim.scope.create<ShardDoc>(repo as Repo, { [collection]: {} } as ShardDoc)
-    : (repo as Repo).create<ShardDoc>({ [collection]: {} } as ShardDoc)
+    ? claim.scope.create<ShardDoc>(repo as Repo, initial)
+    : (repo as Repo).create<ShardDoc>(initial)
   await handle.whenReady()
   onDocumentTouched?.(handle as DocHandle<unknown>)
   await repo.flush([handle.documentId])
@@ -159,7 +163,10 @@ async function createSegment(
     meta[field.segments] = segments
     meta[field.current] = handle.url
     meta.editsOverlayWriteHeadVersion = OVERLAY_WRITE_HEAD_VERSION
-    const shardUrls = (meta[field.shards] ?? (meta[field.shards] = [])) as string[]
+    // Assign, then RE-READ: `meta[f] ?? (meta[f] = [])` yields the plain `[]`,
+    // not the document's list, and the push into it is lost.
+    if (!meta[field.shards]) meta[field.shards] = []
+    const shardUrls = meta[field.shards] as string[]
     if (!shardUrls.includes(handle.url)) shardUrls.push(handle.url)
   })
   return handle
@@ -197,7 +204,8 @@ export async function writeOverlayEntities(
     const values = batch
     if (!Object.keys(values).length) return
     current.change((doc) => {
-      const target = doc[collection] ?? (doc[collection] = {})
+      if (!doc[collection]) doc[collection] = {}
+      const target = doc[collection]
       for (const [id, value] of Object.entries(values)) target[id] = value as Record<string, unknown>
     })
     batch = {}
