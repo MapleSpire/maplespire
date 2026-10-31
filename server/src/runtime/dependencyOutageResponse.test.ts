@@ -28,6 +28,7 @@ import { describe, expect, it } from 'vitest'
 import { StaleSyncCellWriteError, StoragePoolExhaustedError } from '../automergeStorageErrors.js'
 import { RedisUnavailableError } from './redis.js'
 import { WriteAuthorityLostError, WriteAuthorityUnavailableError } from '../syncCells/writeAuthority.js'
+import { WorkspaceRegistryUnavailableError } from '../rbac/workspaceRegistryErrors.js'
 import { dependencyOutageResponse, sendDependencyOutage } from './dependencyOutageResponse.js'
 
 describe('dependencyOutageResponse', () => {
@@ -125,6 +126,7 @@ describe('dependencyOutageResponse', () => {
       // that carry `retryable: true`, and their own arms below say why.
       ['WriteAuthorityUnavailableError', new WriteAuthorityUnavailableError('not-owner', { landscapeId: 'L', versionId: 'V' })],
       ['WriteAuthorityLostError', new WriteAuthorityLostError({ landscapeId: 'L', versionId: 'V' })],
+      ['WorkspaceRegistryUnavailableError', new WorkspaceRegistryUnavailableError(new Error('connection terminated'))],
     ] as const
 
     it('has a fixture for EVERY branch the module maps', () => {
@@ -159,6 +161,22 @@ describe('dependencyOutageResponse', () => {
       expect(response!.body.code).toMatch(/^[a-z][a-z0-9_-]*$/)
       expect(response!.subsystem.length).toBeGreaterThan(0)
     })
+  })
+
+  it('answers a failed registry read 503 — never the 404 "unknown workspace" it was read as', () => {
+    const response = dependencyOutageResponse(new WorkspaceRegistryUnavailableError(
+      new Error('connect ECONNREFUSED 10.0.0.7:5432'),
+    ))
+    expect(response).toMatchObject({
+      status: 503,
+      headers: { 'Retry-After': '1' },
+      body: { code: 'workspace-registry-unavailable' },
+    })
+    // Withheld conservatively — the mapping cannot see a future caller that
+    // canonicalises after it has written.
+    expect(response!.body).not.toHaveProperty('retryable')
+    // The database error is for the log, never the client.
+    expect(JSON.stringify(response!.body)).not.toMatch(/ECONNREFUSED|5432|10\.0\.0\.7/)
   })
 
   it('returns null — NOT a 500 — for everything else', () => {

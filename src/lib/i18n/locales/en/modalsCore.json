@@ -65,16 +65,6 @@
       },
       "mintShortfall": "{{count}} of the imported items could not reserve a synchronization id, so they were created with a temporary one. They are here — keep this tab open for a few seconds, and reload the page if any of them are missing afterwards."
     },
-    "search": {
-      "placeholder": "Search objects, connections, technologies…",
-      "esc": "ESC",
-      "tooShort": "Type at least {{count}} characters to search",
-      "noResults": "No results found for “{{query}}”",
-      "tryLabel": "Try searching for:",
-      "trySuggestions": ["User", "API service", "React", "PostgreSQL", "Login"],
-      "connectionFallbackLabel": "Connection",
-      "resultCount": "{{count}} result{{plural}}"
-    },
     "settings": {
       "title": "Settings",
       "closeAria": "Close settings",

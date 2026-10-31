@@ -27,6 +27,7 @@ import { makeObject } from '../qa/lib.mjs'
 import { assertLoadUserEvidence, parseClosedLoadOutput } from '../qa/loadUserEvidence.mjs'
 import { assertTopologyBuild, assertTopologyTargetReceipt, qualifyRuntimeTopology, revalidateTopologyTargets } from './sync-bench-posture.mjs'
 import { RehearsalObservations, RehearsalSampler, closeRehearsalSeeder, freshnessIdentityValid, isFreshWitness, measureTakeover, publishRehearsalBases, rehearsalDurableAcknowledged } from './sync-cell-rehearsal.mjs'
+import { assertBenchSession, benchRuntime, benchSessionFile, runCompose, runComposeSync } from './sync-bench-runtime.mjs'
 import { readCalibrationReceipt } from './sync-cell-calibration.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -217,6 +218,7 @@ export const LOAD_PROFILES = {
     objects: 5,
     objectAssignment: 'shared',
     clientsPerProcess: 10,
+    writerActors: 'fresh',
   },
   fleet: {
     usersPerWorkspace: 100,
@@ -224,6 +226,12 @@ export const LOAD_PROFILES = {
     objects: 10,
     objectAssignment: 'per-writer',
     clientsPerProcess: 25,
+    // D61: a writer keeps one actor for the whole pass, as an editor staying in
+    // session does; its Repo and connection are still cold every cycle. A fresh
+    // actor per writer per cycle put ~10 new actors a cycle on one uncompacted
+    // head, and cold-load cost is superlinear in actors x history
+    // (`qa/soak-history-growth-probe.mjs`, mesures/G4-4.json).
+    writerActors: 'persistent',
   },
 }
 
@@ -274,6 +282,10 @@ export function parseLoadSoakConfig(env = process.env, argv = process.argv.slice
   if (!['shared', 'per-writer'].includes(objectAssignment)) {
     throw new Error('SYNC_LOAD_OBJECT_ASSIGNMENT must be shared or per-writer')
   }
+  const writerActors = env.SYNC_LOAD_WRITER_ACTORS?.trim() || preset.writerActors
+  if (!['fresh', 'persistent'].includes(writerActors)) {
+    throw new Error('SYNC_LOAD_WRITER_ACTORS must be fresh or persistent')
+  }
   const freshWorkspaces = env.SYNC_LOAD_FRESH_WORKSPACES == null
     ? Boolean(env.SYNC_BENCH_POSTURE && mode === 'soak')
     : env.SYNC_LOAD_FRESH_WORKSPACES === 'on'
@@ -307,6 +319,7 @@ export function parseLoadSoakConfig(env = process.env, argv = process.argv.slice
     topologyGeneration: env.SYNC_FAILOVER_TOPOLOGY_GENERATION?.trim() || null,
     writersPerWorkspace,
     objectAssignment,
+    writerActors,
     // Where the router and the cells are reachable, for a two-host run: the
     // gate and its load clients run on one machine, the compose stack on
     // another. Loopback stays the default. `docker compose
@@ -410,7 +423,7 @@ export function assertPostureQualificationConfig(config) {
     ...(config.mode === 'soak' ? { freshWorkspaces: true, segmentedWorkspaces: false, seedObjectCount: 12_000 } : { seedObjectCount: 0 }),
     partitionCount: 2,
     mode: config.mode === 'soak' ? 'soak' : 'smoke', profile: 'fleet', usersPerWorkspace: 100, writersPerWorkspace: 10,
-    objects: 10, objectAssignment: 'per-writer', clientsPerProcess: 25, rounds: 4,
+    objects: 10, objectAssignment: 'per-writer', writerActors: 'persistent', clientsPerProcess: 25, rounds: 4,
     staggerMs: 40, settleMs: 45_000, sampleMs: 500, diagnosticTimeoutMs: 1_500, failureArmMs: 5_000,
     soakDurationMs: config.mode === 'soak' ? 7_200_000 : 0, normalConvergenceBudgetMs: 3_000,
     failoverConvergenceBudgetMs: 3_000, takeoverBudgetMs: 2_000,
@@ -595,7 +608,12 @@ export function loadProcessesReadyForFailure(processes, snapshots, telemetryGuar
   return telemetryGuard ? telemetryGuard(snapshots) : true
 }
 
+// B5.16c: SYNC_BENCH_RUNTIME=kubernetes runs the same verbs against the
+// kubernetes-runtime module on a local cluster (sync-bench-runtime.mjs).
+const runtime = benchRuntime()
+
 function compose(config, ...args) {
+  if (runtime) return runComposeSync(runtime, args)
   return execFileSync(
     'docker',
     ['compose', '-p', config.project, '-f', composeFile, ...args],
@@ -608,6 +626,7 @@ function compose(config, ...args) {
 }
 
 async function composeAsync(config, ...args) {
+  if (runtime) return runCompose(runtime, args)
   return promisify(execFile)('docker', ['compose', '-p', config.project, '-f', composeFile, ...args], {
     encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024, windowsHide: true,
   })
@@ -863,6 +882,14 @@ function cells(config) {
 }
 
 async function login(config, cell) {
+  // B5.16c: the module refuses AUTH_DEV_LOGIN in production; a Kubernetes run
+  // is handed a session established by the ordinary sign-up and login.
+  const sessionFile = benchSessionFile(runtime)
+  if (sessionFile) {
+    const { cookie } = JSON.parse(readFileSync(sessionFile, 'utf8'))
+    assertBenchSession(await json(`${cell.baseUrl}/api/auth/me`, { cookie }))
+    return { cookie }
+  }
   const response = await fetch(`${cell.baseUrl}/api/auth/dev-login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -1145,6 +1172,7 @@ function startLoadProcess(config, selection, targetUrl, cookie, phase, startDela
     // all write every shared object or each its own. Readers still converge.
     '--writers', String(config.writersPerWorkspace),
     '--objectAssignment', config.objectAssignment,
+    '--writerActors', config.writerActors,
   ]
   const child = spawn(process.execPath, args, {
     cwd: resolve(here, '..'),
@@ -2538,7 +2566,13 @@ export function evaluateLoadSoakEvidence(evidence, config) {
   for (const result of failover) {
     if (!result.fullyConverged || result.missingFields || result.staleFields || result.hotDiverged) failures.push('a failover workspace diverged')
   }
-  if (normalCycleConvergence.some((result) => result.convergenceMs > config.normalConvergenceBudgetMs)) {
+  // D60: the G4 rehearsal gates convergence and loop on population p99s in
+  // RehearsalObservations.finish; only that caller sets populationGated. The
+  // single failover episode stays gated here as well: it is not a population.
+  // An unmeasurable convergence (Infinity) is never a population member: it
+  // fails here whoever the caller is (QA lens).
+  if (normalCycleConvergence.some((result) => !Number.isFinite(result.convergenceMs)
+    || (!config.populationGated && result.convergenceMs > config.normalConvergenceBudgetMs))) {
     failures.push('normal-load convergence exceeded budget')
   }
   if (failoverCycleConvergence.some((result) => result.convergenceMs > config.failoverConvergenceBudgetMs)) {
@@ -2600,7 +2634,7 @@ export function evaluateLoadSoakEvidence(evidence, config) {
   if (Number(evidence.metrics.staleFenceCoalescingEvictions ?? 0) > 0) {
     failures.push('stale-owner exact-mutation coalescing cache evicted an entry')
   }
-  if (evidence.metrics.maxEventLoopP99Ms > config.maxEventLoopP99Ms) failures.push('event-loop p99 exceeded budget')
+  if (!config.populationGated && evidence.metrics.maxEventLoopP99Ms > config.maxEventLoopP99Ms) failures.push('event-loop p99 exceeded budget')
   if (evidence.metrics.maxSynchronizerPeerBindings > config.maxSynchronizerPeerBindings) {
     failures.push('selective-sync peer bindings exceeded budget')
   }
@@ -2826,7 +2860,7 @@ async function runLocalRehearsal(config, allCells, selections, targets, cookie) 
     // The older evaluator retains its supplementary transport/fencing guards.
     // Cohort, posture, clocks and strict limits are qualified above.
     const extraFailures = []
-    try { evaluateLoadSoakEvidence(evidence, { ...config, benchPosture: null }) } catch (error) { extraFailures.push(error.message) }
+    try { evaluateLoadSoakEvidence(evidence, { ...config, benchPosture: null, populationGated: true }) } catch (error) { extraFailures.push(error.message) }
     observations.emit('calibration', calibration)
     const report = observations.finish({ actualSoakMs, freshness, calibration, extraFailures })
     return { ...report, posture: config.benchPosture, topologyBuild: config.topologyBuild, takeover, takeoverPreflights, metrics,
@@ -2944,6 +2978,7 @@ async function run(config) {
       compose(config, 'pause', originalOwner.service)
       const startedAt = Date.now()
       let replacement
+      let completedAt
       try {
         replacement = await waitFor('spare-cell partition takeover under load', async () => {
           const snapshots = await Promise.all(allCells.map((cell) => (
@@ -2954,6 +2989,10 @@ async function run(config) {
           const index = snapshots.findIndex((state) => state?.ready && state.partitionIndex === failurePartition)
           return index >= 0 ? { index, state: snapshots[index] } : null
         }, 30_000)
+        // Dated when the replacement is observed, BEFORE the unpause below:
+        // the unpause is cleanup, and dating it after charged the unpause's
+        // own latency to the takeover (found on the B5.16c Kubernetes lab).
+        completedAt = Date.now()
       } finally {
         unpauseCell(config, originalOwner.service)
         expectedUnavailableService = null
@@ -2962,9 +3001,9 @@ async function run(config) {
         verified: true,
         originalService: originalOwner.service,
         replacementService: allCells[replacement.index].service,
-        takeoverMs: Date.now() - startedAt,
+        takeoverMs: completedAt - startedAt,
         startedAt,
-        completedAt: Date.now(),
+        completedAt,
       }
       setPhase(`failover: waiting for ${originalOwner.service} to return as standby`)
       await waitFor('former owner to return as standby', async () => {

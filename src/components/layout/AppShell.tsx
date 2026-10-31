@@ -17,7 +17,7 @@ import { useTranslation } from 'react-i18next'
 import { LeftSidebar } from './LeftSidebar'
 import { RightSidebar } from './RightSidebar'
 import { BottomBar } from './BottomBar'
-import { SearchModal } from '../modals/SearchModal'
+import { SpotlightSearch } from '../spotlight/SpotlightSearch'
 import { SettingsModal } from '../modals/SettingsModal'
 import { ShareModal } from '../modals/ShareModal'
 import { MergeChangesModal } from '../drafts/MergeChangesModal'
@@ -111,7 +111,7 @@ export function AppShell({ children }: AppShellProps) {
           </button>
         )}
       </div>
-      <SearchModal />
+      <SpotlightSearch />
       <SettingsModal />
       <ShareModal />
       <MergeChangesModal />

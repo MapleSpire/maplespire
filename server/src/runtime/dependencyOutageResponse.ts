@@ -49,6 +49,7 @@ import { StaleSyncCellWriteError, StoragePoolExhaustedError } from '../automerge
 import type { StorageFenceRejectionReason, UnstatedFenceReason } from '../automergeStorageErrors.js'
 import { RedisUnavailableError } from './redisErrors.js'
 import { WriteAuthorityLostError, WriteAuthorityUnavailableError } from '../syncCells/writeAuthority.js'
+import { WorkspaceRegistryUnavailableError } from '../rbac/workspaceRegistryErrors.js'
 
 export interface DependencyOutageResponse {
   status: number
@@ -225,6 +226,26 @@ export function dependencyOutageResponse(err: unknown): DependencyOutageResponse
         wrote: 'nothing',
       },
       subsystem: 'sync-cell ownership',
+    }
+  }
+
+  // THE REGISTRY READ THAT CANONICALISES A WORKSPACE REF. `canonicalWorkspaceKey`
+  // converts the untyped `pg` failure at the read itself, so there is a class to
+  // match on — and an answer other than the 404 "unknown workspace" it used to
+  // be read as.
+  //
+  // NO `retryable: true`, conservatively. Every caller today reaches this read
+  // before it writes anything (the AI tool context's mid-request
+  // `assertWriteOn` re-canonicalises a CONCRETE version, which reads nothing),
+  // but `retryable` promises "safe to repeat" for every future caller too, and
+  // this module cannot see them. 503 + `Retry-After` is enough for a client to
+  // retry a READ (`src/lib/api/retryable.ts`), and that half is always safe.
+  if (err instanceof WorkspaceRegistryUnavailableError) {
+    return {
+      status: 503,
+      headers: { 'Retry-After': '1' },
+      body: { error: err.message, code: err.code },
+      subsystem: 'workspace registry',
     }
   }
 

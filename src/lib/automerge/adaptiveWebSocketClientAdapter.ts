@@ -19,7 +19,7 @@ import {
   type PeerId,
   type PeerMetadata,
 } from '@automerge/automerge-repo/slim'
-import { noteWorkspaceBinding, parseWorkspaceBindingFrame } from './workspaceBinding'
+import { forgetWorkspaceBindingFrom, noteWorkspaceBinding, parseWorkspaceBindingFrame } from './workspaceBinding'
 
 const SERVICE_RESTART_CODES = new Set([1012, 1013])
 
@@ -294,6 +294,9 @@ export class AdaptiveWebSocketClientAdapter extends NetworkAdapter {
 
   private readonly onClose = (event: CloseEvent): void => {
     this.closeCode = event.code
+    // A binding frame this socket sent and no handler took describes a socket
+    // that is gone; the reconnect will send its own (workspaceBinding.ts).
+    forgetWorkspaceBindingFrom(this)
     // `ready` is a fact about a SOCKET, and this one is gone. Leaving it set
     // would make `handshakePending()` false while the transport is busy getting
     // a peer back. `whenReady()` is unaffected: its promise stays resolved, and
@@ -342,7 +345,7 @@ export class AdaptiveWebSocketClientAdapter extends NetworkAdapter {
     // it would only warn about and drop.
     const binding = parseWorkspaceBindingFrame(message)
     if (binding) {
-      noteWorkspaceBinding(binding)
+      noteWorkspaceBinding(binding, this)
       return
     }
     const peer = peerWireMessage(message)

@@ -58,7 +58,7 @@ vi.mock('../diagram/CreateShapePalette', () => ({ CreateShapePalette: () => <div
 vi.mock('../AutomergeBridge', () => ({ AutomergeBridge: () => null }))
 vi.mock('../presence/DiagramPresenceBridge', () => ({ DiagramPresenceBridge: () => null }))
 vi.mock('../ShareAutoPublisher', () => ({ ShareAutoPublisher: () => null }))
-vi.mock('../modals/SearchModal', () => ({ SearchModal: () => null }))
+vi.mock('../spotlight/SpotlightSearch', () => ({ SpotlightSearch: () => null }))
 vi.mock('../modals/SettingsModal', () => ({ SettingsModal: () => null }))
 vi.mock('../modals/ShareModal', () => ({ ShareModal: () => null }))
 vi.mock('../drafts/MergeChangesModal', () => ({ MergeChangesModal: () => null }))

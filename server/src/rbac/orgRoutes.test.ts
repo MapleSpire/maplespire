@@ -347,6 +347,7 @@ describe('PATCH /api/orgs/:orgId/members/:userId', () => {
     queryMock.mockResolvedValueOnce({ rows: [{ role: 'admin' }] }) // canManageOrg
     stubClient.query
       .mockResolvedValueOnce({ rows: [] }) // BEGIN
+      .mockResolvedValueOnce({ rows: [] }) // lock_permission_writes()
       .mockResolvedValueOnce({ rows: [{ user_id: 'u1' }] }) // admin rows FOR UPDATE
       .mockResolvedValueOnce({ rows: [] }) // target lookup: not found
       .mockResolvedValueOnce({ rows: [] }) // ROLLBACK
@@ -365,6 +366,33 @@ describe('PATCH /api/orgs/:orgId/members/:userId', () => {
       await close()
     }
   })
+
+  // Both member writes take the permission-write lock inside the transaction
+  // and before their FOR UPDATE on the admin rows (reviewer lens, 2026-10-17).
+  for (const [method, body] of [['PATCH', JSON.stringify({ role: 'member' })], ['DELETE', undefined]] as const) {
+    it(`${method} takes the permission-write lock after BEGIN and before locking the admin rows`, async () => {
+      queryMock.mockResolvedValueOnce({ rows: [{ role: 'admin' }] }) // canManageOrg
+      vi.resetModules()
+      const { registerOrgAdminRoutes } = await import('./orgRoutes.js')
+      const { url, close } = await startServer(registerOrgAdminRoutes, memberAuth)
+      try {
+        await fetch(`${url}/api/orgs/org1/members/ghost`, {
+          method,
+          headers: { 'Content-Type': 'application/json' },
+          body,
+        })
+        const sql = stubClient.query.mock.calls.map(([text]) => String(text))
+        const begin = sql.indexOf('BEGIN')
+        const lockAt = sql.findIndex((s) => s.includes('lock_permission_writes'))
+        const adminRows = sql.findIndex((s) => s.includes("role = 'admin' FOR UPDATE"))
+        expect(begin).toBeGreaterThan(-1)
+        expect(lockAt).toBeGreaterThan(begin)
+        expect(adminRows).toBeGreaterThan(lockAt)
+      } finally {
+        await close()
+      }
+    })
+  }
 })
 
 describe('PUT /api/orgs/:orgId/access', () => {
@@ -400,6 +428,101 @@ describe('PUT /api/orgs/:orgId/access', () => {
     } finally {
       await close()
     }
+  })
+
+  it("takes the permission-write lock before locking any grant row (no row-order inversion between two batches)", async () => {
+    queryMock.mockResolvedValueOnce({ rows: [{ role: 'admin' }] }) // canManageOrg
+    stubClient.query
+      .mockResolvedValueOnce({ rows: [] }) // BEGIN
+      .mockResolvedValueOnce({ rows: [{ id: 't1' }, { id: 't2' }] }) // owned teams
+      .mockResolvedValueOnce({ rows: [{ id: 's1' }] }) // owned scopes
+    // everything after: the stub's default empty result
+
+    vi.resetModules()
+    const { registerOrgAdminRoutes } = await import('./orgRoutes.js')
+    const { url, close } = await startServer(registerOrgAdminRoutes, memberAuth)
+    try {
+      const change = (teamId: string) => ({ teamId, scopeId: 's1', resourceType: '*', canRead: true, canWrite: false, expectedUpdatedAt: null })
+      const res = await fetch(`${url}/api/orgs/org1/access`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ changes: [change('t2'), change('t1')] }),
+      })
+      expect(res.status).toBe(200)
+      const sql = stubClient.query.mock.calls.map(([text]) => String(text))
+      const lockAt = sql.findIndex((s) => s.includes('lock_permission_writes'))
+      const firstRowLock = sql.findIndex((s) => s.includes('FOR UPDATE'))
+      expect(lockAt).toBeGreaterThan(-1)
+      expect(lockAt).toBeLessThan(firstRowLock)
+      // Inside the transaction: a transaction-scoped lock taken before BEGIN
+      // runs in autocommit and is released at once (QA lens, 2026-10-16).
+      expect(lockAt).toBeGreaterThan(sql.indexOf('BEGIN'))
+    } finally {
+      await close()
+    }
+  })
+
+  describe('deadlock-victim backstop', () => {
+    const deadlock = () => Object.assign(new Error('deadlock detected'), { code: '40P01' })
+    const body = JSON.stringify({
+      changes: [{ teamId: 't1', scopeId: 's1', resourceType: '*', canRead: true, canWrite: false, expectedUpdatedAt: null }],
+    })
+    /** Route the stub client's SQL: ownership checks succeed; `forUpdate`
+     * decides what the batch's first row lock does on each attempt. */
+    function scriptClient(forUpdate: (attempt: number) => Promise<unknown>) {
+      let attempt = 0
+      stubClient.query.mockImplementation(async (text: unknown) => {
+        const sql = String(text)
+        if (sql === 'BEGIN') attempt++
+        if (sql.includes('FROM teams')) return { rows: [{ id: 't1' }] }
+        if (sql.includes('FROM scopes WHERE org_id')) return { rows: [{ id: 's1' }] }
+        if (sql.includes('FOR UPDATE')) return forUpdate(attempt)
+        return { rows: [] }
+      })
+      return () => stubClient.query.mock.calls.filter(([s]) => s === 'BEGIN').length
+    }
+    async function put() {
+      queryMock.mockResolvedValueOnce({ rows: [{ role: 'admin' }] }) // canManageOrg
+      vi.resetModules()
+      const { registerOrgAdminRoutes } = await import('./orgRoutes.js')
+      const { url, close } = await startServer(registerOrgAdminRoutes, memberAuth)
+      try {
+        return await fetch(`${url}/api/orgs/org1/access`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body })
+      } finally {
+        await close()
+      }
+    }
+
+    it('re-runs a batch Postgres picked as a deadlock victim, and it applies', async () => {
+      const begins = scriptClient(async (attempt) => {
+        if (attempt === 1) throw deadlock()
+        return { rows: [] }
+      })
+      const res = await put()
+      expect(res.status).toBe(200)
+      expect(begins()).toBe(2)
+      expect(appendAuditMock).toHaveBeenCalledTimes(1)
+    })
+
+    it('gives up after 3 attempts with a 500', async () => {
+      const begins = scriptClient(async () => { throw deadlock() })
+      const res = await put()
+      expect(res.status).toBe(500)
+      expect(begins()).toBe(3)
+      expect(appendAuditMock).not.toHaveBeenCalled()
+    })
+
+    it('never re-runs a batch that already committed, nor any other error', async () => {
+      let begins = scriptClient(async () => ({ rows: [] }))
+      appendAuditMock.mockRejectedValueOnce(deadlock()) // after COMMIT
+      expect((await put()).status).toBe(500)
+      expect(begins()).toBe(1)
+
+      stubClient.query.mockReset()
+      begins = scriptClient(async () => { throw Object.assign(new Error('boom'), { code: '23505' }) })
+      expect((await put()).status).toBe(500)
+      expect(begins()).toBe(1)
+    })
   })
 
   it('400s when a referenced team does not belong to the org', async () => {

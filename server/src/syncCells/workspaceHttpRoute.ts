@@ -74,8 +74,8 @@ function isWorkspaceHttpPath(rawPathname: string, method: string): boolean {
   }
   // Compaction is workspace-local; GC is accepted only by the sole ready
   // partition owner (and is explicitly rejected in multi-partition mode until a
-  // fenced global worker exists). The last two carry a bounded JSON body — see
-  // `REBUILT_JSON_BODY_PATHS`; the first two are bodyless.
+  // fenced global worker exists). Those two are bodyless; the rest carry a
+  // bounded JSON body — see `REBUILT_JSON_BODY_PATHS`.
   return method === 'POST'
     && (
       pathname === '/api/model/compact'

@@ -197,7 +197,6 @@ Only used by `npm run db:embedded` (the no-Docker path).
 |---|---|---|
 | `DATABASE_URL` | server vitest (`vitest.global-setup.ts`, the `*.integration.test.ts`) | DB the server tests run against; suites **skip gracefully** when unreachable. |
 | `CI`, `E2E_*` | `playwright.config.ts` | Playwright run config. |
-| `GEN_PREVIEW` | `src/lib/layout/genPreview.test.ts` | Opt-in layout-preview generation in a test. |
 | `TEST_DATABASE_URL` | the 21 DB-gated server suites | Postgres they run against; **unset ⇒ they skip silently**. CI sets it and `REQUIRE_DB_TESTS`, and `scripts/check-test-skips.mjs` fails a run that skipped anything undeclared. See `docs/ci.md`. |
 | `TEST_REDIS_URL` | the Redis-gated suites | Same shape, for `runtime/redis.integration.test.ts` and `syncCells/ownership.redis.integration.test.ts`. Paired with `REQUIRE_REDIS_TESTS`. |
 | `REQUIRE_DB_TESTS`, `REQUIRE_REDIS_TESTS` | `src/testing/serviceGates.test.ts` | Declare that this environment intends to run the gated suites, so an unreachable service fails in seconds by name instead of vanishing into a green run. |

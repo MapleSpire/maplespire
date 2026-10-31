@@ -13,6 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import { test, expect } from '@playwright/test'
+import { submitDevLogin } from '../support/devLogin'
 
 // Auth flow against an AUTH=dual stack: real login page → dev login →
 // account badge → invite create (via API) → sign out →
@@ -43,8 +44,11 @@ test.describe('auth — dev login, account badge, invite accept', () => {
 
     // ── real login page → dev login ──
     await page.goto('/login')
-    await page.getByTestId('dev-login-email').fill(adminEmail)
-    await page.getByTestId('dev-login-submit').click()
+    // The helper ticks the legal-acceptance box that gates every sign-in
+    // button; filling the email and clicking waited 15 s on a disabled button
+    // and the spec never reached the invite path it exists for.
+    await expect(page.getByTestId('dev-login-email')).toBeVisible({ timeout: 15_000 })
+    await submitDevLogin(page, adminEmail)
     await page.waitForURL(/\/app/, { timeout: 30_000 })
 
     // ── session is live: the account badge renders and knows who we are ──
@@ -94,8 +98,8 @@ test.describe('auth — dev login, account badge, invite accept', () => {
     await page.goto(acceptPath)
     await expect(page.getByText(/sign in/i).first()).toBeVisible({ timeout: 15_000 })
     await page.goto('/login')
-    await page.getByTestId('dev-login-email').fill(inviteeEmail)
-    await page.getByTestId('dev-login-submit').click()
+    await expect(page.getByTestId('dev-login-email')).toBeVisible({ timeout: 15_000 })
+    await submitDevLogin(page, inviteeEmail)
     await page.waitForURL(/\/app|\/invite\//, { timeout: 30_000 })
     await page.goto(acceptPath)
     await page.getByTestId('invite-accept').click()

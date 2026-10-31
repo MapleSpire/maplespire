@@ -253,7 +253,10 @@ function cookieAttrs(maxAgeS?: number): string {
   return attrs.join('; ')
 }
 
-/** Set the session cookie on the response, honoring `AUTH_SESSION_MAX_AGE_S`. */
+/** Set the session cookie on the response, honoring `AUTH_SESSION_MAX_AGE_S`.
+ * (Exactly one Set-Cookie — pinned by a test. A leftover "session ended"
+ * marker, below, needs no clearing here: GET /api/auth/me only reads it when
+ * there is NO session cookie, and logout clears it.) */
 export function setSessionCookie(res: Response, token: string): void {
   res.append('Set-Cookie', `${sessionCookieName()}=${encodeURIComponent(token)}; ${cookieAttrs(sessionMaxAgeS())}`)
 }
@@ -261,6 +264,41 @@ export function setSessionCookie(res: Response, token: string): void {
 /** Clear the session cookie (logout) — same attributes, immediate expiry. */
 export function clearSessionCookie(res: Response): void {
   res.append('Set-Cookie', `${sessionCookieName()}=; ${cookieAttrs(0)}; Expires=Thu, 01 Jan 1970 00:00:00 GMT`)
+}
+
+/** The marker cookie `rememberSessionEnded` leaves, named after the session
+ * cookie so a renamed session (per-stack AUTH_COOKIE_NAME) never shares it. */
+export function sessionEndedCookieName(): string {
+  return `${sessionCookieName()}_ended`
+}
+
+const SESSION_ENDED_MAX_AGE_S = 120
+
+/**
+ * The server just refused a STALE session and cleared its cookie (the middleware
+ * does, on any route). Leave a short-lived, secret-free marker saying why.
+ *
+ * Why: a page opened on a revoked session fires several requests at once, and
+ * whichever answers first clears the cookie. When GET /api/auth/me — the one
+ * the client asks "why am I signed out?" — arrives second, the cookie is gone
+ * and it can only say "not authenticated", so the login page could not tell a
+ * revoked user from a new visitor (measured 2026-10-17 on AUTH=on: /api/shares
+ * answered session_stale before /api/auth/me did). The clearing itself stays
+ * as it is; the marker only carries the reason across it. `sessionEndedPending`
+ * reads it WITHOUT clearing: every tab shares one cookie jar, so a read that
+ * cleared it would explain the first tab only (architect + reviewer lenses,
+ * 2026-10-18). It simply expires after 120 s. HttpOnly like the rest.
+ * Callers write it BEFORE clearing the session cookie, so no response leaves a
+ * state with neither.
+ */
+export function rememberSessionEnded(res: Response): void {
+  setNamedCookie(res, sessionEndedCookieName(), 'stale', SESSION_ENDED_MAX_AGE_S)
+}
+
+/** Did this request carry the marker? Not consumed: see above. Only
+ * GET /api/auth/me asks, and only when the request has no session cookie. */
+export function sessionEndedPending(req: Request): boolean {
+  return readNamedCookie(req, sessionEndedCookieName()) !== null
 }
 
 /** Set an arbitrary named cookie with the same attributes (HttpOnly,

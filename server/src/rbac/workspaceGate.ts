@@ -19,6 +19,7 @@ import { authStage } from '../auth/middleware.js'
 import { ensureDefaultOrg } from '../auth/schema.js'
 import { allowedWorkspaceKeys, writableWorkspaceKeys } from './docScope.js'
 import { explainAccess } from './access.js'
+import { WorkspaceRegistryUnavailableError } from './workspaceRegistryErrors.js'
 
 /**
  * Shared org/workspace access gates for the landscape + Automerge-root + read
@@ -44,21 +45,32 @@ import { explainAccess } from './access.js'
  *     with alias keys the check denied EVERYONE, platform admins included.
  * Also means a set-default repoint naturally switches 'current' callers to the
  * new head's rows instead of serving rows projected from the old head.
- * Returns null when the landscape doesn't exist (caller 404s).
+ * Returns null when the landscape doesn't exist or has no default (caller
+ * 404s). A failed READ throws `WorkspaceRegistryUnavailableError` instead:
+ * answered as null, it was a 404 "unknown workspace" for a workspace that
+ * exists — and, on the routes that skip the access check for an unknown one,
+ * a path past the check.
  */
 export async function canonicalWorkspaceKey(pool: Pool, key: WorkspaceKey): Promise<WorkspaceKey | null> {
   if (key.versionId !== 'current') return key
+  let rows: Array<{ default_version_id: string | null }>
   try {
-    const { rows } = await pool.query<{ default_version_id: string | null }>(
+    rows = (await pool.query<{ default_version_id: string | null }>(
       'SELECT default_version_id FROM landscapes WHERE id = $1',
       [key.landscapeId]
-    )
-    const vid = rows[0]?.default_version_id
-    return vid ? { landscapeId: key.landscapeId, versionId: vid } : null
+    )).rows
   } catch (err) {
-    console.error('[workspace-gate] canonicalWorkspaceKey failed:', err)
-    return null
+    throw new WorkspaceRegistryUnavailableError(err)
   }
+  const vid = rows[0]?.default_version_id
+  return vid ? { landscapeId: key.landscapeId, versionId: vid } : null
+}
+
+/** Whether `checkWorkspaceAccess` can REFUSE this request: stage 'on' with a
+ * session. Below that it allows every key (see the module doc), so a root that
+ * no check ran on discloses nothing a check would have withheld. */
+export function workspaceAccessEnforced(req: Request): boolean {
+  return authStage() === 'on' && Boolean(req.auth)
 }
 
 /** Stage-aware workspace READ gate (see module doc): true = allowed. `key`

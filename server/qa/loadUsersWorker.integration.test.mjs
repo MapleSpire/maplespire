@@ -21,10 +21,10 @@ import { fileURLToPath } from 'node:url'
 import { setTimeout as delay } from 'node:timers/promises'
 import * as A from '@automerge/automerge'
 import { Repo } from '@automerge/automerge-repo'
-import { NodeWSServerAdapter } from '@automerge/automerge-repo-network-websocket'
+import { NodeWSServerAdapter, WebSocketClientAdapter } from '@automerge/automerge-repo-network-websocket'
 import { WebSocketServer } from 'ws'
 import { assertLoadUserEvidence, parseClosedLoadOutput } from './loadUserEvidence.mjs'
-import { loadObjectIds, loadRoundValue, loadConvergenceState, planWriters } from './loadUsersCore.mjs'
+import { adoptPersistentWriterActor, loadObjectIds, loadRoundValue, loadConvergenceState, persistentWriterActor, planWriters } from './loadUsersCore.mjs'
 
 async function bounded(promise, ms, label, onTimeout = () => {}) {
   let timer
@@ -38,7 +38,7 @@ async function bounded(promise, ms, label, onTimeout = () => {}) {
 /** Real CLI -> Workers -> patched Repos -> authenticated adapter -> TCP server.
  * This small fixture proves generator wiring, not server authorization/SQL or
  * native fleet capacity. No fixture document is injected into a client. */
-async function runCliCase({ assignment, abortBarrier = false }) {
+async function runCliCase({ assignment, abortBarrier = false, writerActors = 'fresh' }) {
   const episodeId = randomUUID()
   const objectPrefix = 'qa-worker-' + episodeId
   const ids = loadObjectIds(2, objectPrefix)
@@ -83,7 +83,7 @@ async function runCliCase({ assignment, abortBarrier = false }) {
       fileURLToPath(new URL('./load-users.mjs', import.meta.url)),
       '--root', handle.url, '--users', '3', '--totalUsers', '3',
       '--writers', '2', '--objects', '2', '--rounds', '4',
-      '--objectAssignment', assignment,
+      '--objectAssignment', assignment, '--writerActors', writerActors,
     ], { env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe', 'ipc'] })
     // Own the child and observe its real identity before readiness or results.
     const actualPid = child.pid
@@ -167,6 +167,19 @@ async function runCliCase({ assignment, abortBarrier = false }) {
       ids, writersOf: plan.writersOf, expectedRound: loadRoundValue(episodeId, 3) })
     assert.equal(truth.fullyConverged, true, 'actual server received useful fields')
     assert.equal(document.writeBatchIds.length, 9, 'seed plus eight writer changes')
+    const fixtureActor = A.decodeChange(A.getAllChanges(document)[0]).actor
+    const actors = new Set(A.getAllChanges(document).map(change => A.decodeChange(change).actor))
+    actors.delete(fixtureActor)
+    const persistent = [0, 1].map(writer => persistentWriterActor(handle.url, writer))
+    if (writerActors === 'persistent') {
+      assert.deepEqual([...actors].filter(actor => !persistent.includes(actor)), [], 'D61: no writer change under a fresh actor')
+      assert.ok(persistent.every(actor => actors.has(actor)), 'D61: both writers wrote under their persistent actor')
+      const reported = result.clientIsolation.clients.map(client => client.actorId)
+      assert.deepEqual(reported.slice(0, 2), persistent, 'D61 QA: each writer reports its own persistent actor')
+      assert.notEqual(reported[2], persistentWriterActor(handle.url, 2), 'D61 QA: a reader keeps a fresh actor')
+    } else {
+      assert.equal(persistent.filter(actor => actors.has(actor)).length, 0, 'fresh mode never borrows a persistent actor')
+    }
     return { exit, socketsClosed: 3, workersClosed: 3, writes: result.writesCompleted.length, closeEventObserved }
   } finally {
     if (child && child.exitCode === null && child.signalCode === null) child.kill()
@@ -208,3 +221,45 @@ test('real load-users CLI closes all loaded users when its external barrier is a
   { timeout: 40_000 }, async t => {
     t.diagnostic(JSON.stringify(await runCliCase({ assignment: 'per-writer', abortBarrier: true })))
   })
+
+test('D61 real load-users CLI writes every writer change under its persistent actor',
+  { timeout: 40_000 }, async t => {
+    t.diagnostic(JSON.stringify(await runCliCase({ assignment: 'per-writer', writerActors: 'persistent' })))
+  })
+
+test('D61 two successive cold Repos keep one writer actor with a continuous sequence through a real server', { timeout: 30_000 }, async () => {
+  const server = createServer()
+  const wss = new WebSocketServer({ server })
+  const adapter = new NodeWSServerAdapter(wss)
+  const repo = new Repo({ network: [adapter], peerId: 'qa-d61-fixture' })
+  const handle = repo.create({ objects: { o: { name: 'seed' } } })
+  await bounded(new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve) }), 2000, 'listen')
+  const url = 'ws://127.0.0.1:' + server.address().port
+  const actor = persistentWriterActor(handle.url, 0)
+  try {
+    for (let cycle = 1; cycle <= 3; cycle++) {
+      const client = new Repo({ network: [new WebSocketClientAdapter(url)] })
+      try {
+        const cold = await bounded(client.find(handle.url), 10_000, 'cold find ' + cycle)
+        await cold.whenReady()
+        assert.equal(adoptPersistentWriterActor(cold, handle.url, 0), actor)
+        cold.change(doc => { doc.objects.o.u0 = 'cycle-' + cycle })
+        await bounded((async () => {
+          while (handle.doc().objects.o.u0 !== 'cycle-' + cycle) await delay(20)
+        })(), 10_000, 'server receives cycle ' + cycle)
+      } finally {
+        await client.shutdown()
+      }
+    }
+    const own = A.getAllChanges(handle.doc()).map(change => A.decodeChange(change)).filter(change => change.actor === actor)
+    assert.deepEqual(own.map(change => change.seq), [1, 2, 3], 'one actor, sequence continued across three cold Repos')
+    assert.equal(new Set(A.getAllChanges(handle.doc()).map(change => A.decodeChange(change).actor)).size, 2, 'fixture plus the one writer actor')
+  } finally {
+    for (const client of wss.clients) client.terminate()
+    await new Promise(resolve => wss.close(resolve))
+    repo.networkSubsystem.removeNetworkAdapter(adapter)
+    await repo.shutdown()
+    server.closeAllConnections()
+    await new Promise(resolve => server.close(resolve))
+  }
+})

@@ -165,4 +165,216 @@ describe.skipIf(!TEST_DATABASE_URL)('setDefaultVersion (live Postgres)', () => {
     expect(await currentDefault('L_unknown')).toBe('V_one')
     expect(announced).toEqual([])
   })
+
+  // `rootUrlOfVersion` is what `/api/automerge/root` resolves a CANONICAL key
+  // through (`resolveWorkspaceRoot`). Its stubbed callers cannot see the SQL: a
+  // query that matched nothing would send every `current` tab down the keyless
+  // legacy path, and its durability witness would never be asked — silently.
+  it('rootUrlOfVersion answers the root of exactly that (landscape, version)', async () => {
+    await realPool.query('INSERT INTO landscapes (id, name) VALUES ($1, $1), ($2, $2)', ['L_root', 'L_root_other'])
+    await realPool.query(
+      `INSERT INTO versions (id, landscape_id, label, root_url) VALUES
+         ('V_root_1', 'L_root', 'one', 'automerge:root-of-v1'),
+         ('V_root_2', 'L_root', 'two', 'automerge:root-of-v2'),
+         ('V_root_x', 'L_root_other', 'x', 'automerge:root-of-x')`
+    )
+
+    await expect(landscapes.rootUrlOfVersion({ landscapeId: 'L_root', versionId: 'V_root_1' })).resolves.toBe('automerge:root-of-v1')
+    await expect(landscapes.rootUrlOfVersion({ landscapeId: 'L_root', versionId: 'V_root_2' })).resolves.toBe('automerge:root-of-v2')
+    // A version of ANOTHER landscape is no root of this one.
+    await expect(landscapes.rootUrlOfVersion({ landscapeId: 'L_root', versionId: 'V_root_x' })).resolves.toBeNull()
+    await expect(landscapes.rootUrlOfVersion({ landscapeId: 'L_root', versionId: 'V_nope' })).resolves.toBeNull()
+  })
+
+  // The routes that disclose or read a workspace root check access on the
+  // CANONICAL key (`canonicalWorkspaceKey`) first. These drive that same
+  // sequence with the real SQL: a set-default landing between the check and
+  // the root read, and a read that fails after (or during) the check.
+  describe('a root is resolved only from the key its access was checked on', () => {
+    const PRIMARY = 'automerge:primary-root'
+    let workspaceGate: typeof import('./rbac/workspaceGate.js')
+    let registryErrors: typeof import('./rbac/workspaceRegistryErrors.js')
+
+    beforeAll(async () => {
+      workspaceGate = await import('./rbac/workspaceGate.js')
+      registryErrors = await import('./rbac/workspaceRegistryErrors.js')
+    })
+
+    async function seedRoots(landscapeId: string, defaultVersionId: string) {
+      await realPool.query('INSERT INTO landscapes (id, name) VALUES ($1, $1)', [landscapeId])
+      await realPool.query(
+        `INSERT INTO versions (id, landscape_id, label, root_url) VALUES
+           ($2, $1, 'one', 'automerge:root-of-v1'),
+           ($3, $1, 'two', 'automerge:root-of-v2')`,
+        [landscapeId, `${landscapeId}_V1`, `${landscapeId}_V2`],
+      )
+      await realPool.query('UPDATE landscapes SET default_version_id = $2 WHERE id = $1', [landscapeId, defaultVersionId])
+    }
+
+    /** A real failed read: the table the lookup needs is not there. */
+    async function withTableAway<T>(table: 'landscapes' | 'versions', run: () => Promise<T>): Promise<T> {
+      await realPool.query(`ALTER TABLE ${table} RENAME TO ${table}_away`)
+      try {
+        return await run()
+      } finally {
+        await realPool.query(`ALTER TABLE ${table}_away RENAME TO ${table}`)
+      }
+    }
+
+    /** Console noise of the failure under test, captured inside the run. */
+    async function quietly<T>(run: () => Promise<T>): Promise<T> {
+      const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+      try {
+        return await run()
+      } finally {
+        error.mockRestore()
+      }
+    }
+
+    it('resolveRootUrl: a failed read THROWS for an explicit ref, and answers the fallback only for the no-params call', async () => {
+      await seedRoots('L_err', 'L_err_V1')
+      await withTableAway('versions', async () => {
+        await expect(landscapes.resolveRootUrl('L_err', 'current', PRIMARY)).rejects.toThrow(/versions/)
+        await expect(landscapes.resolveRootUrl('L_err', 'L_err_V1', PRIMARY)).rejects.toThrow(/versions/)
+      })
+      // The FIRST read fails here, so the no-params answer can only come from
+      // the catch — a missing `default` landscape would answer it as a miss.
+      await withTableAway('landscapes', async () => {
+        await expect(landscapes.resolveRootUrl('L_err', 'current', PRIMARY)).rejects.toThrow(/landscapes/)
+        await expect(quietly(() => landscapes.resolveRootUrl(undefined, undefined, PRIMARY))).resolves.toBe(PRIMARY)
+      })
+      // Control: the same calls with the table back resolve the real roots.
+      await expect(landscapes.resolveRootUrl('L_err', 'current', PRIMARY)).resolves.toBe('automerge:root-of-v1')
+      await expect(landscapes.resolveRootUrl('L_err', 'L_err_V2', PRIMARY)).resolves.toBe('automerge:root-of-v2')
+    })
+
+    /** The `/root` route's own dependencies, over the real registry SQL. */
+    function routeDeps(overrides: Partial<Parameters<typeof landscapes.resolveWorkspaceRoot>[2]> = {}) {
+      return {
+        canonicalize: (ref: { landscapeId: string; versionId: string }) => workspaceGate.canonicalWorkspaceKey(realPool, ref),
+        mayRead: async () => true,
+        accessEnforced: false,
+        ...overrides,
+      }
+    }
+
+    it('canonicalWorkspaceKey: a read that FAILS throws the typed refusal — it is not "no such workspace"', async () => {
+      await seedRoots('L_gate', 'L_gate_V1')
+      const ref = { landscapeId: 'L_gate', versionId: 'current' }
+      await withTableAway('landscapes', async () => {
+        await expect(workspaceGate.canonicalWorkspaceKey(realPool, ref)).rejects.toBeInstanceOf(registryErrors.WorkspaceRegistryUnavailableError)
+      })
+      // Control: the same read, healthy, and a real miss.
+      await expect(workspaceGate.canonicalWorkspaceKey(realPool, ref)).resolves.toEqual({ landscapeId: 'L_gate', versionId: 'L_gate_V1' })
+      await expect(workspaceGate.canonicalWorkspaceKey(realPool, { landscapeId: 'L_nope', versionId: 'current' })).resolves.toBeNull()
+    })
+
+    it('/root: a set-default after the check still answers the checked version, beside its key', async () => {
+      await seedRoots('L_race', 'L_race_V1')
+      const ref = { landscapeId: 'L_race', versionId: 'current' }
+      const checked: Array<{ landscapeId: string; versionId: string }> = []
+      const answer = await landscapes.resolveWorkspaceRoot(ref, PRIMARY, routeDeps({
+        mayRead: async (key) => {
+          checked.push(key)
+          // The set-default lands while the access check runs.
+          await expect(landscapes.setDefaultVersion('L_race', 'L_race_V2')).resolves.toBe(true)
+          return true
+        },
+      }))
+      expect(checked).toEqual([{ landscapeId: 'L_race', versionId: 'L_race_V1' }])
+      expect(answer).toEqual({
+        kind: 'root',
+        url: 'automerge:root-of-v1',
+        key: { landscapeId: 'L_race', versionId: 'L_race_V1' },
+      })
+      // Control: the alias has really moved — reading the ref again answers v2.
+      await expect(landscapes.resolveRootUrl('L_race', 'current', PRIMARY)).resolves.toBe('automerge:root-of-v2')
+    })
+
+    it('/root: a read that fails AFTER the check throws — the primary root only for no params where access is open', async () => {
+      await seedRoots('L_after', 'L_after_V1')
+      await seedRoots(landscapes.DEFAULT_LANDSCAPE_ID, `${landscapes.DEFAULT_LANDSCAPE_ID}_V1`)
+      const ref = { landscapeId: 'L_after', versionId: 'current' }
+
+      await withTableAway('versions', async () => {
+        await expect(landscapes.resolveWorkspaceRoot(ref, PRIMARY, routeDeps())).rejects.toThrow(/versions/)
+        await expect(landscapes.resolveWorkspaceRoot({}, PRIMARY, routeDeps({ accessEnforced: true })))
+          .rejects.toThrow(/versions/)
+        await expect(quietly(() => landscapes.resolveWorkspaceRoot({}, PRIMARY, routeDeps())))
+          .resolves.toEqual({ kind: 'root', url: PRIMARY, key: null })
+      })
+      // Control: with the table back both resolve their own root, beside a key.
+      await expect(landscapes.resolveWorkspaceRoot(ref, PRIMARY, routeDeps()))
+        .resolves.toEqual({ kind: 'root', url: 'automerge:root-of-v1', key: { landscapeId: 'L_after', versionId: 'L_after_V1' } })
+      await expect(landscapes.resolveWorkspaceRoot({}, PRIMARY, routeDeps())).resolves.toEqual({
+        kind: 'root',
+        url: 'automerge:root-of-v1',
+        key: { landscapeId: landscapes.DEFAULT_LANDSCAPE_ID, versionId: `${landscapes.DEFAULT_LANDSCAPE_ID}_V1` },
+      })
+    })
+
+    it('/root: a canonicalisation that cannot read is never answered as a miss, and never with an unchecked root where access is enforced', async () => {
+      await seedRoots('L_canon', 'L_canon_V1')
+      await seedRoots(landscapes.DEFAULT_LANDSCAPE_ID, `${landscapes.DEFAULT_LANDSCAPE_ID}_V1`)
+      const ref = { landscapeId: 'L_canon', versionId: 'current' }
+
+      await withTableAway('landscapes', async () => {
+        await expect(landscapes.resolveWorkspaceRoot(ref, PRIMARY, routeDeps()))
+          .rejects.toBeInstanceOf(registryErrors.WorkspaceRegistryUnavailableError)
+        await expect(landscapes.resolveWorkspaceRoot({}, PRIMARY, routeDeps({ accessEnforced: true })))
+          .rejects.toBeInstanceOf(registryErrors.WorkspaceRegistryUnavailableError)
+        // Open access, no params: the bootable fallback, beside no key.
+        await expect(quietly(() => landscapes.resolveWorkspaceRoot({}, PRIMARY, routeDeps())))
+          .resolves.toEqual({ kind: 'root', url: PRIMARY, key: null })
+      })
+      // Control: a landscape that does not exist is a plain miss (404), and so is `?landscapeId=`.
+      await expect(landscapes.resolveWorkspaceRoot({ landscapeId: 'L_nope', versionId: 'current' }, PRIMARY, routeDeps()))
+        .resolves.toEqual({ kind: 'root', url: null, key: null })
+      await expect(landscapes.resolveWorkspaceRoot({ landscapeId: '' }, PRIMARY, routeDeps()))
+        .resolves.toEqual({ kind: 'root', url: null, key: null })
+    })
+
+    it('registry-diagram / doc-heads: a set-default after the check reads the checked version, not the new default', async () => {
+      await seedRoots('L_probe', 'L_probe_V1')
+      const checked: Array<{ landscapeId: string; versionId: string }> = []
+      const workspace = await landscapes.readableWorkspace({ landscapeId: 'L_probe', versionId: 'current' }, {
+        canonicalize: (ref) => workspaceGate.canonicalWorkspaceKey(realPool, ref),
+        mayRead: async (key) => {
+          checked.push(key)
+          // The set-default lands after the check, before the root is read.
+          await landscapes.setDefaultVersion('L_probe', 'L_probe_V2')
+          return true
+        },
+      })
+      expect(checked).toEqual([{ landscapeId: 'L_probe', versionId: 'L_probe_V1' }])
+      if (workspace.kind !== 'readable') throw new Error(`expected a readable workspace, got ${workspace.kind}`)
+      await expect(workspace.rootUrl()).resolves.toBe('automerge:root-of-v1')
+      // Control: the alias has really moved — reading the ref again answers v2.
+      await expect(landscapes.resolveRootUrl('L_probe', 'current', PRIMARY)).resolves.toBe('automerge:root-of-v2')
+    })
+
+    it('registry-diagram / doc-heads: a root read that fails after the check throws instead of answering the primary root', async () => {
+      await seedRoots('L_probe_err', 'L_probe_err_V1')
+      const workspace = await landscapes.readableWorkspace({ landscapeId: 'L_probe_err', versionId: 'current' }, {
+        canonicalize: (ref) => workspaceGate.canonicalWorkspaceKey(realPool, ref),
+        mayRead: async () => true,
+      })
+      if (workspace.kind !== 'readable') throw new Error(`expected a readable workspace, got ${workspace.kind}`)
+      await withTableAway('versions', async () => {
+        await expect(workspace.rootUrl()).rejects.toThrow(/versions/)
+      })
+    })
+
+    it('registry-diagram / doc-heads: a canonicalisation that cannot read throws — it is not an "unknown" workspace', async () => {
+      await seedRoots('L_probe_canon', 'L_probe_canon_V1')
+      const mayRead = vi.fn(async () => true)
+      await withTableAway('landscapes', async () => {
+        await expect(landscapes.readableWorkspace({ landscapeId: 'L_probe_canon', versionId: 'current' }, {
+          canonicalize: (ref) => workspaceGate.canonicalWorkspaceKey(realPool, ref),
+          mayRead,
+        })).rejects.toBeInstanceOf(registryErrors.WorkspaceRegistryUnavailableError)
+      })
+      expect(mayRead).not.toHaveBeenCalled()
+    })
+  })
 })

@@ -1,0 +1,140 @@
+{
+  "spotlight": {
+    "ariaLabel": "Search",
+    "placeholder": "Search diagrams, objects, decisions and actions",
+    "placeholderScoped": "Search {{scope}}",
+    "clear": "Clear search",
+    "filterResults": "Filter results",
+    "emptyHint": "Check the spelling or try a broader term. Type ? for search tips.",
+    "partialNotice": "Only what this tab has loaded was searched: the workspace search is unavailable right now.",
+    "empty": {
+      "title": "No results for “{{query}}”",
+      "scoped": "Nothing in {{scope}} matches. Remove the filter to search everything."
+    },
+    "scopes": {
+      "diagrams": "Diagrams",
+      "objects": "Objects",
+      "decisions": "Decisions",
+      "actions": "Actions"
+    },
+    "sections": {
+      "top": "Top hit",
+      "objects": "Model objects",
+      "diagrams": "Diagrams",
+      "flows": "Flows",
+      "decisions": "Decision records",
+      "connections": "Connections",
+      "actions": "Actions",
+      "recent": "Recent",
+      "tips": "Search tips",
+      "suggestions": "Suggestions",
+      "fixes": "Did you mean"
+    },
+    "kinds": {
+      "system": "System",
+      "app": "App",
+      "store": "Store",
+      "component": "Component",
+      "actor": "Actor",
+      "group": "Group",
+      "diagram": "Diagram",
+      "flow": "Flow",
+      "adr": "Decision record",
+      "connection": "Connection",
+      "page": "Action",
+      "tip": "Search tip",
+      "suggestion": "Filter value"
+    },
+    "actions": {
+      "open": "Open",
+      "run": "Run",
+      "use": "Use",
+      "reveal": "Reveal in model",
+      "showConnections": "Show in connections",
+      "newTab": "Open in new tab"
+    },
+    "fields": {
+      "technology": "Technology",
+      "scope": "Scope",
+      "status": "Status",
+      "domain": "Domain",
+      "tags": "Tags",
+      "appearsIn": "Appears in",
+      "connections": "Connections",
+      "from": "From",
+      "to": "To",
+      "level": "Level",
+      "contents": "Contents",
+      "diagram": "Diagram",
+      "steps": "Steps",
+      "id": "ID",
+      "updated": "Updated",
+      "example": "Example",
+      "query": "Query",
+      "alsoWritten": "Also written"
+    },
+    "values": {
+      "internal": "Internal",
+      "external": "External",
+      "live": "Live",
+      "draft": "Draft",
+      "down": "Down",
+      "unstable": "Unstable",
+      "inProgress": "In progress",
+      "approved": "Approved",
+      "rejected": "Rejected",
+      "context": "Context",
+      "container": "Container",
+      "component": "Component"
+    },
+    "counts": {
+      "diagrams_one": "{{count}} diagram",
+      "diagrams_other": "{{count}} diagrams",
+      "steps_one": "{{count}} step",
+      "steps_other": "{{count}} steps",
+      "contents": "{{objects}} objects · {{connections}} connections",
+      "in_one": "{{count}} in",
+      "in_other": "{{count}} in",
+      "out_one": "{{count}} out",
+      "out_other": "{{count}} out"
+    },
+    "tipMeta": "Search syntax",
+    "suggestionMeta": "Value for {{key}}:",
+    "suggestionHint": "Press ↵ to add this filter, then keep typing to narrow the results.",
+    "fix": {
+      "key": "{{key}}:",
+      "keyHint": "“{{typed}}:” is not a filter. Choose this to use {{key}}: instead.",
+      "value": "{{key}}:",
+      "valueHint": "“{{value}}” is not a {{key}}. Try one of: {{expected}}."
+    },
+    "tips": {
+      "kind": "Only one kind of result: system, app, store, component, actor, group, diagram, flow, adr, connection or page. kind:object means any C4 object; values can be shortened (kind:sys) or combined (kind:app,store).",
+      "tag": "Objects and connections carrying a tag. Type tag: to pick from the tags in this landscape.",
+      "tech": "Anything built with a technology, matched on its name: tech:postgres finds PostgreSQL.",
+      "in": "Objects, groups, connections and flows placed on a diagram whose name matches.",
+      "status": "Objects by status (live, draft, down, unstable) or decision records by status (in-progress, approved, rejected).",
+      "phrase": "Quotes keep words together and in order.",
+      "exclude": "A leading minus removes matches: -legacy hides everything that mentions legacy. NOT legacy does the same.",
+      "or": "OR (in capitals) matches either side. Words without it must all match.",
+      "has": "Only results that have a description, a diagram, a technology or a tag.",
+      "from": "Connections by endpoint. Use from: and to: together to find one link."
+    },
+    "commands": {
+      "goDiagrams": { "title": "All diagrams", "keywords": "diagrams list browse grid", "description": "Browse every diagram in this landscape." },
+      "goObjects": { "title": "Model objects", "keywords": "objects table model inventory", "description": "The table of every object in the model." },
+      "goConnections": { "title": "Model connections", "keywords": "connections links relationships table", "description": "The table of every connection in the model." },
+      "goDependencies": { "title": "Dependencies", "keywords": "dependencies impact graph upstream downstream", "description": "What an object depends on, and what depends on it." },
+      "goViewer": { "title": "Model viewer", "keywords": "viewer overview grid 3d board", "description": "The whole model, level by level, without editing." },
+      "goDecisions": { "title": "Decision records", "keywords": "adr decisions records", "description": "Your architecture decision records." },
+      "goDrafts": { "title": "Drafts", "keywords": "drafts branches versions merge", "description": "Work in progress you can review and merge." },
+      "newDiagram": { "title": "Create diagram", "keywords": "new add blank diagram", "description": "Start a blank diagram in this landscape." },
+      "view3d": { "title": "Switch to 3D view", "keywords": "3d three dimensional board", "description": "Show this diagram as a 3D board." },
+      "view2d": { "title": "Switch to 2D view", "keywords": "2d flat canvas", "description": "Show this diagram on the flat canvas." },
+      "history": { "title": "Open history", "keywords": "history undo revert versions time travel", "description": "Step back through the changes to this landscape." },
+      "share": { "title": "Share this view", "keywords": "share link export embed", "description": "Share or export the current view." },
+      "themeDark": { "title": "Switch to dark mode", "keywords": "theme appearance dark night", "description": "Change the appearance of the whole workspace." },
+      "themeLight": { "title": "Switch to light mode", "keywords": "theme appearance light day", "description": "Change the appearance of the whole workspace." },
+      "settings": { "title": "Open settings", "keywords": "settings preferences options", "description": "Workspace, appearance and language preferences." }
+    }
+  }
+}

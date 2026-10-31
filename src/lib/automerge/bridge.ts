@@ -52,10 +52,13 @@ import {
 } from './mintedIdSupply'
 import { CURRENT_VERSION_ID, DEFAULT_WORKSPACE_REF, currentWorkspaceRef, isDefaultWorkspaceRef, workspaceRefEquals, workspaceRefKey, type WorkspaceRef } from './workspace'
 import {
+  adoptBindingAsBasis,
+  documentsWorkspaceFor,
   forgetResolvedWorkspace,
   holdWorkspaceOn,
+  installSessionRootUrlSource,
   installWorkspaceBindingHandler,
-  rememberResolvedWorkspace,
+  redeliverWorkspaceBinding,
   resolvedWorkspaceFor,
   type WorkspaceBinding,
 } from './workspaceBinding'
@@ -682,6 +685,38 @@ export function isBootFromServerActive(): boolean {
   return bfsActive
 }
 
+/**
+ * READ-ONLY: whether this session holds a delete tombstone for the entity —
+ * a deletion the server read model may not have projected yet. Readers that
+ * show server answers next to the store (the Spotlight's server tier) use it
+ * so a deleted entity does not come back from a stale projection. The sets
+ * themselves stay private to the bridge.
+ */
+export function hasDeleteTombstone(kind: 'object' | 'connection' | 'group' | 'diagram', id: string): boolean {
+  switch (kind) {
+    case 'object': return tombstoneObjects.has(id)
+    case 'connection': return tombstoneConnections.has(id)
+    case 'group': return tombstoneGroups.has(id)
+    case 'diagram': return tombstoneDiagrams.has(id)
+  }
+}
+
+/**
+ * READ-ONLY: the url of the root this session holds, or null with no session.
+ * It is half of what `documentsWorkspaceFor` needs to name the workspace this
+ * session's documents belong to (the other half is the ref), and the readers
+ * that ask the server about those documents — the crash replay's durability
+ * witness and the Spotlight's server tier — take it from here, and every
+ * `/api/model/*` read through the installed source below.
+ */
+export function sessionRootUrl(): string | null {
+  return rootHandle?.url ?? null
+}
+// `workspaceParams.ts` cannot import this module (see
+// `installSessionRootUrlSource`); bridgeSessionRootUrl.test.ts drives a real
+// boot to check the reads name the documents' workspace through it.
+installSessionRootUrlSource(sessionRootUrl)
+
 /** Workspace key whose boot already re-entered from the cached root this
  * session — the one-shot guard of the boot fallback (a broken local cache must
  * fail honestly, never recurse). NOT cleared in stopBridge: the fallback path
@@ -700,6 +735,12 @@ let bootCachedRootFallbackKey: string | null = null
  * still in its early awaits, the re-entry would re-fetch the FORK root from the
  * server, stall again, and the one-shot guard would brick the whole recovery. */
 let bootFallbackReentryPending = false
+
+/** The version whose root the boot that fell back failed to materialize, for
+ * the session that boot re-entered (null when unknown, or no fallback). Set in
+ * startBridge's fallback branch, kept by the re-entry, cleared by every other
+ * start; `onWorkspaceBound` holds a fallback session only on a frame naming it. */
+let bootFallbackFailedVersionId: string | null = null
 
 /** A parked diagram the next boot PREFERS rather than REQUESTS. A deep link
  * requests a diagram: when it is absent, the canvas shows not-found, which is
@@ -844,6 +885,7 @@ function armRegistryConfirmedPick(preferred: string): void {
 export function __resetBootCachedRootFallbackForTest(): void {
   bootCachedRootFallbackKey = null
   bootFallbackReentryPending = false
+  bootFallbackFailedVersionId = null
 }
 
 /** TEST-ONLY: the summary registry window as the bridge itself sees it. Exposed
@@ -2683,6 +2725,12 @@ async function maybeReplayEntityIntents(options?: { withoutHandles?: boolean }):
       entityIntentsDegradedReplayed = true
     }
     const workspaceKey = workspaceRefKey(currentRef)
+    // Captured with the journal key, once: this session's ref and the root it
+    // ACTUALLY holds. The server witness must answer about the documents this
+    // replay writes into; `documentsWorkspaceFor` names them only while the
+    // recorded basis came with THIS root url, so a basis a stale fetch
+    // overwrote stops matching and the witness is skipped, never misdirected.
+    const witnessJournal = { ref: currentRef, bootedRootUrl: sessionRootUrl() }
     // Object/connection intents ONLY — POSITIVE admission. A negative filter
     // (`!isSmallCollectionKind`) would let any kind that is neither small nor
     // object/connection fall through to the binary dispatch below, which plans
@@ -2788,6 +2836,7 @@ async function maybeReplayEntityIntents(options?: { withoutHandles?: boolean }):
       offset += WITNESS_CHUNK
     ) {
       const result = await witnessed(fetchDurabilityWitness(
+        witnessJournal,
         witnessObjectIds.slice(offset, offset + WITNESS_CHUNK),
         witnessConnectionIds.slice(offset, offset + WITNESS_CHUNK),
       ))
@@ -6484,7 +6533,8 @@ function startLiveSync(): void {
 }
 
 /** Guards against acting twice on the same move: the binding frame arrives on
- * every connect, and the corrective action itself reconnects. */
+ * every connect, and the corrective action itself reconnects. A frame that
+ * lands meanwhile is handed back and re-offered when the action ends. */
 let repointInFlight = false
 
 /**
@@ -6502,13 +6552,34 @@ let repointInFlight = false
  *  - something is unsaved → PIN this tab to the concrete version it was already
  *    editing. The socket rebinds there, every document becomes admissible
  *    again, nothing is lost, and moving to the new default becomes the user's
- *    decision. It is also persisted and rewrites the address bar, so it is
- *    stated in a banner rather than done silently.
+ *    decision. The ref and the address bar stay on `current` and nothing is
+ *    persisted (see the HOLD branch below), so it is stated in a banner rather
+ *    than done silently.
  *  - nothing is unsaved → FOLLOW, which is what `'current'` means, and costs
  *    the user nothing because there is nothing here to strand.
+ *  - this session is the boot FALLBACK (`bootFallbackActive`) and the frame
+ *    names the version whose root failed (`bootFallbackFailedVersionId`) →
+ *    HOLD as well, whatever is unsaved. The root this session holds is the
+ *    cached one, of the version it was fetched for; following re-asks the
+ *    server for the very root that just failed, a follow whose boot falls back
+ *    again meets the same frame again, and each round is a workspace teardown
+ *    plus a full resolution budget — measured 2026-10-29 before this rule, a
+ *    fallback session re-entered that root at +52.9 s and again at +76.5 s
+ *    (repoint-boot-fallback.spec.ts's stack). Holding loses nothing following
+ *    would have kept: nothing is persisted, so the next reload asks the server
+ *    again (the fallback's own contract), and the banner's button is the
+ *    retry, one per click.
  */
-function onWorkspaceBound(bound: WorkspaceBinding): void {
-  if (repointInFlight) return
+function onWorkspaceBound(bound: WorkspaceBinding, defer: () => void): void {
+  if (repointInFlight) {
+    // Not dropped: a FOLLOW runs its whole reload inside the response, so this
+    // can be that reload's own frame, replayed when its boot installed this
+    // handler — and if that boot fell back, it is the only frame there will
+    // be. Re-offered from the `finally` below (repoint-boot-fallback.spec.ts,
+    // test 2).
+    defer()
+    return
+  }
   const ref = currentWorkspaceRef()
   // A concrete ref cannot be re-canonicalised: it names its own version, so a
   // binding for it can only ever agree. Only an alias can move underneath.
@@ -6522,29 +6593,54 @@ function onWorkspaceBound(bound: WorkspaceBinding): void {
     // whole detector inert.
     //
     // The first binding of a session is therefore taken AS the basis. The
-    // cost: a repoint landing between the root fetch and the first socket is
-    // adopted as though it had always been so, and that window goes
-    // undetected. It is one round trip wide, against a whole boot path being
-    // unarmed.
-    rememberResolvedWorkspace(ref, bound)
+    // cost: a repoint landing before the first socket is adopted as though it
+    // had always been so, and goes undetected. This branch runs only when
+    // there is no basis at all — a server that reported no key (after a follow
+    // cleared the basis, too), or a page that
+    // booted from a cached root with no key persisted beside it (one written
+    // before the key was persisted; otherwise `repo.ts` restores the key as a
+    // `root-cache` basis). Hence the provenance: `documentsWorkspaceFor`, which
+    // the durability witness, the Spotlight's server tier and every
+    // `/api/model/*` read ask through, never trusts this basis.
+    //
+    // A frame that arrives DURING a boot is not lost: this handler is installed
+    // by `wireConnectionStatus`, at the end of a successful boot, and
+    // `workspaceBinding.ts` keeps the frame no handler took and replays it on
+    // install. That is how the boot FALLBACK, which runs with the server up and
+    // whose re-entry does not reconnect, meets its socket's frame at all
+    // (e2e/boot/repoint-boot-fallback.spec.ts); a cached-root boot taken with
+    // the server DOWN meets its first frame after boot
+    // (e2e/boot/repoint-cached-root.spec.ts).
+    adoptBindingAsBasis(ref, bound)
     return
   }
   if (bound.versionId === booted.versionId) return
 
   const unsaved = pendingDurabilityCount()
+  const bootFallback = useAutomergeStatus.getState().bootFallbackActive
+  // The fallback rule applies only to the version whose root failed: a repoint
+  // to some OTHER version later in a fallback session (or a fallback that was
+  // a slow server, not a repoint) follows like any other — the flag lasts the
+  // whole session (reviewer lens, 2026-10-29). Unknown (a server that reported
+  // no key) counts as that version: holding is the side that cannot loop.
+  const retriesFailedRoot = bootFallback
+    && (bootFallbackFailedVersionId === null || bootFallbackFailedVersionId === bound.versionId)
+  const hold = unsaved > 0 || retriesFailedRoot
   console.warn(JSON.stringify({
     event: 'workspace.repoint_observed',
     landscapeId: ref.landscapeId,
     bootedVersionId: booted.versionId,
     boundVersionId: bound.versionId,
     unsaved,
-    action: unsaved > 0 ? 'pin' : 'follow',
+    bootFallback,
+    failedVersionId: bootFallbackFailedVersionId,
+    action: hold ? 'pin' : 'follow',
   }))
 
   repointInFlight = true
   void (async () => {
     try {
-      if (unsaved > 0) {
+      if (hold) {
         // HOLD, by re-routing the TRANSPORT only. The ref is deliberately left
         // on `'current'`.
         //
@@ -6568,7 +6664,16 @@ function onWorkspaceBound(bound: WorkspaceBinding): void {
         // hold simply ends, rather than stranding it off the moving pointer for
         // good.
         const held = { landscapeId: ref.landscapeId, versionId: booted.versionId }
-        useAutomergeStatus.getState().noteWorkspacePinnedAfterRepoint(held)
+        // The fallback is named even when there is unsaved work too: it is the
+        // fact the user cannot see, and the hold would have happened anyway.
+        // (Not both: at boot end the unsaved count can be non-zero with no edit
+        // made — measured `unsaved: 1` on a fallback session's replay,
+        // 2026-10-29, and `writeScheduler.pending` in repoint-cached-root.spec.ts
+        // — so the banner would claim work that does not exist.)
+        useAutomergeStatus.getState().noteWorkspacePinnedAfterRepoint(
+          held,
+          retriesFailedRoot ? 'boot-fallback' : 'unsaved-work',
+        )
         // One value, two consumers: the socket route below, and the HTTP params
         // that `workspaceSearchParams` builds for every /api/model/* call. Set
         // BEFORE the route, so no request can be issued against the alias while
@@ -6577,10 +6682,11 @@ function onWorkspaceBound(bound: WorkspaceBinding): void {
         await routeWorkspaceNetwork(held, true)
         return
       }
-      // Clear the basis first — see `forgetResolvedWorkspace`. Following
-      // reconnects, and the next binding frame can beat the root fetch that
-      // would supply the new basis; comparing against the stale one would
-      // follow again, forever.
+      // Clear the basis first — see `forgetResolvedWorkspace`. The reload's
+      // own frame now reaches this handler only after the reload's root fetch
+      // (kept while no handler is installed, deferred while this runs), but a
+      // fetch that reports no key leaves the basis as it was: comparing the new
+      // binding against the stale one would follow again, forever.
       forgetResolvedWorkspace(ref)
       // Dynamic import: `switchWorkspace` closes a static cycle through
       // workspaceStore back into this module, the same reason the dangling-ref
@@ -6591,6 +6697,8 @@ function onWorkspaceBound(bound: WorkspaceBinding): void {
       console.warn('[workspace-binding] repoint response failed', error)
     } finally {
       repointInFlight = false
+      // A frame handed back while this ran (see the top of this function).
+      redeliverWorkspaceBinding()
     }
   })()
 }
@@ -6823,7 +6931,25 @@ export async function startBridge(ref: WorkspaceRef = DEFAULT_WORKSPACE_REF): Pr
   // fallback re-entry iff the fallback branch just handed control here.
   const isFallbackReentry = bootFallbackReentryPending
   bootFallbackReentryPending = false
+  // Only a re-entry keeps the version its failed boot was asked for.
+  if (!isFallbackReentry) bootFallbackFailedVersionId = null
   durableAckEpoch += 1
+  // Which boot owns the module state: the session epoch, bumped by every start
+  // and every stop, so a boot whose epoch has moved on was SUPERSEDED.
+  //
+  // Boots OVERLAP. React StrictMode's dev double-mount — and any re-run of
+  // `AutomergeBridge`'s effect — stops one boot and starts another while the
+  // first still awaits the same memoized root. A failing boot must therefore
+  // ask whether it is still the session before recovering, and a superseded one
+  // used not to: measured 2026-10-29 on the dev stack
+  // (e2e/boot/repoint-boot-fallback.spec.ts), the stopped boot fell back and
+  // re-entered, then the live boot's catch — refused as "already fell back" —
+  // set `started = false` under that re-entry, which went on to boot with every
+  // projection returning early: the bridge held 27 diagrams, the store none,
+  // and the canvas read "No diagrams yet". Checked again after every await on
+  // the recovery paths, and before the success tail.
+  const bootEpoch = durableAckEpoch
+  const superseded = (): boolean => bootEpoch !== durableAckEpoch
   durableHeads.clear()
   serverDurability.clear()
   serverUnreachable = false
@@ -6899,7 +7025,20 @@ export async function startBridge(ref: WorkspaceRef = DEFAULT_WORKSPACE_REF): Pr
   // A deep-linked server-boot diagram is known before the Automerge root. Start
   // its independent read-model requests immediately while root/model-meta
   // continue in parallel. DiagramDoc still starts only after sharding is known.
-  if (requestedAtStart && isBootFromServerEnabled()) {
+  //
+  // NOT on the fallback re-entry. A read issued before the root asks the alias
+  // (nothing names this session's documents yet: the cached root's basis is
+  // restored by the root resolution below), and on this path the alias is the
+  // new default whose graph just failed to arrive. Its render would be
+  // projected over the cached root's documents, and its generation would raise
+  // `lastServerProjectionGeneration` above the cached version's, so that
+  // version's SSE events (which carry a generation) would be ignored by
+  // `scheduleLiveSyncRefresh` until an untyped trigger — sync traffic, the 60 s
+  // timer — refreshed anyway (lens review 2026-10-28, N3). The open fetches
+  // both after the root instead, when the reads name the cached root's
+  // version; the cost is the parallelism, on a boot that has already spent its
+  // resolution budget.
+  if (requestedAtStart && isBootFromServerEnabled() && !isFallbackReentry) {
     preparedInitial.render = loadDiagramRenderForProjection(requestedAtStart)
     const finishMeta = startClientTimelineMeasure('diagram.meta', { prefetched: true })
     preparedInitial.bootstrap = fetchDiagramMeta(requestedAtStart).then(
@@ -7375,6 +7514,15 @@ export async function startBridge(ref: WorkspaceRef = DEFAULT_WORKSPACE_REF): Pr
       }
     }
 
+    // A superseded boot that got this far stops here: the tail below wires the
+    // session's listeners and its repoint handler — which takes the binding
+    // frame kept for it, judged against whatever basis that moment holds — and
+    // publishes the fallback marker the handler reads. All of that belongs to
+    // the boot that owns the session now.
+    if (superseded()) {
+      finishBoot({ superseded: true })
+      return
+    }
     // Asserted connected because the status listeners are wired only below, so a
     // socket that connected DURING boot was never heard — unless this boot already
     // learned the opposite: a render fetch that could not reach the server
@@ -7425,6 +7573,15 @@ export async function startBridge(ref: WorkspaceRef = DEFAULT_WORKSPACE_REF): Pr
     // automatically after boot.
   } catch (err) {
     finishBoot({ failed: true })
+    if (superseded()) {
+      // A stop, or a newer start, took over while this boot was awaiting.
+      // Every step below acts on the module state, i.e. on THAT session —
+      // clearing `started`, ending its document share, falling back,
+      // rebounding, reporting 'error' — so none of it is this boot's to do.
+      // The rebounds await before they act, hence the checks again below.
+      console.warn('Automerge bridge: a superseded boot failed; the current session recovers on its own', err)
+      return
+    }
     started = false
     activeDocumentShare.endSession()
     // A CONTRACT failure is terminal AND local. Every recovery
@@ -7467,6 +7624,10 @@ export async function startBridge(ref: WorkspaceRef = DEFAULT_WORKSPACE_REF): Pr
             're-entering the boot from the last locally materialized root (offline path); the next reload retries the server',
           err
         )
+        // The version whose root just failed: the root fetch's own basis for
+        // the root it attempted, read before the re-entry restores the cached
+        // root's basis over it. Null when the server reported no key.
+        bootFallbackFailedVersionId = documentsWorkspaceFor(ref, lastAttemptedRootUrlFor(ref))?.versionId ?? null
         forgetWorkspaceHandles(ref)
         stopBridge()
         bootCachedRootFallbackKey = refKey
@@ -7495,6 +7656,7 @@ export async function startBridge(ref: WorkspaceRef = DEFAULT_WORKSPACE_REF): Pr
     // and only retry when it resolved somewhere new (no infinite loop).
     if (!isRetryableDocumentResolutionError(err)) {
       const { useAuthStore } = await import('../../stores/authStore')
+      if (superseded()) return
       const authState = useAuthStore.getState()
       if (authState.config && authState.config.stage !== 'off' && authState.user) {
         const { resolveBootWorkspaceRef } = await import('./bootRef')
@@ -7503,19 +7665,24 @@ export async function startBridge(ref: WorkspaceRef = DEFAULT_WORKSPACE_REF): Pr
         // while a truly dangling/forbidden ref falls through to the org
         // fallback exactly as before.
         const fallbackRef = await resolveBootWorkspaceRef(authState.orgId, ref)
+        if (superseded()) return
         if (!workspaceRefEquals(fallbackRef, ref)) {
           console.warn(
             `Automerge bridge: workspace ${ref.landscapeId}/${ref.versionId} is unavailable — ` +
               `falling back to ${fallbackRef.landscapeId}/${fallbackRef.versionId}`,
             err
           )
+          // Imported BEFORE the stop below, so no await separates this boot's
+          // own stop from its restart (a check after one would read this very
+          // stop as a supersession).
+          const { useWorkspaceStore } = await import('../../stores/workspaceStore')
+          if (superseded()) return
           // dropPersistedRootUrl: the failure is authoritative (non-retryable),
           // so keeping the dead root's offline url would only let the cached
           // boot fallback resurrect it later.
           forgetWorkspace(ref, { dropPersistedRootUrl: true })
           stopBridge()
           recoverWorkspaceProjection(fallbackRef)
-          const { useWorkspaceStore } = await import('../../stores/workspaceStore')
           useWorkspaceStore.setState({ ref: fallbackRef })
           return startBridge(fallbackRef)
         }
@@ -7528,13 +7695,15 @@ export async function startBridge(ref: WorkspaceRef = DEFAULT_WORKSPACE_REF): Pr
             'falling back to the live model',
           err
         )
+        // Mirror the fallback into the workspace store so the UI (draft pill, version
+        // menu) reflects the live model and doesn't keep polling the dead draft. Dynamic
+        // import avoids a static cycle (workspaceStore → switchWorkspace → bridge);
+        // imported before the stop, for the reason given above.
+        const { useWorkspaceStore } = await import('../../stores/workspaceStore')
+        if (superseded()) return
         forgetWorkspace(ref, { dropPersistedRootUrl: true })
         stopBridge()
         recoverWorkspaceProjection(DEFAULT_WORKSPACE_REF)
-        // Mirror the fallback into the workspace store so the UI (draft pill, version
-        // menu) reflects the live model and doesn't keep polling the dead draft. Dynamic
-        // import avoids a static cycle (workspaceStore → switchWorkspace → bridge).
-        const { useWorkspaceStore } = await import('../../stores/workspaceStore')
         useWorkspaceStore.setState({ ref: DEFAULT_WORKSPACE_REF })
         return startBridge(DEFAULT_WORKSPACE_REF)
       }

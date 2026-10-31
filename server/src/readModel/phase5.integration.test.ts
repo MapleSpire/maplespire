@@ -49,7 +49,10 @@ suite('Phase-5 derived read model (isolated PostgreSQL)', () => {
 
   it('backfills a Phase-4 workspace once and makes later schema ensures O(1)', async () => {
     const key = ['migration-workspace', 'v1']
+    // A Phase-4 database predates the Spotlight columns too, and they depend on
+    // `title`: drop them first, as that database never had them.
     await pool.query(`
+      ALTER TABLE ro_decision_records DROP COLUMN spot_name, DROP COLUMN spot_text;
       ALTER TABLE ro_decision_records DROP COLUMN search_document;
       ALTER TABLE ro_decision_records DROP COLUMN normalized_title;
       ALTER TABLE ro_decision_records DROP COLUMN adr_number;
@@ -124,6 +127,11 @@ suite('Phase-5 derived read model (isolated PostgreSQL)', () => {
     expect(adr.rows[0]).toEqual({
       title: 'Use events', status: 'approved', created_at: '2026-01-01T00:00:00.000Z',
     })
+    // ...and the upgrade re-adds the Spotlight columns, computed from the backfilled title.
+    const spot = await pool.query<{ spot_name: string }>(
+      `SELECT spot_name FROM ro_decision_records WHERE landscape_id = $1 AND version_id = $2 AND id = 'adr-1'`, key,
+    )
+    expect(spot.rows[0]?.spot_name).toBe('use events')
 
     await pool.query(
       `UPDATE ro_diagram_summaries SET name = 'migration-sentinel'

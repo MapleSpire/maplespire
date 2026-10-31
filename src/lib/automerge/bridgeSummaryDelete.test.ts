@@ -1262,4 +1262,26 @@ describe('T6 — deleting a server-owned diagram under a summary registry', () =
     // still be on disk for the next boot to replay.
     expect(journaledDiagramDeletes()).toContain('dg-classic')
   })
+
+  // The Spotlight's server tier reads the tombstones through hasDeleteTombstone,
+  // and SpotlightSearch.test.tsx mocks it: this is the only test of the real
+  // function (QA lens, 2026-10-25).
+  it('answers hasDeleteTombstone from the tombstones a cold boot hydrates, per kind', async () => {
+    const fixture = summaryFixture({ deletedDiagramIds: ['dg-gone'] })
+    fixture.meta.change((d: any) => {
+      d.deletedObjectIds.push('obj-gone')
+      d.deletedConnectionIds.push('conn-gone')
+    })
+    wire(fixture)
+    const { startBridge, hasDeleteTombstone, isBootFromServerActive } = await import('./bridge')
+    await startBridge(DEFAULT_WORKSPACE_REF)
+    expect(isBootFromServerActive()).toBe(true) // witness: the hydrating branch ran
+    expect(hasDeleteTombstone('object', 'obj-gone')).toBe(true)
+    expect(hasDeleteTombstone('connection', 'conn-gone')).toBe(true)
+    expect(hasDeleteTombstone('diagram', 'dg-gone')).toBe(true)
+    // Each kind reads its own set.
+    expect(hasDeleteTombstone('object', 'conn-gone')).toBe(false)
+    expect(hasDeleteTombstone('connection', 'obj-gone')).toBe(false)
+    expect(hasDeleteTombstone('group', 'obj-gone')).toBe(false)
+  })
 })

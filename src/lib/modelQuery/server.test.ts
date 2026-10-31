@@ -21,6 +21,11 @@ import { createMemoryKvStore } from './kvStore'
 import { buildModelIndex } from './modelIndex'
 import { fetchDiagramRender, __setDiagramRenderFetchForTest } from './diagramRender'
 import { setActiveWorkspaceRef, currentWorkspaceRef, DEFAULT_WORKSPACE_REF } from '../automerge/workspace'
+import {
+  __resetResolvedWorkspacesForTest,
+  holdWorkspaceOn,
+  rememberResolvedWorkspace,
+} from '../automerge/workspaceBinding'
 import type { C4Object, Connection, Group, Diagram } from '../../types'
 import type { SearchHit } from './types'
 import { seededTechnologyUsages } from '../technologyUsage'
@@ -196,34 +201,81 @@ describe('serverModelQuery — server == resident over the API (mapping is a fai
   })
 })
 
+/**
+ * What `POST /api/model/durability-witness` ACTUALLY echoes: the workspace
+ * whose read model answered (`server/src/index.ts` → `ensureWorkspace` →
+ * `canonicalWorkspaceKey`, then `durabilityWitnessPayload`). `current` comes
+ * back as the landscape's concrete default version, never as the alias.
+ *
+ * The previous mock echoed the REQUESTED params. That is how a client comparing
+ * the echo with the raw ref passed here while it discarded every live answer
+ * for a `current` tab (measured 2026-10-25 on an isolated stack: asked
+ * `default/current`, echoed `default/YhKN2DMR6yfdYSBo`, the client kept no
+ * values and no proof).
+ */
+const SERVER_DEFAULT_NOW = 'v-resolved-7'
+const CURRENT_REF = { landscapeId: 'ls-main', versionId: 'current' }
+const BOOTED_ROOT = 'automerge:booted-root'
+type WitnessPayload = {
+  absenceProvable?: unknown
+  caughtUp?: boolean
+  objects?: unknown
+  connections?: unknown
+}
+function canonicalWitnessRoute(
+  payload: WitnessPayload,
+  seen?: Array<{ url: URL; init?: RequestInit }>,
+): (url: string, init?: RequestInit) => Promise<Response> {
+  return async (url, init) => {
+    const u = new URL(url, 'http://localhost')
+    seen?.push({ url: u, init })
+    const versionId = u.searchParams.get('versionId')
+    return new Response(JSON.stringify({
+      landscapeId: u.searchParams.get('landscapeId'),
+      versionId: versionId === 'current' ? SERVER_DEFAULT_NOW : versionId,
+      ...payload,
+    }), { status: 200, headers: { 'content-type': 'application/json' } })
+  }
+}
+/** What the boot's root fetch records (`repo.ts` `fetchRootUrl`). */
+function rootFetchResolvedCurrentTo(versionId: string, rootUrl = BOOTED_ROOT): void {
+  rememberResolvedWorkspace(
+    CURRENT_REF,
+    { landscapeId: CURRENT_REF.landscapeId, versionId },
+    { from: 'root-fetch', rootUrl },
+  )
+}
+const JOURNAL = { ref: CURRENT_REF, bootedRootUrl: BOOTED_ROOT }
+const PROVABLE_WITH_VALUES: WitnessPayload = {
+  absenceProvable: true,
+  objects: { A: { id: 'A', name: 'Auth service' } },
+  connections: { c1: { id: 'c1', fromId: 'B', toId: 'A', type: 'solid' } },
+}
+const asked = (seen: Array<{ url: URL }>) => ({
+  landscapeId: seen[0]?.url.searchParams.get('landscapeId'),
+  versionId: seen[0]?.url.searchParams.get('versionId'),
+})
+
 describe('fetchDurabilityWitness — the batched replay witness', () => {
+  afterEach(() => {
+    holdWorkspaceOn(null)
+    __resetResolvedWorkspacesForTest()
+  })
+
   it('POSTs BOTH id families in one request body, scoped to the workspace, and parses maps', async () => {
     // POST, never GET: 500 long imported ids overflow the request-line/header
     // ceiling (HTTP 431), and a failed witness call defers every stamped
     // intent — the journal would never drain.
+    rootFetchResolvedCurrentTo(SERVER_DEFAULT_NOW)
     const seen: Array<{ url: URL; init?: RequestInit }> = []
-    __setServerFetchForTest(async (url: string, init?: RequestInit) => {
-      const u = new URL(url, 'http://localhost')
-      seen.push({ url: u, init })
-      return new Response(JSON.stringify({
-        // Echo the workspace the request asked for, as the real route does.
-        landscapeId: u.searchParams.get('landscapeId'),
-        versionId: u.searchParams.get('versionId'),
-        absenceProvable: true,
-        objects: { A: { id: 'A', name: 'Auth service' } },
-        connections: { c1: { id: 'c1', fromId: 'B', toId: 'A', type: 'solid' } },
-      }), { status: 200, headers: { 'content-type': 'application/json' } })
-    })
-    const result = await fetchDurabilityWitness(['A', 'missing'], ['c1'])
+    __setServerFetchForTest(canonicalWitnessRoute(PROVABLE_WITH_VALUES, seen))
+    const result = await fetchDurabilityWitness(JOURNAL, ['A', 'missing'], ['c1'])
     expect(seen).toHaveLength(1) // ONE round trip for both families
     expect(seen[0].url.pathname).toBe('/api/model/durability-witness')
     expect(seen[0].init?.method).toBe('POST')
     const body = JSON.parse(String(seen[0].init?.body)) as { objects: string[]; connections: string[] }
     expect(body.objects).toEqual(['A', 'missing'])
     expect(body.connections).toEqual(['c1'])
-    // Workspace scoping is not optional — a witness answering for the wrong
-    // workspace would be worse than no witness.
-    expect(seen[0].url.searchParams.get('landscapeId')).toBeTruthy()
     expect(result.absenceProvable).toBe(true)
     expect(result.objects.get('A')?.name).toBe('Auth service')
     expect(result.objects.has('missing')).toBe(false)
@@ -231,53 +283,188 @@ describe('fetchDurabilityWitness — the batched replay witness', () => {
   })
 
   it('reports an unprovable projection as absenceProvable:false — never silently as absence', async () => {
-    __setServerFetchForTest(async (url: string) => {
-      const u = new URL(url, 'http://localhost')
-      return new Response(
-        JSON.stringify({
-          landscapeId: u.searchParams.get('landscapeId'),
-          versionId: u.searchParams.get('versionId'),
-          absenceProvable: false, objects: {}, connections: {},
-        }),
-        { status: 200, headers: { 'content-type': 'application/json' } },
-      )
-    })
-    const result = await fetchDurabilityWitness(['A'], [])
+    rootFetchResolvedCurrentTo(SERVER_DEFAULT_NOW)
+    __setServerFetchForTest(canonicalWitnessRoute({ ...PROVABLE_WITH_VALUES, absenceProvable: false }))
+    const result = await fetchDurabilityWitness(JOURNAL, ['A'], [])
     expect(result.absenceProvable).toBe(false)
-    expect(result.objects.size).toBe(0)
+    // …while PRESENCE stays usable: a projected value was durable when it was
+    // projected. Only a discarded answer forfeits the values too.
+    expect(result.objects.get('A')?.name).toBe('Auth service')
   })
 
+  // ── a `current` journal: ask about the documents' CONCRETE version ────────
+
+  it('a `current` journal asks about the version its root fetch resolved, and KEEPS the answer', async () => {
+    // The defect this pins: the request said `current`, the server echoed the
+    // concrete version, the client compared that with `current`, and EVERY
+    // answer a `current` tab received was thrown away — witnessesReliable went
+    // false on every replay, stamped intents deferred for ever, unstamped ones
+    // replayed their whole snapshot instead of merging over the server value.
+    rootFetchResolvedCurrentTo(SERVER_DEFAULT_NOW)
+    const seen: Array<{ url: URL; init?: RequestInit }> = []
+    __setServerFetchForTest(canonicalWitnessRoute(PROVABLE_WITH_VALUES, seen))
+    const result = await fetchDurabilityWitness(JOURNAL, ['A'], ['c1'])
+    expect(asked(seen)).toEqual({ landscapeId: 'ls-main', versionId: SERVER_DEFAULT_NOW })
+    expect(result.absenceProvable).toBe(true)
+    expect(result.objects.get('A')?.name).toBe('Auth service')
+    expect(result.connections.get('c1')?.toId).toBe('A')
+  })
+
+  it('after a REPOINT the journal still asks about ITS version, not the new default', async () => {
+    // Booted on v-booted-3; an admin has since moved the default to
+    // v-resolved-7. Asking `current` would get the new default's read model —
+    // another workspace than the one these intents were made in.
+    rootFetchResolvedCurrentTo('v-booted-3')
+    const seen: Array<{ url: URL; init?: RequestInit }> = []
+    __setServerFetchForTest(canonicalWitnessRoute(PROVABLE_WITH_VALUES, seen))
+    const result = await fetchDurabilityWitness(JOURNAL, ['A'], [])
+    expect(asked(seen)).toEqual({ landscapeId: 'ls-main', versionId: 'v-booted-3' })
+    expect(result.objects.get('A')?.name).toBe('Auth service')
+  })
+
+  it('under a HOLD, still asks about the documents\' version — the hold is not consulted', async () => {
+    // The hold re-points the TRANSPORT. The old client sent the held version
+    // and then compared the echo with `current`, refusing its own answer. The
+    // witness now names the root-fetched version whatever the hold says; the
+    // hold is set to a DIFFERENT version here so that re-applying it (the
+    // effective ref) would be caught rather than coincide.
+    rootFetchResolvedCurrentTo('v-booted-3')
+    holdWorkspaceOn({ landscapeId: 'ls-main', versionId: 'v-held-9' })
+    const seen: Array<{ url: URL; init?: RequestInit }> = []
+    __setServerFetchForTest(canonicalWitnessRoute(PROVABLE_WITH_VALUES, seen))
+    const result = await fetchDurabilityWitness(JOURNAL, ['A'], [])
+    expect(asked(seen)).toEqual({ landscapeId: 'ls-main', versionId: 'v-booted-3' })
+    expect(result.absenceProvable).toBe(true)
+    expect(result.objects.get('A')?.name).toBe('Auth service')
+  })
+
+  it('answers for the JOURNAL\'s workspace, not whatever workspace is active', async () => {
+    rootFetchResolvedCurrentTo(SERVER_DEFAULT_NOW)
+    setActiveWorkspaceRef({ landscapeId: 'ls-elsewhere', versionId: 'v-9' })
+    const seen: Array<{ url: URL; init?: RequestInit }> = []
+    __setServerFetchForTest(canonicalWitnessRoute(PROVABLE_WITH_VALUES, seen))
+    const result = await fetchDurabilityWitness(JOURNAL, ['A'], [])
+    expect(asked(seen)).toEqual({ landscapeId: 'ls-main', versionId: SERVER_DEFAULT_NOW })
+    expect(result.objects.get('A')?.name).toBe('Auth service')
+  })
+
+  // ── when the documents' version cannot be named: no witness, no request ──
+
+  const NO_WITNESS_CASES: Array<[string, () => void, string | null]> = [
+    ['no basis at all', () => {}, BOOTED_ROOT],
+    // B1 of the review: after an offline boot from the cached root, the first
+    // socket binding is adopted as the basis — and the socket may be bound to
+    // a version the admin repointed to while the documents are the old one's.
+    ['a basis self-armed from a SOCKET BINDING', () => rememberResolvedWorkspace(
+      CURRENT_REF, { landscapeId: 'ls-main', versionId: SERVER_DEFAULT_NOW }, { from: 'socket-binding' },
+    ), BOOTED_ROOT],
+    // A basis from an earlier root fetch, while this session booted another
+    // root (the cached one, which another tab may have moved on).
+    ['a root-fetched basis recorded beside ANOTHER root url', () => rootFetchResolvedCurrentTo(
+      SERVER_DEFAULT_NOW, 'automerge:an-earlier-root',
+    ), BOOTED_ROOT],
+    ['a session that booted no root url', () => rootFetchResolvedCurrentTo(SERVER_DEFAULT_NOW), null],
+  ]
+  for (const [name, arrange, bootedRootUrl] of NO_WITNESS_CASES) {
+    it(`NO witness and NO request for a \`current\` journal with ${name}`, async () => {
+      arrange()
+      const seen: Array<{ url: URL; init?: RequestInit }> = []
+      __setServerFetchForTest(canonicalWitnessRoute(PROVABLE_WITH_VALUES, seen))
+      const result = await fetchDurabilityWitness({ ref: CURRENT_REF, bootedRootUrl }, ['A'], ['c1'])
+      expect(seen).toHaveLength(0)
+      expect(result.absenceProvable).toBe(false)
+      expect(result.objects.size).toBe(0)
+      expect(result.connections.size).toBe(0)
+    })
+  }
+
+  // ── the echo: anything but exactly the workspace asked is discarded ───────
+
+  it('a CONCRETE journal asks about itself and keeps an exact echo', async () => {
+    const seen: Array<{ url: URL; init?: RequestInit }> = []
+    __setServerFetchForTest(canonicalWitnessRoute(PROVABLE_WITH_VALUES, seen))
+    const result = await fetchDurabilityWitness(
+      { ref: { landscapeId: 'ls-main', versionId: 'v-5' }, bootedRootUrl: null }, ['A'], [],
+    )
+    expect(asked(seen)).toEqual({ landscapeId: 'ls-main', versionId: 'v-5' })
+    expect(result.absenceProvable).toBe(true)
+    expect(result.objects.get('A')?.name).toBe('Auth service')
+  })
+
+  const echoAnswering = (echo: Record<string, unknown>) => async () => new Response(
+    JSON.stringify({ ...echo, ...PROVABLE_WITH_VALUES }),
+    { status: 200, headers: { 'content-type': 'application/json' } },
+  )
+
   it('DISCARDS the whole payload when the server resolved another workspace (M3)', async () => {
-    // ensureWorkspace redirects static/sparse-draft workspaces to their BASE
-    // version's read model. The base's values could equality-acknowledge the
-    // draft's own intents (presence poisoning — the losing direction), so a
-    // mismatched echo forfeits the values too, not just the proof.
-    __setServerFetchForTest(async () => new Response(
-      JSON.stringify({
-        landscapeId: 'the-parent-landscape', versionId: 'the-base-version',
-        absenceProvable: true,
-        objects: { A: { id: 'A', name: 'parent copy' } },
-        connections: {},
-      }),
-      { status: 200, headers: { 'content-type': 'application/json' } },
-    ))
-    const result = await fetchDurabilityWitness(['A'], [])
+    // ensureWorkspace redirects a sparse draft to its BASE version's read
+    // model. The base's values could equality-acknowledge the draft's own
+    // intents (presence poisoning — the losing direction), so a mismatched
+    // echo forfeits the values too, not just the proof.
+    __setServerFetchForTest(echoAnswering({ landscapeId: 'ls-main', versionId: 'v-base' }))
+    const result = await fetchDurabilityWitness(
+      { ref: { landscapeId: 'ls-main', versionId: 'v-draft' }, bootedRootUrl: null }, ['A'], ['c1'],
+    )
     expect(result.absenceProvable).toBe(false)
     expect(result.objects.size).toBe(0)
     expect(result.connections.size).toBe(0)
   })
 
+  it('DISCARDS an echo for another LANDSCAPE, even one carrying the version asked', async () => {
+    rootFetchResolvedCurrentTo(SERVER_DEFAULT_NOW)
+    __setServerFetchForTest(echoAnswering({ landscapeId: 'ls-other', versionId: SERVER_DEFAULT_NOW }))
+    const result = await fetchDurabilityWitness(JOURNAL, ['A'], [])
+    expect(result.absenceProvable).toBe(false)
+    expect(result.objects.size).toBe(0)
+  })
+
+  it('DISCARDS an answer with no echo at all (an older or broken server)', async () => {
+    rootFetchResolvedCurrentTo(SERVER_DEFAULT_NOW)
+    __setServerFetchForTest(echoAnswering({}))
+    const result = await fetchDurabilityWitness(JOURNAL, ['A'], [])
+    expect(result.absenceProvable).toBe(false)
+    expect(result.objects.size).toBe(0)
+  })
+
+  it('DISCARDS a payload missing either map — a gap is not an empty family', async () => {
+    // Read as `{}`, a missing `connections` under `absenceProvable: true`
+    // would prove every asked connection absent.
+    rootFetchResolvedCurrentTo(SERVER_DEFAULT_NOW)
+    const { connections: _omitConnections, ...noConnections } = PROVABLE_WITH_VALUES
+    const { objects: _omitObjects, ...noObjects } = PROVABLE_WITH_VALUES
+    for (const [payload, label] of [
+      [noConnections, 'no connections map'],
+      [noObjects, 'no objects map'],
+      [{ ...PROVABLE_WITH_VALUES, connections: ['c1'] }, 'connections as an array'],
+      [{ ...PROVABLE_WITH_VALUES, objects: null }, 'objects null'],
+    ] as Array<[WitnessPayload, string]>) {
+      __setServerFetchForTest(canonicalWitnessRoute(payload))
+      const result = await fetchDurabilityWitness(JOURNAL, ['A'], ['c1'])
+      expect(result.absenceProvable, label).toBe(false)
+      expect(result.objects.size, label).toBe(0)
+      expect(result.connections.size, label).toBe(0)
+    }
+  })
+
   it('THROWS on a server failure — a failed fetch is "unknown", never "absent"', async () => {
+    rootFetchResolvedCurrentTo(SERVER_DEFAULT_NOW)
     __setServerFetchForTest(async () => new Response('boom', { status: 503 }))
-    await expect(fetchDurabilityWitness(['A'], [])).rejects.toThrow(/HTTP 503/)
+    await expect(fetchDurabilityWitness(JOURNAL, ['A'], [])).rejects.toThrow(/HTTP 503/)
   })
 
   it('a missing or malformed absenceProvable is read as NOT provable (old server, bad payload)', async () => {
-    __setServerFetchForTest(async () => new Response(
-      JSON.stringify({ caughtUp: true, objects: {}, connections: {} }),
-      { status: 200, headers: { 'content-type': 'application/json' } },
-    ))
-    expect((await fetchDurabilityWitness(['A'], [])).absenceProvable).toBe(false)
+    // The echo is right here, so the answer is KEPT: what this pins is the
+    // strict `=== true` read, not the echo check (with no echo the payload is
+    // discarded first and this test would pass whatever the read did).
+    rootFetchResolvedCurrentTo(SERVER_DEFAULT_NOW)
+    for (const absenceProvable of [undefined, 'true', 1]) {
+      __setServerFetchForTest(canonicalWitnessRoute({
+        absenceProvable, caughtUp: true, objects: { A: { id: 'A', name: 'Auth service' } }, connections: {},
+      }))
+      const result = await fetchDurabilityWitness(JOURNAL, ['A'], [])
+      expect(result.objects.get('A')?.name).toBe('Auth service')
+      expect(result.absenceProvable).toBe(false)
+    }
   })
 })
 

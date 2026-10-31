@@ -10,6 +10,7 @@
     },
     "repointed": {
       "message": "An administrator changed this landscape’s default version. You were kept on the version you were editing, because you had unsaved work here.",
+      "messageBootFallback": "An administrator changed this landscape’s default version, and it could not be loaded yet. You were kept on the version saved on this device.",
       "follow": "Go to the new default",
       "dismiss": "Dismiss"
     }

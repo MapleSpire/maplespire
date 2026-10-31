@@ -14,6 +14,11 @@
 
 import { describe, expect, it, vi } from 'vitest'
 import { WorkspaceNetworkRouter, workspaceWebSocketUrl, type NetworkAdapterLike } from './networkRoute'
+import {
+  __resetWorkspaceBindingFramesForTest,
+  installWorkspaceBindingHandler,
+  noteWorkspaceBinding,
+} from './workspaceBinding'
 
 interface FakeAdapter extends NetworkAdapterLike {
   url: string
@@ -52,6 +57,42 @@ describe('WorkspaceNetworkRouter', () => {
       'remove:ws://localhost:3001/automerge?landscapeId=L1&versionId=V1',
       'add:ws://localhost:3001/automerge?landscapeId=L2&versionId=V2',
     ])
+  })
+
+  it('retires a binding frame no handler took when it swaps the adapter that sent it', async () => {
+    // The frame states where ONE socket is bound. Kept for the next handler
+    // (workspaceBinding.ts), it must not outlive the adapter that produced it:
+    // after a HOLD and a reload, the held socket's frame names the held version.
+    const network = { addNetworkAdapter: vi.fn(), removeNetworkAdapter: vi.fn() }
+    const adapters: FakeAdapter[] = []
+    const router = new WorkspaceNetworkRouter<FakeAdapter>(
+      network,
+      (url) => {
+        const adapter = { url, disconnect: vi.fn() }
+        adapters.push(adapter)
+        return adapter
+      },
+      'ws://localhost/automerge',
+    )
+    const ref = { landscapeId: 'L1', versionId: 'current' }
+    const seen: string[] = []
+    try {
+      await router.route(ref)
+      noteWorkspaceBinding({ landscapeId: 'L1', versionId: 'V2' }, adapters[0]!)
+      // THE CONTROL: the same route is a no-op, so the frame survives it.
+      await router.route(ref)
+      const uninstall = installWorkspaceBindingHandler((b) => { seen.push(b.versionId) })
+      expect(seen).toEqual(['V2'])
+      uninstall()
+
+      noteWorkspaceBinding({ landscapeId: 'L1', versionId: 'V1' }, adapters[0]!)
+      await router.route(ref, true)
+      expect(adapters).toHaveLength(2)
+      installWorkspaceBindingHandler((b) => { seen.push(`stale:${b.versionId}`) })
+      expect(seen).toEqual(['V2'])
+    } finally {
+      __resetWorkspaceBindingFramesForTest()
+    }
   })
 
   it('force-routes the same ref for a moving current-version pointer', async () => {

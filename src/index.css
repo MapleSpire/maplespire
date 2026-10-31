@@ -632,3 +632,197 @@ textarea.adr-textarea:focus-visible {
   .mv-flowdot, .mv-flowdot--in { display: none; }
   .mv-tile-shake { animation: none; }
 }
+
+/*
+ * ───────────────────────────────────────────────────────────────────────────
+ *  Kbd — the design system's keyboard hint chip (components/core/Kbd).
+ * ───────────────────────────────────────────────────────────────────────────
+ */
+.ms-kbd {
+  display: inline-flex; align-items: center; gap: 2px;
+  font-family: var(--font-mono); font-size: 10px; font-weight: 500; line-height: 1;
+  color: var(--color-fg-subtle); background: var(--color-surface-200);
+  border: 1px solid var(--color-line); border-radius: var(--radius-sm);
+  padding: 3px 5px; white-space: nowrap;
+}
+
+/*
+ * ───────────────────────────────────────────────────────────────────────────
+ *  Spotlight — global search (components/spotlight/Spotlight.tsx), ported
+ *  from the design system's components/navigation/Spotlight. Values are the
+ *  kit's, exactly. The kit's motion tokens are scoped here as --spot-*: the
+ *  app does not define them globally, and a global --ease-out would retarget
+ *  Tailwind's own `ease-out` utility everywhere.
+ * ───────────────────────────────────────────────────────────────────────────
+ */
+.ms-spot {
+  --spot-ease-standard: cubic-bezier(0.175, 0.885, 0.32, 1.1);
+  --spot-ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --spot-ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+  --spot-fast: 150ms;
+  --spot-pop: 200ms;
+  --spot-overlay: 300ms;
+  position: fixed; inset: 0; z-index: 50; font-family: var(--font-sans);
+}
+.ms-spot__scrim { position: absolute; inset: 0; }
+.ms-spot--closing .ms-spot__scrim { animation: ms-spot-fade-out 140ms var(--spot-ease-in-out) both; }
+.ms-spot__stage {
+  position: absolute; inset: 0; display: flex; justify-content: center; align-items: flex-start;
+  padding: max(48px, 15vh) 16px 24px; pointer-events: none;
+}
+.ms-spot__panel {
+  pointer-events: auto; width: min(760px, 100%); border-radius: 20px; overflow: hidden;
+  background: color-mix(in srgb, var(--color-surface-100) 80%, transparent);
+  -webkit-backdrop-filter: blur(28px) saturate(1.5); backdrop-filter: blur(28px) saturate(1.5);
+  border: 1px solid color-mix(in srgb, var(--color-line-strong) 75%, transparent); box-shadow: var(--shadow-xl);
+  transform-origin: 50% 30px; animation: ms-spot-in var(--spot-overlay) var(--spot-ease-standard) both;
+}
+.ms-spot--closing .ms-spot__panel { animation: ms-spot-out 140ms var(--spot-ease-in-out) both; }
+.ms-spot__bar { display: flex; align-items: center; gap: 12px; height: 60px; padding: 0 12px 0 20px; }
+.ms-spot__glass { flex-shrink: 0; color: var(--color-fg-subtle); transition: color var(--spot-fast) var(--spot-ease-out); }
+.ms-spot__bar--typing .ms-spot__glass { color: var(--color-fg); }
+.ms-spot__token {
+  display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 10px 0 8px; border-radius: var(--radius-md);
+  background: var(--color-accent-subtle); color: var(--color-orange-text); font-size: 13px; font-weight: 500; flex-shrink: 0;
+  animation: ms-spot-pop var(--spot-pop) var(--spot-ease-standard) both;
+}
+.ms-spot__field { position: relative; flex: 1; min-width: 0; height: 100%; }
+.ms-spot__input, .ms-spot__ghost { font-family: var(--font-sans); font-size: 20px; font-weight: 400; letter-spacing: -0.012em; }
+.ms-spot__input {
+  position: relative; z-index: 1; display: block; width: 100%; height: 100%; border: none; outline: none; background: transparent;
+  color: var(--color-fg); padding: 0; margin: 0; caret-color: var(--color-accent);
+}
+.ms-spot__input::placeholder { color: var(--color-fg-subtle); }
+.ms-spot__ghost {
+  position: absolute; inset: 0; line-height: 60px; white-space: pre; overflow: hidden; text-overflow: ellipsis;
+  pointer-events: none; color: var(--color-fg-subtle);
+}
+.ms-spot__ghost-typed { color: transparent; }
+.ms-spot__iconbtn {
+  display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px; padding: 0; border: none; background: none;
+  border-radius: var(--radius-md); color: var(--color-fg-subtle); cursor: pointer; flex-shrink: 0;
+  transition: background var(--spot-fast) var(--spot-ease-out), color var(--spot-fast) var(--spot-ease-out);
+}
+.ms-spot__iconbtn:hover { background: var(--color-surface-hover); color: var(--color-fg); }
+.ms-spot__iconbtn[aria-pressed="true"] { background: var(--color-accent-subtle); color: var(--color-orange-text); }
+.ms-spot__iconbtn:focus-visible { outline: 2px solid var(--color-line-focus); outline-offset: 1px; }
+.ms-spot__clear {
+  width: 22px; height: 22px; border-radius: var(--radius-full); background: var(--color-surface-200); color: var(--color-fg-muted);
+  animation: ms-spot-pop var(--spot-pop) var(--spot-ease-standard) both;
+}
+.ms-spot__sep { width: 1px; height: 20px; background: var(--color-line-strong); margin: 0 4px; flex-shrink: 0; }
+.ms-spot__scopes { display: flex; align-items: center; gap: 2px; }
+.ms-spot__body { height: 0; overflow: hidden; transition: height 280ms var(--spot-ease-out); }
+.ms-spot__inner {
+  border-top: 1px solid var(--color-line); display: grid;
+  grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr);
+}
+.ms-spot__inner--split { grid-template-columns: 300px minmax(0, 1fr); }
+.ms-spot__list {
+  overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin;
+  scrollbar-color: var(--color-surface-400) transparent; min-height: 0;
+}
+.ms-spot__listin { position: relative; padding: 4px 8px 8px; }
+.ms-spot__ind {
+  position: absolute; left: 8px; right: 8px; top: 0; height: 0; opacity: 0; border-radius: var(--radius-lg);
+  background: var(--color-accent-subtle); pointer-events: none;
+  transition: transform 180ms var(--spot-ease-out), height 180ms var(--spot-ease-out), opacity var(--spot-fast) var(--spot-ease-out);
+}
+.ms-spot__sech {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
+  padding: 12px 10px 5px; font-size: 10px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--color-fg-subtle);
+}
+.ms-spot__count { font-family: var(--font-mono); font-weight: 500; letter-spacing: 0; text-transform: none; }
+.ms-spot__notice { padding: 10px 10px 6px; font-size: 11.5px; color: var(--color-fg-subtle); }
+.ms-spot__row {
+  position: relative; display: flex; align-items: center; gap: 10px; height: 34px; padding: 0 10px;
+  border-radius: var(--radius-lg); cursor: default; user-select: none;
+}
+.ms-spot__row--top { height: 54px; gap: 12px; }
+.ms-spot__tile {
+  display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; border-radius: 7px; flex-shrink: 0;
+}
+.ms-spot__row--top .ms-spot__tile { width: 34px; height: 34px; border-radius: 10px; }
+.ms-spot__txt { flex: 1; min-width: 0; display: flex; align-items: baseline; gap: 8px; }
+.ms-spot__row--top .ms-spot__txt { flex-direction: column; align-items: stretch; gap: 3px; }
+.ms-spot__title {
+  font-size: 13px; color: var(--color-fg-strong); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  flex: 0 1 auto; min-width: 0;
+}
+.ms-spot__title mark { background: none; color: var(--color-fg); font-weight: 600; }
+.ms-spot__row--top .ms-spot__title { font-size: 14px; font-weight: 500; }
+.ms-spot__row--top .ms-spot__title mark { font-weight: 700; }
+.ms-spot__row--active .ms-spot__title { color: var(--color-fg); }
+.ms-spot__sub {
+  font-size: 12px; color: var(--color-fg-subtle); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  flex: 1 1 0; min-width: 0;
+}
+.ms-spot__row--top .ms-spot__sub { flex: none; }
+.ms-spot__row--active .ms-spot__sub { color: var(--color-fg-muted); }
+.ms-spot__in { animation: ms-spot-row 260ms var(--spot-ease-out) both; animation-delay: calc(var(--i, 0) * 18ms); }
+.ms-spot__pvwrap { border-left: 1px solid var(--color-line); min-height: 0; display: flex; }
+.ms-spot__pv {
+  flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column;
+  animation: ms-spot-pv 200ms var(--spot-ease-out) both;
+}
+.ms-spot__pvbody {
+  flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 16px; padding: 22px 24px 16px;
+  overflow-x: hidden; overflow-y: auto; scrollbar-width: thin; scrollbar-color: var(--color-surface-400) transparent;
+}
+.ms-spot__pvhd { display: flex; align-items: center; gap: 14px; }
+.ms-spot__pvtile {
+  display: inline-flex; align-items: center; justify-content: center; width: 48px; height: 48px; border-radius: 12px; flex-shrink: 0;
+}
+.ms-spot__pvtitle {
+  font-size: 17px; font-weight: 600; letter-spacing: -0.01em; line-height: 1.25; color: var(--color-fg);
+  text-wrap: pretty; overflow-wrap: anywhere;
+}
+.ms-spot__pvmeta { font-size: 12px; color: var(--color-fg-muted); margin-top: 3px; }
+.ms-spot__pvdesc {
+  margin: 0; font-size: 13px; line-height: 1.6; color: var(--color-fg-secondary); text-wrap: pretty;
+  white-space: pre-line; overflow-wrap: anywhere;
+}
+.ms-spot__fields { display: grid; grid-template-columns: 104px minmax(0, 1fr); margin: 0; }
+.ms-spot__fields dt, .ms-spot__fields dd { margin: 0; padding: 8px 0; border-top: 1px solid var(--color-line-soft); }
+.ms-spot__fields dt { font-size: 12px; color: var(--color-fg-muted); }
+.ms-spot__fields dd { font-size: 12.5px; color: var(--color-fg); min-width: 0; overflow-wrap: anywhere; }
+.ms-spot__mono { font-family: var(--font-mono); font-size: 11.5px; }
+.ms-spot__title.ms-spot__mono { font-size: 12px; }
+.ms-spot__pvtitle.ms-spot__mono { font-size: 15px; }
+.ms-spot__acts {
+  flex: none; display: flex; align-items: center; gap: 6px; padding: 10px 24px 12px;
+  border-top: 1px solid var(--color-line-soft);
+}
+.ms-spot__act {
+  display: inline-flex; align-items: center; gap: 8px; height: 28px; padding: 0 5px 0 10px; border: none;
+  border-radius: var(--radius-md); background: transparent; color: var(--color-fg-secondary);
+  font-family: var(--font-sans); font-size: 12.5px; font-weight: 500; cursor: pointer;
+  transition: background var(--spot-fast) var(--spot-ease-out), color var(--spot-fast) var(--spot-ease-out);
+}
+.ms-spot__act:hover { background: var(--color-surface-hover); color: var(--color-fg); }
+.ms-spot__act--primary, .ms-spot__act--primary:hover { background: var(--color-inverse); color: var(--color-on-inverse); }
+.ms-spot__act--primary:hover { background: var(--color-inverse-hover); }
+.ms-spot__act .ms-kbd { background: transparent; }
+.ms-spot__act--primary .ms-kbd {
+  background: color-mix(in srgb, currentColor 16%, transparent); border-color: transparent; color: inherit;
+}
+.ms-spot__empty {
+  grid-column: 1 / -1; display: flex; flex-direction: column; align-items: center; gap: 6px;
+  padding: 30px 24px 32px; text-align: center;
+}
+.ms-spot__emptyic {
+  display: inline-flex; align-items: center; justify-content: center; width: 36px; height: 36px; border-radius: 10px;
+  background: var(--color-surface-200); color: var(--color-fg-subtle); margin-bottom: 6px;
+}
+.ms-spot__empty-t { font-size: 13px; font-weight: 500; color: var(--color-fg); }
+.ms-spot__empty-s { font-size: 12.5px; color: var(--color-fg-muted); max-width: 360px; text-wrap: pretty; }
+@keyframes ms-spot-in { from { opacity: 0; transform: translateY(-6px) scale(0.965); } to { opacity: 1; transform: none; } }
+@keyframes ms-spot-out { to { opacity: 0; transform: translateY(-2px) scale(0.985); } }
+@keyframes ms-spot-fade-out { to { opacity: 0; } }
+@keyframes ms-spot-pop { from { opacity: 0; transform: scale(0.85); } }
+@keyframes ms-spot-row { from { opacity: 0; transform: translateY(-4px); } }
+@keyframes ms-spot-pv { from { opacity: 0; transform: translateX(6px); } }
+@media (prefers-reduced-motion: reduce) {
+  .ms-spot, .ms-spot * { animation: none !important; transition: none !important; }
+}

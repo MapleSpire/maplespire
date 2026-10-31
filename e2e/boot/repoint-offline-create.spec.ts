@@ -56,6 +56,23 @@
  * offline while the operator acts — exactly the real scenario (an admin
  * repoints while the user is disconnected).
  *
+ * "Offline" was not offline until 2026-10-29. Both tests create on a LIVE
+ * page, and `goOffline(page)` without `installServerRouting` before the first
+ * load cannot hold a live page's socket (see helpers.ts). Measured on test 2:
+ * the "offline" DiagramDoc was claimed for the source version 3.6 s before
+ * the operator's fork, the fork cloned the diagram under a new url, and the
+ * url assertion below was red on that clone — not on the product. The
+ * window is now routed before load, entered with `{ live: true }`, and
+ * checked three ways: the badge reads `offline`, and neither the source
+ * version nor the fork lists the diagram before the page reconnects.
+ *
+ * With the window honest, both tests were RED on 2026-10-29 for product
+ * reasons, on origin/develop and on the repoint-binding branch alike. The
+ * DiagramDoc of an offline-created diagram had zero storage rows on the
+ * server while the registry meta naming it was there (5 runs of 5; test 1's
+ * (d) is the check for it). After the repoint, the diagram was absent from
+ * the current version (test 2, 3 runs of 3).
+ *
  * Test 2 leaves the default landscape pointed at the forked version — that IS
  * the scenario (a promoted draft), and the fork is a superset of its source,
  * so subsequent suites see an equivalent workspace.
@@ -74,6 +91,7 @@ import {
   reloadBootApp,
   goOffline,
   goOnline,
+  installServerRouting,
   dragNewShapeToCanvas,
   flushLocal,
   serverObject,
@@ -164,6 +182,50 @@ function mintedDocInfo(page: Page, diagramId: string): Promise<{ bytes: number; 
   }, diagramId)
 }
 
+/** Take the LOADED page offline and prove it is: the creation below happens
+ * without a reload, and a live page used to keep (or re-open) its sync socket
+ * — measured 2026-10-29 on this spec, the "offline" DiagramDoc was claimed by
+ * the server 3.6 s before the operator's fork, which then cloned the diagram
+ * under a new url. Needs `installServerRouting(page)` before the first load. */
+async function goOfflineLive(page: Page): Promise<void> {
+  await goOffline(page, { live: true })
+  const badge = page.locator('#sync-status')
+  await expect
+    .poll(() => badge.getAttribute('data-status'), { timeout: 20_000, message: 'the page is still connected after goOffline' })
+    .toBe('offline')
+}
+
+/** Whether ONE named version's own registry lists the diagram, asked of the
+ * server through `page.request` (the page's offline routes do not apply). */
+async function registryLists(page: Page, versionId: string, diagramId: string): Promise<boolean> {
+  const query = new URLSearchParams({ landscapeId: 'default', versionId, id: diagramId })
+  const response = await page.request.get(`${API_BASE}/api/automerge/registry-diagram?${query.toString()}`)
+  expect(response.ok(), `GET /api/automerge/registry-diagram -> ${response.status()}`).toBe(true)
+  return ((await response.json()) as { present: boolean }).present
+}
+
+/**
+ * (d) — once the badge says ready, the user may close the tab: close it, and
+ * ask the server for the diagram's DiagramDoc. `doc-heads` resolves the url the
+ * registry names and answers 404 when the server cannot load that document.
+ *
+ * The page is closed FIRST on purpose: the server's lookup is a network find,
+ * so with the tab still open it could fetch the document from the tab itself
+ * and heal the very thing being measured. Closed, nothing but the server holds
+ * it — which is what every other client would get.
+ *
+ * Not the read model: `diagram-render` places an object from the object's own
+ * model position, so it answered "placed" for a DiagramDoc with zero storage
+ * rows (measured 2026-10-29) — a witness that could not fail.
+ */
+async function closeAndReadServerDiagramDoc(page: Page, diagramId: string): Promise<number> {
+  const request = page.context().request
+  await page.close()
+  const query = new URLSearchParams({ landscapeId: 'default', versionId: 'current', id: diagramId })
+  const response = await request.get(`${API_BASE}/api/automerge/doc-heads?${query.toString()}`)
+  return response.status()
+}
+
 async function assertDiagramPresent(page: Page, diagramId: string): Promise<void> {
   await expect
     .poll(
@@ -179,12 +241,13 @@ async function assertDiagramPresent(page: Page, diagramId: string): Promise<void
 
 test.describe('minted browser naming — offline create + repoint (E3)', () => {
   test('an offline-created diagram is admitted on reconnect: minted name, zero gate misses', async ({ page }) => {
+    await installServerRouting(page)
     await enterBootApp(page)
     await waitForMintedPool(page)
     const missesBefore = await gateMissTotal(page)
 
     // OFFLINE: create a diagram and draw a shape on it, all through the UI.
-    await goOffline(page)
+    await goOfflineLive(page)
     const diagramId = await createBlankDiagramViaUi(page)
     const objectId = await dragNewShapeToCanvas(page, 'system')
     await flushLocal(page)
@@ -217,15 +280,27 @@ test.describe('minted browser naming — offline create + repoint (E3)', () => {
       (await gateMissTotal(page)) - missesBefore,
       'an offline-created minted document must never miss the durable index on admission',
     ).toBe(0)
+
+    // (d) The DiagramDoc itself reached the server, not only the registry
+    // meta naming it. Measured 2026-10-29, 3 runs of 3 once the window was
+    // really offline: the meta was published, the document never arrived
+    // (zero storage rows, even with the tab held open 60 s) while the badge
+    // said ready, and the version's next fork failed on "Document … is
+    // unavailable".
+    expect(
+      await closeAndReadServerDiagramDoc(page, diagramId),
+      'the badge said ready, yet the server cannot load the offline-created DiagramDoc',
+    ).toBe(200)
   })
 
   test('offline create through a set-default repoint: displaced-claimed, converges, zero gate misses', async ({ page }) => {
+    await installServerRouting(page)
     await enterBootApp(page)
     await waitForMintedPool(page)
     const missesBefore = await gateMissTotal(page)
 
     // OFFLINE: same creation as test 1 (diagram + shape), through the UI.
-    await goOffline(page)
+    await goOfflineLive(page)
     const diagramId = await createBlankDiagramViaUi(page)
     const objectId = await dragNewShapeToCanvas(page, 'system')
     await flushLocal(page)
@@ -265,6 +340,21 @@ test.describe('minted browser naming — offline create + repoint (E3)', () => {
     })
     expect(setDefaultResponse.ok(), 'the operator set-default must succeed').toBe(true)
 
+    // The fork must NOT already carry the diagram. If it does, the creation
+    // reached the server before the fork, the fork CLONED it under a new url,
+    // and every assertion below would be about the operator's copy — the
+    // displaced branch never runs. (The fork is a snapshot: what it lists
+    // now is fixed, while the page stays offline.)
+    expect(await page.locator('#sync-status').getAttribute('data-status'), 'the page reconnected during the offline window').toBe('offline')
+    expect(
+      await registryLists(page, defaultLandscape!.defaultVersionId!, diagramId),
+      'the offline-created diagram reached the source version while the page was offline',
+    ).toBe(false)
+    expect(
+      await registryLists(page, forkedVersionId, diagramId),
+      'the fork already lists the offline-created diagram: it cloned a creation that was not offline',
+    ).toBe(false)
+
     // Reconnect: the client's `current` alias now resolves to the fork
     // (fetchRootUrl is no-store; the alias's cached root url is re-fetched
     // online), so this boot IS the repoint from the client's point of view.
@@ -278,6 +368,11 @@ test.describe('minted browser naming — offline create + repoint (E3)', () => {
     // (slice D end to end, previously uncovered by any e2e).
     await assertDiagramPresent(page, diagramId)
     await expect.poll(() => mintedDocInfo(page, diagramId), { timeout: 30_000 }).toEqual({ bytes: 24, v0: 1 })
+    // The positive half of the fork check above: the fork lists it now, and
+    // only the reconnected client can have put it there.
+    await expect
+      .poll(() => registryLists(page, forkedVersionId, diagramId), { timeout: 60_000 })
+      .toBe(true)
 
     // The URL captured offline survived the repoint IDENTICALLY — admitted
     // displaced, not re-created under a V2 id (see the capture above).
@@ -300,6 +395,13 @@ test.describe('minted browser naming — offline create + repoint (E3)', () => {
       (await gateMissTotal(page)) - missesBefore,
       'a repointed minted document must take the displaced branch, not the index-miss branch',
     ).toBe(0)
+
+    // (d) as in test 1: the current version can load the DiagramDoc once the
+    // tab that made it is gone.
+    expect(
+      await closeAndReadServerDiagramDoc(page, diagramId),
+      'the badge said ready, yet the current version cannot load the offline-created DiagramDoc',
+    ).toBe(200)
 
     // Consigned, not asserted (correct behaviour, per the design): a local
     // edit of the V1 REGISTRY SHARD on the V2 socket is rightly refused

@@ -10,6 +10,7 @@
     },
     "repointed": {
       "message": "Un administrateur a changé la version par défaut de ce landscape. Vous avez été maintenu sur celle que vous éditiez, car vous y aviez du travail non enregistré.",
+      "messageBootFallback": "Un administrateur a changé la version par défaut de ce landscape, et elle n’a pas encore pu être chargée. Vous avez été maintenu sur la version enregistrée sur cet appareil.",
       "follow": "Aller à la nouvelle version par défaut",
       "dismiss": "Fermer"
     }
