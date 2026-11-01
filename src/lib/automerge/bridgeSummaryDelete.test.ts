@@ -91,11 +91,17 @@ function diagramMeta(id: string, name: string) {
 }
 
 /** The journalled entity intents as a crash would find them on disk. */
+/** The PENDING intents on disk. A SENT one rides in the same array, marked: its
+ * carrier was flushed, nothing replays it, and it is not a debt the badge
+ * waits on — it exists only so a repoint can put it back (entityIntents.ts). */
 function journaledIntents(): Array<{ kind: string; id: string; op: string }> {
   const out: Array<{ kind: string; id: string; op: string }> = []
   for (const [key, value] of kv) {
     if (!key.includes('entity-intents') || !Array.isArray(value)) continue
-    for (const intent of value) out.push(intent as { kind: string; id: string; op: string })
+    for (const intent of value) {
+      if ((intent as { sent?: unknown }).sent !== undefined) continue
+      out.push(intent as { kind: string; id: string; op: string })
+    }
   }
   return out
 }

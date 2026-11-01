@@ -69,8 +69,9 @@ export function ImportModal({ open, onClose }: ImportModalProps) {
   const [busy, setBusy] = useState(false)
   /** How many documents the import could NOT reserve a workspace-bound id for.
    *  Non-zero holds the modal open so the shortfall is stated rather than
-   *  swallowed — `ensureMintedIdCapacity` returns a number and never throws, so
-   *  the `catch` around it can only ever see a synchronous fault. */
+   *  swallowed — `ensureMintedIdCapacity` answers short with a number, and
+   *  rejects only when the reserve's IndexedDB store fails, which the `catch`
+   *  around it counts as every document short. */
   const [mintShortfall, setMintShortfall] = useState(0)
   const [target, setTarget] = useState<ImportTarget>('current')
   const [newName, setNewName] = useState('')

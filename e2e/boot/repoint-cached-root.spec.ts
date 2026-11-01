@@ -44,9 +44,12 @@
  * name V1, and the Model Objects page must find the object by V1's name. Before
  * the fix they all asked `current` (= V2). This phase is what pins the reads'
  * rule: under a hold the reads reach V1 through the hold whatever that rule is.
- * Phase 2 — the socket back: `held` must become V1 (before the fix the basis was
- * self-armed and nothing was ever held, in either auth mode), the offline edit
- * durable in V1 and not in V2, the canvas showing V1's name, every render V1.
+ * Phase 2 — the socket back: the tab must FOLLOW in place to a `root-fetch` V2
+ * basis (before the fix the basis was self-armed and nothing reacted, in either
+ * auth mode), the offline edit carried into V2 and not split into V1, the canvas
+ * showing V2's rename and the carried edit. (Until 2026-10-31 this phase
+ * asserted a HOLD on V1: the product decision of that day is that unsynced
+ * work follows `current` — repoint-offline-create.spec.ts test 2.)
  *
  * Test 2 (no offline work): the detector must react — FOLLOW, or a HOLD when
  * the reconnect lands while a write is still scheduled, which the test then
@@ -125,7 +128,7 @@ test.describe('a `current` tab booted from its cached root after the default mov
   // cold-builds on first demand) and a reconnect: well past the project's 120 s.
   test.beforeEach(() => test.setTimeout(360_000))
 
-  test('holding offline work, it is held on its own version, saves the work there and shows that version', async ({ page, browser }) => {
+  test('holding offline work, it follows the new default in place and carries the work there', async ({ page, browser }) => {
     const { landscapeId, diagramId, tabUrl } = await enterOnAlias(page)
     const v1 = await defaultVersionId(page, landscapeId)
     // The basis comes from the root fetch, beside the root this boot caches.
@@ -187,29 +190,39 @@ test.describe('a `current` tab booted from its cached root after the default mov
     const renders = recordRenderVersions(page)
     await goOnline(page)
 
-    // HELD on the version it was editing, and told so.
-    await expect.poll(async () => (await bindingProbe(page, landscapeId)).held?.versionId ?? null, { timeout: 90_000 })
-      .toBe(v1)
-    await expect(page.getByTestId('workspace-repoint-banner')).toBeVisible({ timeout: 30_000 })
+    // FOLLOWED, not held — the product decision of 2026-10-31: unsynced work
+    // follows `current` (it used to be held on V1 behind a banner). The new
+    // basis comes from a root fetch, nothing is pinned, the address bar still
+    // says `current`.
+    await expect
+      .poll(async () => {
+        const probe = await bindingProbe(page, landscapeId)
+        return `${probe.basis?.versionId ?? null}/${probe.provenance}`
+      }, { timeout: 90_000 })
+      .toBe(`${v2}/root-fetch`)
+    expect((await bindingProbe(page, landscapeId)).held, 'the tab was pinned to the old version').toBeNull()
+    await expect(page.getByTestId('workspace-repoint-banner')).toHaveCount(0)
     expect(page.url()).toContain('/version/current')
 
-    // The work is durable where the tab is, and nowhere else.
-    await expect.poll(() => nameInWorkspace(page, edited.id, { landscapeId, versionId: v1 }), { timeout: 90_000 })
+    // The work is CARRIED into the new default — a different object from the
+    // one the operator renamed there, so nothing of theirs stands in its way —
+    // and the old version, which nobody opens any more, does not get it: not
+    // split.
+    await expect.poll(() => nameInWorkspace(page, edited.id, { landscapeId, versionId: v2 }), { timeout: 90_000 })
       .toBe(offlineName)
-    await expect.poll(() => nameInWorkspace(page, edited.id, { landscapeId, versionId: v2 }), { timeout: 60_000 })
+    await expect.poll(() => nameInWorkspace(page, edited.id, { landscapeId, versionId: v1 }), { timeout: 60_000 })
       .toBe(edited.name)
     await expect(syncBadge(page)).toHaveAttribute('data-status', 'ready', { timeout: 120_000 })
 
-    // At least one render was fetched since the reconnect (so the canvas
-    // assertion is not about a stale offline copy), and every one named V1.
-    await expect.poll(() => renders.length, { timeout: 60_000 }).toBeGreaterThan(0)
-    expect(renders.filter((version) => version !== v1), `renders since the reconnect: ${renders.join(', ')}`)
-      .toEqual([])
-    await expect.poll(() => canvasName(page, renamed.id), { timeout: 30_000 }).toBe(renamed.name)
-    expect(await canvasName(page, edited.id)).toBe(offlineName)
+    // The canvas shows the new default: the operator's rename AND the carried
+    // edit. A render named V2 has been fetched since the follow (so this is
+    // not a stale offline copy).
+    await expect.poll(() => renders.filter((version) => version === v2).length, { timeout: 60_000 }).toBeGreaterThan(0)
+    await expect.poll(() => canvasName(page, renamed.id), { timeout: 30_000 }).toBe(v2Name)
+    await expect.poll(() => canvasName(page, edited.id), { timeout: 30_000 }).toBe(offlineName)
 
     expect(await page.evaluate(() => (window as any).__cachedRootSentinel ?? null),
-      'the hold must happen IN PLACE — a reload re-fetches the root and proves nothing').toBe('alive')
+      'the follow must happen IN PLACE — a reload re-fetches the root and proves nothing').toBe('alive')
   })
 
   test('with no offline work, it ends on the new default in place — documents and reads together', async ({ page, browser }) => {

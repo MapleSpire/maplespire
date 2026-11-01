@@ -23,8 +23,9 @@ import type { ImportResult, ImportSource } from '../../lib/import/types'
  * `ensureMintedIdCapacity` is best-effort by contract: a short answer still
  * imports, and that is correct — refusing to import offline would be a worse
  * failure than the one it prevents. But a short answer must not be SILENT: the
- * function returns a number and never throws, so a `try/catch` alone cannot
- * surface it — the return value has to be checked and the shortfall shown.
+ * function answers short with a number (it rejects only when the reserve's
+ * IndexedDB store fails), so a `try/catch` alone cannot surface it — the return
+ * value has to be checked and the shortfall shown.
  */
 
 const mocks = vi.hoisted(() => ({

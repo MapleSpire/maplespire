@@ -200,7 +200,10 @@ describe('a binding frame that arrived during the boot', () => {
     vi.restoreAllMocks()
   })
 
-  it('outside a fallback, a disagreeing frame with UNSAVED work HOLDS, and says unsaved work', async () => {
+  // The product decision of 2026-10-31: unsaved work is CARRIED into the
+  // version the tab follows, never pinned to the one it leaves (the carry
+  // itself is bridgeRepointCarry.test.ts). This case used to assert the pin.
+  it('outside a fallback, a disagreeing frame with UNSAVED work FOLLOWS — never pinned to the old version', async () => {
     const route = vi.spyOn(repoModule, 'routeWorkspaceNetwork').mockResolvedValue(undefined)
     const { rootHandle } = cachedV1Graph()
     vi.spyOn(repoModule, 'getRootHandle').mockImplementationOnce(async () => {
@@ -214,12 +217,10 @@ describe('a binding frame that arrived during the boot', () => {
     await startBridge(REF)
 
     expect(useAutomergeStatus.getState().bootFallbackActive).toBe(false)
-    await vi.waitFor(() => expect(heldWorkspace()).toEqual(V1))
-    expect(route).toHaveBeenCalledWith(V1, true)
-    expect(reloadWorkspace).not.toHaveBeenCalled()
-    expect(useAutomergeStatus.getState().workspaceRepointNotice).toEqual({
-      landscapeId: 'L1', pinnedVersionId: 'V1', reason: 'unsaved-work',
-    })
+    await vi.waitFor(() => expect(reloadWorkspace).toHaveBeenCalledTimes(1))
+    expect(heldWorkspace()).toBeNull()
+    expect(route).not.toHaveBeenCalledWith(V1, true)
+    expect(useAutomergeStatus.getState().workspaceRepointNotice).toBeNull()
   })
 
   it('a fallback session that ALSO has unsaved work names the fallback', async () => {
@@ -425,11 +426,15 @@ describe('a binding frame that arrived during the boot', () => {
 
   it('two OVERLAPPING boots that fail: only the live one falls back, and its re-entry is a working session', async () => {
     // React StrictMode's dev double-mount (and any re-run of AutomergeBridge's
-    // effect): boot A starts, is stopped, boot B starts, and both await the
-    // same root. Measured 2026-10-29 on the dev stack: A's catch fell back and
+    // effect): boot A starts, is stopped, boot B starts. Measured 2026-10-29 on
+    // the dev stack, when both awaited the same root: A's catch fell back and
     // re-entered, then B's catch — refused as "already fell back" — set
     // `started = false` under that re-entry, whose boot-from-server
     // projections then all returned early: the canvas read "No diagrams yet".
+    // Since 2026-10-31 a boot stopped that early never reaches its root at all:
+    // it returns after its ledger read, before routing the transport, which is
+    // module state (the repoint-carry fix: the live boot may not have withheld
+    // its documents yet). Only B asks for a root.
     localStorage.setItem('maplespire:bootFromServer', 'true')
     try {
       vi.spyOn(repoModule, 'routeWorkspaceNetwork').mockResolvedValue(undefined)
@@ -444,7 +449,6 @@ describe('a binding frame that arrived during the boot', () => {
       sharedRoot.catch(() => undefined)
       const getRoot = vi.spyOn(repoModule, 'getRootHandle')
         .mockReturnValueOnce(sharedRoot)
-        .mockReturnValueOnce(sharedRoot)
         .mockResolvedValue(root)
       useModelStore.setState({ currentDiagramId: 'd1' })
 
@@ -452,13 +456,14 @@ describe('a binding frame that arrived during the boot', () => {
       const bootA = startBridge(REF)
       stopBridge()
       const bootB = startBridge(REF)
-      await vi.waitFor(() => expect(getRoot).toHaveBeenCalledTimes(2))
+      await vi.waitFor(() => expect(getRoot).toHaveBeenCalledTimes(1))
       failRoot(unanswered())
       await Promise.all([bootA, bootB])
 
-      // ONE fallback, by the live boot; the stopped one recovered nothing.
+      // ONE fallback, by the live boot; the stopped one routed nothing and
+      // recovered nothing: B's root, then B's re-entry.
       expect(repoModule.preferCachedRootForNextResolve).toHaveBeenCalledTimes(1)
-      expect(getRoot).toHaveBeenCalledTimes(3)
+      expect(getRoot).toHaveBeenCalledTimes(2)
       // And the re-entry's session is whole: projected, the detour shown.
       await vi.waitFor(() => expect(
         useModelStore.getState().objects.map((o) => o.id),
@@ -486,6 +491,8 @@ describe('a binding frame that arrived during the boot', () => {
     // (B) fails first and re-enters, THEN the stopped boot (A) fails. If A's
     // catch cleared `started` before asking whether it was superseded, the
     // re-entry would boot with every projection returning early (QA lens).
+    // A is stopped while it AWAITS ITS ROOT — stopped any earlier it never
+    // reaches one (the test above) and this catch path would go unexercised.
     localStorage.setItem('maplespire:bootFromServer', 'true')
     try {
       vi.spyOn(repoModule, 'routeWorkspaceNetwork').mockResolvedValue(undefined)
@@ -507,6 +514,7 @@ describe('a binding frame that arrived during the boot', () => {
 
       const { startBridge, stopBridge } = await import('./bridge')
       const bootA = startBridge(REF)
+      await vi.waitFor(() => expect(getRoot).toHaveBeenCalledTimes(1))
       stopBridge()
       const bootB = startBridge(REF)
       await vi.waitFor(() => expect(getRoot).toHaveBeenCalledTimes(2))
@@ -593,20 +601,24 @@ describe('a boot that fails after its session was stopped', () => {
 
   it('a stop issued before the boot\'s FIRST await still supersedes it', async () => {
     // The epoch is taken before the boot's first await, so an unmount that
-    // lands while the boot routes its socket already counts (QA lens).
+    // lands while the boot reads its ledger already counts (QA lens) — and
+    // since 2026-10-31 such a boot returns before routing the transport or
+    // asking for a root (a superseded boot must not route: the live one may
+    // not have withheld its documents yet).
     const { __resetBootCachedRootFallbackForTest } = await import('./bridge')
     __resetBootCachedRootFallbackForTest()
     useAutomergeStatus.setState({ status: 'connecting', error: null, bootFallbackActive: false })
     const { preferCached, getRoot, failRoot } = armFailingBoot()
+    const route = vi.spyOn(repoModule, 'routeWorkspaceNetwork')
     const { startBridge, stopBridge } = await import('./bridge')
     const boot = startBridge(REF)
     stopBridge()
-    await vi.waitFor(() => expect(getRoot).toHaveBeenCalledTimes(1))
-    failRoot(unanswered())
     await boot
+    failRoot(unanswered())
 
+    expect(route).not.toHaveBeenCalled()
+    expect(getRoot).not.toHaveBeenCalled()
     expect(preferCached).not.toHaveBeenCalled()
-    expect(getRoot).toHaveBeenCalledTimes(1)
   })
 
   it('a REFUSED start (already started) does not supersede the live boot', async () => {

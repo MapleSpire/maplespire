@@ -498,6 +498,27 @@ describe('a new registry shard is pointed at by the root only after the server h
     expect(useModelStore.getState().diagrams.map((d) => d.id).sort()).toEqual(['d1', 'd2'])
   })
 
+  it('a queue that cannot be updated at boot neither stops the boot nor fails silently', async () => {
+    // KvStore.update rejects when its IndexedDB read fails (it used to hang
+    // there, and this resume is awaited by startBridge).
+    const ws = workspace()
+    const store = await memoryStore()
+    const elsewhere = { holderDocumentId: 'a-root-this-workspace-replaced', field: 'shardUrls', url: 'automerge:2v8T6YWrMtUjdGWzE7Ju4Sf2Ziyt' }
+    const published = { holderDocumentId: ws.root.documentId, field: 'shardUrls', url: ws.shard.url }
+    await store.set(DEFERRED_REFERENCES_KEY, [elsewhere, published])
+    const gone = new Error('IndexedDB is gone')
+    vi.spyOn(store, 'update').mockRejectedValue(gone)
+
+    await boot(ws)
+
+    const warnedWith = (text: string) => vi.mocked(console.warn).mock.calls
+      .some(([message, error]) => String(message).includes(text) && error === gone)
+    await expect.poll(() => warnedWith("this boot's failure could not be counted"), POLL).toBe(true)
+    await expect.poll(() => warnedWith('reference could not be dequeued'), POLL).toBe(true)
+    vi.mocked(store.update).mockRestore()
+    expect(await store.get(DEFERRED_REFERENCES_KEY)).toEqual([elsewhere, published])
+  })
+
   it('a queued pointer the root already carries is dropped at boot, not published twice', async () => {
     const ws = workspace()
     await (await memoryStore()).set(DEFERRED_REFERENCES_KEY, [

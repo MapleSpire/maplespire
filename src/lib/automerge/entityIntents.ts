@@ -135,6 +135,37 @@ export function isKnownIntentKind(kind: string): kind is EntityIntentKind {
     || (DIAGRAM_COLLECTION_INTENT_KINDS as readonly string[]).includes(kind)
 }
 
+/** One document that carried a SENT intent, at the heads its local flush left. */
+export interface SentCarrier {
+  documentId: string
+  heads: string[]
+}
+
+/**
+ * Why an intent is SENT rather than gone: its carrier document was flushed to
+ * IndexedDB, but nothing has yet proved the SERVER holds that write.
+ *
+ * The local flush is what the crash journal waits for, and it is not enough to
+ * forget the user's intention. A `current` tab writes into the documents of the
+ * version it booted into; when the default moves to a fork while the tab is
+ * offline, those documents belong to a version nobody opens any more, and the
+ * reload into the new default has nothing left to replay. Measured 2026-10-31
+ * (repoint-offline-create.spec.ts test 2, probe of the journals): the offline
+ * diagram's creation intent was gone at the registry shard's local flush, and
+ * after the reload the diagram was in neither version the user could see.
+ *
+ * `workspace` is the CONCRETE version the carrier belongs to
+ * (`landscapeId/versionId`), null when the session could not name one. The
+ * heads are the positive witness: a SENT intent is released only when the
+ * server answers `durable` for exactly those heads in that workspace — never by
+ * absence from the durable-heads ledger, which is one key shared by every tab
+ * and which a sibling tab's ack round deletes.
+ */
+export interface SentMark {
+  workspace: string | null
+  carriers: SentCarrier[]
+}
+
 interface EntityIntentBase {
   workspaceKey: string
   /** Monotone per-journal revision; acknowledgements are `<= revision captured
@@ -142,6 +173,18 @@ interface EntityIntentBase {
   revision: number
   recordedAt: number
   id: string
+  /** Present only on a SENT intent (see {@link SentMark}). */
+  sent?: SentMark
+  /** Put back by a repoint (`requeueSent`): the planners replay it
+   * CONFLICT-AVERSE (`planCarriedUpsert`). Nothing proves it did not reach the
+   * old version before the fork copied it, so where the new version differs
+   * from what the user saw, the new version's value is someone else's later
+   * work and wins. */
+  carried?: true
+  /** A baselined edit recorded while the entity's CREATION was SENT and
+   * unconfirmed: the edit is a field patch for every ordinary replay, but a
+   * carried replay must create the entity when the new version lacks it. */
+  createIfAbsent?: true
 }
 
 export interface ObjectUpsertIntent extends EntityIntentBase {
@@ -309,19 +352,60 @@ function newerThan(a: SerializedEntityIntent, b: SerializedEntityIntent): boolea
   return a.revision > b.revision
 }
 
+export function cloneSentMark(mark: SentMark): SentMark {
+  return {
+    workspace: mark.workspace,
+    carriers: mark.carriers.map((carrier) => ({ documentId: carrier.documentId, heads: [...carrier.heads] })),
+  }
+}
+
 function cloneIntent(source: SerializedEntityIntent): SerializedEntityIntent {
-  if (source.op === 'delete') return { ...source }
+  const sent = source.sent ? { sent: cloneSentMark(source.sent) } : {}
+  if (source.op === 'delete') return { ...source, ...sent }
   return {
     ...source,
     snapshot: stripUndefined(source.snapshot),
     ...(source.baseline !== undefined ? { baseline: stripUndefined(source.baseline) } : {}),
+    ...sent,
   } as SerializedEntityIntent
 }
 
-/** Latest-wins per `kind:id`; a delete replaces a pending upsert and vice versa. */
+/** A persisted SENT mark is browser storage, so it is checked before it is trusted. */
+export function isSentMark(value: unknown): value is SentMark {
+  if (!value || typeof value !== 'object') return false
+  const { workspace, carriers } = value as Partial<SentMark>
+  return (workspace === null || typeof workspace === 'string')
+    && Array.isArray(carriers)
+    && carriers.every((carrier) => carrier
+      && typeof carrier.documentId === 'string'
+      && Array.isArray(carrier.heads)
+      && carrier.heads.every((head) => typeof head === 'string'))
+}
+
+function isCreation(record: SerializedEntityIntent | undefined): boolean {
+  return record?.op === 'upsert' && record.baseline === undefined
+}
+
+/**
+ * Latest-wins per `kind:id`; a delete replaces a pending upsert and vice versa.
+ *
+ * Two stages. PENDING is what the crash journal always was: an intention not
+ * yet in its carrier's local flush, replayed at boot. SENT is an intention whose
+ * carrier was flushed locally but which no server has acknowledged yet (see
+ * {@link SentMark}): it is not replayed, not counted, not a debt — it is kept
+ * only so that a repoint can put it back ({@link requeueSent}).
+ */
 export class PendingEntityIntents {
   private revision = 0
   private readonly byWorkspace = new Map<string, Map<string, SerializedEntityIntent>>()
+  private readonly sentByWorkspace = new Map<string, Map<string, SerializedEntityIntent>>()
+  /** When each SENT intent was marked, on a per-page counter (`sentSequenceNow`);
+   * one hydrated from disk was marked in an earlier page, i.e. before every
+   * request this page makes, and reads 0. A release round may release only
+   * what was marked before it asked: an intent marked during the round has
+   * heads the round never asked about (reviewer lens, 2026-10-31). */
+  private sentSequence = 0
+  private readonly sentAt = new Map<string, number>()
 
   /** The high-water revision. Capture BEFORE the durable write; acknowledge
    * through it AFTER, so anything recorded mid-flight keeps its intent. */
@@ -417,6 +501,23 @@ export class PendingEntityIntents {
     baseline?: C4Object | Connection | Group | Domain | Tag | DecisionRecord | Comment | Flow | Diagram,
   ): number {
     const revision = ++this.revision
+    const key = intentKey(kind, id)
+    // A baselined edit over a SENT creation still owes that creation. The
+    // record below supersedes it, and as a plain field patch a repoint would
+    // replay a patch for an entity the new version never had — which the
+    // planners read as "deleted since" and drop. The capture layers ask
+    // `pendingCreation`, which covers SENT, but the object/connection capture
+    // takes its baseline from the last flush, so the rule lives here, once.
+    // Kept as a FLAG beside the baseline, not by dropping the baseline: an
+    // ordinary crash replay still merges only the changed fields (reviewer
+    // lens, 2026-10-31: dropping it turned crash replays into whole-value
+    // writes over a colleague's concurrent edit).
+    const sentRecord = this.sentByWorkspace.get(workspaceKey)?.get(key)
+    const createIfAbsent = baseline !== undefined && (
+      isCreation(sentRecord)
+      || sentRecord?.createIfAbsent === true
+      || this.byWorkspace.get(workspaceKey)?.get(key)?.createIfAbsent === true
+    )
     // Snapshot and baseline are held BY REF — store entities are immutable
     // (immer), so recording costs no copy; cloning happens at serialization.
     const record = {
@@ -428,8 +529,10 @@ export class PendingEntityIntents {
       id,
       snapshot,
       ...(baseline !== undefined ? { baseline } : {}),
+      ...(createIfAbsent ? { createIfAbsent: true } : {}),
     } as SerializedEntityIntent
-    this.records(workspaceKey).set(intentKey(kind, id), record)
+    this.records(workspaceKey).set(key, record)
+    this.forgetSent(workspaceKey, key)
     return revision
   }
 
@@ -449,7 +552,9 @@ export class PendingEntityIntents {
       id,
       ...(meta?.diagramId !== undefined ? { diagramId: meta.diagramId } : {}),
     }
-    this.records(workspaceKey).set(intentKey(kind, id), record)
+    const key = intentKey(kind, id)
+    this.records(workspaceKey).set(key, record)
+    this.forgetSent(workspaceKey, key)
     return revision
   }
 
@@ -495,7 +600,10 @@ export class PendingEntityIntents {
    * hard kill inside the coalescing window would replay a delete of an
    * entity the user just restored. */
   pendingOp(workspaceKey: string, kind: EntityIntentKind, id: string): 'upsert' | 'delete' | null {
-    return this.byWorkspace.get(workspaceKey)?.get(intentKey(kind, id))?.op ?? null
+    const key = intentKey(kind, id)
+    return this.byWorkspace.get(workspaceKey)?.get(key)?.op
+      ?? this.sentByWorkspace.get(workspaceKey)?.get(key)?.op
+      ?? null
   }
 
   /** True while the pending intent for this entity is an UPSERT with no
@@ -504,10 +612,19 @@ export class PendingEntityIntents {
    * the journal is latest-wins per key, recording it as a baselined edit
    * would REPLACE the creation intent with a field patch whose replay only
    * asserts the newly changed fields — the entity itself would never be
-   * recreated. */
+   * recreated.
+   *
+   * A SENT creation counts, for both kinds of caller. The capture layers keep
+   * re-recording the full snapshot, so a new diagram's journaled value carries
+   * the composition and layouts it gained after its first flush (measured
+   * 2026-10-31: the creation was acked at the registry shard's flush, BEFORE the
+   * drag, with `objectIds: []`). And the create-then-delete retirements
+   * (`acknowledge` below) still see a creation the server may never have had. */
   pendingCreation(workspaceKey: string, kind: EntityIntentKind, id: string): boolean {
-    const record = this.byWorkspace.get(workspaceKey)?.get(intentKey(kind, id))
-    return record?.op === 'upsert' && record.baseline === undefined
+    const key = intentKey(kind, id)
+    const record = this.byWorkspace.get(workspaceKey)?.get(key)
+    if (record) return isCreation(record)
+    return isCreation(this.sentByWorkspace.get(workspaceKey)?.get(key))
   }
 
   pendingCount(workspaceKey: string): number {
@@ -520,11 +637,16 @@ export class PendingEntityIntents {
   }
 
   /**
-   * Forget intents that are now durable in the LOCAL document: matching kind, id
-   * in `ids`, and revision ≤ `throughRevision` (captured before the write). An
-   * intent re-recorded during the flight has a higher revision and survives.
-   * Op-agnostic on purpose: whichever op was current at capture time is the one
-   * the durable write expressed.
+   * Forget intents outright: matching kind, id in `ids`, and revision ≤
+   * `throughRevision` (captured before the write). An intent re-recorded during
+   * the flight has a higher revision and survives. Op-agnostic on purpose:
+   * whichever op was current at capture time is the one the write expressed.
+   *
+   * SENT entries go too. Every caller here has a reason that outlives the
+   * server's answer — the planner found the value already held, the diagram is
+   * gone, a creation was deleted before anything held it — and a SENT entry left
+   * behind would come back on a repoint: a create-then-delete would resurrect.
+   * A carrier's local flush is NOT such a reason; that is {@link markSent}.
    */
   acknowledge(
     workspaceKey: string,
@@ -533,21 +655,164 @@ export class PendingEntityIntents {
     throughRevision: number,
   ): void {
     const records = this.byWorkspace.get(workspaceKey)
-    if (!records) return
+    const sent = this.sentByWorkspace.get(workspaceKey)
+    for (const id of ids) {
+      const key = intentKey(kind, id)
+      const record = records?.get(key)
+      if (record && record.revision <= throughRevision) records!.delete(key)
+      const sentRecord = sent?.get(key)
+      if (sentRecord && sentRecord.revision <= throughRevision) this.forgetSent(workspaceKey, key)
+    }
+    if (records?.size === 0) this.byWorkspace.delete(workspaceKey)
+  }
+
+  /**
+   * The carrier's LOCAL flush expressed these intents: move them to SENT, with
+   * the carriers' heads and the concrete workspace they belong to. Same
+   * revision rule as `acknowledge`. Returns how many moved.
+   */
+  markSent(
+    workspaceKey: string,
+    kind: EntityIntentKind,
+    ids: readonly string[],
+    throughRevision: number,
+    mark: SentMark,
+  ): number {
+    const records = this.byWorkspace.get(workspaceKey)
+    if (!records) return 0
+    let moved = 0
     for (const id of ids) {
       const key = intentKey(kind, id)
       const record = records.get(key)
-      if (record && record.revision <= throughRevision) records.delete(key)
+      if (!record || record.revision > throughRevision) continue
+      records.delete(key)
+      // A carried intent that reached a carrier of the new version is an
+      // ordinary SENT one again: its replay already was conflict-averse.
+      const { carried: _carried, ...uncarried } = record
+      this.sentRecords(workspaceKey).set(key, { ...uncarried, sent: cloneSentMark(mark) } as SerializedEntityIntent)
+      this.sentAt.set(sentKey(workspaceKey, key), ++this.sentSequence)
+      moved += 1
     }
     if (records.size === 0) this.byWorkspace.delete(workspaceKey)
+    return moved
+  }
+
+  /** The SENT-mark counter, for a release round to capture BEFORE it asks. */
+  get sentSequenceNow(): number {
+    return this.sentSequence
+  }
+
+  /** The named workspaces SENT intents are tagged with (null excluded). */
+  sentWorkspaces(workspaceKey: string): string[] {
+    const workspaces = new Set<string>()
+    for (const record of this.sentByWorkspace.get(workspaceKey)?.values() ?? []) {
+      if (typeof record.sent?.workspace === 'string') workspaces.add(record.sent.workspace)
+    }
+    return [...workspaces]
+  }
+
+  /** How many SENT intents wait for the server. Diagnostics only: SENT is not a
+   * durability debt — the badge's witness is the durable-heads ledger. */
+  sentCount(workspaceKey: string): number {
+    return this.sentByWorkspace.get(workspaceKey)?.size ?? 0
+  }
+
+  /**
+   * One carrier per document for the SENT intents of `workspace`: the heads of
+   * its MOST RECENT capture. A carrier's heads are read after its local flush,
+   * and a document's local history only grows, so the latest capture descends
+   * from every earlier one — a server that holds it holds them all. (Asking with
+   * the union instead would grow with the journal, and the endpoint refuses the
+   * whole request past 512 heads per document or on a repeated id.)
+   */
+  sentCarriers(
+    workspaceKey: string,
+    workspace: string | null,
+    throughSequence: number = Number.POSITIVE_INFINITY,
+  ): SentCarrier[] {
+    const latest = new Map<string, { order: [number, number]; carrier: SentCarrier }>()
+    for (const [key, record] of this.sentByWorkspace.get(workspaceKey) ?? []) {
+      if (!releasableIn(record, workspace)) continue
+      const sequence = this.sentAt.get(sentKey(workspaceKey, key)) ?? 0
+      if (sequence > throughSequence) continue
+      const order: [number, number] = [sequence, record.revision]
+      for (const carrier of record.sent!.carriers) {
+        const held = latest.get(carrier.documentId)
+        if (!held || order[0] > held.order[0] || (order[0] === held.order[0] && order[1] > held.order[1])) {
+          latest.set(carrier.documentId, { order, carrier })
+        }
+      }
+    }
+    return [...latest.values()].map(({ carrier }) => ({ documentId: carrier.documentId, heads: [...carrier.heads] }))
+  }
+
+  /**
+   * Retire the SENT intents of `workspace` whose every carrier the server
+   * acknowledged. `durable` answers for one carrier at its recorded heads; it
+   * must be a POSITIVE server answer (see {@link SentMark}). A SENT intent with
+   * no carrier is released at once — there is nothing to prove, which is the
+   * behaviour every intent had before this stage existed.
+   *
+   * `throughSequence` is `sentSequenceNow` captured BEFORE the request whose
+   * answers `durable` reads: an intent marked after it carries heads the
+   * request never named. A SENT intent tagged `null` (a session that could not
+   * name its workspace) is releasable in any workspace — asked there, a
+   * document of another version answers `durable: false`, never a false yes.
+   * Returns how many were released.
+   */
+  releaseSent(
+    workspaceKey: string,
+    workspace: string | null,
+    durable: (carrier: SentCarrier) => boolean,
+    throughSequence: number = Number.POSITIVE_INFINITY,
+  ): number {
+    const records = this.sentByWorkspace.get(workspaceKey)
+    if (!records) return 0
+    let released = 0
+    for (const [key, record] of [...records]) {
+      if (!releasableIn(record, workspace)) continue
+      if ((this.sentAt.get(sentKey(workspaceKey, key)) ?? 0) > throughSequence) continue
+      if (!record.sent!.carriers.every(durable)) continue
+      this.forgetSent(workspaceKey, key)
+      released += 1
+    }
+    return released
+  }
+
+  /**
+   * A repoint: the session now writes into `bootedWorkspace`, and every SENT
+   * intent of ANOTHER named workspace was expressed only in documents nobody
+   * opens any more. Put them back to PENDING, CARRIED, so the ordinary replays
+   * plan them — conflict-averse — against the booted workspace's witnesses.
+   * Each gets a fresh revision (an ack captured before the move must not
+   * retire it) and loses its `writtenInBatchId`, which names a batch in the
+   * OLD version's overlay shard. SENT intents with no workspace (`null`) are
+   * left alone: nothing says they belong elsewhere. Returns the requeued
+   * `kind:id` keys.
+   */
+  requeueSent(workspaceKey: string, bootedWorkspace: string): string[] {
+    const records = this.sentByWorkspace.get(workspaceKey)
+    if (!records) return []
+    const requeued: string[] = []
+    for (const [key, record] of [...records]) {
+      const workspace = record.sent?.workspace ?? null
+      if (workspace === null || workspace === bootedWorkspace) continue
+      this.forgetSent(workspaceKey, key)
+      const { sent: _sent, writtenInBatchId: _batch, ...rest } = record
+      this.records(workspaceKey).set(key, { ...rest, carried: true, revision: ++this.revision } as SerializedEntityIntent)
+      requeued.push(key)
+    }
+    return requeued
   }
 
   serialize(workspaceKey: string): SerializedEntityIntent[] {
     // stripUndefined both deep-copies (the live ref must not be shared with
     // IndexedDB's structured clone) and normalizes to exactly what the Automerge
     // write path persists — so a hydrated snapshot compares equal to the doc
-    // value it produced.
-    return this.pending(workspaceKey).map(cloneIntent)
+    // value it produced. SENT intents ride in the same array, marked.
+    const sent = [...(this.sentByWorkspace.get(workspaceKey)?.values() ?? [])]
+      .sort((left, right) => left.revision - right.revision)
+    return [...this.pending(workspaceKey), ...sent].map(cloneIntent)
   }
 
   hydrate(
@@ -555,15 +820,28 @@ export class PendingEntityIntents {
     serialized: readonly SerializedEntityIntent[] | undefined,
   ): void {
     if (!serialized?.length) return
-    const records = this.records(workspaceKey)
     for (const source of serialized) {
       if (source.workspaceKey !== workspaceKey) continue
       const key = intentKey(source.kind, source.id)
-      const existing = records.get(key)
-      // Never let a stale entry (own disk state, or an adopted sibling tab's)
-      // clobber a NEWER one already held.
+      // A key lives in ONE stage. Never let a stale entry (own disk state, or an
+      // adopted sibling tab's) clobber a NEWER one already held in either.
+      const existing = this.byWorkspace.get(workspaceKey)?.get(key)
+        ?? this.sentByWorkspace.get(workspaceKey)?.get(key)
       if (existing && !newerThan(source, existing)) continue
-      records.set(key, cloneIntent(source))
+      // Checked BEFORE the clone, which would throw on it and abort the whole
+      // adoption. A malformed mark cannot be released or requeued: keep the
+      // intent PENDING, which is what it was before the stage existed.
+      const { sent: mark, ...unmarked } = source
+      const clone = cloneIntent(
+        (isSentMark(mark) ? source : unmarked) as SerializedEntityIntent,
+      )
+      if (clone.sent) {
+        this.byWorkspace.get(workspaceKey)?.delete(key)
+        this.sentRecords(workspaceKey).set(key, clone)
+      } else {
+        this.forgetSent(workspaceKey, key)
+        this.records(workspaceKey).set(key, clone)
+      }
       this.revision = Math.max(this.revision, source.revision)
     }
   }
@@ -576,6 +854,33 @@ export class PendingEntityIntents {
     }
     return records
   }
+
+  private sentRecords(workspaceKey: string): Map<string, SerializedEntityIntent> {
+    let records = this.sentByWorkspace.get(workspaceKey)
+    if (!records) {
+      records = new Map()
+      this.sentByWorkspace.set(workspaceKey, records)
+    }
+    return records
+  }
+
+  private forgetSent(workspaceKey: string, key: string): void {
+    this.sentAt.delete(sentKey(workspaceKey, key))
+    const records = this.sentByWorkspace.get(workspaceKey)
+    if (!records?.delete(key)) return
+    if (records.size === 0) this.sentByWorkspace.delete(workspaceKey)
+  }
+}
+
+function sentKey(workspaceKey: string, key: string): string {
+  return `${workspaceKey}\u0000${key}`
+}
+
+/** A SENT intent the server of `workspace` may confirm: its own, or one whose
+ * session could not name a workspace. */
+function releasableIn(record: SerializedEntityIntent, workspace: string | null): boolean {
+  const tag = record.sent?.workspace
+  return record.sent !== undefined && (tag === workspace || tag === null)
 }
 
 export const pendingEntityIntents = new PendingEntityIntents()
@@ -645,6 +950,53 @@ export function mergeChangedFields<T extends Record<string, unknown>>(
     else delete merged[key]
   }
   return merged as T
+}
+
+export type CarriedUpsertDecision<T> = { write: false } | { write: true; value: T; created: boolean }
+
+/**
+ * The replay of a CARRIED upsert (`requeueSent`): the default moved, and this
+ * intent goes into the version `current` names now. CONFLICT-AVERSE, because
+ * nothing proves it did not reach the OLD version before the fork copied it —
+ * a SENT intent outlives its delivery until a release round proves it, and a
+ * tab can close in between (reviewer lens, 2026-10-31). Wherever the new
+ * version differs from what the user saw (`baseline`), it is someone else's
+ * later work, and it wins:
+ *
+ *  - entity absent: a creation (no baseline, or `createIfAbsent`) is created —
+ *    unless the new version TOMBSTONED it, which is a later delete; a field
+ *    patch of an absent entity has nothing left to patch;
+ *  - entity present: a creation is already there (the fork copied it); a patch
+ *    writes only the fields the user changed AND the new version still holds
+ *    at the user's baseline.
+ *
+ * The cost, accepted: an offline edit of a field someone else changed in the
+ * new version since is not carried (it stays in the old version's copy).
+ * An ordinary crash replay never comes here: it keeps `mergeChangedFields`.
+ */
+export function planCarriedUpsert<T extends Record<string, unknown>>(input: {
+  snapshot: T
+  baseline: Record<string, unknown> | undefined
+  current: T | undefined
+  tombstoned: boolean
+  createIfAbsent: boolean
+}): CarriedUpsertDecision<T> {
+  const { snapshot, baseline, current, tombstoned, createIfAbsent } = input
+  if (current === undefined) {
+    if (tombstoned) return { write: false }
+    if (baseline === undefined || createIfAbsent) return { write: true, value: snapshot, created: true }
+    return { write: false }
+  }
+  if (baseline === undefined) return { write: false }
+  const merged: Record<string, unknown> = { ...current }
+  for (const key of new Set([...Object.keys(snapshot), ...Object.keys(baseline)])) {
+    if (deepEqualPlain(snapshot[key], baseline[key])) continue
+    if (!deepEqualPlain(current[key], baseline[key])) continue
+    if (key in snapshot) merged[key] = snapshot[key]
+    else delete merged[key]
+  }
+  if (deepEqualPlain(merged, current)) return { write: false }
+  return { write: true, value: merged as T, created: false }
 }
 
 /**
@@ -728,6 +1080,23 @@ export function planEntityIntentReplay(input: EntityIntentReplayInput): EntityIn
     const snapshot = stripUndefined(intent.snapshot)
     if (current !== undefined && deepEqualPlain(snapshot, stripUndefined(current))) {
       plan.satisfied.push({ kind: intent.kind, id: intent.id, revision: intent.revision })
+      continue
+    }
+    if (intent.carried) {
+      const decision = planCarriedUpsert({
+        snapshot: snapshot as unknown as Record<string, unknown>,
+        baseline: intent.baseline ? stripUndefined(intent.baseline) as unknown as Record<string, unknown> : undefined,
+        current: current !== undefined ? stripUndefined(current) as unknown as Record<string, unknown> : undefined,
+        tombstoned,
+        createIfAbsent: intent.createIfAbsent === true,
+      })
+      if (!decision.write) {
+        plan.satisfied.push({ kind: intent.kind, id: intent.id, revision: intent.revision })
+      } else if (isObject) {
+        plan.replayObjects.push(decision.value as unknown as C4Object)
+      } else {
+        plan.replayConnections.push(decision.value as unknown as Connection)
+      }
       continue
     }
     // Stamped + no witness can vouch for absence: the write may have happened
@@ -829,6 +1198,18 @@ export function planSmallCollectionIntentReplay(
     const baseline = intent.baseline
       ? stripUndefined(intent.baseline) as unknown as Record<string, unknown>
       : undefined
+    if (intent.carried) {
+      const decision = planCarriedUpsert({
+        snapshot,
+        baseline,
+        current: current !== undefined ? stripUndefined(current) as Record<string, unknown> : undefined,
+        tombstoned: kind === 'decisionRecord' && input.deletedDecisionRecordIds.has(intent.id),
+        createIfAbsent: intent.createIfAbsent === true,
+      })
+      if (decision.write) plan.replayUpserts[kind].push(decision.value)
+      else plan.satisfied.push({ kind, id: intent.id, revision: intent.revision })
+      continue
+    }
     let value: Record<string, unknown>
     if (current !== undefined) {
       // Satisfaction is the MERGE predicate, not raw equality: the intent is
@@ -911,6 +1292,18 @@ export function planDiagramCollectionIntentReplay(
     const baseline = intent.baseline
       ? stripUndefined(intent.baseline) as unknown as Record<string, unknown>
       : undefined
+    if (intent.carried) {
+      const decision = planCarriedUpsert({
+        snapshot,
+        baseline,
+        current: current !== undefined ? stripUndefined(current) as Record<string, unknown> : undefined,
+        tombstoned: false,
+        createIfAbsent: intent.createIfAbsent === true,
+      })
+      if (decision.write) plan.replayUpserts[kind].push(decision.value)
+      else plan.satisfied.push({ kind, id: intent.id, revision: intent.revision })
+      continue
+    }
     let value: Record<string, unknown>
     if (current !== undefined) {
       // The MERGE predicate, not raw equality — same livelock rationale as the

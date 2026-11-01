@@ -15,7 +15,14 @@
 import type { Connection, Diagram, Group, LowerConnectionRouting, Position, Size } from '../../types'
 import type { KvStore } from '../modelQuery/kvStore'
 import { cleanLowerRouting, lowerRoutingFields, withLowerRoutingForSpace } from '../diagrams/lowerRouting'
-import { deepEqualPlain, entityIntentTabId } from './entityIntents'
+import {
+  cloneSentMark,
+  deepEqualPlain,
+  entityIntentTabId,
+  isSentMark,
+  type SentCarrier,
+  type SentMark,
+} from './entityIntents'
 import { adoptSingleKeyLegacyJournal, adoptTabJournalNamespace } from './tabJournalAdoption'
 import type { DiagramDoc } from './types'
 
@@ -71,6 +78,10 @@ interface PendingRecordBase {
    * Absent on legacy v1 records (treated as oldest). */
   recordedAt?: number
   id: string
+  /** Present only on a SENT record — the entity journal's stage, for the same
+   * reason (`SentMark` in entityIntents.ts): the carrier was flushed locally,
+   * no server has confirmed it, and a repoint must be able to put it back. */
+  sent?: SentMark
 }
 
 interface PendingObjectRecord extends PendingRecordBase, PendingObjectPlacement {
@@ -115,16 +126,17 @@ export function isDiagramDocPlacementRecord(record: SerializedPlacementIntent): 
 
 /** A copy of a record, sharing no structure with it. */
 function cloneRecord(record: SerializedPlacementIntent): SerializedPlacementIntent {
+  const sent = record.sent ? { sent: cloneSentMark(record.sent) } : {}
   if (record.kind === 'object') {
-    return { ...record, position: { ...record.position }, size: { ...record.size } }
+    return { ...record, position: { ...record.position }, size: { ...record.size }, ...sent }
   }
   if (record.kind === 'group') {
-    return { ...record, position: clonePosition(record.position), size: cloneSize(record.size) }
+    return { ...record, position: clonePosition(record.position), size: cloneSize(record.size), ...sent }
   }
   if (record.kind === 'lowerRoute') {
-    return { ...record, routing: cleanLowerRouting(record.routing) }
+    return { ...record, routing: cleanLowerRouting(record.routing), ...sent }
   }
-  return { ...record, data: { ...record.data } }
+  return { ...record, data: { ...record.data }, ...sent }
 }
 
 export interface PlacementProjection {
@@ -215,6 +227,13 @@ function cloneSize(size: Size | undefined): Size | undefined {
 export class PendingPlacementIntents {
   private revision = 0
   private readonly byWorkspace = new Map<string, Map<string, SerializedPlacementIntent>>()
+  /** SENT records (see `PendingRecordBase.sent`): not replayed, not counted,
+   * not projected — kept only so that a repoint can put them back. */
+  private readonly sentByWorkspace = new Map<string, Map<string, SerializedPlacementIntent>>()
+  /** Mark order on a per-page counter; hydrated SENT records read 0. Same
+   * release-round rule as the entity journal's `sentAt`. */
+  private sentSequence = 0
+  private readonly sentAt = new Map<string, number>()
 
   /** Ack ceiling for retirements planned NOW: an unconditional
    * MAX_SAFE_INTEGER acknowledgement would also swallow records recorded
@@ -306,6 +325,10 @@ export class PendingPlacementIntents {
       if (!records.has(key)) newKeys = true
       records.set(key, record)
     }
+    // A new record of a key supersedes its SENT copy (latest-wins, as ever).
+    for (const key of records.keys()) {
+      if (records.get(key)!.revision === revision) this.forgetSent(workspaceKey, key)
+    }
     return { revision, newKeys }
   }
 
@@ -365,6 +388,9 @@ export class PendingPlacementIntents {
     return { throughRevision, objects, groups, connections, lowerRoutes }
   }
 
+  /** Forget a diagram's records outright, SENT ones included — for a reason
+   * that outlives the server's answer (the diagram is gone). A carrier's local
+   * flush is NOT such a reason: that is {@link markSentWhere}. */
   acknowledge(workspaceKey: string, diagramId: string, throughRevision: number): void {
     this.acknowledgeWhere(workspaceKey, diagramId, throughRevision, () => true)
   }
@@ -379,13 +405,126 @@ export class PendingPlacementIntents {
     include: (record: SerializedPlacementIntent) => boolean,
   ): void {
     const records = this.byWorkspace.get(workspaceKey)
-    if (!records) return
-    for (const [key, record] of records) {
+    if (records) {
+      for (const [key, record] of records) {
+        if (record.diagramId === diagramId && record.revision <= throughRevision && include(record)) {
+          records.delete(key)
+        }
+      }
+      if (records.size === 0) this.byWorkspace.delete(workspaceKey)
+    }
+    for (const [key, record] of [...(this.sentByWorkspace.get(workspaceKey) ?? [])]) {
       if (record.diagramId === diagramId && record.revision <= throughRevision && include(record)) {
-        records.delete(key)
+        this.forgetSent(workspaceKey, key)
       }
     }
+  }
+
+  /** The carriers just flushed locally: move the matching records to SENT
+   * (same selection as `acknowledgeWhere`). */
+  markSentWhere(
+    workspaceKey: string,
+    diagramId: string,
+    throughRevision: number,
+    include: (record: SerializedPlacementIntent) => boolean,
+    mark: SentMark,
+  ): void {
+    const records = this.byWorkspace.get(workspaceKey)
+    if (!records) return
+    for (const [key, record] of [...records]) {
+      if (record.diagramId !== diagramId || record.revision > throughRevision || !include(record)) continue
+      records.delete(key)
+      this.sentRecords(workspaceKey).set(key, { ...record, sent: cloneSentMark(mark) })
+      this.sentAt.set(sentKey(workspaceKey, key), ++this.sentSequence)
+    }
     if (records.size === 0) this.byWorkspace.delete(workspaceKey)
+  }
+
+  get sentSequenceNow(): number {
+    return this.sentSequence
+  }
+
+  /** The named workspaces SENT records are tagged with (null excluded). */
+  sentWorkspaces(workspaceKey: string): string[] {
+    const workspaces = new Set<string>()
+    for (const record of this.sentByWorkspace.get(workspaceKey)?.values() ?? []) {
+      if (typeof record.sent?.workspace === 'string') workspaces.add(record.sent.workspace)
+    }
+    return [...workspaces]
+  }
+
+  sentCount(workspaceKey: string): number {
+    return this.sentByWorkspace.get(workspaceKey)?.size ?? 0
+  }
+
+  /** One carrier per document, its latest capture (see the entity journal's
+   * `sentCarriers`). */
+  sentCarriers(
+    workspaceKey: string,
+    workspace: string | null,
+    throughSequence: number = Number.POSITIVE_INFINITY,
+  ): SentCarrier[] {
+    const latest = new Map<string, { order: [number, number]; carrier: SentCarrier }>()
+    for (const [key, record] of this.sentByWorkspace.get(workspaceKey) ?? []) {
+      if (!releasableIn(record, workspace)) continue
+      const sequence = this.sentAt.get(sentKey(workspaceKey, key)) ?? 0
+      if (sequence > throughSequence) continue
+      const order: [number, number] = [sequence, record.revision]
+      for (const carrier of record.sent!.carriers) {
+        const held = latest.get(carrier.documentId)
+        if (!held || order[0] > held.order[0] || (order[0] === held.order[0] && order[1] > held.order[1])) {
+          latest.set(carrier.documentId, { order, carrier })
+        }
+      }
+    }
+    return [...latest.values()].map(({ carrier }) => ({ documentId: carrier.documentId, heads: [...carrier.heads] }))
+  }
+
+  /** Same contract as the entity journal's `releaseSent`. */
+  releaseSent(
+    workspaceKey: string,
+    workspace: string | null,
+    durable: (carrier: SentCarrier) => boolean,
+    throughSequence: number = Number.POSITIVE_INFINITY,
+  ): number {
+    let released = 0
+    for (const [key, record] of [...(this.sentByWorkspace.get(workspaceKey) ?? [])]) {
+      if (!releasableIn(record, workspace)) continue
+      if ((this.sentAt.get(sentKey(workspaceKey, key)) ?? 0) > throughSequence) continue
+      if (!record.sent!.carriers.every(durable)) continue
+      this.forgetSent(workspaceKey, key)
+      released += 1
+    }
+    return released
+  }
+
+  /**
+   * A repoint (see the entity journal's `requeueSent`): put another named
+   * workspace's SENT records back to PENDING for this diagram id in the
+   * version `current` names now, with a fresh revision. Placements are
+   * ABSOLUTE values, so their replay stays last-writer-wins: a carried record
+   * whose shape someone moved in the new version since overwrites that move —
+   * a narrower loss than geometry the user drew offline vanishing, and the
+   * record holds no baseline to be conflict-averse with. Returns the diagram
+   * ids that got records back.
+   */
+  requeueSent(workspaceKey: string, bootedWorkspace: string): string[] {
+    const diagramIds = new Set<string>()
+    for (const [key, record] of [...(this.sentByWorkspace.get(workspaceKey) ?? [])]) {
+      const workspace = record.sent?.workspace ?? null
+      if (workspace === null || workspace === bootedWorkspace) continue
+      this.forgetSent(workspaceKey, key)
+      const { sent: _sent, ...rest } = record
+      let records = this.byWorkspace.get(workspaceKey)
+      if (!records) {
+        records = new Map()
+        this.byWorkspace.set(workspaceKey, records)
+      }
+      if (records.has(key)) continue // a newer pending record already wins
+      records.set(key, { ...rest, revision: ++this.revision } as SerializedPlacementIntent)
+      diagramIds.add(record.diagramId)
+    }
+    return [...diagramIds]
   }
 
   overlayProjection(
@@ -454,7 +593,10 @@ export class PendingPlacementIntents {
   }
 
   serialize(workspaceKey: string): SerializedPlacementIntent[] {
-    return [...(this.byWorkspace.get(workspaceKey)?.values() ?? [])].map(cloneRecord)
+    return [
+      ...(this.byWorkspace.get(workspaceKey)?.values() ?? []),
+      ...(this.sentByWorkspace.get(workspaceKey)?.values() ?? []),
+    ].map(cloneRecord)
   }
 
   hydrate(workspaceKey: string, serialized: readonly SerializedPlacementIntent[] | undefined): void {
@@ -466,12 +608,13 @@ export class PendingPlacementIntents {
     }
     for (const source of serialized) {
       if (source.workspaceKey !== workspaceKey) continue
+      const key = recordKey(source)
       // Cross-tab recency: revisions from different tabs are incomparable
       // counters, so a key collision is decided by wall clock first, revision
       // as the same-tab tiebreak — otherwise the LAST-ADOPTED tab's geometry
-      // would win regardless of age.
+      // would win regardless of age. A key lives in ONE stage.
       // Legacy v1 records carry no recordedAt and rank oldest.
-      const existing = records.get(recordKey(source))
+      const existing = records.get(key) ?? this.sentByWorkspace.get(workspaceKey)?.get(key)
       if (existing) {
         const sourceAt = source.recordedAt ?? 0
         const existingAt = existing.recordedAt ?? 0
@@ -480,8 +623,17 @@ export class PendingPlacementIntents {
           : source.revision > existing.revision
         if (!newer) continue
       }
-      const record = cloneRecord(source)
-      records.set(recordKey(record), record)
+      // Validated before the clone, which would throw on it; a malformed mark
+      // keeps the record PENDING, what it was before the stage existed.
+      const { sent: mark, ...unmarked } = source
+      const record = cloneRecord((isSentMark(mark) ? source : unmarked) as SerializedPlacementIntent)
+      if (record.sent) {
+        records.delete(key)
+        this.sentRecords(workspaceKey).set(key, record)
+      } else {
+        this.forgetSent(workspaceKey, key)
+        records.set(key, record)
+      }
       this.revision = Math.max(this.revision, record.revision)
     }
   }
@@ -490,6 +642,31 @@ export class PendingPlacementIntents {
     const records = this.byWorkspace.get(workspaceKey)
     return records ? [...records.values()].filter((record) => record.diagramId === diagramId) : []
   }
+
+  private sentRecords(workspaceKey: string): Map<string, SerializedPlacementIntent> {
+    let records = this.sentByWorkspace.get(workspaceKey)
+    if (!records) {
+      records = new Map()
+      this.sentByWorkspace.set(workspaceKey, records)
+    }
+    return records
+  }
+
+  private forgetSent(workspaceKey: string, key: string): void {
+    this.sentAt.delete(sentKey(workspaceKey, key))
+    const records = this.sentByWorkspace.get(workspaceKey)
+    if (!records?.delete(key)) return
+    if (records.size === 0) this.sentByWorkspace.delete(workspaceKey)
+  }
+}
+
+function sentKey(workspaceKey: string, key: string): string {
+  return `${workspaceKey}\u0000${key}`
+}
+
+function releasableIn(record: SerializedPlacementIntent, workspace: string | null): boolean {
+  const tag = record.sent?.workspace
+  return record.sent !== undefined && (tag === workspace || tag === null)
 }
 
 export const pendingPlacementIntents = new PendingPlacementIntents()

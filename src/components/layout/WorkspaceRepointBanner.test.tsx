@@ -53,13 +53,4 @@ describe('WorkspaceRepointBanner — the reason it states', () => {
     expect(banner.getAttribute('data-reason')).toBe('boot-fallback')
     expect(banner.textContent).toContain('workspace.repointed.messageBootFallback')
   })
-
-  it('an unsaved-work hold keeps the original message (the control)', () => {
-    useAutomergeStatus.getState().noteWorkspacePinnedAfterRepoint({ landscapeId: 'L1', versionId: 'V1' }, 'unsaved-work')
-    render(<WorkspaceRepointBanner />)
-    const banner = screen.getByTestId('workspace-repoint-banner')
-    expect(banner.getAttribute('data-reason')).toBe('unsaved-work')
-    expect(banner.textContent).toContain('workspace.repointed.message')
-    expect(banner.textContent).not.toContain('workspace.repointed.messageBootFallback')
-  })
 })

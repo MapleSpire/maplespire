@@ -88,6 +88,11 @@ let inFlight: Promise<void> | null = null
  * deficit at that instant sees `reserve === null` and over-mints a FULL pool
  * on top of the one about to be hydrated (~2×POOL_TARGET). Never rejects. */
 let bindingReady: Promise<void> = Promise.resolve()
+/** The canonical workspace this session writes into, once the bridge's root
+ * resolution named it (`noteMintedIdSupplyWorkspace`); null until then, and
+ * outside a session. */
+let expectedWorkspace: string | null = null
+let bindingMismatchWarned = false
 let takenMinted = 0
 let takenFallback = 0
 let lastMintStatus: number | null = null
@@ -103,7 +108,12 @@ let takeOverride: (() => Uint8Array | null) | null = null
  */
 export function takeMintedDocumentIdBytes(): Uint8Array | null {
   if (takeOverride) return takeOverride()
-  const bytes = reserve?.take() ?? null
+  // A pool bound to another version than the one this session writes into
+  // names nothing here (`noteMintedIdSupplyWorkspace`), even before its drop
+  // has run: checked at the take, there is no window (architect lens,
+  // 2026-10-31).
+  const bound = expectedWorkspace === null || reserve?.workspace === expectedWorkspace
+  const bytes = bound ? (reserve?.take() ?? null) : null
   if (active) {
     if (bytes) takenMinted += 1
     else takenFallback += 1
@@ -132,6 +142,7 @@ export function startMintedIdSupply(ref: WorkspaceRef): void {
   if (backoffTimer) { clearTimeout(backoffTimer); backoffTimer = null }
   lastHostReachableWakeAt = Number.NEGATIVE_INFINITY
   reserve = null
+  expectedWorkspace = null
   const boundStore = workspaceKvStore()
   store = boundStore
   bindingReady = (async () => {
@@ -170,6 +181,38 @@ export function stopMintedIdSupply(): void {
   lastHostReachableWakeAt = Number.NEGATIVE_INFINITY
   if (reserve) drainReserve(reserve)
   reserve = null
+  expectedWorkspace = null
+}
+
+/**
+ * The bridge's root resolution names the concrete version this session writes
+ * into (`landscapeId/versionId`). A pool bound to ANOTHER one is dropped now
+ * and re-minted.
+ *
+ * The mint response's canonical key is the other way a repoint is observed —
+ * but only when a mint is ASKED for, and a full pool asks for nothing
+ * (`replenishOnce` returns before the fetch when there is no deficit). So a
+ * `current` tab that filled its pool under V1 kept naming V2's new documents
+ * with V1 ids after the default moved; each one then reaches V2 through the
+ * server's displaced scan instead of the bound fast path, and a document the
+ * repoint carries over (a re-created offline diagram) would carry the old
+ * version's name for its whole life.
+ *
+ * Takes before the drop still get the old block: the drop cannot outrun a
+ * synchronous take, only shorten its window.
+ */
+export async function noteMintedIdSupplyWorkspace(canonical: string): Promise<void> {
+  if (!active) return
+  expectedWorkspace = canonical
+  const epoch = sessionEpoch
+  // The boot binding re-reads the LAST session's pool; it is that pool which
+  // may be bound elsewhere, so the comparison waits for it.
+  await bindingReady
+  if (!active || epoch !== sessionEpoch) return
+  if (!reserve || reserve.workspace === canonical) return
+  drainReserve(reserve)
+  reserve = null
+  scheduleReplenish()
 }
 
 /** Back online: reset the backoff and top up immediately (the mint response is
@@ -308,6 +351,7 @@ export const MINT_JOIN_DEADLINE_MS = 2_000
  * caller must not treat a short answer as a reason to abort: falling back to
  * random ids is still the documented behaviour, and refusing to import because
  * the network is down would be a worse failure than the one this prevents.
+ * It rejects only when the reserve's IndexedDB store fails.
  */
 export async function ensureMintedIdCapacity(count: number): Promise<number> {
   if (!active || count <= 0) return capacityNow()
@@ -439,9 +483,23 @@ async function replenishOnce(epoch: number, target: number = POOL_TARGET): Promi
     if (reserve) drainReserve(reserve)
     reserve = createMintedIdReserve(boundStore, canonical)
   }
-  await reserve.deposit(body.ids) // replaces any foreign persisted pool — reserve semantics
-  if (epoch !== sessionEpoch) return
-  if (reserve.available() === 0) await reserve.hydrate()
+  if (expectedWorkspace !== null && canonical !== expectedWorkspace && !bindingMismatchWarned) {
+    // Every take of this session now falls back to a random id (the take-time
+    // check) — say so once instead of letting `takenFallback` be the only
+    // trace (architect lens, 2026-10-31).
+    bindingMismatchWarned = true
+    console.warn(`[mintedIdSupply] the mint named ${canonical}, the session writes into ${expectedWorkspace}: new documents take random ids`)
+  }
+  try {
+    await reserve.deposit(body.ids) // replaces any foreign persisted pool — reserve semantics
+    if (epoch !== sessionEpoch) return
+    if (reserve.available() === 0) await reserve.hydrate()
+  } catch (error) {
+    // Both callers read a rejection as the network's and back off without a
+    // word; a pool this browser cannot write is not that.
+    console.warn('[mintedIdSupply] the minted-id pool could not be written; backing off (random ids once the drawn block runs out)', error)
+    throw error
+  }
   backoffMs = 0
 }
 

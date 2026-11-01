@@ -26,6 +26,7 @@ import {
   ensureMintedIdCapacity,
   MINT_JOIN_DEADLINE_MS,
   MINT_FETCH_TIMEOUT_MS,
+  noteMintedIdSupplyWorkspace,
 } from './mintedIdSupply'
 import { apiFetch } from '../api/http'
 
@@ -185,6 +186,31 @@ describe('minted id supply', () => {
     expect(apiFetchMock.mock.calls.length).toBe(atCap + 1)
   })
 
+  // A pool this browser cannot write (KvStore.update rejects) backs off like
+  // an unreachable server, and says so — both callers' catches are silent.
+  // Mutants: the warn removed; the rethrow removed (no backoff, no retry).
+  it('a pool that cannot be written is reported and backs off like a network failure', async () => {
+    const base = createMemoryKvStore()
+    const full = new DOMException('the disk is full', 'QuotaExceededError')
+    __setWorkspaceKvBaseForTest({ ...base, update: async () => { throw full } })
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    vi.useFakeTimers()
+    apiFetchMock.mockImplementation(respondCanonical('default', 'v-main'))
+
+    startMintedIdSupply(REF)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(apiFetchMock).toHaveBeenCalledTimes(1)
+    expect(warn.mock.calls.some(([message, error]) =>
+      String(message).includes('pool could not be written') && error === full)).toBe(true)
+    expect(mintedIdSupplyStats().available).toBe(0)
+
+    await vi.advanceTimersByTimeAsync(4_999)
+    expect(apiFetchMock).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(apiFetchMock).toHaveBeenCalledTimes(2)
+    warn.mockRestore()
+  })
+
   // The pure-reader rule: 403 = silence for the whole workspace session.
   // Mutant: 403 treated like 503 (backoff-retry) → a second call after the
   // timers advance.
@@ -231,6 +257,48 @@ describe('minted id supply', () => {
     for (let bytes = takeMintedDocumentIdBytes(); bytes; bytes = takeMintedDocumentIdBytes()) {
       expect(markerOf(bytes), 'a v1 id survived the rebind').toBeGreaterThanOrEqual(100)
     }
+  })
+
+  // The other way a repoint is observed. A FULL pool asks for nothing, so no
+  // mint response ever names the new version: without the bridge's note, a
+  // `current` tab keeps naming the new default's documents with old ids.
+  it('a FULL pool bound elsewhere is never re-minted by itself; the root resolution\'s note rebinds it', async () => {
+    const v1Ids = Array.from({ length: POOL_TARGET }, (_v, i) => fakeMintedId(i + 1))
+    await workspaceKvStore().set(RESERVE_KEY, { ids: v1Ids, workspace: 'default/v1' })
+    apiFetchMock.mockImplementation(respondCanonical('default', 'v2', 1000))
+
+    startMintedIdSupply(REF)
+    await vi.waitFor(() => expect(mintedIdSupplyStats().available).toBeGreaterThan(0))
+    // Settle the boot replenish: no deficit, so it never reaches the network.
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(apiFetchMock).not.toHaveBeenCalled()
+    expect(mintedIdSupplyStats().poolWorkspace).toBe('default/v1')
+
+    // Same version: nothing to do.
+    await noteMintedIdSupplyWorkspace('default/v1')
+    expect(apiFetchMock).not.toHaveBeenCalled()
+    expect(takeMintedDocumentIdBytes(), 'the same version still names documents').not.toBeNull()
+
+    // Checked AT THE TAKE: the moment the note is made, before its drop has
+    // run, the old version's ids name nothing (a random id instead).
+    const noted = noteMintedIdSupplyWorkspace('default/v2')
+    expect(takeMintedDocumentIdBytes(), 'a v1 id was handed out after the note').toBeNull()
+    await noted
+    await vi.waitFor(() => expect(mintedIdSupplyStats().poolWorkspace).toBe('default/v2'))
+    await vi.waitFor(() => expect(mintedIdSupplyStats().available).toBeGreaterThan(0))
+    for (let bytes = takeMintedDocumentIdBytes(); bytes; bytes = takeMintedDocumentIdBytes()) {
+      expect(markerOf(bytes), 'a v1 id survived the note').toBeGreaterThanOrEqual(1000)
+    }
+  })
+
+  it('the note is inert outside a session and after a stop', async () => {
+    await noteMintedIdSupplyWorkspace('default/v2')
+    expect(apiFetchMock).not.toHaveBeenCalled()
+    await workspaceKvStore().set(RESERVE_KEY, { ids: [fakeMintedId(1)], workspace: 'default/v1' })
+    startMintedIdSupply(REF)
+    stopMintedIdSupply()
+    await noteMintedIdSupplyWorkspace('default/v2')
+    expect(apiFetchMock).not.toHaveBeenCalled()
   })
 
   // The stopBridge contract, seen from the supply's side: the outgoing
