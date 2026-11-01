@@ -16,6 +16,7 @@ import type { Diagram } from '../../types'
 import {
   deepEqualPlain,
   mergeChangedFields,
+  planCarriedUpsert,
   type PendingEntityIntents,
   type SerializedEntityIntent,
 } from './entityIntents'
@@ -227,6 +228,41 @@ export function planDiagramStubReplay(input: DiagramStubReplayInput): DiagramStu
   for (const intent of input.intents) {
     if (intent.kind !== 'diagram') continue
     const meta = input.currentMetaStubs.get(intent.id)
+    // CARRIED by a repoint into the version `current` names now: conflict-
+    // averse (`planCarriedUpsert`). Unlike an ordinary journaled creation, a
+    // carried one does NOT outrank a tombstone — the new version's tombstone is
+    // someone's later delete there, not a stale edit of ours.
+    if (intent.carried) {
+      // Under a summary window absence proves nothing — the same rule as the
+      // ordinary branch below: a delete or a field patch whose target the
+      // window does not show is re-expressed as a tombstone or stays journaled,
+      // never "satisfied" (QA lens, 2026-10-31: satisfied, it went SENT and was
+      // released — the edit lost). A creation still replays whole, as below.
+      const absenceUnproved = meta === undefined && !input.metasComplete
+      if (intent.op === 'delete') {
+        if (meta !== undefined) plan.replayDeletes.push(intent.id)
+        else if (!absenceUnproved || tombstoned.has(intent.id)) plan.satisfied.push({ id: intent.id, revision: intent.revision })
+        else if (input.canTombstone) plan.replayTombstones.push(intent.id)
+        else plan.remaining += 1
+        continue
+      }
+      if (absenceUnproved && intent.baseline !== undefined && intent.createIfAbsent !== true) {
+        plan.remaining += 1
+        continue
+      }
+      const snapshot = stripUndefined(intent.snapshot) as unknown as Diagram
+      const decision = planCarriedUpsert({
+        snapshot: diagramStubOf(snapshot),
+        baseline: intent.baseline ? diagramStubOf(stripUndefined(intent.baseline)) : undefined,
+        current: meta,
+        tombstoned: tombstoned.has(intent.id),
+        createIfAbsent: intent.createIfAbsent === true,
+      })
+      if (!decision.write) plan.satisfied.push({ id: intent.id, revision: intent.revision })
+      else if (decision.created) plan.replayCreates.push(snapshot)
+      else plan.replayStubPatches.push({ id: intent.id, fields: decision.value })
+      continue
+    }
     // DELETE-WINS, checked before anything else. A rename patch replayed over a
     // tombstoned target would re-place its registry meta — a permanent
     // resurrection of a diagram someone deliberately deleted.

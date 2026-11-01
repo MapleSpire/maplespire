@@ -88,8 +88,9 @@ export const WORKSPACE_KEYABLE_JOBS: Readonly<Record<MaintenanceJobName, boolean
  *     recorded nowhere;
  *   - every replica must agree on the workspace key text, and `index.ts` falls
  *     back to `DEFAULT_WORKSPACE_KEY` (`versionId: 'current'`) when
- *     `canonicalWorkspaceKey` returns null — two replicas disagreeing there would
- *     key differently and not exclude each other.
+ *     `canonicalWorkspaceKey` returns null (a default landscape with no default
+ *     version; a failed read throws and ends boot instead) — two replicas
+ *     disagreeing there would key differently and not exclude each other.
  */
 export function workspaceKeyedMaintenanceEnabled(
   env: { MAINTENANCE_WORKSPACE_KEYED?: string } = process.env,

@@ -206,6 +206,24 @@ describe('placeMergeWrite — the rotation witness', () => {
     await expect(placeMergeWrite(h.options)).resolves.toBeNull()
     expect(h.rotated).toEqual([])
   })
+
+  it('a failed root read ends the placement: it is thrown, never read as "no root"', async () => {
+    // `resolveRootUrl` throws for an explicit key on a failed read. Read as
+    // "no root", the parent would skip its repair and the merge would go on;
+    // thrown, it ends in the handler's catch before `applyMerge`.
+    const failure = new Error('connection terminated')
+    const h = harness()
+    const repaired: string[] = []
+    await expect(placeMergeWrite({
+      ...h.options,
+      resolveRootUrl: async (key) => {
+        if (key.versionId === PARENT) throw failure
+        return `automerge:root-${key.versionId}`
+      },
+      ensureCanonicalRoot: async (key) => { repaired.push(key.versionId); return 'automerge:whatever' },
+    })).rejects.toBe(failure)
+    expect(repaired, 'only the draft half had been reached').toEqual([DRAFT])
+  })
 })
 
 describe('placeMergeWrite — the cross-partition witness', () => {

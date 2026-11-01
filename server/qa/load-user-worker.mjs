@@ -17,12 +17,12 @@ import { parentPort, threadId, workerData } from 'node:worker_threads'
 import { setTimeout as delay } from 'node:timers/promises'
 import * as A from '@automerge/automerge'
 import { newRepo, makeObject, changeCount } from './lib.mjs'
-import { appendOverlayBatchId, loadRoundValue, objectMap, planWriters, resolveLoadHandle } from './loadUsersCore.mjs'
+import { adoptPersistentWriterActor, appendOverlayBatchId, loadRoundValue, objectMap, planWriters, resolveLoadHandle } from './loadUsersCore.mjs'
 import { projectLoadObjects } from './loadUserSnapshots.mjs'
 
 assert.ok(parentPort, 'load user must run in an owned Worker')
 const { cohortId, episodeId, user, config } = workerData
-const { rootUrl, ids, totalUsers, writers, objectAssignment, rounds, runBatchPrefix } = config
+const { rootUrl, ids, totalUsers, writers, objectAssignment, rounds, runBatchPrefix, writerActors = 'fresh' } = config
 const plan = planWriters({ totalUsers, writers, objectAssignment, ids })
 loadRoundValue(episodeId, rounds - 1)
 assert.ok(Number.isSafeInteger(user) && user >= 0 && user < totalUsers)
@@ -88,6 +88,7 @@ async function dispatch(operation, context) {
     const resolved = await pending
     handle = resolved.handle
     await handle.whenReady()
+    if (writerActors === 'persistent' && plan.isWriter(user)) adoptPersistentWriterActor(handle, rootUrl, user)
     return { documentReady: true, unavailableRetries: resolved.unavailableRetries,
       peerId: repo.peerId, actorId: A.getActorId(handle.doc()), ...identity }
   }

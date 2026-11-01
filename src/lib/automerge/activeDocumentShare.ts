@@ -27,18 +27,37 @@ export interface ActiveDocumentShareSnapshot {
  * `access` deliberately remains open. Callers add the requested document to
  * this allow-list immediately before `repo.find()`; the requested doc can then
  * synchronize without replaying every cached document from other workspaces.
+ *
+ * The one exception is a WITHHELD document, which neither announces nor
+ * answers: a document holding local changes the server must not receive on
+ * this socket. After a repoint, a `current` tab still holds the old version's
+ * documents with its offline edits in them, and the socket is bound to the new
+ * version. Measured 2026-10-31 (AUTH off): the reload's resume sent them on
+ * that socket 30 ms after the handshake and the server took them — the old
+ * version's registry gained the offline diagram while its document was claimed
+ * by the new one. An open `access` would still let the server's own announce
+ * of a core document pull the same changes out, so withholding closes both
+ * directions.
  */
 export class ActiveDocumentShare {
   private session: string | null = null
   private readonly leases = new Map<DocumentId, Set<string>>()
+  private readonly withheld = new Set<DocumentId>()
+  /** The session the withholds were made under. They outlive `endSession`:
+   * a FOLLOW stops and restarts the SAME session while its socket stays up,
+   * and the server announces its root's core documents — registry shards
+   * included — to every peer, so a gap in the withhold is a gap the old
+   * version's offline edits leave through. */
+  private withheldSession: string | null = null
   private notify: ((documentIds: readonly DocumentId[]) => void) | null = null
   private notifyQueued = false
   private readonly changedDocuments = new Set<DocumentId>()
 
   readonly shareConfig: NonNullable<RepoConfig['shareConfig']> = {
     announce: async (_peerId, documentId) =>
-      documentId !== undefined && this.leases.has(documentId),
-    access: async () => true,
+      documentId !== undefined && this.leases.has(documentId) && !this.withheld.has(documentId),
+    access: async (_peerId, documentId) =>
+      documentId === undefined || !this.withheld.has(documentId),
   }
 
   bindLeaseChanged(notify: (documentIds: readonly DocumentId[]) => void): void {
@@ -47,12 +66,14 @@ export class ActiveDocumentShare {
 
   beginSession(session: string): void {
     if (this.session === session) return
-    this.clear()
+    this.clearLeases()
+    if (this.withheldSession !== session) this.clearWithheld()
     this.session = session
   }
 
+  /** Leases end here; withholds do not (see `withheldSession`). */
   endSession(): void {
-    this.clear()
+    this.clearLeases()
     this.session = null
   }
 
@@ -98,13 +119,51 @@ export class ActiveDocumentShare {
   }
 
   isPinned(documentId: DocumentId): boolean {
-    return this.leases.has(documentId)
+    return this.leases.has(documentId) && !this.withheld.has(documentId)
   }
 
-  private clear(): void {
+  /**
+   * Keep these documents off the network for this session, leases or not. It
+   * takes effect for the next share evaluation, which is why a caller that
+   * must beat a handshake calls it synchronously, before the peer exists.
+   * Ends with {@link release}, or when ANOTHER session begins (a switch to
+   * another workspace decides afresh) — not with `endSession`.
+   */
+  withhold(documentIds: Iterable<DocumentId>): void {
+    if (this.session) this.withheldSession = this.session
+    for (const documentId of documentIds) {
+      if (this.withheld.has(documentId)) continue
+      this.withheld.add(documentId)
+      this.changed(documentId)
+    }
+  }
+
+  /** Lift a {@link withhold}. The change notification is the lift's
+   * re-evaluation: a deny with no paired re-evaluation leaves the document
+   * withheld until something unrelated happens to re-ask. */
+  release(documentIds: Iterable<DocumentId>): void {
+    for (const documentId of documentIds) {
+      if (!this.withheld.delete(documentId)) continue
+      this.changed(documentId)
+    }
+  }
+
+  isWithheld(documentId: DocumentId): boolean {
+    return this.withheld.has(documentId)
+  }
+
+  private clearLeases(): void {
     if (this.leases.size === 0) return
     const released = [...this.leases.keys()]
     this.leases.clear()
+    for (const documentId of released) this.changed(documentId)
+  }
+
+  private clearWithheld(): void {
+    this.withheldSession = null
+    if (this.withheld.size === 0) return
+    const released = [...this.withheld]
+    this.withheld.clear()
     for (const documentId of released) this.changed(documentId)
   }
 

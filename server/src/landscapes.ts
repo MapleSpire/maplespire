@@ -236,6 +236,13 @@ export async function ensureDefaultLandscape(primaryRootUrl: string): Promise<vo
   }
 }
 
+/** A ref is EXPLICIT when it carries either half. With neither it is the legacy
+ * no-params call — the default landscape's default version — and only that call
+ * resolves with a bootable fallback. */
+export function isExplicitWorkspaceRef(ref: { landscapeId?: string; versionId?: string }): boolean {
+  return ref.landscapeId !== undefined || ref.versionId !== undefined
+}
+
 /**
  * Resolve a (landscapeId, versionId) ref to its Automerge root URL.
  *
@@ -246,16 +253,23 @@ export async function ensureDefaultLandscape(primaryRootUrl: string): Promise<vo
  * exactly the "my duplicate/draft shows the default landscape" failure mode — a
  * dangling explicit ref must fail LOUD (the client's bridge already has a
  * fallback-to-default path WITH a user-visible warning for that).
+ *
+ * For the same reason a database error THROWS for an explicit ref: the fallback
+ * is the DEFAULT landscape's primary root, and every explicit caller acts on the
+ * workspace it named — discloses it, projects it, compacts it, or writes to it.
  */
 export async function resolveRootUrl(
   landscapeId: string | undefined,
   versionId: string | undefined,
   fallbackRootUrl: string
 ): Promise<string | null> {
-  const explicit = landscapeId !== undefined || versionId !== undefined
+  const explicit = isExplicitWorkspaceRef({ landscapeId, versionId })
   const miss = explicit ? null : fallbackRootUrl
   try {
-    const lid = landscapeId || DEFAULT_LANDSCAPE_ID
+    // `??`, not `||`: the landscape id is read as `canonicalWorkspaceKey`
+    // reads it, so `?landscapeId=` names the landscape '' on both — never a
+    // check on one landscape and a root of the default one.
+    const lid = landscapeId ?? DEFAULT_LANDSCAPE_ID
     const { rows: lrows } = await pool.query<{ default_version_id: string | null }>(
       'SELECT default_version_id FROM landscapes WHERE id = $1',
       [lid]
@@ -269,11 +283,123 @@ export async function resolveRootUrl(
     )
     return vrows[0]?.root_url ?? miss
   } catch (err) {
-    // A DB error (not a miss) still returns something bootable — the boot path
-    // must never break on infrastructure hiccups.
+    if (explicit) throw err
+    // A DB error (not a miss) on the legacy call still returns something
+    // bootable — the default workspace's boot must never break on an
+    // infrastructure hiccup.
     console.error('resolveRootUrl error:', err)
     return fallbackRootUrl
   }
+}
+
+/** The root url of one CONCRETE version, or null when there is no such row.
+ * Throws on a database error: unlike `resolveRootUrl`, it has no bootable
+ * fallback, because its caller reports the key beside the url. */
+export async function rootUrlOfVersion(key: { landscapeId: string; versionId: string }): Promise<string | null> {
+  const { rows } = await pool.query<{ root_url: string }>(
+    'SELECT root_url FROM versions WHERE id = $1 AND landscape_id = $2',
+    [key.versionId, key.landscapeId],
+  )
+  return rows[0]?.root_url ?? null
+}
+
+type CanonicalKey = { landscapeId: string; versionId: string }
+
+export type WorkspaceRootAnswer =
+  | { kind: 'forbidden' }
+  | {
+      kind: 'root'
+      url: string | null
+      /** The canonical key the url was resolved FROM, or null when it was not. */
+      key: CanonicalKey | null
+    }
+
+/**
+ * Everything `/api/automerge/root` decides before it discloses a root url: the
+ * canonical key, the access check on it, the url, and the key it may report
+ * beside the url. A client records that pair as the workspace its documents
+ * belong to (the durability witness asks the server about exactly that
+ * version), so the key is reported ONLY beside a url resolved FROM it.
+ *
+ * Resolving the ref a second time would read `default_version_id` again: a
+ * set-default landing between the access check and that read pairs V1's key
+ * with V2's root.
+ *
+ * Every ref is answered only from the canonical key its access was checked
+ * on — a missing version row is a miss (404), a failed read throws (the
+ * route's retryable 503) — with ONE exception, the bootable fallback: the
+ * no-params legacy call while access is not enforced (`accessEnforced`, see
+ * `workspaceAccessEnforced`). There a failed canonicalisation, a missing
+ * version row or a failed root read falls back to the legacy resolution,
+ * beside no key. No check ran on that root, which is why it is served only
+ * where no check could have refused it.
+ */
+export async function resolveWorkspaceRoot(
+  ref: { landscapeId?: string; versionId?: string },
+  fallbackRootUrl: string,
+  deps: {
+    canonicalize: (ref: CanonicalKey) => Promise<CanonicalKey | null>
+    mayRead: (key: CanonicalKey) => Promise<boolean>
+    accessEnforced: boolean
+    urlOfVersion?: (key: CanonicalKey) => Promise<string | null>
+    legacy?: () => Promise<string | null>
+  },
+): Promise<WorkspaceRootAnswer> {
+  const urlOfVersion = deps.urlOfVersion ?? rootUrlOfVersion
+  const legacy = deps.legacy ?? (() => resolveRootUrl(undefined, undefined, fallbackRootUrl))
+  const bootable = !isExplicitWorkspaceRef(ref) && !deps.accessEnforced
+  let canonical: CanonicalKey | null
+  try {
+    canonical = await deps.canonicalize({
+      landscapeId: ref.landscapeId ?? DEFAULT_LANDSCAPE_ID,
+      versionId: ref.versionId ?? 'current',
+    })
+  } catch (err) {
+    if (!bootable) throw err
+    console.error('resolveWorkspaceRoot: canonicalisation failed; serving the bootable fallback', err)
+    return { kind: 'root', url: await legacy(), key: null }
+  }
+  if (canonical && !(await deps.mayRead(canonical))) return { kind: 'forbidden' }
+  if (canonical) {
+    const key = { landscapeId: canonical.landscapeId, versionId: canonical.versionId }
+    try {
+      const url = await urlOfVersion(key)
+      if (url) return { kind: 'root', url, key }
+    } catch (err) {
+      if (!bootable) throw err
+      console.error('resolveWorkspaceRoot: version root lookup failed; resolving without a key', err)
+    }
+  }
+  return { kind: 'root', url: bootable ? await legacy() : null, key: null }
+}
+
+/** A workspace a request may read. Access was checked on `key`, the CANONICAL
+ * key (`current` resolved), and `rootUrl` resolves that same key — never the
+ * request's ref a second time, which a set-default in between would move to
+ * another version, and never the primary root on a failed read (it throws). */
+export type ReadableWorkspace =
+  | { kind: 'readable'; key: CanonicalKey; rootUrl: () => Promise<string | null> }
+  | { kind: 'forbidden' }
+  | { kind: 'unknown' }
+
+/** Canonicalise `ref`, check read access on the canonical key, and bind the
+ * root lookup to it. `unknown` is a ref that canonicalises to nothing, and no
+ * access check runs on it; a canonicalisation that could not READ the registry
+ * throws (`canonicalWorkspaceKey`), so it never lands here. */
+export async function readableWorkspace(
+  ref: { landscapeId: string; versionId: string },
+  deps: {
+    canonicalize: (ref: { landscapeId: string; versionId: string }) => Promise<{ landscapeId: string; versionId: string } | null>
+    mayRead: (key: { landscapeId: string; versionId: string }) => Promise<boolean>
+    urlOfVersion?: (key: { landscapeId: string; versionId: string }) => Promise<string | null>
+  },
+): Promise<ReadableWorkspace> {
+  const canonical = await deps.canonicalize(ref)
+  if (!canonical) return { kind: 'unknown' }
+  if (!(await deps.mayRead(canonical))) return { kind: 'forbidden' }
+  const key = { landscapeId: canonical.landscapeId, versionId: canonical.versionId }
+  const urlOfVersion = deps.urlOfVersion ?? rootUrlOfVersion
+  return { kind: 'readable', key, rootUrl: () => urlOfVersion(key) }
 }
 
 /** List landscapes — ALL of them for legacy/AUTH=off callers, or one org's

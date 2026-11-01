@@ -22,12 +22,15 @@ import bigBank from '../structurizr/fixtures/big-bank-plc.dsl?raw'
 import grouped from '../structurizr/fixtures/grouped.dsl?raw'
 import noViews from '../structurizr/fixtures/no-views.dsl?raw'
 
-// Guarded generator: emits SVG previews of the auto-laid-out diagrams into
-// `preview/` so the layout can be reviewed visually. Run with:
-//   GEN_PREVIEW=1 npx vitest run src/lib/layout/genPreview.test.ts
+// Developer tool, NOT a test: emits SVG previews of the auto-laid-out diagrams
+// into `preview/` (gitignored) so a layout change can be reviewed by eye. It
+// asserts nothing, so it lives outside the test suite (`*.tool.ts` matches no
+// test glob) instead of skipping inside it. Run with:
+//   npm run gen:layout-preview
+// (vitest only as the runner: the fixtures are `?raw` Vite imports.)
 const FIXTURES: Record<string, string> = { 'big-bank-plc': bigBank, grouped, 'no-views': noViews }
 
-describe.runIf(process.env.GEN_PREVIEW === '1')('generate SVG previews', () => {
+describe('generate SVG previews', () => {
   it('writes one SVG per generated diagram', async () => {
     const outDir = resolve(process.cwd(), 'preview')
     mkdirSync(outDir, { recursive: true })

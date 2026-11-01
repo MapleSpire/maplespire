@@ -27,8 +27,10 @@ import {
  *
  * Each is a bounded JSON contract the owner re-validates: the landing cell
  * re-serialises `req.body` and the owning cell's handler applies its own limits
- * — `durability-witness` slices to 500 ids of 256 characters, the others filter
- * to strings. That is what makes rebuilding safe here rather than a general
+ * — `durability-witness` slices to 500 ids of 256 characters, `spotlight`
+ * refuses anything `parseSpotlightRequest` does not bound (query 256
+ * characters, vocabulary 1 000 / 5 000 pairs of 256), the others filter to
+ * strings. That is what makes rebuilding safe here rather than a general
  * licence: `express.json` has already consumed the inbound stream by the time
  * this proxy runs, so a POST that is NOT in this set must never be forwarded
  * with a stale `content-length` describing a body nobody will send.
@@ -43,6 +45,7 @@ export const REBUILT_JSON_BODY_PATHS = new Set([
   '/api/automerge/durable-heads',
   '/api/model/durability-witness',
   '/api/model/related-diagram-object-ids',
+  '/api/model/spotlight',
 ])
 
 /**

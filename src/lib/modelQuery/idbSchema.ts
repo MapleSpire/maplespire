@@ -286,11 +286,22 @@ export function requestResult<T>(request: IDBRequest<T>): Promise<T> {
   })
 }
 
+/**
+ * Settles on the transaction's outcome: `complete` or `abort`, nothing else.
+ * A failed request aborts its transaction with that request's error, so
+ * `abort` carries the cause. Rejecting on the request's `error` event instead
+ * lost it: `transaction.error` is still null during that dispatch, so callers
+ * got "IndexedDB transaction failed" for a QuotaExceededError (measured on
+ * fake-indexeddb, the 'request-error' cases of
+ * src/lib/tags/api.storeFailure.test.ts); and the pending requests of an
+ * explicit `abort()` carry an AbortError, which `stopsFallback` (paged.ts)
+ * reads as a cancellation. An explicit `abort()` leaves `transaction.error`
+ * null.
+ */
 export function transactionDone(transaction: IDBTransaction): Promise<void> {
   return new Promise<void>((resolve, reject) => {
     transaction.oncomplete = () => resolve()
     transaction.onabort = () => reject(transaction.error ?? new Error('IndexedDB transaction aborted'))
-    transaction.onerror = () => reject(transaction.error ?? new Error('IndexedDB transaction failed'))
   })
 }
 

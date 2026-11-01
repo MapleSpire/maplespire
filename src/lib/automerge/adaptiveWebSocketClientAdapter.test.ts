@@ -13,10 +13,15 @@
 // GNU Affero General Public License for more details.
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { WORKSPACE_BINDING_TYPE, installWorkspaceBindingHandler } from './workspaceBinding'
+import {
+  WORKSPACE_BINDING_TYPE,
+  __resetWorkspaceBindingFramesForTest,
+  installWorkspaceBindingHandler,
+} from './workspaceBinding'
 import { cbor, type PeerId } from '@automerge/automerge-repo/slim'
 import { reconnectDelayMs, setTransportCloseObserver } from './adaptiveWebSocketClientAdapter'
 import { AdaptiveWebSocketClientAdapter } from './adaptiveWebSocketClientAdapter'
+import { WorkspaceNetworkRouter } from './networkRoute'
 
 class DelayedHandshakeWebSocket {
   static readonly CONNECTING = 0
@@ -456,6 +461,107 @@ describe('the workspace-binding frame', () => {
       expect(seen).toEqual(['V1', 'V2'])
     } finally {
       uninstall()
+    }
+  })
+
+  // The frame arrives once per connect, and the bridge installs its handler at
+  // the END of a boot: a boot's socket binds before that. Kept, keyed to the
+  // adapter that produced it, and retired with that adapter's socket.
+  it('keeps a frame that came before any handler and hands it to the first one installed', () => {
+    vi.stubGlobal('WebSocket', DelayedHandshakeWebSocket)
+    try {
+      const adapter = new AdaptiveWebSocketClientAdapter('ws://localhost/automerge')
+      adapter.connect('peer-a' as PeerId, {})
+      const socket = DelayedHandshakeWebSocket.instances[0]!
+      socket.open()
+      bindingFrame(socket, 'L1', 'V2')
+
+      const seen: string[] = []
+      const uninstall = installWorkspaceBindingHandler((b) => { seen.push(b.versionId) })
+      uninstall()
+      expect(seen).toEqual(['V2'])
+    } finally {
+      __resetWorkspaceBindingFramesForTest()
+    }
+  })
+
+  it('retires a kept frame when its socket closes — the reconnect sends its own', async () => {
+    vi.stubGlobal('WebSocket', DelayedHandshakeWebSocket)
+    vi.useFakeTimers()
+    try {
+      const adapter = new AdaptiveWebSocketClientAdapter('ws://localhost/automerge')
+      adapter.connect('peer-a' as PeerId, {})
+      const first = DelayedHandshakeWebSocket.instances[0]!
+      first.open()
+      bindingFrame(first, 'L1', 'V1')
+      first.closeWith(1006)
+
+      const seen: string[] = []
+      const uninstall = installWorkspaceBindingHandler((b) => { seen.push(b.versionId) })
+      expect(seen, 'a closed socket\'s frame describes nothing that exists').toEqual([])
+      uninstall()
+
+      await vi.advanceTimersByTimeAsync(5_000)
+      const second = DelayedHandshakeWebSocket.instances[1]!
+      second.open()
+      bindingFrame(second, 'L1', 'V2')
+      installWorkspaceBindingHandler((b) => { seen.push(b.versionId) })
+      expect(seen, 'the control: the live socket\'s frame is kept').toEqual(['V2'])
+    } finally {
+      __resetWorkspaceBindingFramesForTest()
+    }
+  })
+
+  // Ownership drains close with 1012/1013, an orderly server stop with 1001:
+  // the frame describes the closed socket whatever the code.
+  it.each([1000, 1001, 1011, 1012, 1013, 4000])('retires a kept frame whatever the close code (%i)', (code) => {
+    vi.stubGlobal('WebSocket', DelayedHandshakeWebSocket)
+    vi.useFakeTimers()
+    const adapter = new AdaptiveWebSocketClientAdapter('ws://localhost/automerge')
+    try {
+      adapter.connect('peer-a' as PeerId, {})
+      const socket = DelayedHandshakeWebSocket.instances[0]!
+      socket.open()
+      bindingFrame(socket, 'L1', 'V1')
+      socket.closeWith(code)
+      const seen: string[] = []
+      installWorkspaceBindingHandler((b) => { seen.push(b.versionId) })()
+      expect(seen).toEqual([])
+    } finally {
+      adapter.disconnect()
+      __resetWorkspaceBindingFramesForTest()
+    }
+  })
+
+  it('retires a kept frame when the REAL router replaces its adapter', async () => {
+    // Real router, real adapters, and a network that disconnects what it
+    // removes, as automerge-repo's NetworkSubsystem.removeNetworkAdapter does.
+    vi.stubGlobal('WebSocket', DelayedHandshakeWebSocket)
+    try {
+      const network = {
+        addNetworkAdapter: (adapter: AdaptiveWebSocketClientAdapter) => adapter.connect('peer-a' as PeerId, {}),
+        removeNetworkAdapter: (adapter: AdaptiveWebSocketClientAdapter) => adapter.disconnect(),
+      }
+      const router = new WorkspaceNetworkRouter(network, (url) => new AdaptiveWebSocketClientAdapter(url), 'ws://localhost/automerge')
+      const ref = { landscapeId: 'L1', versionId: 'current' }
+      await router.route(ref)
+      const held = DelayedHandshakeWebSocket.instances[0]!
+      held.open()
+      bindingFrame(held, 'L1', 'V1')
+      await router.route(ref, true)
+
+      const seen: string[] = []
+      const uninstall = installWorkspaceBindingHandler((b) => { seen.push(b.versionId) })
+      expect(seen).toEqual([])
+      uninstall()
+
+      const next = DelayedHandshakeWebSocket.instances[1]!
+      next.open()
+      bindingFrame(next, 'L1', 'V2')
+      installWorkspaceBindingHandler((b) => { seen.push(b.versionId) })
+      expect(seen, 'the control: the new adapter\'s frame is kept').toEqual(['V2'])
+    } finally {
+      __resetWorkspaceBindingFramesForTest()
     }
   })
 

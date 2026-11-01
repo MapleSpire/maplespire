@@ -15,6 +15,7 @@
 import type { TagSnapshot } from '../../types'
 import { registerTagCanonicalIds } from './canonicalIds'
 import { accountDatabaseName } from '../auth/accountNamespace'
+import { transactionDone } from '../modelQuery/idbSchema'
 
 export type CatalogTagLifecycle = 'active' | 'archived' | 'merged'
 export type CatalogTagGroupLifecycle = 'active' | 'archived'
@@ -302,6 +303,30 @@ function openCache(): Promise<IDBDatabase> {
   })
 }
 
+/**
+ * One readwrite transaction on `storeName`. It settles on IndexedDB's verdict
+ * (`transactionDone`): a transaction that aborts with nothing pending, as a
+ * commit-time QuotaExceededError does, fires `abort` alone and rejects here
+ * instead of leaving the caller waiting. A `write` that throws aborts the
+ * transaction rather than committing the requests it had already queued, and
+ * the connection is closed on every path.
+ */
+async function writeStore(storeName: string, write: (store: IDBObjectStore) => void): Promise<void> {
+  const db = await openCache()
+  try {
+    const transaction = db.transaction(storeName, 'readwrite')
+    try {
+      write(transaction.objectStore(storeName))
+    } catch (error) {
+      transaction.abort()
+      throw error
+    }
+    await transactionDone(transaction)
+  } finally {
+    db.close()
+  }
+}
+
 async function readOutbox(orgId?: string): Promise<OutboxEntry[]> {
   if (typeof indexedDB === 'undefined') {
     return [...memoryOutbox.values()].filter((entry) => !orgId || entry.orgId === orgId)
@@ -323,20 +348,27 @@ async function readOutbox(orgId?: string): Promise<OutboxEntry[]> {
   }
 }
 
-async function putOutbox(entry: OutboxEntry): Promise<void> {
+/**
+ * `queued`: a new command, nothing of it stored yet. `attempted`: the state a
+ * replay attempt left on a command readOutbox read from IndexedDB, whose
+ * earlier copy is still stored there. The two fail with different outcomes.
+ */
+async function putOutbox(entry: OutboxEntry, origin: 'queued' | 'attempted'): Promise<void> {
   memoryOutbox.set(entry.id, entry)
   if (typeof indexedDB !== 'undefined') {
     try {
-      const db = await openCache()
-      await new Promise<void>((resolve, reject) => {
-        const transaction = db.transaction(OUTBOX_STORE_NAME, 'readwrite')
-        transaction.objectStore(OUTBOX_STORE_NAME).put(entry)
-        transaction.oncomplete = () => resolve()
-        transaction.onerror = () => reject(transaction.error)
-      })
-      db.close()
-    } catch {
-      // Memory fallback keeps creation usable in private/restricted browsers.
+      await writeStore(OUTBOX_STORE_NAME, (store) => store.put(entry))
+    } catch (error) {
+      // readOutbox serves memoryOutbox only while IndexedDB cannot be read at
+      // all (private/restricted browsers); a readable store is served instead.
+      if (origin === 'queued') {
+        // The store does not hold this command, so no flush replays it.
+        console.warn("[tag-catalog] could not save an offline Tag catalog command on this device; it is held in this tab's memory only and may never reach the server", error)
+      } else {
+        // The store's copy is the one served, so a command the server refused
+        // for good goes back to its earlier state and is replayed again.
+        console.warn('[tag-catalog] could not record a replay attempt of a Tag catalog command on this device; its stored copy keeps the state it had before the attempt', error)
+      }
     }
   }
   notifyOutboxChanged(entry.orgId)
@@ -346,16 +378,9 @@ async function deleteOutbox(id: string, orgId: string): Promise<void> {
   memoryOutbox.delete(id)
   if (typeof indexedDB !== 'undefined') {
     try {
-      const db = await openCache()
-      await new Promise<void>((resolve, reject) => {
-        const transaction = db.transaction(OUTBOX_STORE_NAME, 'readwrite')
-        transaction.objectStore(OUTBOX_STORE_NAME).delete(id)
-        transaction.oncomplete = () => resolve()
-        transaction.onerror = () => reject(transaction.error)
-      })
-      db.close()
-    } catch {
-      // Memory state still prevents a second replay in this session.
+      await writeStore(OUTBOX_STORE_NAME, (store) => store.delete(id))
+    } catch (error) {
+      console.warn('[tag-catalog] could not remove a Tag catalog command from the outbox on this device; while the store is readable, the next outbox read restores it and a flush sends it again unless it needs attention', error)
     }
   }
   notifyOutboxChanged(orgId)
@@ -386,16 +411,10 @@ async function putOperationEvent(event: OperationEvent): Promise<void> {
   memoryOperationEvents.set(event.id, event)
   if (typeof indexedDB === 'undefined') return
   try {
-    const db = await openCache()
-    await new Promise<void>((resolve, reject) => {
-      const transaction = db.transaction(OPERATION_STORE_NAME, 'readwrite')
-      transaction.objectStore(OPERATION_STORE_NAME).put(event)
-      transaction.oncomplete = () => resolve()
-      transaction.onerror = () => reject(transaction.error)
-    })
-    db.close()
-  } catch {
+    await writeStore(OPERATION_STORE_NAME, (store) => store.put(event))
+  } catch (error) {
     // Telemetry is best-effort and must never block governed catalog work.
+    console.warn('[tag-catalog] could not save an outbox telemetry event on this device; it may never be reported', error)
   }
 }
 
@@ -403,17 +422,12 @@ async function deleteOperationEvents(ids: readonly string[]): Promise<void> {
   for (const id of ids) memoryOperationEvents.delete(id)
   if (typeof indexedDB === 'undefined' || ids.length === 0) return
   try {
-    const db = await openCache()
-    await new Promise<void>((resolve, reject) => {
-      const transaction = db.transaction(OPERATION_STORE_NAME, 'readwrite')
-      const store = transaction.objectStore(OPERATION_STORE_NAME)
+    await writeStore(OPERATION_STORE_NAME, (store) => {
       for (const id of ids) store.delete(id)
-      transaction.oncomplete = () => resolve()
-      transaction.onerror = () => reject(transaction.error)
     })
-    db.close()
-  } catch {
+  } catch (error) {
     // A duplicate resend is safe because the server event ID is idempotent.
+    console.warn('[tag-catalog] could not remove sent outbox telemetry events from this device; while the store is readable, they will be sent again', error)
   }
 }
 
@@ -468,16 +482,10 @@ async function mergeCache(
   memoryCache.set(orgId, next)
   if (typeof indexedDB === 'undefined') return
   try {
-    const db = await openCache()
-    await new Promise<void>((resolve, reject) => {
-      const transaction = db.transaction(STORE_NAME, 'readwrite')
-      transaction.objectStore(STORE_NAME).put(next)
-      transaction.oncomplete = () => resolve()
-      transaction.onerror = () => reject(transaction.error)
-    })
-    db.close()
-  } catch {
+    await writeStore(STORE_NAME, (store) => store.put(next))
+  } catch (error) {
     // A best-effort offline cache never turns a successful request into a failure.
+    console.warn('[tag-catalog] could not save Tag catalog results for offline use', error)
   }
 }
 
@@ -493,16 +501,11 @@ async function removeOptimisticCacheEntry(entry: OutboxEntry): Promise<void> {
   memoryCache.set(entry.orgId, next)
   if (typeof indexedDB === 'undefined') return
   try {
-    const db = await openCache()
-    await new Promise<void>((resolve, reject) => {
-      const transaction = db.transaction(STORE_NAME, 'readwrite')
-      transaction.objectStore(STORE_NAME).put(next)
-      transaction.oncomplete = () => resolve()
-      transaction.onerror = () => reject(transaction.error)
-    })
-    db.close()
-  } catch {
-    // Removing a local optimistic row remains effective for this session.
+    await writeStore(STORE_NAME, (store) => store.put(next))
+  } catch (error) {
+    // Removing a local optimistic row remains effective for this session:
+    // readCache answers from memoryCache first.
+    console.warn('[tag-catalog] could not remove a local draft from the offline cache on this device; it can reappear offline after a reload', error)
   }
 }
 
@@ -824,7 +827,7 @@ async function replayOutboxEntry(entry: OutboxEntry): Promise<boolean> {
       lastAttemptAt: Date.now(),
       lastError: failure.error,
     }
-    await putOutbox(failedEntry)
+    await putOutbox(failedEntry, 'attempted')
     if (failure.state === 'attention' && (
       (entry.state ?? 'pending') !== 'attention' || entry.lastError?.code !== failure.error.code
     )) {
@@ -926,18 +929,15 @@ export async function reconcileTagGroupOutboxEntry(
   memoryOutbox.delete(entry.id)
   if (typeof indexedDB !== 'undefined') {
     try {
-      const db = await openCache()
-      await new Promise<void>((resolve, reject) => {
-        const transaction = db.transaction(OUTBOX_STORE_NAME, 'readwrite')
-        const store = transaction.objectStore(OUTBOX_STORE_NAME)
+      await writeStore(OUTBOX_STORE_NAME, (store) => {
         for (const candidate of rewritten) store.put(candidate)
         store.delete(entry.id)
-        transaction.oncomplete = () => resolve()
-        transaction.onerror = () => reject(transaction.error)
       })
-      db.close()
-    } catch {
-      // The server-side audit is durable; memory state keeps this session safe.
+    } catch (error) {
+      // The server-side audit is durable. The local commands are not: the
+      // transaction rolled back whole, and readOutbox serves IndexedDB while
+      // it is readable.
+      console.warn('[tag-catalog] could not save the Tag Group mapping on this device; while the store is readable, the next outbox read restores the unmapped local Group and its Tags, and a flush replays those still pending', error)
     }
   }
   await removeOptimisticCacheEntry(entry)
@@ -1018,7 +1018,7 @@ export async function createCatalogTagGroup(
     const outboxEntry: OutboxEntry = {
       id: idempotencyKey, orgId, kind: 'group', clientId, input: body, optimistic, createdAt: Date.now(),
     }
-    await putOutbox(outboxEntry)
+    await putOutbox(outboxEntry, 'queued')
     await recordOutboxOperation(outboxEntry, 'queued')
     await mergeCache(orgId, { groups: [optimistic] })
     installOnlineOutboxFlush()
@@ -1112,7 +1112,7 @@ export async function createCatalogTag(
     const outboxEntry: OutboxEntry = {
       id: idempotencyKey, orgId, kind: 'tag', clientId, input: body, optimistic, createdAt: Date.now(),
     }
-    await putOutbox(outboxEntry)
+    await putOutbox(outboxEntry, 'queued')
     await recordOutboxOperation(outboxEntry, 'queued')
     await mergeCache(orgId, { tags: [optimistic] })
     installOnlineOutboxFlush()

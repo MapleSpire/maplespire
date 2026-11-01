@@ -49,13 +49,18 @@ import {
   stopMintedIdSupply,
   notifyMintedIdSupplyOnline,
   notifyMintedIdSupplyHostReachable,
+  noteMintedIdSupplyWorkspace,
+  ensureMintedIdCapacity,
 } from './mintedIdSupply'
 import { CURRENT_VERSION_ID, DEFAULT_WORKSPACE_REF, currentWorkspaceRef, isDefaultWorkspaceRef, workspaceRefEquals, workspaceRefKey, type WorkspaceRef } from './workspace'
 import {
+  adoptBindingAsBasis,
+  documentsWorkspaceFor,
   forgetResolvedWorkspace,
   holdWorkspaceOn,
+  installSessionRootUrlSource,
   installWorkspaceBindingHandler,
-  rememberResolvedWorkspace,
+  redeliverWorkspaceBinding,
   resolvedWorkspaceFor,
   type WorkspaceBinding,
 } from './workspaceBinding'
@@ -87,7 +92,7 @@ import {
   type DeferredReference,
 } from './deferredReferences'
 import { subscribeCurrentWorkspaceInvalidations } from '../modelQuery/workspaceInvalidation'
-import { workspaceKvStore } from '../modelQuery/kvStore'
+import { workspaceKvStore, type KvStore } from '../modelQuery/kvStore'
 import { withWorkspaceParams } from '../modelQuery/workspaceParams'
 import { apiFetch } from '../api/http'
 import { stripUndefined } from './docSafe'
@@ -120,6 +125,7 @@ import {
   changeWithDurabilityTracking as changeAndTrack,
   DurableHeadLedger,
   durableConnectionStatus,
+  mergeDurableHeadSnapshots,
   pendingDurabilityDebts,
   setLocalDocumentChangeListener,
 } from './durableSync'
@@ -135,6 +141,7 @@ import {
   isDiagramDocPlacementRecord,
   pendingPlacementIntents,
   persistPlacementIntents,
+  persistPlacementIntentsNow,
   type PlacementIntentSnapshot,
 } from './placementIntents'
 import { isLowerConnectionId } from '../diagrams/lowerRouting'
@@ -178,8 +185,10 @@ import {
   splitResidentPlannableIntents,
   type DiagramCollectionIntentKind,
   type EntityIntentKind,
+  type SentCarrier,
   type SmallCollectionIntentKind,
 } from './entityIntents'
+import { syncedHandle } from './repoCompat'
 import { SmallCollectionCapture, planSmallCollectionAck } from './smallCollectionCapture'
 import {
   sliceToRootModel,
@@ -332,34 +341,235 @@ const DURABLE_ACK_RETRY_MS = 750
 const DURABLE_ACK_BATCH_SIZE = 48
 const DURABLE_HEAD_LEDGER_KEY = 'pending-durable-heads:v1'
 let durableLedgerPersistence: Promise<void> = Promise.resolve()
+/** The session (`durableAckEpoch`) whose `durableHeads` has absorbed the
+ *  persisted ledger. Only that session's snapshot is the WHOLE set. */
+let durableLedgerHydratedEpoch = -1
+/** The store the ledger of the session started last lives in, taken when it
+ *  started. `workspaceKvStore()` follows the ACTIVE workspace, and the active
+ *  workspace can move before the session stops: the auth-on rebound in
+ *  startBridge's catch resolves (and activates) its fallback, THEN stops — and
+ *  that stop wrote the failed workspace's ledger over the fallback's
+ *  (reviewer lens probe, 2026-10-31). */
+let durableLedgerStore: KvStore | null = null
+
+function durableLedgerHydrated(): boolean {
+  return durableLedgerHydratedEpoch === durableAckEpoch
+}
 
 function queueDurableLedgerPersistence(): void {
-  const store = workspaceKvStore()
-  const snapshot = durableHeads.snapshot()
+  const store = durableLedgerStore ?? workspaceKvStore()
+  // Dormant entries included: they wait for their version to come back.
+  const snapshot = durableHeads.persisted()
+  // Before this session has read the persisted ledger, its snapshot holds only
+  // what it marked since `startBridge` cleared it, so writing it as THE ledger
+  // deletes what earlier sessions left. Measured 2026-10-31: StrictMode's
+  // remount stopped the first boot mid-read, the stop's empty snapshot deleted
+  // the key, and an offline-created DiagramDoc was never re-presented while the
+  // badge said ready. Until the read, a write may only add.
+  const replace = durableLedgerHydrated()
   durableLedgerPersistence = durableLedgerPersistence
     .catch(() => undefined)
     .then(async () => {
-      if (snapshot.length > 0) await store.set(DURABLE_HEAD_LEDGER_KEY, snapshot)
-      else await store.del(DURABLE_HEAD_LEDGER_KEY)
+      if (replace) {
+        if (snapshot.length > 0) await store.set(DURABLE_HEAD_LEDGER_KEY, snapshot)
+        else await store.del(DURABLE_HEAD_LEDGER_KEY)
+      } else if (snapshot.length > 0) {
+        // A read then a write, not `store.update`: idb-keyval's update settles
+        // only from its read's `onsuccess`, so a failed read left it — and this
+        // chain, which the next boot's hydration awaits — pending for ever
+        // (reviewer lens, fake-indexeddb probe). The chain already serializes
+        // this tab's writes; across tabs the replace above is no more atomic.
+        const persisted = await store.get<unknown>(DURABLE_HEAD_LEDGER_KEY)
+        await store.set(DURABLE_HEAD_LEDGER_KEY, mergeDurableHeadSnapshots(persisted, snapshot))
+      }
     })
     .catch((error) => {
       console.warn('pending PostgreSQL durability ledger persistence failed', error)
     })
 }
 
-async function hydrateDurableLedger(): Promise<void> {
+/**
+ * Read the persisted ledger and WITHHOLD every entry — not pin it. The ledger
+ * hydrates its entries DORMANT (`DurableHeadLedger.dormant`): which of them
+ * belong to this session is known only once the root resolution names its
+ * workspace (`partitionDurableLedger`), and until then none may reach the
+ * socket — the server announces its root's core documents, registry shards
+ * included, to every peer. That is why startBridge awaits this BEFORE routing
+ * the network. Measured 2026-10-31: pinned here, a `current` tab's reload sent
+ * the OLD version's offline edits on the NEW version's socket 30 ms after the
+ * handshake, and the old version's registry gained the offline diagram.
+ */
+async function hydrateDurableLedger(epoch: number, store: KvStore): Promise<void> {
   await durableLedgerPersistence.catch(() => undefined)
-  const entries = await workspaceKvStore().get<ReturnType<DurableHeadLedger['snapshot']>>(
-    DURABLE_HEAD_LEDGER_KEY,
-  )
+  const entries = await store.get<unknown>(DURABLE_HEAD_LEDGER_KEY)
+  // `durableHeads` is module state: a session stopped during the read must
+  // leave it to the session that replaced it.
+  if (epoch !== durableAckEpoch) return
   durableHeads.hydrate(entries)
-  for (const { documentId } of durableHeads.snapshot()) {
-    activeDocumentShare.pin(documentId, 'durability-pending')
+  durableLedgerHydratedEpoch = epoch
+  activeDocumentShare.withhold(durableHeads.dormantEntries().map(({ documentId }) => documentId))
+}
+
+/** The placement journal's hydration, for the carry (`carryRepointedWork`) to
+ * await: startBridge's own handle on it is local. Session state. */
+let placementIntentHydration: Promise<void> = Promise.resolve()
+
+/** How long the carry asks the old version (`carryRepointedWork`) before it
+ * treats every record as unknown — carried, conflict-averse. */
+const REPOINT_CARRY_ASK_TIMEOUT_MS = 10_000
+
+/**
+ * The root resolution named the workspace this session's documents belong to.
+ * Split the hydrated (dormant) ledger by the workspace each document was
+ * marked under:
+ *
+ *  - this workspace, or untagged → activate, lift the withhold, pin,
+ *    re-present: what every boot did before the tag existed;
+ *  - ANOTHER workspace → the default moved while those changes were unsent.
+ *    They stay DORMANT and withheld: presented neither to the old version
+ *    (which would split the work) nor to the new one (which would claim the
+ *    old version's documents), not counted, and persisted — so that if the
+ *    default ever comes back to their version, this same partition activates
+ *    them there. The work they carried goes back into the journals for this
+ *    workspace (`carryRepointedWork`), where the ordinary replays write it
+ *    into this workspace's documents. That is the product decision of
+ *    2026-10-31: unsynced work follows `current`.
+ *
+ * A session that cannot name its workspace (`documentsWorkspaceKey()` null)
+ * keeps the old behaviour for everything: it cannot tell what moved.
+ */
+function partitionDurableLedger(): void {
+  const booted = documentsWorkspaceKey()
+  const local: DocumentId[] = []
+  for (const { documentId, workspace } of durableHeads.dormantEntries()) {
+    const elsewhere = booted !== null && typeof workspace === 'string' && workspace !== booted
+    if (!elsewhere) local.push(documentId)
+  }
+  durableHeads.activate(local)
+  activeDocumentShare.release(local)
+  for (const documentId of local) activeDocumentShare.pin(documentId, 'durability-pending')
+  resumePendingDurableDocuments(local)
+  if (booted === null) return
+  void noteMintedIdSupplyWorkspace(booted)
+  // Every replay awaits `entityIntentHydration`, so the carry rides on it: no
+  // replay plans before the carried records are back. (Reassigned before any
+  // replay junction runs: those follow the overlay materialization, which
+  // follows this root resolution.)
+  entityIntentHydration = carryRepointedWork(booted, entityIntentHydration, durableAckEpoch)
+}
+
+/**
+ * Put back the SENT records of other workspaces (see `partitionDurableLedger`)
+ * — but only those the OLD version does not already hold.
+ *
+ * A SENT record outlives its delivery until a release round proves it: a tab
+ * that closed in between leaves records the old version received, which the
+ * fork may then have copied. Replayed into the new version anyway, a creation
+ * the fork carried and a colleague deleted there would come back — and where
+ * deletes leave no tombstone (comments, groups, the resident replay) not even
+ * the conflict-averse planner could tell (reviewer lens, 2026-10-31). So the
+ * old version is ASKED, through the durable-heads endpoint, about each record's
+ * carriers:
+ *  - durable there → released: the old version has it, the fork may too, and
+ *    whatever the new version did since is later work; it is not carried;
+ *  - not durable there → requeued: the fork, copied from that version, cannot
+ *    hold it, so creating it in the new version resurrects nothing;
+ *  - the old version cannot answer (offline, denied, past the timeout) →
+ *    requeued, `carried`, replayed conflict-averse (`planCarriedUpsert`): the
+ *    side that loses no work, with a resurrection risk recorded rather than
+ *    removed.
+ * Never rejects: every replay awaits it.
+ */
+async function carryRepointedWork(booted: string, hydrated: Promise<void>, epoch: number): Promise<void> {
+  try {
+    await hydrated
+    await placementIntentHydration
+    if (epoch !== durableAckEpoch) return
+    const workspaceKey = workspaceRefKey(currentRef)
+    const elsewhere = new Set([
+      ...pendingEntityIntents.sentWorkspaces(workspaceKey),
+      ...pendingPlacementIntents.sentWorkspaces(workspaceKey),
+    ].filter((workspace) => workspace !== booted))
+    let releasedEntity = 0
+    let releasedPlacement = 0
+    for (const workspace of elsewhere) {
+      const [landscapeId, versionId] = workspace.split('/')
+      if (!landscapeId || !versionId) continue
+      try {
+        const durable = await durableInWorkspace(workspaceKey, workspace, { landscapeId, versionId })
+        if (epoch !== durableAckEpoch) return
+        const proved = (carrier: SentCarrier) => durable.has(carrier.documentId)
+        releasedEntity += pendingEntityIntents.releaseSent(workspaceKey, workspace, proved)
+        releasedPlacement += pendingPlacementIntents.releaseSent(workspaceKey, workspace, proved)
+      } catch (error) {
+        // Unknown: carried, conflict-averse (see above).
+        console.warn(`[repoint] the old version ${workspace} could not be asked; its unconfirmed work is carried`, error)
+      }
+    }
+    if (epoch !== durableAckEpoch) return
+    const requeued = pendingEntityIntents.requeueSent(workspaceKey, booted)
+    for (const key of requeued) {
+      if (key.startsWith('diagram:')) carriedCreationIds.add(key.slice('diagram:'.length))
+    }
+    const placementDiagrams = pendingPlacementIntents.requeueSent(workspaceKey, booted)
+    if (requeued.length > 0 || releasedEntity > 0) persistEntityIntentsNow(workspaceKvStore(), workspaceKey)
+    if (placementDiagrams.length > 0 || releasedPlacement > 0) persistPlacementIntentsNow(workspaceKvStore(), workspaceKey)
+    if (requeued.length + placementDiagrams.length + releasedEntity + releasedPlacement === 0) return
+    console.info(JSON.stringify({
+      event: 'workspace.repoint_carried',
+      workspace: booted,
+      carried: requeued.length,
+      carriedPlacementDiagrams: placementDiagrams.length,
+      alreadyInOldVersion: releasedEntity + releasedPlacement,
+    }))
+    // The placements are read by the first projection, which does not wait for
+    // this; the drains take the late ones (both self-guard on the session).
+    if (placementDiagrams.length > 0) {
+      void drainOffActivePlacementIntents()
+      if (activeDiagramId && placementDiagrams.includes(activeDiagramId)) scheduleWrite('placement')
+    }
+  } catch (error) {
+    console.warn('[repoint] carrying the unconfirmed work failed', error)
   }
 }
 
-function resumePendingDurableDocuments(): void {
-  for (const { documentId } of durableHeads.snapshot()) {
+/** The documents among `workspace`'s SENT carriers that that workspace's
+ * server holds, asked in batches the endpoint accepts. Throws when it cannot
+ * be asked (the caller's "unknown"). */
+async function durableInWorkspace(
+  workspaceKey: string,
+  workspace: string,
+  ref: { landscapeId: string; versionId: string },
+): Promise<Set<string>> {
+  const headsByDocument = new Map<string, Set<string>>()
+  for (const carrier of [
+    ...pendingEntityIntents.sentCarriers(workspaceKey, workspace),
+    ...pendingPlacementIntents.sentCarriers(workspaceKey, workspace),
+  ]) {
+    const heads = headsByDocument.get(carrier.documentId) ?? new Set<string>()
+    for (const head of carrier.heads) heads.add(head)
+    headsByDocument.set(carrier.documentId, heads)
+  }
+  const asked = [...headsByDocument]
+    .filter(([, heads]) => heads.size > 0)
+    .map(([documentId, heads]) => ({ documentId: documentId as DocumentId, heads: [...heads].sort() }))
+  const durable = new Set<string>()
+  for (let start = 0; start < asked.length; start += DURABLE_ACK_BATCH_SIZE) {
+    const batch = asked.slice(start, start + DURABLE_ACK_BATCH_SIZE)
+    const answers = await acknowledgeDurableDocumentHeads(batch, {
+      workspace: ref,
+      signal: AbortSignal.timeout(REPOINT_CARRY_ASK_TIMEOUT_MS),
+    })
+    const askedIds = new Set<string>(batch.map(({ documentId }) => documentId))
+    for (const answer of answers) {
+      if (answer.durable && askedIds.has(answer.documentId)) durable.add(answer.documentId)
+    }
+  }
+  return durable
+}
+
+function resumePendingDurableDocuments(documentIds: readonly DocumentId[]): void {
+  for (const documentId of documentIds) {
     const url = `automerge:${documentId}`
     if (!isValidAutomergeUrl(url)) continue
     prepareDocumentRequest(url, 'durability-pending')
@@ -466,6 +676,72 @@ function representRefusedDocuments(
   }
 }
 
+let sentReleaseInFlight = false
+
+/**
+ * Retire the SENT intents whose carriers the server now holds — a POSITIVE
+ * answer for the heads each carrier had after its local flush, asked of the
+ * workspace this session's documents belong to (the same params every
+ * durable-heads round sends). Never by absence from `durableHeads`: that ledger
+ * is one key every tab of the browser rewrites, and a sibling's ack round
+ * deletes it.
+ *
+ * Two SENT records can name the same document at different heads; each
+ * journal's `sentCarriers` gives its latest capture, which descends from its
+ * others, and a document both journals carry is asked with the union of their
+ * two latest (two captures of one local history, in an order neither journal
+ * knows). Only what was marked BEFORE the request may be released by its
+ * answer: a record marked during the round carries heads it never named
+ * (reviewer lens, 2026-10-31). A carrier past the batch is simply not proved
+ * this round. A failed round is retried with the next one: SENT is not a debt,
+ * so nothing waits on it.
+ */
+async function releaseConfirmedSentIntents(): Promise<void> {
+  if (sentReleaseInFlight) return
+  const workspaceKey = workspaceRefKey(currentRef)
+  if (pendingEntityIntents.sentCount(workspaceKey) === 0 && pendingPlacementIntents.sentCount(workspaceKey) === 0) return
+  const workspace = documentsWorkspaceKey()
+  const entityThrough = pendingEntityIntents.sentSequenceNow
+  const placementThrough = pendingPlacementIntents.sentSequenceNow
+  const headsByDocument = new Map<string, Set<string>>()
+  for (const carrier of [
+    ...pendingEntityIntents.sentCarriers(workspaceKey, workspace, entityThrough),
+    ...pendingPlacementIntents.sentCarriers(workspaceKey, workspace, placementThrough),
+  ]) {
+    const heads = headsByDocument.get(carrier.documentId) ?? new Set<string>()
+    for (const head of carrier.heads) heads.add(head)
+    headsByDocument.set(carrier.documentId, heads)
+  }
+  const asked = [...headsByDocument]
+    .filter(([, heads]) => heads.size > 0)
+    .slice(0, DURABLE_ACK_BATCH_SIZE)
+    .map(([documentId, heads]) => ({ documentId: documentId as DocumentId, heads: [...heads].sort() }))
+  const epoch = durableAckEpoch
+  const store = workspaceKvStore()
+  sentReleaseInFlight = true
+  try {
+    const answers = asked.length > 0 ? await acknowledgeDurableDocumentHeads(asked) : []
+    if (epoch !== durableAckEpoch) return
+    const askedIds = new Set<string>(asked.map(({ documentId }) => documentId))
+    const durable = new Set(answers
+      .filter((answer) => answer.durable && askedIds.has(answer.documentId))
+      .map((answer) => answer.documentId as string))
+    // A SENT record with no carrier has nothing to prove: `releaseSent` frees
+    // it without a request, which is why an empty `asked` still reaches here.
+    const proved = (carrier: SentCarrier) => durable.has(carrier.documentId)
+    if (pendingEntityIntents.releaseSent(workspaceKey, workspace, proved, entityThrough) > 0) {
+      await persistEntityIntents(store, workspaceKey)
+    }
+    if (pendingPlacementIntents.releaseSent(workspaceKey, workspace, proved, placementThrough) > 0) {
+      await persistPlacementIntents(store, workspaceKey)
+    }
+  } catch (error) {
+    console.warn('SENT intent release round failed; retried with the next durability round', error)
+  } finally {
+    sentReleaseInFlight = false
+  }
+}
+
 async function runDurableAcknowledgement(): Promise<void> {
   if (durableAckInFlight) {
     durableAckFollowUp = true
@@ -480,6 +756,7 @@ async function runDurableAcknowledgement(): Promise<void> {
     if (syncTransportConnected && pendingDurabilityCount() === 0) {
       useAutomergeStatus.getState().setStatus('ready')
     }
+    if (syncTransportConnected) void releaseConfirmedSentIntents()
     return
   }
   durableAckInFlight = true
@@ -524,6 +801,7 @@ async function runDurableAcknowledgement(): Promise<void> {
       true,
       pendingDurabilityCount(),
     ))
+    void releaseConfirmedSentIntents()
   } catch (error) {
     // Never show Synced on an unavailable or rejecting durability endpoint.
     // Keep retrying as a connectivity probe while the browser itself is online.
@@ -560,7 +838,9 @@ async function runDurableAcknowledgement(): Promise<void> {
 function trackDurableHandle<T>(handle: DocHandle<T>): void {
   const doc = handle.doc()
   if (!doc) return
-  durableHeads.mark(handle.documentId, getHeads(doc as never))
+  // Tagged with the workspace the document belongs to; an unknown one leaves
+  // any earlier tag in place (`partitionDurableLedger` reads it).
+  durableHeads.mark(handle.documentId, getHeads(doc as never), documentsWorkspaceKey() ?? undefined)
   activeDocumentShare.pin(handle.documentId, 'durability-pending')
   queueDurableLedgerPersistence()
   if (syncTransportConnected) useAutomergeStatus.getState().setStatus('saving')
@@ -682,6 +962,38 @@ export function isBootFromServerActive(): boolean {
   return bfsActive
 }
 
+/**
+ * READ-ONLY: whether this session holds a delete tombstone for the entity —
+ * a deletion the server read model may not have projected yet. Readers that
+ * show server answers next to the store (the Spotlight's server tier) use it
+ * so a deleted entity does not come back from a stale projection. The sets
+ * themselves stay private to the bridge.
+ */
+export function hasDeleteTombstone(kind: 'object' | 'connection' | 'group' | 'diagram', id: string): boolean {
+  switch (kind) {
+    case 'object': return tombstoneObjects.has(id)
+    case 'connection': return tombstoneConnections.has(id)
+    case 'group': return tombstoneGroups.has(id)
+    case 'diagram': return tombstoneDiagrams.has(id)
+  }
+}
+
+/**
+ * READ-ONLY: the url of the root this session holds, or null with no session.
+ * It is half of what `documentsWorkspaceFor` needs to name the workspace this
+ * session's documents belong to (the other half is the ref), and the readers
+ * that ask the server about those documents — the crash replay's durability
+ * witness and the Spotlight's server tier — take it from here, and every
+ * `/api/model/*` read through the installed source below.
+ */
+export function sessionRootUrl(): string | null {
+  return rootHandle?.url ?? null
+}
+// `workspaceParams.ts` cannot import this module (see
+// `installSessionRootUrlSource`); bridgeSessionRootUrl.test.ts drives a real
+// boot to check the reads name the documents' workspace through it.
+installSessionRootUrlSource(sessionRootUrl)
+
 /** Workspace key whose boot already re-entered from the cached root this
  * session — the one-shot guard of the boot fallback (a broken local cache must
  * fail honestly, never recurse). NOT cleared in stopBridge: the fallback path
@@ -700,6 +1012,12 @@ let bootCachedRootFallbackKey: string | null = null
  * still in its early awaits, the re-entry would re-fetch the FORK root from the
  * server, stall again, and the one-shot guard would brick the whole recovery. */
 let bootFallbackReentryPending = false
+
+/** The version whose root the boot that fell back failed to materialize, for
+ * the session that boot re-entered (null when unknown, or no fallback). Set in
+ * startBridge's fallback branch, kept by the re-entry, cleared by every other
+ * start; `onWorkspaceBound` holds a fallback session only on a frame naming it. */
+let bootFallbackFailedVersionId: string | null = null
 
 /** A parked diagram the next boot PREFERS rather than REQUESTS. A deep link
  * requests a diagram: when it is absent, the canvas shows not-found, which is
@@ -844,6 +1162,7 @@ function armRegistryConfirmedPick(preferred: string): void {
 export function __resetBootCachedRootFallbackForTest(): void {
   bootCachedRootFallbackKey = null
   bootFallbackReentryPending = false
+  bootFallbackFailedVersionId = null
 }
 
 /** TEST-ONLY: the summary registry window as the bridge itself sees it. Exposed
@@ -993,6 +1312,7 @@ let placementIntentsHydrated = false
 function pendingDurabilityCount(): number {
   return pendingDurabilityDebts({
     durableHeadCount: durableHeads.size,
+    durableLedgerHydrated: durableLedgerHydrated(),
     writeSchedulerPending: writeScheduler.pending,
     entityIntentCount: pendingEntityIntents.pendingCount(workspaceRefKey(currentRef)),
     entityIntentsHydrated,
@@ -1717,7 +2037,11 @@ async function resumeHeldReferences<T>(options: {
   // review, 2026-10-19). `holdReference` reads the epoch only when it is called.
   const epoch = durableAckEpoch
   const giveUp = async (reference: DeferredReference, why: string, error?: unknown) => {
-    const failures = await deferredReferences.noteResumeFailure(reference, HELD_SHARD_RESUME_LIMIT).catch(() => 0)
+    const failures = await deferredReferences.noteResumeFailure(reference, HELD_SHARD_RESUME_LIMIT).catch((countError) => {
+      // Uncounted, this boot does not bring the give-up any closer.
+      console.warn(`held ${reference.field} entry ${reference.url}: this boot's failure could not be counted`, countError)
+      return 0
+    })
     const verdict = failures >= HELD_SHARD_RESUME_LIMIT
       ? `given up after ${failures} boots: ${options.lost}`
       : `retrying next boot (${failures}/${HELD_SHARD_RESUME_LIMIT})`
@@ -1730,7 +2054,10 @@ async function resumeHeldReferences<T>(options: {
       return
     }
     if (options.isPublished(reference)) {
-      await deferredReferences.remove(reference).catch(() => undefined)
+      // A failed dequeue only leaves the entry for the next boot to drop.
+      await deferredReferences.remove(reference).catch((error) => {
+        console.warn(`published ${reference.field} reference could not be dequeued`, error)
+      })
       return
     }
     let handle: DocHandle<T>
@@ -2055,6 +2382,10 @@ let diagramCollectionReplaying = false
 let diagramCollectionReplayTimer: ReturnType<typeof setTimeout> | null = null
 let diagramStubReplaying = false
 let diagramStubReplayTimer: ReturnType<typeof setTimeout> | null = null
+/** Diagram ids whose creation a repoint just put back into the journal
+ * (`partitionDurableLedger`): their replay waits for a pool named for the
+ * version they now live in (`replayDiagramStubIntents`). Session state. */
+const carriedCreationIds = new Set<string>()
 let offActiveDrainTimer: ReturnType<typeof setTimeout> | null = null
 let diagramAbsenceSweeping = false
 let diagramAbsenceSweepTimer: ReturnType<typeof setTimeout> | null = null
@@ -2282,15 +2613,14 @@ async function replaySmallCollectionIntents(): Promise<void> {
     //    there. A direct ack here would be one-shot: a later projection
     //    clobber + full-set flush would erase the replayed value with no
     //    intent left to re-assert it.
+    const sentWorkspace = documentsWorkspaceKey()
     const forgetForMode = () => {
       if (epoch !== durableAckEpoch) return
-      for (const done of plan.satisfied) {
-        pendingEntityIntents.acknowledge(workspaceKey, done.kind, [done.id], done.revision)
-      }
+      markReplayedSent(workspaceKey, plan.satisfied, sentWorkspace, [metaHandle.documentId], epoch)
       if (!bfsActive) {
         for (const kind of SMALL_INTENT_KINDS) {
           if (replayedByKind[kind].length) {
-            pendingEntityIntents.acknowledge(workspaceKey, kind, replayedByKind[kind], revision)
+            markIntentsSent(workspaceKey, kind, replayedByKind[kind], revision, sentWorkspace, [metaHandle.documentId], epoch)
           }
         }
       }
@@ -2444,15 +2774,14 @@ async function replayDiagramCollectionIntents(): Promise<void> {
     // render, and the next full-set flush would erase the replayed value with
     // no intent left to re-assert it. The scheduled flush re-expresses them
     // from the injected slices and the value-checked ack retires them.
+    const sentWorkspace = documentsWorkspaceKey()
     const forgetForMode = () => {
       if (epoch !== durableAckEpoch) return
-      for (const done of plan.satisfied) {
-        pendingEntityIntents.acknowledge(workspaceKey, done.kind, [done.id], done.revision)
-      }
+      markReplayedSent(workspaceKey, plan.satisfied, sentWorkspace, [handle.documentId], epoch)
       if (!bfsActive) {
         for (const kind of DIAGRAM_INTENT_KINDS) {
           if (replayedByKind[kind].length) {
-            pendingEntityIntents.acknowledge(workspaceKey, kind, replayedByKind[kind], revision)
+            markIntentsSent(workspaceKey, kind, replayedByKind[kind], revision, sentWorkspace, [handle.documentId], epoch)
           }
         }
       }
@@ -2504,11 +2833,28 @@ async function replayDiagramStubIntents(): Promise<void> {
     await entityIntentHydration
     if (epoch !== durableAckEpoch || !started || !rootHandle) return
     const workspaceKey = workspaceRefKey(currentRef)
-    const intents = pendingEntityIntents.pending(workspaceKey)
+    const pendingStubs = () => pendingEntityIntents.pending(workspaceKey)
       .filter((intent) => intent.kind === 'diagram')
       // Same gate as the flush-side ack: an id whose doc flush is still
       // pending is already being expressed by the ordinary path.
       .filter((intent) => !pendingDurableDiagramDocs.has(intent.id))
+    // A creation a repoint carried over gets a NEW DiagramDoc here (through
+    // `ensureDiagramDoc`), and that document must be named for the version it
+    // now lives in: the minted pool may still hold ids of the version the work
+    // left (`noteMintedIdSupplyWorkspace` drops it, the mint refills it). Only
+    // carried creations wait — an ordinary crash replay must not hang on a slow
+    // mint — and only before the plan, which the wait would otherwise stale.
+    const carried = pendingStubs().filter((intent) => carriedCreationIds.has(intent.id)).length
+    if (carried > 0) {
+      // The note again, AWAITED: the partition's own call is not, and a
+      // capacity read before its drop would count the old version's ids.
+      const booted = documentsWorkspaceKey()
+      if (booted) await noteMintedIdSupplyWorkspace(booted)
+      await ensureMintedIdCapacity(carried)
+      if (epoch !== durableAckEpoch || !started || !rootHandle) return
+    }
+    const intents = pendingStubs()
+    for (const intent of intents) carriedCreationIds.delete(intent.id)
     if (!intents.length) return
     // SHARD DOCS ONLY as witness — same rule as the flush-side ack: the
     // in-memory summary window is partly fed by this client itself. A shard
@@ -2604,18 +2950,21 @@ async function replayDiagramStubIntents(): Promise<void> {
         stubCapture.seed(diagrams)
       })
     }
-    // SATISFIED intents die now (flush-then-forget through the one helper);
+    // SATISFIED intents go SENT now (flush-then-mark through the one helper:
+    // satisfied by the LOCAL shards is a local fact, `markReplayedSent`);
     // REPLAYED intents stay journaled in BOTH modes — the registry pass of
     // the next flush writes the metas, and its planDiagramStubAck retires
     // them against what was actually written.
     const shardDocIds = shardHandles.map((shardHandle) => shardHandle.documentId)
     const persistStore = workspaceKvStore()
+    const sentWorkspace = documentsWorkspaceKey()
     await forgetIntentsOnceDurable(
       () => repo.flush(shardDocIds),
       () => {
         if (epoch !== durableAckEpoch) return
-        for (const done of plan.satisfied) {
-          pendingEntityIntents.acknowledge(workspaceKey, 'diagram', [done.id], done.revision)
+        for (const [carriers, ids] of registryCarriersOf(plan.satisfied.map((done) => done.id))) {
+          const grouped = plan.satisfied.filter((done) => ids.includes(done.id))
+          markReplayedSent(workspaceKey, grouped.map((done) => ({ ...done, kind: 'diagram' as const })), sentWorkspace, carriers, epoch)
         }
       },
       () => flushEntityIntentPersistence(persistStore, workspaceKey),
@@ -2683,6 +3032,12 @@ async function maybeReplayEntityIntents(options?: { withoutHandles?: boolean }):
       entityIntentsDegradedReplayed = true
     }
     const workspaceKey = workspaceRefKey(currentRef)
+    // Captured with the journal key, once: this session's ref and the root it
+    // ACTUALLY holds. The server witness must answer about the documents this
+    // replay writes into; `documentsWorkspaceFor` names them only while the
+    // recorded basis came with THIS root url, so a basis a stale fetch
+    // overwrote stops matching and the witness is skipped, never misdirected.
+    const witnessJournal = { ref: currentRef, bootedRootUrl: sessionRootUrl() }
     // Object/connection intents ONLY — POSITIVE admission. A negative filter
     // (`!isSmallCollectionKind`) would let any kind that is neither small nor
     // object/connection fall through to the binary dispatch below, which plans
@@ -2788,6 +3143,7 @@ async function maybeReplayEntityIntents(options?: { withoutHandles?: boolean }):
       offset += WITNESS_CHUNK
     ) {
       const result = await witnessed(fetchDurabilityWitness(
+        witnessJournal,
         witnessObjectIds.slice(offset, offset + WITNESS_CHUNK),
         witnessConnectionIds.slice(offset, offset + WITNESS_CHUNK),
       ))
@@ -2823,11 +3179,12 @@ async function maybeReplayEntityIntents(options?: { withoutHandles?: boolean }):
         ...editsConnectionSegmentHandles.map((handle) => handle.documentId),
         ...(modelMetaHandle ? [modelMetaHandle.documentId] : []),
       ]
+      const sentWorkspace = documentsWorkspaceKey()
       if (carriers.length) await repo.flush(carriers)
       if (epoch !== durableAckEpoch) return
-      for (const done of plan.satisfied) {
-        pendingEntityIntents.acknowledge(workspaceKey, done.kind, [done.id], done.revision)
-      }
+      // SENT, not forgotten: the witness may be the local overlay
+      // (`markReplayedSent`).
+      markReplayedSent(workspaceKey, plan.satisfied, sentWorkspace, carriers as DocumentId[], epoch)
       persistEntityIntentsNow(workspaceKvStore(), workspaceKey)
     }
     const replayCount = plan.replayObjects.length + plan.replayConnections.length
@@ -3054,11 +3411,11 @@ async function maybeReplayEntityIntentsResident(): Promise<void> {
       // before the journal forgets anything.
       const carriers = residentCarrierDocumentIds()
       if (!carriers) return
+      const sentWorkspace = documentsWorkspaceKey()
       await repo.flush(carriers)
       if (epoch !== durableAckEpoch) return
-      for (const done of plan.satisfied) {
-        pendingEntityIntents.acknowledge(workspaceKey, done.kind, [done.id], done.revision)
-      }
+      // SENT, not forgotten: the witness is the local model (`markReplayedSent`).
+      markReplayedSent(workspaceKey, plan.satisfied, sentWorkspace, carriers as DocumentId[], epoch)
       persistEntityIntentsNow(workspaceKvStore(), workspaceKey)
     }
     // Interleave guard: skip an upsert whose STORE value already
@@ -3139,11 +3496,14 @@ async function maybeReplayEntityIntentsResident(): Promise<void> {
     writeScheduler.flushNow()
     const carriers = residentCarrierDocumentIds()
     if (!carriers) return
+    const sentWorkspace = documentsWorkspaceKey()
     await repo.flush(carriers)
     if (epoch !== durableAckEpoch) return
     for (const { kind, id } of ackAfterWrite) {
       const revision = revisionOf.get(`${kind}:${id}`)
-      if (revision !== undefined) pendingEntityIntents.acknowledge(workspaceKey, kind, [id], revision)
+      if (revision !== undefined) {
+        markIntentsSent(workspaceKey, kind, [id], revision, sentWorkspace, carriers as DocumentId[], epoch)
+      }
     }
     persistEntityIntentsNow(workspaceKvStore(), workspaceKey)
     // Latch AFTER the flush succeeded, and only when nothing was left behind —
@@ -6107,9 +6467,16 @@ function acknowledgeDiagramStubsAgainstRegistry(): void {
   }
   const shardDocIds = shardHandles.map((shardHandle) => shardHandle.documentId)
   const persistStore = workspaceKvStore()
+  const workspace = documentsWorkspaceKey()
+  const epoch = durableAckEpoch
+  const idsByCarrier = registryCarriersOf(ackPlan.ackIds)
   void forgetIntentsOnceDurable(
     () => repo.flush(shardDocIds),
-    () => pendingEntityIntents.acknowledge(workspaceKey, 'diagram', ackPlan.ackIds, throughRevision),
+    () => {
+      for (const [carriers, ids] of idsByCarrier) {
+        markIntentsSent(workspaceKey, 'diagram', ids, throughRevision, workspace, carriers, epoch)
+      }
+    },
     () => persistEntityIntents(persistStore, workspaceKey),
   ).then(() => {
     scheduleDurableAcknowledgement(0)
@@ -6158,8 +6525,21 @@ function acknowledgePlacementSnapshot(
   const needsFullFlush = snapshot.connections.length > 0
     || snapshot.groups.some((group) => group.autoSize !== undefined)
   const flushCarriers = needsFullFlush ? repo.flush() : repo.flush([documentId])
+  // SENT, not forgotten (`SentMark`): the DiagramDoc carries the geometry, and
+  // the model documents the connection/autoSize records — the overlay write
+  // heads under boot-from-server, ModelMeta otherwise.
+  const sentWorkspace = documentsWorkspaceKey()
+  const epoch = durableAckEpoch
+  const carrierIds = needsFullFlush
+    ? [documentId, ...[editsConnectionShardHandle, editsObjectShardHandle, modelMetaHandle]
+      .flatMap((handle) => (handle ? [handle.documentId] : []))]
+    : [documentId]
   void flushCarriers.then(async () => {
-    pendingPlacementIntents.acknowledge(workspaceKey, diagramId, snapshot.throughRevision)
+    if (epoch === durableAckEpoch) {
+      pendingPlacementIntents.markSentWhere(workspaceKey, diagramId, snapshot.throughRevision, () => true, {
+        workspace: sentWorkspace, carriers: carriersOf(carrierIds),
+      })
+    }
     await persistPlacementIntents(store, workspaceKey)
     markClientTimeline('placement.flush.durable', {
       coalescedRevision: snapshot.throughRevision,
@@ -6227,6 +6607,7 @@ async function drainOffActivePlacementIntents(): Promise<void> {
       changeAndTrack(handle, (doc) => {
         applyPlacementSnapshotToDiagramDoc(doc, fresh)
       })
+      const sentWorkspace = documentsWorkspaceKey()
       await repo.flush([handle.documentId])
       if (epoch !== durableAckEpoch) return
       // Only what THIS doc write expressed: object records, pure-geometry
@@ -6234,10 +6615,11 @@ async function drainOffActivePlacementIntents(): Promise<void> {
       // autoSize-carrying group records target the MODEL documents, which only
       // the active-diagram flush writes — they survive for the activation
       // path. Revision-scoped to the FRESH snapshot: anything re-recorded after
-      // it survives.
-      pendingPlacementIntents.acknowledgeWhere(
+      // it survives. SENT, not forgotten (`SentMark`).
+      pendingPlacementIntents.markSentWhere(
         workspaceKey, diagramId, fresh.throughRevision,
         isDiagramDocPlacementRecord,
+        { workspace: sentWorkspace, carriers: carriersOf([handle.documentId]) },
       )
       await persistPlacementIntents(store, workspaceKey)
       markClientTimeline('placement.offactive.drained', {
@@ -6253,13 +6635,101 @@ async function drainOffActivePlacementIntents(): Promise<void> {
   }
 }
 
+/** `landscapeId/versionId` of the concrete workspace this session's documents
+ * belong to, or null when the session cannot name it (`documentsWorkspaceFor`:
+ * a root-fetch or root-cache basis for the root this session holds). It tags
+ * what the durable-heads ledger and the SENT intents carry, so a repoint can
+ * tell which documents belong to a version nobody opens any more. */
+function documentsWorkspaceKey(): string | null {
+  const workspace = documentsWorkspaceFor(currentRef, sessionRootUrl())
+  return workspace ? `${workspace.landscapeId}/${workspace.versionId}` : null
+}
+
 /**
- * Forget entity intents ONLY once the overlay/meta document that carries them is
- * durably saved by the local IndexedDB adapter — `handle.change` is synchronous
- * but the adapter is debounced, so acknowledging earlier would re-open the exact
- * crash window this journal closes (same contract as acknowledgePlacementSnapshot).
- * `throughRevision` was captured BEFORE the Automerge change: an intent re-recorded
- * mid-flight has a higher revision and survives.
+ * The carriers just flushed locally: move the intents to SENT, with each
+ * carrier's heads as the server must later acknowledge them. Called from a
+ * `forgetIntentsOnceDurable` forget step, i.e. after the flush.
+ *
+ * A carrier whose handle cannot be read contributes no proof, so the intent is
+ * released on the others alone — or at once, with none, which is the behaviour
+ * every intent had before the SENT stage. `workspace` and `epoch` are taken by
+ * the caller BEFORE the flush, with its store: a switch landing during the
+ * flush must not tag these intents with the next session's workspace.
+ *
+ * A flush that completes after its session ENDED marks nothing: the intents
+ * stay PENDING, and the next session's replay plans them against its own
+ * witnesses. Marked SENT under the old tag they would miss that session's
+ * requeue — a FOLLOW's lifecycle flush lands just after it (reviewer lens,
+ * 2026-10-31) — and sit uncounted while the badge said Synced.
+ */
+function markIntentsSent(
+  workspaceKey: string,
+  kind: EntityIntentKind,
+  ids: readonly string[],
+  throughRevision: number,
+  workspace: string | null,
+  carrierIds: readonly DocumentId[],
+  epoch: number,
+): void {
+  if (epoch !== durableAckEpoch) return
+  pendingEntityIntents.markSent(workspaceKey, kind, ids, throughRevision, { workspace, carriers: carriersOf(carrierIds) })
+}
+
+/**
+ * A replay found these intents expressed in — or just wrote them into — the
+ * LOCAL carrier: SENT, not forgotten. "Satisfied" read off a local document is
+ * a local fact, and the journal must not lose an intention on a local fact: a
+ * tab reopened offline from the cached root replays, finds the value in the
+ * old version's local copy, and an outright ack there was the original loss
+ * again once the default moved (architect lens, 2026-10-31).
+ */
+function markReplayedSent(
+  workspaceKey: string,
+  items: ReadonlyArray<{ kind: EntityIntentKind; id: string; revision: number }>,
+  workspace: string | null,
+  carrierIds: readonly DocumentId[],
+  epoch: number,
+): void {
+  if (epoch !== durableAckEpoch || items.length === 0) return
+  // Heads read once for the batch (each item at its own revision).
+  const carriers = carriersOf(carrierIds)
+  for (const item of items) {
+    pendingEntityIntents.markSent(workspaceKey, item.kind, [item.id], item.revision, { workspace, carriers })
+  }
+}
+
+/** Diagram ids grouped by the registry shard that carries each one's meta. An
+ * id the index cannot place is carried by every shard: stricter, never wrong. */
+function registryCarriersOf(ids: readonly string[]): Map<readonly DocumentId[], string[]> {
+  const shardIdByUrl = new Map(shardHandles.map((shardHandle) => [shardHandle.url as string, shardHandle.documentId]))
+  const all = shardHandles.map((shardHandle) => shardHandle.documentId)
+  const byShard = new Map<DocumentId | null, string[]>()
+  for (const id of ids) {
+    const shard = shardIdByUrl.get(shardByDiagramId.get(id) ?? '') ?? null
+    byShard.set(shard, [...(byShard.get(shard) ?? []), id])
+  }
+  return new Map([...byShard].map(([shard, grouped]) => [shard ? [shard] : all, grouped]))
+}
+
+/** Each carrier's heads, read now (after its flush). */
+function carriersOf(carrierIds: readonly DocumentId[]): SentCarrier[] {
+  const carriers: SentCarrier[] = []
+  for (const documentId of carrierIds) {
+    const doc = syncedHandle(repo, documentId)?.doc()
+    if (doc) carriers.push({ documentId, heads: getHeads(doc as never) })
+  }
+  return carriers
+}
+
+/**
+ * Move entity intents to SENT ONLY once the overlay/meta document that carries
+ * them is durably saved by the local IndexedDB adapter — `handle.change` is
+ * synchronous but the adapter is debounced, so acknowledging earlier would
+ * re-open the exact crash window this journal closes (same contract as
+ * acknowledgePlacementSnapshot). `throughRevision` was captured BEFORE the
+ * Automerge change: an intent re-recorded mid-flight has a higher revision and
+ * survives. SENT, not forgotten: see `SentMark` (entityIntents.ts) for why the
+ * local flush is not enough to drop the user's intention.
  */
 function acknowledgeEntityIntentBatch(
   kind: EntityIntentKind,
@@ -6270,11 +6740,13 @@ function acknowledgeEntityIntentBatch(
   if (ids.length === 0) return
   const workspaceKey = workspaceRefKey(currentRef)
   const store = workspaceKvStore()
+  const workspace = documentsWorkspaceKey()
+  const epoch = durableAckEpoch
   // The flush→forget→persist ORDER lives in forgetIntentsOnceDurable, where a
   // unit test pins it. Do not re-inline it.
   void forgetIntentsOnceDurable(
     () => repo.flush([documentId]),
-    () => pendingEntityIntents.acknowledge(workspaceKey, kind, ids, throughRevision),
+    () => markIntentsSent(workspaceKey, kind, ids, throughRevision, workspace, [documentId], epoch),
     () => persistEntityIntents(store, workspaceKey),
   ).then(() => {
     // Let the badge re-evaluate now that the journal may have drained.
@@ -6484,7 +6956,8 @@ function startLiveSync(): void {
 }
 
 /** Guards against acting twice on the same move: the binding frame arrives on
- * every connect, and the corrective action itself reconnects. */
+ * every connect, and the corrective action itself reconnects. A frame that
+ * lands meanwhile is handed back and re-offered when the action ends. */
 let repointInFlight = false
 
 /**
@@ -6496,19 +6969,49 @@ let repointInFlight = false
  * `workspace-mismatch`, permanently, and everything done afterwards is lost
  * behind a badge that says "Saving…".
  *
- * Two responses, and which one is right depends on whether there is anything to
- * lose — the rule that generalises is "never discard work", not "always pin":
+ * The answer is to FOLLOW, which is what `'current'` means, and to CARRY what
+ * this tab has not got confirmed into the version it follows. That is the
+ * product decision of 2026-10-31: unsynced work lands in the new default,
+ * whether the tab reloads or stays open, so a user's work is never split
+ * between a version nobody opens any more and the one everybody does. (This
+ * branch used to PIN the tab to the old version whenever anything was unsaved;
+ * the work then landed in V1 only, or — when the reload outran the pin — in
+ * V1's registry with its DiagramDoc claimed by V2: repoint-offline-create.spec
+ * test 2, 3 runs of 3.)
  *
- *  - something is unsaved → PIN this tab to the concrete version it was already
- *    editing. The socket rebinds there, every document becomes admissible
- *    again, nothing is lost, and moving to the new default becomes the user's
- *    decision. It is also persisted and rewrites the address bar, so it is
- *    stated in a banner rather than done silently.
- *  - nothing is unsaved → FOLLOW, which is what `'current'` means, and costs
- *    the user nothing because there is nothing here to strand.
+ * Carrying needs two things, in this order:
+ *  - the documents holding the unconfirmed changes are WITHHELD at once,
+ *    synchronously, here: the frame precedes the handshake on this socket, and
+ *    the server announces its root's core documents (registry shards included)
+ *    to every peer, so without the withhold the old version's offline edits
+ *    leave on the very socket that just told us the version moved;
+ *  - the FOLLOW reboots the bridge, whose root resolution then puts the work
+ *    those documents carried back into the journal for the new version
+ *    (`partitionDurableLedger`).
+ *
+ *  - this session is the boot FALLBACK (`bootFallbackActive`) and the frame
+ *    names the version whose root failed (`bootFallbackFailedVersionId`) →
+ *    HOLD as well, whatever is unsaved. The root this session holds is the
+ *    cached one, of the version it was fetched for; following re-asks the
+ *    server for the very root that just failed, a follow whose boot falls back
+ *    again meets the same frame again, and each round is a workspace teardown
+ *    plus a full resolution budget — measured 2026-10-29 before this rule, a
+ *    fallback session re-entered that root at +52.9 s and again at +76.5 s
+ *    (repoint-boot-fallback.spec.ts's stack). Holding loses nothing following
+ *    would have kept: nothing is persisted, so the next reload asks the server
+ *    again (the fallback's own contract), and the banner's button is the
+ *    retry, one per click.
  */
-function onWorkspaceBound(bound: WorkspaceBinding): void {
-  if (repointInFlight) return
+function onWorkspaceBound(bound: WorkspaceBinding, defer: () => void): void {
+  if (repointInFlight) {
+    // Not dropped: a FOLLOW runs its whole reload inside the response, so this
+    // can be that reload's own frame, replayed when its boot installed this
+    // handler — and if that boot fell back, it is the only frame there will
+    // be. Re-offered from the `finally` below (repoint-boot-fallback.spec.ts,
+    // test 2).
+    defer()
+    return
+  }
   const ref = currentWorkspaceRef()
   // A concrete ref cannot be re-canonicalised: it names its own version, so a
   // binding for it can only ever agree. Only an alias can move underneath.
@@ -6522,39 +7025,66 @@ function onWorkspaceBound(bound: WorkspaceBinding): void {
     // whole detector inert.
     //
     // The first binding of a session is therefore taken AS the basis. The
-    // cost: a repoint landing between the root fetch and the first socket is
-    // adopted as though it had always been so, and that window goes
-    // undetected. It is one round trip wide, against a whole boot path being
-    // unarmed.
-    rememberResolvedWorkspace(ref, bound)
+    // cost: a repoint landing before the first socket is adopted as though it
+    // had always been so, and goes undetected. This branch runs only when
+    // there is no basis at all — a server that reported no key (after a follow
+    // cleared the basis, too), or a page that
+    // booted from a cached root with no key persisted beside it (one written
+    // before the key was persisted; otherwise `repo.ts` restores the key as a
+    // `root-cache` basis). Hence the provenance: `documentsWorkspaceFor`, which
+    // the durability witness, the Spotlight's server tier and every
+    // `/api/model/*` read ask through, never trusts this basis.
+    //
+    // A frame that arrives DURING a boot is not lost: this handler is installed
+    // by `wireConnectionStatus`, at the end of a successful boot, and
+    // `workspaceBinding.ts` keeps the frame no handler took and replays it on
+    // install. That is how the boot FALLBACK, which runs with the server up and
+    // whose re-entry does not reconnect, meets its socket's frame at all
+    // (e2e/boot/repoint-boot-fallback.spec.ts); a cached-root boot taken with
+    // the server DOWN meets its first frame after boot
+    // (e2e/boot/repoint-cached-root.spec.ts).
+    adoptBindingAsBasis(ref, bound)
     return
   }
   if (bound.versionId === booted.versionId) return
 
   const unsaved = pendingDurabilityCount()
+  const bootFallback = useAutomergeStatus.getState().bootFallbackActive
+  // The fallback rule applies only to the version whose root failed: a repoint
+  // to some OTHER version later in a fallback session (or a fallback that was
+  // a slow server, not a repoint) follows like any other — the flag lasts the
+  // whole session (reviewer lens, 2026-10-29). Unknown (a server that reported
+  // no key) counts as that version: holding is the side that cannot loop.
+  const retriesFailedRoot = bootFallback
+    && (bootFallbackFailedVersionId === null || bootFallbackFailedVersionId === bound.versionId)
+  const hold = retriesFailedRoot
   console.warn(JSON.stringify({
     event: 'workspace.repoint_observed',
     landscapeId: ref.landscapeId,
     bootedVersionId: booted.versionId,
     boundVersionId: bound.versionId,
     unsaved,
-    action: unsaved > 0 ? 'pin' : 'follow',
+    bootFallback,
+    failedVersionId: bootFallbackFailedVersionId,
+    action: hold ? 'pin' : 'follow',
   }))
+  // Before anything awaits (see the docstring): the handshake follows this
+  // frame on the same socket. Every document the ledger names holds changes
+  // the server has not confirmed; the follow's boot decides which of them
+  // belong to the version it lands on and lifts those.
+  if (!hold) activeDocumentShare.withhold(durableHeads.snapshot().map(({ documentId }) => documentId))
 
   repointInFlight = true
   void (async () => {
     try {
-      if (unsaved > 0) {
+      if (hold) {
         // HOLD, by re-routing the TRANSPORT only. The ref is deliberately left
         // on `'current'`.
         //
-        // Switching the workspace to the concrete version would LOSE the very
-        // work this exists to protect (an offline-created object ends up 404
-        // on the server and gone from the store), because the intent journals
-        // are keyed by
-        // `workspaceRefKey(currentRef)`, so moving the ref from `L/current` to
-        // `L/V1` orphans the entries the replay would have found. Any response
-        // that changes the ref disarms the offline-durability machinery.
+        // Switching the workspace to the concrete version would orphan the
+        // intent journals, which are keyed by `workspaceRefKey(currentRef)`:
+        // moving the ref from `L/current` to `L/V1` hides the entries the
+        // replay would have found.
         //
         // Swapping the adapter changes one thing — the `versionId` on the socket
         // url — and touches nothing else: the Repo, the store, the projection,
@@ -6563,12 +7093,10 @@ function onWorkspaceBound(bound: WorkspaceBinding): void {
         // document the tab holds is admissible again and the pending writes
         // drain on their own.
         //
-        // Nothing is persisted either, which is what makes this cheaper than the
-        // switch it replaces: a reload puts the tab back on `current` and the
-        // hold simply ends, rather than stranding it off the moving pointer for
-        // good.
+        // Nothing is persisted either: a reload puts the tab back on `current`
+        // and the hold simply ends, and the reload is the fallback's retry.
         const held = { landscapeId: ref.landscapeId, versionId: booted.versionId }
-        useAutomergeStatus.getState().noteWorkspacePinnedAfterRepoint(held)
+        useAutomergeStatus.getState().noteWorkspacePinnedAfterRepoint(held, 'boot-fallback')
         // One value, two consumers: the socket route below, and the HTTP params
         // that `workspaceSearchParams` builds for every /api/model/* call. Set
         // BEFORE the route, so no request can be issued against the alias while
@@ -6577,10 +7105,11 @@ function onWorkspaceBound(bound: WorkspaceBinding): void {
         await routeWorkspaceNetwork(held, true)
         return
       }
-      // Clear the basis first — see `forgetResolvedWorkspace`. Following
-      // reconnects, and the next binding frame can beat the root fetch that
-      // would supply the new basis; comparing against the stale one would
-      // follow again, forever.
+      // Clear the basis first — see `forgetResolvedWorkspace`. The reload's
+      // own frame now reaches this handler only after the reload's root fetch
+      // (kept while no handler is installed, deferred while this runs), but a
+      // fetch that reports no key leaves the basis as it was: comparing the new
+      // binding against the stale one would follow again, forever.
       forgetResolvedWorkspace(ref)
       // Dynamic import: `switchWorkspace` closes a static cycle through
       // workspaceStore back into this module, the same reason the dangling-ref
@@ -6591,6 +7120,8 @@ function onWorkspaceBound(bound: WorkspaceBinding): void {
       console.warn('[workspace-binding] repoint response failed', error)
     } finally {
       repointInFlight = false
+      // A frame handed back while this ran (see the top of this function).
+      redeliverWorkspaceBinding()
     }
   })()
 }
@@ -6823,8 +7354,28 @@ export async function startBridge(ref: WorkspaceRef = DEFAULT_WORKSPACE_REF): Pr
   // fallback re-entry iff the fallback branch just handed control here.
   const isFallbackReentry = bootFallbackReentryPending
   bootFallbackReentryPending = false
+  // Only a re-entry keeps the version its failed boot was asked for.
+  if (!isFallbackReentry) bootFallbackFailedVersionId = null
   durableAckEpoch += 1
+  // Which boot owns the module state: the session epoch, bumped by every start
+  // and every stop, so a boot whose epoch has moved on was SUPERSEDED.
+  //
+  // Boots OVERLAP. React StrictMode's dev double-mount — and any re-run of
+  // `AutomergeBridge`'s effect — stops one boot and starts another while the
+  // first still awaits the same memoized root. A failing boot must therefore
+  // ask whether it is still the session before recovering, and a superseded one
+  // used not to: measured 2026-10-29 on the dev stack
+  // (e2e/boot/repoint-boot-fallback.spec.ts), the stopped boot fell back and
+  // re-entered, then the live boot's catch — refused as "already fell back" —
+  // set `started = false` under that re-entry, which went on to boot with every
+  // projection returning early: the bridge held 27 diagrams, the store none,
+  // and the canvas read "No diagrams yet". Checked again after every await on
+  // the recovery paths, and before the success tail.
+  const bootEpoch = durableAckEpoch
+  const superseded = (): boolean => bootEpoch !== durableAckEpoch
   durableHeads.clear()
+  const ledgerStore = workspaceKvStore()
+  durableLedgerStore = ledgerStore
   serverDurability.clear()
   serverUnreachable = false
   // Same lifetime as the ledger it shadows. A new session gets a fresh budget:
@@ -6838,13 +7389,22 @@ export async function startBridge(ref: WorkspaceRef = DEFAULT_WORKSPACE_REF): Pr
   serverProjectionRequestSequence = 0
   lastAppliedServerProjectionRequest = 0
   activeDocumentShare.beginSession(workspaceRefKey(ref))
-  const durableHydration = hydrateDurableLedger().catch((error) => {
+  const durableHydration = hydrateDurableLedger(durableAckEpoch, ledgerStore).catch((error) => {
     console.warn('pending PostgreSQL durability ledger hydration failed', error)
   })
   lastServerProjectionGeneration = -1
   const status = useAutomergeStatus.getState()
   status.setStatus('connecting')
   const finishBoot = startClientTimelineMeasure('workspace.boot.total')
+  sentReleaseInFlight = false
+  // BEFORE the route: the ledger's documents are withheld by the hydration and
+  // must be before any socket of this session can hand them to the server (see
+  // `hydrateDurableLedger`). The read used to overlap the route.
+  await durableHydration
+  // A superseded boot must not route: the transport is module state, and the
+  // live boot may still be reading ITS ledger, with nothing withheld yet
+  // (reviewer lens, 2026-10-31).
+  if (superseded()) return
   // A root handle can remain cached after visiting this workspace, while the
   // single Repo transport has since been routed to another workspace. Resolving
   // that cached handle does not call getRootHandle's cache-miss route setup, so
@@ -6857,8 +7417,8 @@ export async function startBridge(ref: WorkspaceRef = DEFAULT_WORKSPACE_REF): Pr
   // hydration and top-up run in the background and creations fall back to
   // random ids until it is warm.
   startMintedIdSupply(currentRef)
-  await durableHydration
-  resumePendingDurableDocuments()
+  // (The ledger's documents are re-presented by `partitionDurableLedger`,
+  // once the root resolution below has named this session's workspace.)
   const requestedAtStart = useModelStore.getState().currentDiagramId
   const preparedInitial: PreparedDiagramOpen = {}
   // Start the tiny crash-recovery journal beside root/render work; only the
@@ -6876,7 +7436,8 @@ export async function startBridge(ref: WorkspaceRef = DEFAULT_WORKSPACE_REF): Pr
       // beats a "Synced" over one (same rule as the entity journal).
       console.warn('pending placement hydration failed', error)
     })
-  const overlayBatchHydration = hydrateOverlayBatchJournal(workspaceKvStore(), workspaceRefKey(ref)).catch((error) => {
+  placementIntentHydration = placementHydration
+  const overlayBatchHydration =hydrateOverlayBatchJournal(workspaceKvStore(), workspaceRefKey(ref)).catch((error) => {
     console.warn('pending overlay batch hydration failed', error)
   })
   // Entity-intent crash journal. NEVER awaited by the boot path (only the
@@ -6899,7 +7460,20 @@ export async function startBridge(ref: WorkspaceRef = DEFAULT_WORKSPACE_REF): Pr
   // A deep-linked server-boot diagram is known before the Automerge root. Start
   // its independent read-model requests immediately while root/model-meta
   // continue in parallel. DiagramDoc still starts only after sharding is known.
-  if (requestedAtStart && isBootFromServerEnabled()) {
+  //
+  // NOT on the fallback re-entry. A read issued before the root asks the alias
+  // (nothing names this session's documents yet: the cached root's basis is
+  // restored by the root resolution below), and on this path the alias is the
+  // new default whose graph just failed to arrive. Its render would be
+  // projected over the cached root's documents, and its generation would raise
+  // `lastServerProjectionGeneration` above the cached version's, so that
+  // version's SSE events (which carry a generation) would be ignored by
+  // `scheduleLiveSyncRefresh` until an untyped trigger — sync traffic, the 60 s
+  // timer — refreshed anyway (lens review 2026-10-28, N3). The open fetches
+  // both after the root instead, when the reads name the cached root's
+  // version; the cost is the parallelism, on a boot that has already spent its
+  // resolution budget.
+  if (requestedAtStart && isBootFromServerEnabled() && !isFallbackReentry) {
     preparedInitial.render = loadDiagramRenderForProjection(requestedAtStart)
     const finishMeta = startClientTimelineMeasure('diagram.meta', { prefetched: true })
     preparedInitial.bootstrap = fetchDiagramMeta(requestedAtStart).then(
@@ -6922,6 +7496,9 @@ export async function startBridge(ref: WorkspaceRef = DEFAULT_WORKSPACE_REF): Pr
       rootHandle = await getRootHandle(currentRef)
       activeDocumentShare.pin(rootHandle.documentId, 'root')
       finishRoot()
+      // The root resolution has named this session's workspace (the
+      // root-fetch or root-cache basis `documentsWorkspaceKey` trusts).
+      if (!superseded()) partitionDurableLedger()
     } catch (error) {
       finishRoot({ failed: true })
       throw error
@@ -7375,6 +7952,15 @@ export async function startBridge(ref: WorkspaceRef = DEFAULT_WORKSPACE_REF): Pr
       }
     }
 
+    // A superseded boot that got this far stops here: the tail below wires the
+    // session's listeners and its repoint handler — which takes the binding
+    // frame kept for it, judged against whatever basis that moment holds — and
+    // publishes the fallback marker the handler reads. All of that belongs to
+    // the boot that owns the session now.
+    if (superseded()) {
+      finishBoot({ superseded: true })
+      return
+    }
     // Asserted connected because the status listeners are wired only below, so a
     // socket that connected DURING boot was never heard — unless this boot already
     // learned the opposite: a render fetch that could not reach the server
@@ -7425,6 +8011,15 @@ export async function startBridge(ref: WorkspaceRef = DEFAULT_WORKSPACE_REF): Pr
     // automatically after boot.
   } catch (err) {
     finishBoot({ failed: true })
+    if (superseded()) {
+      // A stop, or a newer start, took over while this boot was awaiting.
+      // Every step below acts on the module state, i.e. on THAT session —
+      // clearing `started`, ending its document share, falling back,
+      // rebounding, reporting 'error' — so none of it is this boot's to do.
+      // The rebounds await before they act, hence the checks again below.
+      console.warn('Automerge bridge: a superseded boot failed; the current session recovers on its own', err)
+      return
+    }
     started = false
     activeDocumentShare.endSession()
     // A CONTRACT failure is terminal AND local. Every recovery
@@ -7467,6 +8062,10 @@ export async function startBridge(ref: WorkspaceRef = DEFAULT_WORKSPACE_REF): Pr
             're-entering the boot from the last locally materialized root (offline path); the next reload retries the server',
           err
         )
+        // The version whose root just failed: the root fetch's own basis for
+        // the root it attempted, read before the re-entry restores the cached
+        // root's basis over it. Null when the server reported no key.
+        bootFallbackFailedVersionId = documentsWorkspaceFor(ref, lastAttemptedRootUrlFor(ref))?.versionId ?? null
         forgetWorkspaceHandles(ref)
         stopBridge()
         bootCachedRootFallbackKey = refKey
@@ -7495,6 +8094,7 @@ export async function startBridge(ref: WorkspaceRef = DEFAULT_WORKSPACE_REF): Pr
     // and only retry when it resolved somewhere new (no infinite loop).
     if (!isRetryableDocumentResolutionError(err)) {
       const { useAuthStore } = await import('../../stores/authStore')
+      if (superseded()) return
       const authState = useAuthStore.getState()
       if (authState.config && authState.config.stage !== 'off' && authState.user) {
         const { resolveBootWorkspaceRef } = await import('./bootRef')
@@ -7503,19 +8103,24 @@ export async function startBridge(ref: WorkspaceRef = DEFAULT_WORKSPACE_REF): Pr
         // while a truly dangling/forbidden ref falls through to the org
         // fallback exactly as before.
         const fallbackRef = await resolveBootWorkspaceRef(authState.orgId, ref)
+        if (superseded()) return
         if (!workspaceRefEquals(fallbackRef, ref)) {
           console.warn(
             `Automerge bridge: workspace ${ref.landscapeId}/${ref.versionId} is unavailable — ` +
               `falling back to ${fallbackRef.landscapeId}/${fallbackRef.versionId}`,
             err
           )
+          // Imported BEFORE the stop below, so no await separates this boot's
+          // own stop from its restart (a check after one would read this very
+          // stop as a supersession).
+          const { useWorkspaceStore } = await import('../../stores/workspaceStore')
+          if (superseded()) return
           // dropPersistedRootUrl: the failure is authoritative (non-retryable),
           // so keeping the dead root's offline url would only let the cached
           // boot fallback resurrect it later.
           forgetWorkspace(ref, { dropPersistedRootUrl: true })
           stopBridge()
           recoverWorkspaceProjection(fallbackRef)
-          const { useWorkspaceStore } = await import('../../stores/workspaceStore')
           useWorkspaceStore.setState({ ref: fallbackRef })
           return startBridge(fallbackRef)
         }
@@ -7528,13 +8133,15 @@ export async function startBridge(ref: WorkspaceRef = DEFAULT_WORKSPACE_REF): Pr
             'falling back to the live model',
           err
         )
+        // Mirror the fallback into the workspace store so the UI (draft pill, version
+        // menu) reflects the live model and doesn't keep polling the dead draft. Dynamic
+        // import avoids a static cycle (workspaceStore → switchWorkspace → bridge);
+        // imported before the stop, for the reason given above.
+        const { useWorkspaceStore } = await import('../../stores/workspaceStore')
+        if (superseded()) return
         forgetWorkspace(ref, { dropPersistedRootUrl: true })
         stopBridge()
         recoverWorkspaceProjection(DEFAULT_WORKSPACE_REF)
-        // Mirror the fallback into the workspace store so the UI (draft pill, version
-        // menu) reflects the live model and doesn't keep polling the dead draft. Dynamic
-        // import avoids a static cycle (workspaceStore → switchWorkspace → bridge).
-        const { useWorkspaceStore } = await import('../../stores/workspaceStore')
         useWorkspaceStore.setState({ ref: DEFAULT_WORKSPACE_REF })
         return startBridge(DEFAULT_WORKSPACE_REF)
       }
@@ -7577,6 +8184,8 @@ export function stopBridge(): void {
   // creates documents that must still be named with the OUTGOING workspace's
   // ids (mintedIdReserve's drainReserve contract).
   stopMintedIdSupply()
+  // Before the epoch moves: a session that has read the ledger writes it whole
+  // here; after the bump the same call could only add to it.
   queueDurableLedgerPersistence()
   durableAckEpoch += 1
   if (durableAckTimer) clearTimeout(durableAckTimer)
@@ -7617,6 +8226,7 @@ export function stopBridge(): void {
   if (diagramCollectionReplayTimer) { clearTimeout(diagramCollectionReplayTimer); diagramCollectionReplayTimer = null }
   diagramStubReplaying = false
   if (diagramStubReplayTimer) { clearTimeout(diagramStubReplayTimer); diagramStubReplayTimer = null }
+  carriedCreationIds.clear()
   if (offActiveDrainTimer) { clearTimeout(offActiveDrainTimer); offActiveDrainTimer = null }
   diagramAbsenceSweeping = false
   diagramAbsenceSweepFollowUp = false

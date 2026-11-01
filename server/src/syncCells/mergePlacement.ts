@@ -80,7 +80,8 @@ export interface MergePlacementOptions {
    *  have something to ask about would hash into a real partition. */
   parentVersionId: string | null
   /** `landscapes.ts`'s `resolveRootUrl`, curried. Falsy means "no root", and
-   *  the loop then touches nothing. */
+   *  the loop then touches nothing. A failed read throws (an explicit key has
+   *  no fallback root) and ends the merge before `applyMerge`. */
   resolveRootUrl: (key: WorkspaceKey) => Promise<string | null>
   /** `index.ts`'s `ensureCanonicalWorkspaceRoot`. Calls `onRotated` EXACTLY
    *  when it published a fresh root and swapped `versions.root_url` — not when

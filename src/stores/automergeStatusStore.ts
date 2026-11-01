@@ -16,6 +16,11 @@ import { create } from 'zustand'
 
 export type AutomergeStatus = 'connecting' | 'saving' | 'ready' | 'offline' | 'error'
 
+/** Why a repoint HELD this tab instead of letting it follow
+ * (`workspaceRepointNotice`). Unsaved work is not a reason any more: it is
+ * carried into the new default (bridge.ts `onWorkspaceBound`). */
+export type WorkspaceRepointHoldReason = 'boot-fallback'
+
 /**
  * WHAT THE BADGE MAY SAY WHILE A ROUTED READ IS BEING RETRIED.
  *
@@ -85,14 +90,18 @@ interface AutomergeStatusState {
   /**
    * Set when a repoint moved the landscape's default version under this tab and
    * the tab was HELD on the concrete version it was already editing, rather than
-   * carried to the new one (carrying it would discard whatever was unsaved).
+   * following the new one.
    *
    * `pinnedVersionId` is where the TRANSPORT was pointed. The ref itself is
    * untouched and still says `'current'`, so the banner's condition is "still on
    * the alias, in this landscape" — any real move away hides it without a rule
    * to forget. Nothing here is persisted: a reload ends the hold on its own.
+   *
+   * `reason` is why the tab was held: `boot-fallback` — this session booted
+   * from its cached root because the new default's did not arrive (see
+   * `onWorkspaceBound` in bridge.ts).
    */
-  workspaceRepointNotice: { landscapeId: string; pinnedVersionId: string } | null
+  workspaceRepointNotice: { landscapeId: string; pinnedVersionId: string; reason: WorkspaceRepointHoldReason } | null
   /**
    * Bumped each time the sync transport comes BACK (not connected → connected).
    *
@@ -110,7 +119,10 @@ interface AutomergeStatusState {
   /** The bridge saw the workspace contract change mid-session — ask for a reload. */
   markWorkspaceContractStale: () => void
   /** The transport was held on `versionId` because the landscape's default moved. */
-  noteWorkspacePinnedAfterRepoint: (workspace: { landscapeId: string; versionId: string }) => void
+  noteWorkspacePinnedAfterRepoint: (
+    workspace: { landscapeId: string; versionId: string },
+    reason: WorkspaceRepointHoldReason,
+  ) => void
   /** The user acknowledged the notice. */
   dismissWorkspaceRepointNotice: () => void
   /**
@@ -161,10 +173,11 @@ export const useAutomergeStatus = create<AutomergeStatusState>((set) => ({
   setBootFallbackActive: (active) => set({ bootFallbackActive: active }),
   markWorkspaceContractStale: () => set({ workspaceContractStale: true }),
   clearWorkspaceContractStale: () => set({ workspaceContractStale: false }),
-  noteWorkspacePinnedAfterRepoint: (workspace) => set({
+  noteWorkspacePinnedAfterRepoint: (workspace, reason) => set({
     workspaceRepointNotice: {
       landscapeId: workspace.landscapeId,
       pinnedVersionId: workspace.versionId,
+      reason,
     },
   }),
   dismissWorkspaceRepointNotice: () => set({ workspaceRepointNotice: null }),

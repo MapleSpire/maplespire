@@ -13,6 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import type { Queryable } from './types.js'
+import { ensureSpotlightSchema } from './spotlightSql.js'
 
 /**
  * Create the read-model tables + indexes (idempotent). Full entity in `data`
@@ -1143,6 +1144,11 @@ export async function ensureReadModelSchema(db: Queryable): Promise<void> {
       applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
     )
   `)
+
+  // Spotlight search (spotlightSql.ts): the accent-fold functions and the
+  // stored, folded `spot_*` columns over the tables above. After the tables
+  // and the ledger it records its fingerprint in; a no-op once built.
+  await ensureSpotlightSchema(db)
   const migration = await db.query<{ applied: boolean }>(
     `SELECT EXISTS (
        SELECT 1 FROM read_model_schema_migrations WHERE name = $1

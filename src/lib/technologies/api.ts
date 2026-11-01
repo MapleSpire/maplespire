@@ -16,6 +16,7 @@ import type { TechnologyRole, TechnologyShapeType } from '../../types'
 import { registerTechnologyCanonicalIds } from './canonicalIds'
 import { compareTechnologyMatches } from './ranking'
 import { accountDatabaseName } from '../auth/accountNamespace'
+import { transactionDone } from '../modelQuery/idbSchema'
 
 export interface CatalogTechnologyRevision {
   revision: number
@@ -157,15 +158,18 @@ async function mergeCache(orgId: string, technologies: CatalogTechnology[]): Pro
   if (typeof indexedDB === 'undefined') return
   try {
     const db = await openCache()
-    await new Promise<void>((resolve, reject) => {
+    try {
+      // Settles on IndexedDB's verdict: a transaction that aborts with nothing
+      // pending fires `abort` alone, and must not leave the page waiting.
       const transaction = db.transaction(STORE_NAME, 'readwrite')
       transaction.objectStore(STORE_NAME).put({ orgId, technologies: next, updatedAt: Date.now() })
-      transaction.oncomplete = () => resolve()
-      transaction.onerror = () => reject(transaction.error)
-    })
-    db.close()
-  } catch {
+      await transactionDone(transaction)
+    } finally {
+      db.close()
+    }
+  } catch (error) {
     // A cache failure must never turn a successful catalog request into an error.
+    console.warn('[technology-catalog] could not save technology catalog results for offline use', error)
   }
 }
 

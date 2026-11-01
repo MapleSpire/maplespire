@@ -14,7 +14,7 @@
 
 import { createServer, type Server } from 'node:http'
 import { once } from 'node:events'
-import { readFile } from 'node:fs/promises'
+import { readdir, readFile } from 'node:fs/promises'
 import express from 'express'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { SyncCellOwnership } from './ownership.js'
@@ -70,6 +70,7 @@ describe('parseWorkspaceHttpRoute', () => {
     for (const [path, method] of [
       ['/api/model/durability-witness?landscapeId=L1&versionId=V1', 'POST'],
       ['/api/model/related-diagram-object-ids?landscapeId=L1&versionId=V1', 'POST'],
+      ['/api/model/spotlight?landscapeId=L1&versionId=V1', 'POST'],
     ] as const) {
       expect(
         parseWorkspaceHttpRoute(path, method),
@@ -78,11 +79,23 @@ describe('parseWorkspaceHttpRoute', () => {
     }
 
     // AND THE SET IS DERIVED FROM THE TREE, not from memory: every
-    // `ensureWorkspace` route in `index.ts` must be routable. This is what makes
-    // the assertion above stay true when a new route is added.
-    const source = await readFile(new URL('../index.ts', import.meta.url), 'utf8')
-    const routes = [...source.matchAll(/app\.(get|post)\('(\/api\/[^']+)'[\s\S]{0,400}?await ensureWorkspace\(req, res\)/g)]
+    // `ensureWorkspace` route must be routable, in `index.ts` OR in a route
+    // module it registers (`registerXRoutes(app, { ensureWorkspace })`, which
+    // calls it as `deps.ensureWorkspace`). Scanning index.ts alone let a route
+    // moved into a module leave the gate silently. This is what makes the
+    // assertion above stay true when a new route is added.
+    const sources: string[] = []
+    const walk = async (dir: URL): Promise<void> => {
+      for (const entry of await readdir(dir, { withFileTypes: true })) {
+        if (entry.isDirectory()) await walk(new URL(`${entry.name}/`, dir))
+        else if (entry.name.endsWith('.ts') && !entry.name.endsWith('.test.ts')) sources.push(await readFile(new URL(entry.name, dir), 'utf8'))
+      }
+    }
+    await walk(new URL('../', import.meta.url))
+    const routes = sources.flatMap((source) => [...source.matchAll(/app\.(get|post)\('(\/api\/[^']+)'[\s\S]{0,400}?await (?:deps\.)?ensureWorkspace\(req, res\)/g)])
       .map((match) => [match[2]!, match[1]!.toUpperCase()] as const)
+    // A route module is in the scan, not just index.ts.
+    expect(routes.some(([path]) => path === '/api/model/spotlight'), 'the scan misses route modules').toBe(true)
     // The control: a scan that found nothing would make the loop below vacuous.
     expect(routes.length, 'the ensureWorkspace scan found nothing — it is broken, not the tree')
       .toBeGreaterThan(20)
@@ -343,6 +356,7 @@ describe('the admission gate is a SUPERSET of what Express routes', () => {
     '/api/automerge/durable-heads',
     '/api/model/durability-witness',
     '/api/model/related-diagram-object-ids',
+    '/api/model/spotlight',
   ]
 
   const spellings = (pathname: string): string[] => [

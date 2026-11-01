@@ -34,7 +34,7 @@ import {
   createVersion, listVersions, getVersion, deleteVersion, validateCreateVersion,
 } from './landscapeVersions.js'
 import {
-  ensureDefaultLandscape, resolveRootUrl, listLandscapes,
+  ensureDefaultLandscape, resolveRootUrl, resolveWorkspaceRoot, readableWorkspace, listLandscapes,
   createLandscape, createVersion as createEditableVersion, setDefaultVersion,
   renameLandscape, deleteLandscape, renameVersion, deleteVersion as deleteEditableVersion,
   createDraft, listDrafts, setDraftStatus, backfillLandscapeOrgs,
@@ -45,7 +45,7 @@ import { SummaryForkUnsupportedError } from './forkRoot.js'
 import {
   canonicalWorkspaceKey, checkWorkspaceAccess, sessionOrgId, requireLandscapeInOrg,
   requirePlatformAdminAtStageOn, requireLandscapeWrite, requireVersionWrite, requireOrgAdmin,
-  workspaceAccessForRequest,
+  workspaceAccessForRequest, workspaceAccessEnforced,
 } from './rbac/workspaceGate.js'
 import { computeDraftChanges } from './draft/changes.js'
 import { applyMerge } from './draft/applyMerge.js'
@@ -101,6 +101,7 @@ import {
   roConnectionCount, roDescendants, roRelatedDiagrams, roRelatedDiagramObjectIds, roSearch, roPageObjects, roPageConnections,
   roDiagramMeta, roFilteredObjectTree, roModelObjectFacets, roEntityFlows, roEntityDiagrams,
 } from './readModel/queries.js'
+import { registerSpotlightRoutes } from './readModel/spotlightRoute.js'
 import { roDiagramRender, toFirstPaintDiagramRender } from './readModel/diagramRender.js'
 import {
   DiagramRenderContextLoader,
@@ -125,6 +126,7 @@ import { roViewerLevel } from './readModel/viewerLevel.js'
 import { staticReadModelQueryWorkspaceIfPresent } from './readModel/staticWorkspace.js'
 import { ensureSparseDraftDiagram } from './draft/sparse.js'
 import { resolveHandleWithRetry } from './readModel/projectorService.js'
+import { ensureDefaultProjectorAtBoot } from './readModel/defaultProjectorBoot.js'
 /**
  * Per-attempt ceiling for a document resolved INSIDE an HTTP request.
  *
@@ -1855,6 +1857,8 @@ if (READ_MODEL_ENABLED) {
     timing.write(res)
     res.type('application/json').send(body)
   }))
+  // Spotlight: POST /api/model/spotlight (readModel/spotlightRoute.ts).
+  registerSpotlightRoutes(app, { db: pool, ensureWorkspace })
   app.get('/api/model/search', route(async (req, res) => {
     const key = await ensureWorkspace(req, res)
     if (!key) return
@@ -2450,7 +2454,8 @@ function setRestrictedEmbedHeaders(res: express.Response): void {
 /** Canonicalize a share's stored workspace ('current' → the landscape's real default
  * version id) so the RBAC gates — which are keyed by real version ids — match. Falls
  * back to the raw key when the landscape can't be resolved (a missing landscape makes
- * requireVersionWrite permissive, and its own row lookup 404s downstream). */
+ * requireVersionWrite permissive, and its own row lookup 404s downstream). A registry
+ * read that FAILS throws (`WorkspaceRegistryUnavailableError`) rather than falling back. */
 async function shareWorkspaceKey(landscapeId: string | null, versionId: string | null): Promise<WorkspaceKey> {
   const raw: WorkspaceKey = {
     landscapeId: landscapeId ?? DEFAULT_WORKSPACE_KEY.landscapeId,
@@ -2510,6 +2515,7 @@ app.post('/api/shares', async (req, res) => {
     const { snapshot: _snapshot, ...meta } = share
     res.json({ token: share.token, url, share: meta })
   } catch (err) {
+    if (sendDependencyOutage(res, err)) return
     console.error('Create share error:', err)
     res.status(500).json({ error: 'Failed to create share' })
   }
@@ -2521,6 +2527,7 @@ app.get('/api/shares', async (req, res) => {
     const shares = await filterSharesByReadAccess(req, await listShares(diagramId))
     res.json({ shares })
   } catch (err) {
+    if (sendDependencyOutage(res, err)) return
     console.error('List shares error:', err)
     res.status(500).json({ error: 'Failed to list shares' })
   }
@@ -2598,6 +2605,7 @@ app.patch('/api/shares/:token', async (req, res) => {
     if (!share) { res.status(404).json({ error: 'Share not found' }); return }
     res.json({ share })
   } catch (err) {
+    if (sendDependencyOutage(res, err)) return
     console.error('Update share error:', err)
     res.status(500).json({ error: 'Failed to update share' })
   }
@@ -2612,6 +2620,7 @@ app.delete('/api/shares/:token', async (req, res) => {
     const ok = await revokeShare(req.params.token)
     res.json({ success: ok })
   } catch (err) {
+    if (sendDependencyOutage(res, err)) return
     console.error('Revoke share error:', err)
     res.status(500).json({ error: 'Failed to revoke share' })
   }
@@ -2924,7 +2933,12 @@ async function main() {
   readiness.automerge = true
 
   // Canonical once per process: maintenance and the default projector must use
-  // the persisted version id, never the public `current` sentinel.
+  // the persisted version id, never the public `current` sentinel. A failed
+  // read ends boot, as `ensureDefaultLandscape` above does on the same
+  // failure: while canonicalWorkspaceKey swallowed it, this process ran on the
+  // sentinel for its whole life — the pin, the GC fence and the compaction
+  // admission all keyed on `current`. Only a landscape with no default
+  // version still falls back to it.
   const defaultWorkspaceKey = (
     await canonicalWorkspaceKey(pool, DEFAULT_WORKSPACE_KEY)
   ) ?? DEFAULT_WORKSPACE_KEY
@@ -3123,7 +3137,10 @@ async function main() {
   // EXPLICIT ref that doesn't resolve is a dangling workspace (deleted draft/
   // version, wiped landscape) — 404 so the client runs its own fallback-to-default
   // WITH its user-visible warning, instead of us silently handing it the default
-  // landscape's root as if it were the requested one.
+  // landscape's root as if it were the requested one. A ref whose registry
+  // cannot be READ (a database error) is the retryable 503 below, for the same
+  // reason: only the no-params call falls back to the primary root, and only
+  // where access is not enforced.
   app.get('/api/automerge/root', async (req, res) => {
     const landscapeId = typeof req.query.landscapeId === 'string' ? req.query.landscapeId : undefined
     const versionId = typeof req.query.versionId === 'string' ? req.query.versionId : undefined
@@ -3131,39 +3148,42 @@ async function main() {
       // Stage-aware read gate BEFORE disclosing the root URL — the URL is the
       // capability the WS layer syncs by, so handing it out unchecked would
       // leak another org's workspace to any authenticated user. Same gate as
-      // /api/model/* (canonical key + allowedWorkspaceKeys). A null canonical
-      // key (unknown landscape / no default version) falls through to
-      // resolveRootUrl's own explicit-miss 404 / legacy-fallback handling.
-      const canonical = await canonicalWorkspaceKey(pool, {
-        landscapeId: landscapeId ?? DEFAULT_WORKSPACE_KEY.landscapeId,
-        versionId: versionId ?? DEFAULT_WORKSPACE_KEY.versionId,
+      // /api/model/* (canonical key + allowedWorkspaceKeys), and the url comes
+      // FROM the key it checked, so the key reported below names the version
+      // this root belongs to — see `resolveWorkspaceRoot`.
+      const answer = await resolveWorkspaceRoot({ landscapeId, versionId }, rootUrl, {
+        canonicalize: (ref) => canonicalWorkspaceKey(pool, ref),
+        mayRead: (key) => checkWorkspaceAccess(pool, req, key),
+        accessEnforced: workspaceAccessEnforced(req),
       })
-      if (canonical && !(await checkWorkspaceAccess(pool, req, canonical))) {
+      if (answer.kind === 'forbidden') {
         res.status(403).json({ error: 'forbidden' })
         return
       }
-      const url = await resolveRootUrl(landscapeId, versionId, rootUrl)
+      const { url, key: reportedKey } = answer
       if (!url) {
         res.status(404).json({ error: `unknown workspace ${landscapeId ?? 'default'}/${versionId ?? 'current'}` })
         return
       }
-      const healthyUrl = canonical
-        ? await ensureCanonicalWorkspaceRoot(canonical, url)
+      // Repaired as the workspace it was resolved FROM, or not at all: the
+      // bootable fallback reports no key, and is not that workspace's root.
+      const healthyUrl = reportedKey
+        ? await ensureCanonicalWorkspaceRoot(reportedKey, url)
         : url
       // A concrete version root is normally stable but may rotate during
       // integrity recovery. ETag/304 caching can otherwise strand a browser on
       // the retired URL even though the server has repaired the workspace.
       res.setHeader('Cache-Control', 'private, no-store')
-      // The CANONICAL workspace goes back with the url. It was already computed
-      // above and thrown away, and the client needs it: `versionId=current` is a
-      // moving pointer, so a tab that never learns which CONCRETE version it
-      // booted against has nothing to compare the socket's binding to when a
-      // repoint moves the alias under it (§5/N14). Null when the ref did not
-      // canonicalise — the legacy fallback path, which has no key to report.
+      // The CANONICAL workspace goes back with the url, and the client needs
+      // it: `versionId=current` is a moving pointer, so a tab that never learns
+      // which CONCRETE version it booted against has nothing to compare the
+      // socket's binding to when a repoint moves the alias under it (§5/N14),
+      // and nothing to ask the durability witness about. Null when the url was
+      // not resolved from the key — the legacy fallback path.
       res.json({
         url: healthyUrl,
-        landscapeId: canonical?.landscapeId ?? null,
-        versionId: canonical?.versionId ?? null,
+        landscapeId: reportedKey?.landscapeId ?? null,
+        versionId: reportedKey?.versionId ?? null,
       })
     } catch (err) {
       console.error('Resolve root error:', err)
@@ -3188,23 +3208,26 @@ async function main() {
       return
     }
     try {
-      const canonical = await canonicalWorkspaceKey(pool, {
+      const workspace = await readableWorkspace({
         landscapeId: landscapeId ?? DEFAULT_WORKSPACE_KEY.landscapeId,
         versionId: versionId ?? DEFAULT_WORKSPACE_KEY.versionId,
+      }, {
+        canonicalize: (ref) => canonicalWorkspaceKey(pool, ref),
+        mayRead: (key) => checkWorkspaceAccess(pool, req, key),
       })
-      if (canonical && !(await checkWorkspaceAccess(pool, req, canonical))) {
+      if (workspace.kind === 'forbidden') {
         res.status(403).json({ error: 'forbidden' })
         return
       }
-      if (!canonical) {
+      if (workspace.kind === 'unknown') {
         res.status(404).json({ error: `unknown workspace ${landscapeId ?? 'default'}/${versionId ?? 'current'}` })
         return
       }
       let docUrl = READ_MODEL_ENABLED
-        ? await resolveDiagramDocUrlFromReadModel(pool, canonical, id)
+        ? await resolveDiagramDocUrlFromReadModel(pool, workspace.key, id)
         : null
       if (!READ_MODEL_ENABLED) {
-        const url = await resolveRootUrl(landscapeId, versionId, rootUrl)
+        const url = await workspace.rootUrl()
         if (!url) {
           res.status(404).json({ error: `unknown workspace ${landscapeId ?? 'default'}/${versionId ?? 'current'}` })
           return
@@ -3218,6 +3241,7 @@ async function main() {
       }
       res.json({ heads })
     } catch (err) {
+      if (sendDependencyOutage(res, err)) return
       console.error('doc-heads error:', err)
       res.status(500).json({ error: 'failed to read diagram heads' })
     }
@@ -3226,7 +3250,9 @@ async function main() {
   // Whether a workspace's OWN registry lists a diagram (see registryHasDiagram):
   // a booting client's answer to "does this version have the diagram I was
   // viewing?" when its own registry copy may be stale. Same stage-aware
-  // workspace gate as doc-heads; the root is resolved server-side.
+  // workspace gate as doc-heads; the root is resolved server-side, from the
+  // canonical key the gate checked (`readableWorkspace`), never from the ref
+  // again — a set-default in between would answer for another version.
   app.get('/api/automerge/registry-diagram', async (req, res) => {
     const landscapeId = typeof req.query.landscapeId === 'string' ? req.query.landscapeId : undefined
     const versionId = typeof req.query.versionId === 'string' ? req.query.versionId : undefined
@@ -3236,15 +3262,18 @@ async function main() {
       return
     }
     try {
-      const canonical = await canonicalWorkspaceKey(pool, {
+      const workspace = await readableWorkspace({
         landscapeId: landscapeId ?? DEFAULT_WORKSPACE_KEY.landscapeId,
         versionId: versionId ?? DEFAULT_WORKSPACE_KEY.versionId,
+      }, {
+        canonicalize: (ref) => canonicalWorkspaceKey(pool, ref),
+        mayRead: (key) => checkWorkspaceAccess(pool, req, key),
       })
-      if (canonical && !(await checkWorkspaceAccess(pool, req, canonical))) {
+      if (workspace.kind === 'forbidden') {
         res.status(403).json({ error: 'forbidden' })
         return
       }
-      const url = canonical ? await resolveRootUrl(landscapeId, versionId, rootUrl) : null
+      const url = workspace.kind === 'readable' ? await workspace.rootUrl() : null
       if (!url) {
         res.status(404).json({ error: `unknown workspace ${landscapeId ?? 'default'}/${versionId ?? 'current'}` })
         return
@@ -3261,6 +3290,7 @@ async function main() {
       res.setHeader('Cache-Control', 'private, no-store')
       res.json({ present: result.present })
     } catch (err) {
+      if (sendDependencyOutage(res, err)) return
       console.error('registry-diagram error:', err)
       res.status(500).json({ error: 'failed to read the registry' })
     }
@@ -3411,6 +3441,7 @@ async function main() {
       }
       res.json({ access: await workspaceAccessForRequest(pool, req, canonical) })
     } catch (err) {
+      if (sendDependencyOutage(res, err)) return
       console.error('Workspace access error:', err)
       res.status(500).json({ error: 'Failed to resolve workspace access' })
     }
@@ -3978,16 +4009,29 @@ async function main() {
         readModelFleet?.release(workspace, reason)
         staticDeltaProjector?.release(workspace, reason)
       })
+      // A PROMOTED default workspace has no ordinary projector by design, and a
+      // lost lease projects nothing — boot continues past both. Any other
+      // failure is retried in the background (`defaultProjectorBoot.ts`), and
+      // the pod stays unready until a retry settles it, instead of until a
+      // restart.
+      let bringUpComplete = false
+      let defaultProjectorPending = false
       if (syncCellOwnership!.owns(defaultWorkspaceKey)) {
-        try {
-          await readModelFleet.ensure(defaultWorkspaceKey)
-        } catch (error) {
-          // A PROMOTED default workspace has no ordinary projector by design —
-          // boot must continue, not abort. Same for a lost lease.
-          if (error instanceof ProjectorStaticWorkspaceError) {
-            console.log('[read-model] default workspace is summary/static — served by the static delta projector')
-          } else if (!(error instanceof ProjectorOwnershipError)) throw error
+        const fleet = readModelFleet
+        const outcome = await ensureDefaultProjectorAtBoot({
+          ensure: () => fleet.ensure(defaultWorkspaceKey),
+          isStaticRefusal: (error) => error instanceof ProjectorStaticWorkspaceError,
+          isOwnershipRefusal: (error) => error instanceof ProjectorOwnershipError,
+          stopped: () => readiness.shuttingDown,
+          onSettled: () => {
+            defaultProjectorPending = false
+            if (bringUpComplete && !readiness.shuttingDown) readiness.readModel = true
+          },
+        })
+        if (outcome === 'static') {
+          console.log('[read-model] default workspace is summary/static — served by the static delta projector')
         }
+        defaultProjectorPending = outcome === 'retrying'
       }
       if (readiness.shuttingDown) return
       staticDeltaProjector = new StaticDeltaProjector(
@@ -4011,7 +4055,8 @@ async function main() {
       // descriptor/control-document hydration is still consuming the same DB,
       // Repo and event loop as user reads. The first post-ready request must see
       // the fully attached read plane, not compete with startup work.
-      readiness.readModel = true
+      bringUpComplete = true
+      if (!defaultProjectorPending) readiness.readModel = true
       console.log(
         'Read-model projector fleet + static delta projector ready (READ_MODEL=on); only locally-owned workspaces may attach listeners'
       )

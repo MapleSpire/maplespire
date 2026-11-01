@@ -126,6 +126,33 @@ const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{1
 const count = value => Number.isSafeInteger(value) && value >= 0
 const finite = value => typeof value === 'number' && Number.isFinite(value) && value >= 0
 
+/** D60: the loop and convergence budgets are a p99 over the pass's whole
+ * population — every counted loop window of one cell, every episode-partition
+ * convergence — never the maximum of it. A window is one consuming read:
+ * nominally 500 ms, longer for the first read of an episode and the last one.
+ * Nearest-rank, so the reported value is an observed one: with n values the
+ * p99 is the ceil(0.99 n)-th smallest, and
+ * a pass of n windows tolerates n - ceil(0.99 n) windows at or over budget. */
+export function populationP99(values) {
+  if (!Array.isArray(values) || !values.length || !values.every(finite)) return null
+  const sorted = [...values].sort((a, b) => a - b)
+  return sorted[Math.ceil(0.99 * sorted.length) - 1]
+}
+
+/** What a reader needs beside the gated p99: the tail the p99 tolerates. The
+ * run length is over the values in arrival order (one cell's windows). */
+export function populationTail(values, budget) {
+  let run = 0, longest = 0
+  for (const value of values) { run = value >= budget ? run + 1 : 0; longest = Math.max(longest, run) }
+  return { p99Ms: populationP99(values), maxMs: values.length ? Math.max(...values) : null,
+    overBudget: values.filter(value => value >= budget).length,
+    allowedOverBudget: values.length ? values.length - Math.ceil(0.99 * values.length) : 0,
+    longestOverBudgetRun: longest, legacyMaxRuleFailed: values.some(value => value >= budget) }
+}
+
+export const LOOP_P99_BUDGET_MS = 100
+export const CONVERGENCE_P99_BUDGET_MS = 3_000
+
 /** One consumer of loop windows: finish the current collection before pausing,
  * skip the unavailable owner, then drain exactly once before admitting it again. */
 export class RehearsalSampler {
@@ -207,6 +234,8 @@ export class RehearsalObservations {
     this.reportedConvergence = new Set()
     this.loopWindows = new Map()
     this.loopWindowCounts = Object.fromEntries(services.map(service => [service, 0]))
+    this.loopPopulation = Object.fromEntries(services.map(service => [service, []]))
+    this.convergencePopulation = new Map()
     if (!Array.isArray(initialSnapshots) || initialSnapshots.length !== 3
       || new Set(initialSnapshots.map(row => row?.service)).size !== 3
       || initialSnapshots.some(row => !services.includes(row?.service))) {
@@ -317,7 +346,12 @@ export class RehearsalObservations {
       active += fact.activeConnections
       if (!fact.eventLoopExcluded) {
         this.maxEventLoopP99MsByService[row.service] = Math.max(this.maxEventLoopP99MsByService[row.service], fact.eventLoopP99Ms)
-        if (fact.eventLoopP99Ms >= 100) this.fail('event-loop', fact.eventLoopP99Ms, { ...context, service: row.service, ceilingExclusiveMs: 100 })
+        // One window over budget is a published fact, not a verdict (D60).
+        this.loopPopulation[row.service].push(fact.eventLoopP99Ms)
+        if (fact.eventLoopP99Ms >= LOOP_P99_BUDGET_MS) {
+          this.emit('event-loop-window-over-budget', { ...context, service: row.service, value: fact.eventLoopP99Ms,
+            budgetExclusiveMs: LOOP_P99_BUDGET_MS })
+        }
       }
     }
     if (drainService === null) this.peakActiveConnections = Math.max(this.peakActiveConnections, active)
@@ -341,10 +375,17 @@ export class RehearsalObservations {
       const convergedAt = Math.max(...rows.map(row => row.convergedAt))
       const convergenceMs = convergedAt - lastWriteCompletedAt
       const key = `${phase}:${cycle}:${partition}:convergence`
-      if (count(lastWriteCompletedAt) && finite(convergenceMs) && convergenceMs >= 3_000 && !this.reportedConvergence.has(key)) {
+      if (!count(lastWriteCompletedAt) || !finite(convergenceMs)) continue
+      // Later cohort rows can only raise convergedAt, so the last write per
+      // episode-partition is its final value; a population member, not a verdict (D60).
+      this.convergencePopulation.set(key, { phase, cycle, partition, convergenceMs })
+      if (convergenceMs >= CONVERGENCE_P99_BUDGET_MS && !this.reportedConvergence.has(key)) {
         this.reportedConvergence.add(key)
-        this.fail('convergence', convergenceMs, { phase, cycle, partition, ceilingExclusiveMs: 3_000,
-          lastWriteCompletedAt, convergedAt, receivedAt: Math.max(...rows.map(row => row.receivedAt ?? 0)) })
+        const detail = { phase, cycle, partition, lastWriteCompletedAt, convergedAt,
+          receivedAt: Math.max(...rows.map(row => row.receivedAt ?? 0)) }
+        // Failover is gated per partition, so its first crossing is its verdict.
+        if (phase === 'failover') this.fail('convergence', convergenceMs, { ...detail, statistic: 'failover-each', ceilingExclusiveMs: CONVERGENCE_P99_BUDGET_MS })
+        else this.emit('convergence-episode-over-budget', { ...detail, value: convergenceMs, budgetExclusiveMs: CONVERGENCE_P99_BUDGET_MS })
       }
     }
     const lost = raw.reduce((total, row) => total + (row?.missingFields ?? NaN) + (row?.staleFields ?? NaN)
@@ -400,6 +441,46 @@ export class RehearsalObservations {
     const durationCompleted = finite(actualSoakMs) && actualSoakMs >= 7_200_000
     if (!this.firstFailure && !durationCompleted) this.refuse('a PASS requires 7200000 ms of actual soak', {})
     for (const reason of extraFailures) this.fail('qualification', reason, { phase: 'final', cycle: null })
+    const eventLoopPopulation = Object.fromEntries(services.map(service => {
+      const values = this.loopPopulation[service]
+      return [service, { windows: values.length, ...populationTail(values, LOOP_P99_BUDGET_MS) }]
+    }))
+    for (const [service, population] of Object.entries(eventLoopPopulation)) {
+      if (population.p99Ms === null) this.refuse('empty event-loop window population', { service })
+      else if (population.p99Ms >= LOOP_P99_BUDGET_MS) {
+        this.fail('event-loop', population.p99Ms, { phase: 'final', cycle: null, service, statistic: 'population-p99',
+          ceilingExclusiveMs: LOOP_P99_BUDGET_MS, windows: population.windows, overBudget: population.overBudget,
+          allowedOverBudget: population.allowedOverBudget })
+      }
+    }
+    // The single failover episode is its own population of two partitions, so
+    // its p99 is its maximum: pooled with every soak cycle it would be one of
+    // hundreds of members, and the one episode this gate exists to qualify
+    // could take any value (architecture lens, 2026-10-21).
+    const members = [...this.convergencePopulation.values()]
+    const steady = members.filter(entry => entry.phase !== 'failover')
+    const failover = members.filter(entry => entry.phase === 'failover')
+    const convergencePopulation = {
+      steady: { episodePartitions: steady.length, ...populationTail(steady.map(entry => entry.convergenceMs), CONVERGENCE_P99_BUDGET_MS),
+        byPartition: [0, 1].map(partition => ({ partition,
+          ...populationTail(steady.filter(entry => entry.partition === partition).map(entry => entry.convergenceMs), CONVERGENCE_P99_BUDGET_MS) })) },
+      failover: failover.map(({ partition, convergenceMs }) => ({ partition, convergenceMs })),
+    }
+    if (convergencePopulation.steady.p99Ms === null) this.refuse('empty convergence population', {})
+    else if (convergencePopulation.steady.p99Ms >= CONVERGENCE_P99_BUDGET_MS) {
+      this.fail('convergence', convergencePopulation.steady.p99Ms, { phase: 'final', cycle: null, statistic: 'population-p99',
+        ceilingExclusiveMs: CONVERGENCE_P99_BUDGET_MS, episodePartitions: steady.length,
+        overBudget: convergencePopulation.steady.overBudget, allowedOverBudget: convergencePopulation.steady.allowedOverBudget })
+    }
+    if (failover.length !== 2) this.refuse('failover convergence population is not exactly two partitions', { failover: failover.length })
+    // convergence() skips a partition it cannot measure; under D60 a skip would
+    // silently drop a member — possibly the worst one — so every recorded
+    // steady episode must have contributed both partitions (correctness + QA lenses).
+    for (const entry of this.episodes) {
+      if (entry.phase === 'failover' || entry.record.status === 'VOID') continue
+      const missing = [0, 1].filter(partition => !this.convergencePopulation.has(`${entry.phase}:${entry.cycle}:${partition}:convergence`))
+      if (missing.length) this.refuse('steady episode missing from the convergence population', { phase: entry.phase, cycle: entry.cycle, missing })
+    }
     if (!freshness?.valid || !calibration?.valid || !(calibration.freshAfterTakeoverMs < 500)
       || !(freshness.freshAfterTakeoverMs >= 1_000)) {
       this.refuse('freshness calibration did not discriminate 5 and 12000 objects', {})
@@ -412,6 +493,8 @@ export class RehearsalObservations {
       requestedSoakMs: 7_200_000, actualSoakMs, durationCompleted,
       startedAt: this.startedAt, firstFailure: this.firstFailure, failures: this.failures, invalid: this.invalid,
       firstFailureDefinition: 'first criterion observed by the parent; source timestamps and sampled windows do not establish the physical order within overlapping intervals',
+      statistic: 'D60. Loop, per cell: each consuming read yields one window value, the HDR p99 of its 20 ms-resolution samples — nominally a 500 ms window of about 25 samples, i.e. about its maximum; the first window of an episode and the final one are longer. The gate is the nearest-rank p99 of those window values, so at most n - ceil(0.99 n) windows of the pass may reach 100 ms. Steady convergence (baseline and soak, partitions pooled): the same p99 over episode-partitions, budget 3000 ms. Failover convergence: each of its two partitions under 3000 ms. Maxima, over-budget counts, longest consecutive run and the pre-D60 max-rule verdict are published, not gated.',
+      eventLoopPopulation, convergencePopulation,
       maxEventLoopP99MsByService: this.maxEventLoopP99MsByService, samples: this.samples,
       eventLoopWindowCounts: this.loopWindowCounts,
       freshness, calibration, episodes: this.episodes,

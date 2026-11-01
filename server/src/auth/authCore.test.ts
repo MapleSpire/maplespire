@@ -20,6 +20,9 @@ import {
   readSessionCookie,
   setSessionCookie,
   clearSessionCookie,
+  sessionEndedPending,
+  rememberSessionEnded,
+  sessionEndedCookieName,
   SESSION_COOKIE_NAME,
   type SessionClaims,
 } from './tokens.js'
@@ -279,6 +282,46 @@ describe('tokens: cookie read/write', () => {
     expect(header).toContain(`${SESSION_COOKIE_NAME}=;`)
     expect(header).toContain('Max-Age=0')
     expect(header).toContain('1970')
+  })
+
+  // The "session ended" marker: a stale cookie answered by one request and
+  // cleared must still be explainable to the next (GET /api/auth/me).
+  it('rememberSessionEnded leaves a short-lived HttpOnly marker named after the session cookie', () => {
+    const res = fakeRes()
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    rememberSessionEnded(res as any)
+    expect(res.headers).toHaveLength(1)
+    expect(res.headers[0]).toContain(`${SESSION_COOKIE_NAME}_ended=stale`)
+    // Exact attributes: a browser drops or never sends a marker with another Path/Domain/SameSite,
+    // and Max-Age is seconds (120000 would be ~33 h).
+    expect(res.headers[0]).toMatch(/^[a-z_]+_ended=stale; Path=\/; HttpOnly; SameSite=Lax; Max-Age=120$/)
+    expect(sessionEndedCookieName()).toBe(`${SESSION_COOKIE_NAME}_ended`)
+  })
+
+  it('the marker follows a renamed session cookie (per-stack AUTH_COOKIE_NAME), so stacks never share it', () => {
+    process.env.AUTH_COOKIE_NAME = 'maplespire_session_5261'
+    expect(sessionEndedCookieName()).toBe('maplespire_session_5261_ended')
+    const res = fakeRes()
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    rememberSessionEnded(res as any)
+    expect(res.headers[0]).toContain('maplespire_session_5261_ended=stale')
+  })
+
+  it('sessionEndedPending reads the marker WITHOUT clearing it, so every tab is told', () => {
+    const res = fakeRes()
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect(sessionEndedPending(fakeReq(`${SESSION_COOKIE_NAME}_ended=stale`))).toBe(true)
+    expect(res.headers).toEqual([])
+    expect(sessionEndedPending(fakeReq('other=1'))).toBe(false)
+    // Another stack's marker (different AUTH_COOKIE_NAME) is not ours.
+    expect(sessionEndedPending(fakeReq('maplespire_session_5261_ended=stale'))).toBe(false)
+  })
+
+  it('setSessionCookie still sets exactly one cookie (the marker needs no clearing there)', () => {
+    const res = fakeRes()
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    setSessionCookie(res as any, 'my-token')
+    expect(res.headers).toHaveLength(1)
   })
 })
 
@@ -576,6 +619,16 @@ describe('middleware: requireAuth isSessionCurrent (a revoked session on cookie 
     expect(res.jsonBody).toMatchObject({ code: 'session_stale' })
     expect(res.setCookies.some((c) => c.startsWith(`${SESSION_COOKIE_NAME}=;`))).toBe(true)
     expect(req.auth).toBeUndefined()
+  })
+
+  it('a stale session also leaves the "session ended" marker, so the cleared cookie does not erase the reason', async () => {
+    const { res } = await run({ stage: 'on', isSessionCurrent: async () => false })
+    expect(res.setCookies.some((c) => c.startsWith(`${SESSION_COOKIE_NAME}_ended=stale`))).toBe(true)
+  })
+
+  it('a current session leaves no marker', async () => {
+    const { res } = await run({ stage: 'on', isSessionCurrent: async () => true })
+    expect(res.setCookies.some((c) => c.includes('_ended='))).toBe(false)
   })
 
   it('a current session proceeds with req.auth set, and the check saw its claims', async () => {

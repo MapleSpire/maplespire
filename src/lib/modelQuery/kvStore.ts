@@ -12,7 +12,7 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU Affero General Public License for more details.
 
-import { get, getMany, set, setMany, del, delMany, entries, clear, createStore, update, type UseStore } from 'idb-keyval'
+import { get, getMany, set, setMany, del, delMany, entries, clear, createStore, type UseStore } from 'idb-keyval'
 import { currentWorkspaceRef, workspaceRefKey } from '../automerge/workspace'
 import { accountDatabaseName } from '../auth/accountNamespace'
 import { recordModelQueryOperation } from '../observability/modelQueryDiagnostics'
@@ -35,7 +35,9 @@ export interface KvStore {
   /** ATOMIC read-modify-write of one key: get + set run inside a single
    * IndexedDB readwrite transaction, so concurrent updates from two TABS
    * serialize instead of losing one — a plain get-then-set cannot promise
-   * that, and the entity-intent tab registry was strandable because of it. */
+   * that, and the entity-intent tab registry was strandable because of it.
+   * Resolves once the write commits; rejects when the read fails, the
+   * transaction aborts, or the updater throws — it never stays pending. */
   update<T>(key: string, updater: (old: T | undefined) => T): Promise<void>
   /** All [key, value] pairs whose key starts with `prefix`. Used to enumerate a
    * whole entity family (o:/c:/g:/d:) so the index can back the global tables when
@@ -52,6 +54,42 @@ function idb(): UseStore {
   return store
 }
 
+/**
+ * idb-keyval's `update`, minus its hang. Measured 2026-10-31 on
+ * fake-indexeddb (`idbKvStoreUpdate.test.ts`): idb-keyval 6.2.2 listens only
+ * for the read's `success`, so a read that fails — its transaction aborted,
+ * or the request erroring — leaves the promise pending for ever, while a
+ * plain `get` failing the same way rejects. It also rejects an aborted
+ * explicit transaction with `null`. Upstream 6.2.5 adds the read's `onerror`
+ * (its source read 2026-10-31, not run); the lock still pins 6.2.2, and this
+ * version does not depend on which one is installed.
+ *
+ * Still ONE readwrite transaction (the atomicity the interface promises), and
+ * still resolved on `complete` rather than on the write's success: a write the
+ * transaction rolls back afterwards must not read as done.
+ */
+function updateInOneTransaction<T>(
+  withStore: UseStore,
+  key: string,
+  updater: (old: T | undefined) => T,
+): Promise<void> {
+  return withStore('readwrite', (objectStore) => new Promise<void>((resolve, reject) => {
+    const transaction = objectStore.transaction
+    transaction.oncomplete = () => resolve()
+    transaction.onabort = () => reject(transaction.error ?? new DOMException('the update transaction was aborted', 'AbortError'))
+    const read = objectStore.get(key)
+    read.onerror = () => reject(read.error)
+    read.onsuccess = () => {
+      try {
+        objectStore.put(updater(read.result as T | undefined), key)
+      } catch (error) {
+        // Nothing was written; the empty transaction commits.
+        reject(error)
+      }
+    }
+  }))
+}
+
 /** Production KvStore backed by IndexedDB (idb-keyval). */
 export const idbKvStore: KvStore = {
   get: <T>(k: string) => get<T>(k, idb()),
@@ -60,7 +98,7 @@ export const idbKvStore: KvStore = {
   setMany: (e) => setMany(e, idb()),
   del: (k) => del(k, idb()),
   delMany: (ks) => delMany(ks, idb()),
-  update: <T>(k: string, updater: (old: T | undefined) => T) => update<T>(k, updater, idb()),
+  update: <T>(k: string, updater: (old: T | undefined) => T) => updateInOneTransaction<T>(idb(), k, updater),
   scanPrefix: async <T>(prefix: string) => {
     const started = typeof performance !== 'undefined' ? performance.now() : Date.now()
     try {

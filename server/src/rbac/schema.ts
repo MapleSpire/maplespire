@@ -338,6 +338,59 @@ export async function ensureRbacSchema(pool: Pool): Promise<void> {
     `)
 
     // ---------------------------------------------------------------
+    // lock_permission_writes — ONE transaction-scoped lock serializing every
+    // permission write (org_members, team_members, team_scope_permissions, and
+    // the deletes that cascade into them). Taken by a BEFORE … FOR EACH
+    // STATEMENT trigger on those tables (auth/wsAuth.ts ensureEpochTriggers),
+    // i.e. before the statement locks any row, and by PUT
+    // /api/orgs/:orgId/access before its first FOR UPDATE.
+    //
+    // Why: every write to these tables used to bump the org's auth epoch row,
+    // which serialized them as a side effect. Grants stopped bumping, then
+    // reductions moved to per-user epochs, and lock-order inversions appeared
+    // — measured 2026-10-16 as deterministic 40P01s in
+    // auth/epochDeadlock.integration.test.ts: on the per-user epoch rows, and
+    // on user_effective_permissions (two transactions writing grants of teams
+    // that share members, in opposite orders — masked until then by the org
+    // row).
+    //
+    // Why ONE lock and not one per org (the first version): a per-org lock can
+    // only be taken in a ROW trigger, which fires after the statement has
+    // locked all its rows — so a statement spanning several orgs took their
+    // locks in row order, and a single-row writer could hold its row while
+    // waiting for the lock. A statement trigger fires before any row lock but
+    // cannot know the rows, hence the orgs: the lock has to be global. (A
+    // BEFORE ROW trigger is no way out: for UPDATE/DELETE it fires after the
+    // row's own lock — measured as a 40P01 by epochDeadlock's mutants.)
+    //
+    // The price: permission writes of DIFFERENT orgs queue behind each other.
+    // They wait (the primary pool sets no lock_timeout), they do not fail.
+    // Hold time of one statement, measured 2026-10-17 (local Postgres 16,
+    // median of 5): an org_members insert (invite accept) or one team-member
+    // removal < 1 ms at any size; a grant created or narrowed recomputes every
+    // member of the team — 3 ms at 10 members, ~70-80 ms at 1 000, ~380 ms at
+    // 5 000. A matrix save of k such grants holds it ~k times that. Not
+    // measured: the queue under concurrent load.
+    //
+    // A transaction that took it and then went idle (a leaked client, the #53
+    // class) would stop every org's permission writes; the lock therefore sets
+    // idle_in_transaction_session_timeout for its own transaction, so such a
+    // session is terminated — and the lock released — after 30 s.
+    // An advisory lock rather than a row: it revokes nobody and needs no row.
+    // ---------------------------------------------------------------
+    await client.query(`
+      CREATE OR REPLACE FUNCTION lock_permission_writes() RETURNS void AS $$
+      BEGIN
+        PERFORM set_config('idle_in_transaction_session_timeout', '30s', true);
+        PERFORM pg_advisory_xact_lock(hashtextextended('auth-permission-writes', 0));
+      END;
+      $$ LANGUAGE plpgsql
+    `)
+    // The per-org functions of the first version (never released).
+    await client.query('DROP FUNCTION IF EXISTS lock_orgs_permissions(TEXT, TEXT)')
+    await client.query('DROP FUNCTION IF EXISTS lock_org_permissions(TEXT)')
+
+    // ---------------------------------------------------------------
     // rbac_effective_access — the decision function `access.ts` wraps. See
     // that file's header for the semantics (org-admin bypass, read inherits
     // down the ancestor chain, write never comes from mere org membership).

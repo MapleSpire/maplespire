@@ -24,8 +24,9 @@
  *    every alias cache it cannot reach, asks the sockets bound to the OLD
  *    default to reconnect (`syncCells/defaultVersionRepoint.ts`);
  *  - the BROWSER is told which workspace each socket was bound to, and on a
- *    disagreement either FOLLOWS the move or HOLDS its transport on the version
- *    it was editing (`lib/automerge/workspaceBinding.ts`, `bridge.ts`).
+ *    disagreement FOLLOWS the move, carrying whatever it has not had
+ *    confirmed into the version it follows (`lib/automerge/workspaceBinding.ts`,
+ *    `bridge.ts` `onWorkspaceBound`). Only a boot-fallback session holds.
  *
  * ## The discriminant, and what it is against
  *
@@ -37,10 +38,17 @@
  *
  * Test 2 is the CONTROL for it. Draining alone would convert a working client
  * into one that can sync nothing (the post-repoint write lost behind a badge
- * reading "Enregistrement…"); it is safe only because the browser can hold.
- * If a change ever makes the drain carry a tab away from unsaved work, test 2
- * goes red and test 1 stays green — which is the pair worth having, since each
- * alone can be satisfied by breaking the other.
+ * reading "Enregistrement…"); it is safe only because the browser carries
+ * what it has not had confirmed into the version it follows. If a change ever
+ * makes the follow drop that work, test 2 goes red and test 1 stays green —
+ * which is the pair worth having, since each alone can be satisfied by
+ * breaking the other.
+ *
+ * Until 2026-10-31 test 2 asserted a HOLD: a tab with unsaved work stayed on
+ * the old version, behind a banner. The product decision of that day replaced
+ * it: unsynced work follows `current`, whether the tab reloads or stays open,
+ * so it is never split between the old version and the new default
+ * (repoint-offline-create.spec.ts test 2 is the offline half).
  *
  * ## Why the badge is the precondition of test 1, and not decoration
  *
@@ -48,10 +56,9 @@
  * `ws-sync-status[data-status=ready]` reports. Asserting it first is not
  * belt-and-braces: on a landscape created in the same session the follow never
  * happens, because that status is a durability LATCH that never reaches
- * `ready` on a brand-new landscape (`TagPerspectiveBar.tsx` says so; measured
- * `unsaved: 1` → `action: 'pin'`). A repoint on such a workspace always HOLDS. That is the
- * safe direction — it never discards work — but it is a real limit, and a test
- * that did not state its precondition would have blamed the drain for it.
+ * `ready` on a brand-new landscape (`TagPerspectiveBar.tsx` says so). Test 1
+ * asserts the tab had nothing to carry, so it states that precondition rather
+ * than blaming the drain for a carry it did not mean to measure.
  *
  * ## How test 2 keeps a CONNECTED tab holding unsaved work
  *
@@ -268,6 +275,11 @@ async function allowDurableAcknowledgement(page: Page): Promise<void> {
 }
 
 test.describe.configure({ mode: 'serial' })
+// The polls below allow up to 120 s (the badge) + 90 s (the follow) + 60 s
+// (presence) — more than the 120 s project default, which then ends a test in
+// the middle of a wait it declared it would make (measured 2026-10-31 under
+// load: test 1 timed out inside its 60 s follow poll).
+test.beforeEach(() => test.setTimeout(360_000))
 
 test.describe('a default version that moves under a live tab', () => {
   test('is followed by a tab with nothing to lose, without a page reload', async ({ page }) => {
@@ -337,7 +349,7 @@ test.describe('a default version that moves under a live tab', () => {
       .toBe('absent')
   })
 
-  test('is NOT followed by a tab holding unsaved work — it is held, and says so', async ({ page }) => {
+  test('is followed by a tab holding unsaved work too — and the work comes with it', async ({ page }) => {
     await signIn(page)
     await gotoModelObjects(page)
     await expect(page.getByTestId('ws-sync-status')).toHaveAttribute('data-status', 'ready', {
@@ -366,47 +378,41 @@ test.describe('a default version that moves under a live tab', () => {
     })
 
     // The repoint now lands on a tab that is CONNECTED and holding unsaved
-    // work: the drain is what reaches it, and the hold is what answers.
+    // work: the drain is what reaches it, and the follow is what answers.
     await setDefaultVersion(page, LANDSCAPE, v2)
 
-    // The tab is held on the version it was editing, and the address bar still
-    // says `current` — the hold moves the TRANSPORT, never the reference. Moving
-    // the reference would lose the very work it exists to protect: the intent
-    // journals are keyed by the ref.
-    await expect
-      .poll(async () => (await bindingProbe(page, LANDSCAPE)).held?.versionId ?? null, { timeout: 90_000 })
-      .toBe(v1)
-    expect(page.url()).toContain('/version/current')
-    await expect(page.getByTestId('workspace-repoint-banner')).toBeVisible({ timeout: 30_000 })
-
-    // And the work is DURABLE where the tab is, not merely still on screen.
-    await expect
-      .poll(() => objectPresence(page, objectId, { landscapeId: LANDSCAPE, versionId: v1 }), {
-        timeout: 90_000,
-      })
-      .toBe('present')
-    // The version the tab refused to follow has no resident projector until
-    // something asks, so this one genuinely starts at `unknown` — poll it to a
-    // definite answer instead of reading a 503 as an absence.
-    await expect
-      .poll(() => objectPresence(page, objectId, { landscapeId: LANDSCAPE, versionId: v2 }), {
-        timeout: 60_000,
-      })
-      .toBe('absent')
-
-    // The banner is the user's way out, and taking it must not cost the work.
-    // The acknowledgement is restored first: the interesting question is what
-    // the button does for a user whose situation has recovered, not what it
-    // does while the endpoint is still down.
-    await allowDurableAcknowledgement(page)
-    await page.getByTestId('workspace-repoint-follow').click()
+    // FOLLOWED, not held: the basis moves to the new default, nothing is
+    // pinned, no banner, and the address bar still says `current`.
     await expect
       .poll(async () => (await bindingProbe(page, LANDSCAPE)).basis?.versionId ?? null, { timeout: 90_000 })
       .toBe(v2)
+    expect((await bindingProbe(page, LANDSCAPE)).held, 'the tab was pinned to the old version').toBeNull()
+    expect(page.url()).toContain('/version/current')
+    await expect(page.getByTestId('workspace-repoint-banner')).toHaveCount(0)
+
+    // And the work came WITH it — durable in the version the tab now writes
+    // into, while the acknowledgement is still blocked (the follow carries what
+    // was not confirmed, it does not wait for a confirmation). The fork has no
+    // resident projector until something asks, so it starts at `unknown`.
+    await expect
+      .poll(() => objectPresence(page, objectId, { landscapeId: LANDSCAPE, versionId: v2 }), {
+        timeout: 90_000,
+      })
+      .toBe('present')
+    // At-least-once, stated rather than hidden: the write had reached V1
+    // before the repoint (only its acknowledgement was blocked), and the
+    // client cannot tell delivered-unconfirmed from never-delivered, so the
+    // old version keeps it too.
     await expect
       .poll(() => objectPresence(page, objectId, { landscapeId: LANDSCAPE, versionId: v1 }), {
         timeout: 60_000,
       })
       .toBe('present')
+
+    // Once the server can confirm again, nothing is left owed.
+    await allowDurableAcknowledgement(page)
+    await expect(page.getByTestId('ws-sync-status')).toHaveAttribute('data-status', 'ready', {
+      timeout: 90_000,
+    })
   })
 })

@@ -12,6 +12,7 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU Affero General Public License for more details.
 
+import { createHash } from 'node:crypto'
 import type { IncomingMessage } from 'node:http'
 import type { Pool, PoolClient } from 'pg'
 import type WebSocket from 'ws'
@@ -487,23 +488,81 @@ interface OrgEpochRow {
 }
 
 /**
- * Ensure the AFTER INSERT/UPDATE/DELETE triggers on `org_members`,
- * `team_members`, and `team_scope_permissions` that bump `auth_user_epochs` for
- * each affected (org, user) and `pg_notify('auth_user_epoch', …)` — on a change
- * that can REDUCE that user's access only; a pure grant notifies
- * `workspace_access_changed` instead (see `note_auth_grant`). Idempotent (CREATE OR
- * REPLACE / DROP+CREATE TRIGGER), safe to call on every boot alongside
- * `ensureRbacSchema`.
+ * Ensure the triggers behind session revocation and the permission-write lock:
+ *  - AFTER INSERT/UPDATE/DELETE on `org_members`, `team_members` and
+ *    `team_scope_permissions` (and BEFORE DELETE on `teams`) that bump
+ *    `auth_user_epochs` for each affected (org, user) and
+ *    `pg_notify('auth_user_epoch', …)` — on a change that can REDUCE that
+ *    user's access only; a pure grant notifies `workspace_access_changed`
+ *    instead (see `note_auth_grant`);
+ *  - AFTER UPDATE/DELETE on `users` (`trg_epoch_users`) that bumps the user's
+ *    GLOBAL epoch when they lose platform admin, leave 'active', or are deleted;
+ *  - BEFORE … FOR EACH STATEMENT on the permission tables
+ *    (`trg_auth_lock_writes`) that take `lock_permission_writes()`.
+ * Idempotent (CREATE OR REPLACE FUNCTION; a trigger is created only when
+ * missing or different), safe to call on every boot alongside
+ * `ensureRbacSchema`. Returns what it did: 'installed', 'up-to-date' (no DDL
+ * issued) or 'skipped-newer' (a newer build's set is left alone).
  *
  * Placed here (auth/wsAuth.ts) rather than rbac/schema.ts because it's a
  * consumer-side concern (WS revocation) layered on top of the already-idempotent
  * `auth_epochs` table from auth/schema.ts — no circular import between the two
  * schema modules.
  */
-export async function ensureEpochTriggers(pool: Pool): Promise<void> {
+export async function ensureEpochTriggers(pool: Pool): Promise<'installed' | 'up-to-date' | 'skipped-newer'> {
   const client = await pool.connect()
   try {
     await client.query('BEGIN')
+
+    // Never downgrade: a process older than the installed trigger set (a
+    // rolling deploy) leaves it alone. The row is locked for the rest of this
+    // transaction, so two booting processes install one after the other.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS auth_trigger_schema (
+        singleton BOOLEAN PRIMARY KEY DEFAULT true CHECK (singleton),
+        version   INTEGER NOT NULL
+      )
+    `)
+    await client.query('ALTER TABLE auth_trigger_schema ADD COLUMN IF NOT EXISTS ddl_hash TEXT')
+    await client.query('INSERT INTO auth_trigger_schema (singleton, version) VALUES (true, 0) ON CONFLICT DO NOTHING')
+    const { rows: versionRows } = await client.query<{ version: number; ddl_hash: string | null }>(
+      'SELECT version, ddl_hash FROM auth_trigger_schema FOR UPDATE',
+    )
+    const installed = versionRows[0]?.version ?? 0
+    if (installed > AUTH_TRIGGER_SCHEMA_VERSION) {
+      console.warn(
+        `[ws-auth] permission triggers v${installed} are newer than this build's v${AUTH_TRIGGER_SCHEMA_VERSION}; leaving them installed`,
+      )
+      await client.query('COMMIT')
+      return 'skipped-newer'
+    }
+
+    // Nothing to do — same version, same installer code, every trigger present
+    // and no older build's trigger re-added: skip the DDL. DROP/CREATE TRIGGER
+    // takes an ACCESS EXCLUSIVE lock on its table, and the set now includes
+    // users and orgs, which every sign-in touches; a boot should not queue
+    // behind (or in front of) them for nothing (architect lens, 2026-10-17).
+    if (installed === AUTH_TRIGGER_SCHEMA_VERSION && versionRows[0]?.ddl_hash === epochTriggersDdlHash()) {
+      const expected = [
+        ['users', 'trg_epoch_users'],
+        ...PERMISSION_WRITE_TABLES.map(([table]) => [table, 'trg_auth_lock_writes']),
+        ...['org_members', 'team_members', 'team_scope_permissions', 'teams'].map((table) => [table, 'trg_auth_revoke']),
+      ]
+      const { rows: present } = await client.query<{ tbl: string; tg: string }>(
+        `SELECT e.tbl, e.tg FROM unnest($1::text[], $2::text[]) AS e(tbl, tg)
+         WHERE EXISTS (SELECT 1 FROM pg_trigger t
+                       WHERE t.tgrelid = to_regclass(e.tbl) AND t.tgname = e.tg AND NOT t.tgisinternal)`,
+        [
+          [...expected.map(([t]) => t), ...LEGACY_EPOCH_TRIGGERS.map(([t]) => t)],
+          [...expected.map(([, g]) => g), ...LEGACY_EPOCH_TRIGGERS.map(([, g]) => g)],
+        ],
+      )
+      const has = (table: string, trigger: string) => present.some((r) => r.tbl === table && r.tg === trigger)
+      if (expected.every(([t, g]) => has(t, g)) && !LEGACY_EPOCH_TRIGGERS.some(([t, g]) => has(t, g))) {
+        await client.query('COMMIT')
+        return 'up-to-date'
+      }
+    }
 
     // Global per-user bump: UPSERT-increment auth_global_epochs + notify. Ends
     // the user's sessions in every org AND the org-less ones, which no
@@ -563,6 +622,43 @@ export async function ensureEpochTriggers(pool: Pool): Promise<void> {
       END
       $$
     `)
+
+    // Serialize every permission write, BEFORE the statement locks any row:
+    // a statement-level BEFORE trigger fires before the executor fetches the
+    // first row, so the lock (lock_permission_writes, rbac/schema.ts) comes
+    // before every row lock, epoch row and effective-permission row of the
+    // statement — whatever orgs its rows belong to. A row trigger could only
+    // take it after the statement had locked all its rows, which is how a
+    // statement spanning two orgs could still invert (measured cases:
+    // epochDeadlock.integration.test.ts). Tables whose DELETE cascades into
+    // permission rows are covered for DELETE (the cascade then runs inside
+    // the held lock); users.status / last_org_id updates are not permission
+    // writes and stay unserialized (so `trg_epoch_users` above, an AFTER ROW
+    // trigger on UPDATE, runs without it).
+    //
+    // Installed here, right after `trg_epoch_users` and parents first (see
+    // PERMISSION_WRITE_TABLES): this transaction takes its table locks in the
+    // order a cascading delete does. ensureTrigger touches a table only when
+    // its trigger is missing or different, so a re-install does not lock
+    // `users` or `orgs` (read by every sign-in) for nothing.
+    await client.query(`
+      CREATE OR REPLACE FUNCTION auth_lock_permission_writes() RETURNS trigger AS $$
+      BEGIN
+        PERFORM lock_permission_writes();
+        RETURN NULL;
+      END;
+      $$ LANGUAGE plpgsql
+    `)
+    for (const [table, events] of PERMISSION_WRITE_TABLES) {
+      await ensureTrigger(client, {
+        table,
+        name: 'trg_auth_lock_writes',
+        timing: 'BEFORE',
+        level: 'STATEMENT',
+        events,
+        fn: 'auth_lock_permission_writes',
+      })
+    }
 
     // Shared bump function: UPSERT-increment auth_epochs for one org + notify.
     await client.query(`
@@ -625,11 +721,35 @@ export async function ensureEpochTriggers(pool: Pool): Promise<void> {
       $$ LANGUAGE plpgsql
     `)
 
+    // teams: a DELETE cascades into team_members and team_scope_permissions,
+    // whose AFTER triggers then find no team row — no org, so no epoch bump (QA
+    // lens, 2026-10-16). BEFORE DELETE runs while the team row still exists,
+    // i.e. before the cascade: revoke every member there — their team grants
+    // are about to vanish. No route deletes a team today (they are archived).
+    // First of the revoke triggers: `teams` is the parent of the two below.
+    await client.query(`
+      CREATE OR REPLACE FUNCTION auth_revoke_teams_delete() RETURNS trigger AS $$
+      BEGIN
+        PERFORM bump_auth_user_epoch(OLD.org_id, tm.user_id)
+        FROM team_members tm WHERE tm.team_id = OLD.id;
+        RETURN OLD;
+      END;
+      $$ LANGUAGE plpgsql
+    `)
+    await ensureTrigger(client, {
+      table: 'teams',
+      name: 'trg_auth_revoke',
+      timing: 'BEFORE',
+      level: 'ROW',
+      events: 'DELETE',
+      fn: 'auth_revoke_teams_delete',
+    })
+
     // org_members: org_id is a direct column. Roles are 'admin' | 'member'
     // (orgRoutes.ts); a change TO admin is the only role change that cannot
     // reduce access, and a re-keyed row is a removal from the OLD org.
     await client.query(`
-      CREATE OR REPLACE FUNCTION trg_bump_epoch_org_members() RETURNS trigger AS $$
+      CREATE OR REPLACE FUNCTION auth_revoke_org_members() RETURNS trigger AS $$
       BEGIN
         IF TG_OP = 'INSERT' THEN
           PERFORM note_auth_grant(NEW.org_id);
@@ -648,18 +768,20 @@ export async function ensureEpochTriggers(pool: Pool): Promise<void> {
       END;
       $$ LANGUAGE plpgsql
     `)
-    await client.query(`DROP TRIGGER IF EXISTS trg_epoch_org_members ON org_members`)
-    await client.query(`
-      CREATE TRIGGER trg_epoch_org_members
-      AFTER INSERT OR UPDATE OR DELETE ON org_members
-      FOR EACH ROW EXECUTE FUNCTION trg_bump_epoch_org_members()
-    `)
+    await ensureTrigger(client, {
+      table: 'org_members',
+      name: 'trg_auth_revoke',
+      timing: 'AFTER',
+      level: 'ROW',
+      events: 'INSERT OR UPDATE OR DELETE',
+      fn: 'auth_revoke_org_members',
+    })
 
     // team_members: org_id via teams.org_id. Team grants are a union
     // (rbac_effective_access: bool_or over every team), so joining a team only
     // adds; leaving one — or a row re-keyed away from it — may take away.
     await client.query(`
-      CREATE OR REPLACE FUNCTION trg_bump_epoch_team_members() RETURNS trigger AS $$
+      CREATE OR REPLACE FUNCTION auth_revoke_team_members() RETURNS trigger AS $$
       DECLARE
         v_old_org_id TEXT;
         v_new_org_id TEXT;
@@ -684,18 +806,20 @@ export async function ensureEpochTriggers(pool: Pool): Promise<void> {
       END;
       $$ LANGUAGE plpgsql
     `)
-    await client.query(`DROP TRIGGER IF EXISTS trg_epoch_team_members ON team_members`)
-    await client.query(`
-      CREATE TRIGGER trg_epoch_team_members
-      AFTER INSERT OR UPDATE OR DELETE ON team_members
-      FOR EACH ROW EXECUTE FUNCTION trg_bump_epoch_team_members()
-    `)
+    await ensureTrigger(client, {
+      table: 'team_members',
+      name: 'trg_auth_revoke',
+      timing: 'AFTER',
+      level: 'ROW',
+      events: 'INSERT OR UPDATE OR DELETE',
+      fn: 'auth_revoke_team_members',
+    })
 
     // team_scope_permissions: org_id via teams.org_id. A new grant, or an
     // update that only turns flags ON, adds; clearing can_read or can_write,
     // deleting the row, or re-keying it may take away.
     await client.query(`
-      CREATE OR REPLACE FUNCTION trg_bump_epoch_tsp() RETURNS trigger AS $$
+      CREATE OR REPLACE FUNCTION auth_revoke_tsp() RETURNS trigger AS $$
       DECLARE
         v_old_org_id TEXT;
         v_new_org_id TEXT;
@@ -727,15 +851,34 @@ export async function ensureEpochTriggers(pool: Pool): Promise<void> {
       END;
       $$ LANGUAGE plpgsql
     `)
-    await client.query(`DROP TRIGGER IF EXISTS trg_epoch_tsp ON team_scope_permissions`)
-    await client.query(`
-      CREATE TRIGGER trg_epoch_tsp
-      AFTER INSERT OR UPDATE OR DELETE ON team_scope_permissions
-      FOR EACH ROW EXECUTE FUNCTION trg_bump_epoch_tsp()
-    `)
+    await ensureTrigger(client, {
+      table: 'team_scope_permissions',
+      name: 'trg_auth_revoke',
+      timing: 'AFTER',
+      level: 'ROW',
+      events: 'INSERT OR UPDATE OR DELETE',
+      fn: 'auth_revoke_tsp',
+    })
 
+    // Retire every trigger name an older build installed. Older builds
+    // re-create THEIR names when they boot (CREATE OR REPLACE + DROP/CREATE
+    // TRIGGER on trg_epoch_* / trg_bump_epoch_*); the names above are new, so
+    // such a boot can add its old triggers back but can no longer replace or
+    // remove these — the statement lock above survives a rolling deploy. The
+    // next boot of this build removes the old ones again.
+    for (const [table, trigger] of LEGACY_EPOCH_TRIGGERS) {
+      await client.query(`DROP TRIGGER IF EXISTS ${trigger} ON ${table}`)
+    }
+    for (const fn of LEGACY_EPOCH_TRIGGER_FUNCTIONS) {
+      await client.query(`DROP FUNCTION IF EXISTS ${fn}()`)
+    }
 
+    await client.query('UPDATE auth_trigger_schema SET version = $1, ddl_hash = $2', [
+      AUTH_TRIGGER_SCHEMA_VERSION,
+      epochTriggersDdlHash(),
+    ])
     await client.query('COMMIT')
+    return 'installed'
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {})
     throw err
@@ -743,6 +886,101 @@ export async function ensureEpochTriggers(pool: Pool): Promise<void> {
     client.release()
   }
 }
+
+/**
+ * Version of the trigger set ensureEpochTriggers installs. Bump it whenever the
+ * SQL above changes. A process whose version is OLDER than the database's
+ * leaves the triggers alone instead of replacing newer ones with its own —
+ * a rolling deploy where an old process restarts after a new one used to
+ * re-install the old triggers silently (2026-10-17). (Builds older than this
+ * guard cannot read it; their names are retired above instead.)
+ */
+export const AUTH_TRIGGER_SCHEMA_VERSION = 4
+
+/** A fingerprint of the installer's code and tables. Compared on boot with
+ * the stored one, so a change to the trigger SQL is installed even when
+ * nobody bumped AUTH_TRIGGER_SCHEMA_VERSION; the version only decides who may
+ * overwrite whom. One build always produces the same fingerprint. */
+function epochTriggersDdlHash(): string {
+  return createHash('sha256')
+    .update(ensureEpochTriggers.toString())
+    .update(ensureTrigger.toString())
+    .update(JSON.stringify([PERMISSION_WRITE_TABLES, LEGACY_EPOCH_TRIGGERS, LEGACY_EPOCH_TRIGGER_FUNCTIONS]))
+    .digest('hex')
+}
+
+/**
+ * Create trigger `spec.name` on `spec.table` unless an identical one is already
+ * there. `DROP TRIGGER IF EXISTS` takes ACCESS EXCLUSIVE on the table even when
+ * nothing is dropped, so reinstalling an unchanged trigger would queue behind
+ * (and in front of) every reader of a hot table such as `users` — the reason
+ * `trg_epoch_users` is created only when missing. "Identical" = same
+ * timing/level/events (pg_trigger.tgtype) and same function; the function BODY
+ * is replaced separately by CREATE OR REPLACE FUNCTION, which locks no table.
+ * Every value interpolated below is a constant of this module.
+ */
+async function ensureTrigger(
+  client: PoolClient,
+  spec: {
+    table: string
+    name: string
+    timing: 'BEFORE' | 'AFTER'
+    level: 'ROW' | 'STATEMENT'
+    events: string
+    fn: string
+  },
+): Promise<void> {
+  // pg_trigger.tgtype bits: ROW 1, BEFORE 2, INSERT 4, DELETE 8, UPDATE 16.
+  const type =
+    (spec.level === 'ROW' ? 1 : 0) +
+    (spec.timing === 'BEFORE' ? 2 : 0) +
+    (spec.events.includes('INSERT') ? 4 : 0) +
+    (spec.events.includes('DELETE') ? 8 : 0) +
+    (spec.events.includes('UPDATE') ? 16 : 0)
+  const { rows } = await client.query(
+    `SELECT 1 FROM pg_trigger
+     WHERE tgrelid = to_regclass($1) AND tgname = $2 AND NOT tgisinternal
+       AND tgtype = $3::int AND tgfoid = to_regproc($4)::oid`,
+    [spec.table, spec.name, type, spec.fn],
+  )
+  if (rows.length > 0) return
+  await client.query(`DROP TRIGGER IF EXISTS ${spec.name} ON ${spec.table}`)
+  await client.query(
+    `CREATE TRIGGER ${spec.name} ${spec.timing} ${spec.events} ON ${spec.table}
+     FOR EACH ${spec.level} EXECUTE FUNCTION ${spec.fn}()`,
+  )
+}
+
+/**
+ * Tables whose writes are permission writes, and the statements to serialize —
+ * PARENTS FIRST (users, orgs, scopes, teams, then the memberships). A hard
+ * delete cascades in that order, so a boot that takes its table locks in
+ * another order could deadlock with one. Reasoned by the reviewer lens of the
+ * `trg_epoch_users` change (2026-10-16) and kept here; not measured.
+ */
+const PERMISSION_WRITE_TABLES: Array<[table: string, events: string]> = [
+  ['users', 'DELETE'],
+  ['orgs', 'DELETE'],
+  ['scopes', 'DELETE'],
+  ['teams', 'DELETE'],
+  ['org_members', 'INSERT OR UPDATE OR DELETE'],
+  ['team_members', 'INSERT OR UPDATE OR DELETE'],
+  ['team_scope_permissions', 'INSERT OR UPDATE OR DELETE'],
+]
+
+/** Trigger names installed by builds before the rework; parents first. */
+const LEGACY_EPOCH_TRIGGERS: Array<[table: string, trigger: string]> = [
+  ['teams', 'trg_epoch_teams_delete'],
+  ['org_members', 'trg_epoch_org_members'],
+  ['team_members', 'trg_epoch_team_members'],
+  ['team_scope_permissions', 'trg_epoch_tsp'],
+]
+const LEGACY_EPOCH_TRIGGER_FUNCTIONS = [
+  'trg_bump_epoch_org_members',
+  'trg_bump_epoch_team_members',
+  'trg_bump_epoch_tsp',
+  'trg_bump_epoch_teams_delete',
+]
 
 /**
  * Start listening for org epoch bumps and terminate live connections whose

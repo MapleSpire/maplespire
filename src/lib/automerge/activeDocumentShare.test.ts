@@ -60,4 +60,55 @@ describe('ActiveDocumentShare', () => {
     share.unpin(doc('diagram'), 'dirty')
     await expect(share.shareConfig.announce(peer, doc('diagram'))).resolves.toBe(false)
   })
+
+  it('a WITHHELD document neither announces nor answers, pinned or not, until released', async () => {
+    const share = new ActiveDocumentShare()
+    const changed = vi.fn()
+    share.bindLeaseChanged(changed)
+    share.beginSession('a/current')
+    share.pin(doc('old-shard'), 'durability-pending')
+    share.withhold([doc('old-shard'), doc('old-diagram')])
+
+    // Synchronous: the very next evaluation sees it — the live path withholds
+    // on the binding frame, before the handshake that would start the sync.
+    await expect(share.shareConfig.announce(peer, doc('old-shard'))).resolves.toBe(false)
+    await expect(share.shareConfig.access(peer, doc('old-shard'))).resolves.toBe(false)
+    await expect(share.shareConfig.access(peer, doc('old-diagram'))).resolves.toBe(false)
+    await expect(share.shareConfig.access(peer, doc('anything-else'))).resolves.toBe(true)
+    expect(share.isPinned(doc('old-shard'))).toBe(false)
+    expect(share.isWithheld(doc('old-diagram'))).toBe(true)
+
+    // The lift is a re-evaluation, not just a set deletion.
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    changed.mockClear()
+    share.release([doc('old-shard')])
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(changed).toHaveBeenCalledWith([doc('old-shard')])
+    await expect(share.shareConfig.announce(peer, doc('old-shard'))).resolves.toBe(true)
+    await expect(share.shareConfig.access(peer, doc('old-diagram'))).resolves.toBe(false)
+  })
+
+  it('a withhold outlives a stop and restart of the SAME session and ends with a switch', async () => {
+    // A FOLLOW stops the bridge (endSession) and restarts it under the same
+    // `L/current` session while the socket stays up, and the server announces
+    // its root's registry shards to every peer: the documents it withheld must
+    // stay off the socket through the gap. Another workspace decides afresh
+    // (and re-evaluates what it lifts).
+    const share = new ActiveDocumentShare()
+    const changed = vi.fn()
+    share.bindLeaseChanged(changed)
+    share.beginSession('a/current')
+    share.withhold([doc('old-shard')])
+    share.endSession()
+    await expect(share.shareConfig.access(peer, doc('old-shard'))).resolves.toBe(false)
+    share.beginSession('a/current')
+    await expect(share.shareConfig.access(peer, doc('old-shard'))).resolves.toBe(false)
+    share.endSession()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    changed.mockClear()
+    share.beginSession('a/V1')
+    await expect(share.shareConfig.access(peer, doc('old-shard'))).resolves.toBe(true)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(changed).toHaveBeenCalledWith([doc('old-shard')])
+  })
 })

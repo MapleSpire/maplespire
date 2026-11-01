@@ -45,7 +45,7 @@ import {
 } from './workspace'
 import { clonePlain } from './reconcile'
 import { takeMintedDocumentIdBytes } from './mintedIdSupply'
-import { rememberResolvedWorkspace } from './workspaceBinding'
+import { documentsWorkspaceFor, rememberResolvedWorkspace } from './workspaceBinding'
 import { WorkspaceNetworkRouter } from './networkRoute'
 import { apiFetch } from '../api/http'
 import { resolveInBatches } from './batchedResolve'
@@ -302,7 +302,11 @@ const ROOT_URL_CACHE_KEY = 'maplespire:rootUrl'
 function rootUrlCacheKey(ref: WorkspaceRef): string {
   // Per user (accountNamespace.ts): a root materialized in one account's
   // database is not in the next account's.
-  return accountStorageKey(isDefaultWorkspaceRef(ref) ? ROOT_URL_CACHE_KEY : `${ROOT_URL_CACHE_KEY}:${workspaceRefKey(ref)}`)
+  return accountStorageKey(unscopedRootUrlCacheKey(ref))
+}
+
+function unscopedRootUrlCacheKey(ref: WorkspaceRef): string {
+  return isDefaultWorkspaceRef(ref) ? ROOT_URL_CACHE_KEY : `${ROOT_URL_CACHE_KEY}:${workspaceRefKey(ref)}`
 }
 
 function readCachedRootUrl(ref: WorkspaceRef): AutomergeUrl | null {
@@ -326,6 +330,80 @@ function rememberMaterializedRootUrl(ref: WorkspaceRef, url: AutomergeUrl): void
   } catch {
     /* private mode / quota — non-fatal, just no offline cache */
   }
+  rememberMaterializedRootWorkspace(ref, url)
+}
+
+/**
+ * WHICH VERSION THE CACHED ROOT BELONGS TO, kept beside it.
+ *
+ * A `'current'` ref's cached root is the default version as of the last online
+ * boot, and the alias may have moved since. A boot that resolves that root
+ * without the server (offline, or the boot fallback) used to know nothing
+ * about which version it held: the first socket binding was then adopted as
+ * the basis (`bridge.ts`'s self-arm), so a repoint made while the tab was away
+ * went undetected — measured 2026-10-28, the canvas drew the new default's
+ * objects over the old version's documents, edits were refused
+ * `workspace-mismatch` (or, AUTH off, written to the old version while the
+ * badge said "Saving…" for ever), and the next reload followed the alias away
+ * from them.
+ *
+ * So the key the root fetch reported is stored WITH the url it was reported
+ * for, and restored only for that url (`restoreCachedRootWorkspace`): the reads
+ * then name that version (`workspaceSearchParams`), and the detector compares
+ * the next binding frame with it instead of adopting it — which, for the boot
+ * fallback, is the frame its socket sent during the boot that failed, kept and
+ * replayed by `workspaceBinding.ts` (see the self-arm in `bridge.ts`). A
+ * separate key rather than a new format for the url's own value: the url key is
+ * what a warm offline boot reads, and an older build reading a JSON value there
+ * would find no root at all. The two are written one after the other, not
+ * atomically, which the url check makes harmless: a record beside another url
+ * is ignored.
+ *
+ * Written only from a basis `documentsWorkspaceFor` trusts for this url — the
+ * root fetch that returned it, or a record restored for it — never from a
+ * binding the socket reported.
+ */
+function rootWorkspaceCacheKey(ref: WorkspaceRef): string {
+  return accountStorageKey(`${unscopedRootUrlCacheKey(ref)}:workspace`)
+}
+
+interface CachedRootWorkspace {
+  rootUrl: string
+  landscapeId: string
+  versionId: string
+}
+
+function rememberMaterializedRootWorkspace(ref: WorkspaceRef, url: AutomergeUrl): void {
+  if (ref.versionId !== CURRENT_VERSION_ID) return
+  const workspace = documentsWorkspaceFor(ref, url)
+  if (!workspace) return
+  const record: CachedRootWorkspace = { rootUrl: url, landscapeId: workspace.landscapeId, versionId: workspace.versionId }
+  try {
+    localStorage.setItem(rootWorkspaceCacheKey(ref), JSON.stringify(record))
+  } catch {
+    /* private mode / quota — the next cached boot falls back to the self-arm */
+  }
+}
+
+/** Restore the basis a cached root was stored with, when the record names that
+ * very url and the ref's own landscape. Anything else leaves the basis alone
+ * (and so does a concrete ref: `rememberResolvedWorkspace` ignores one). */
+function restoreCachedRootWorkspace(ref: WorkspaceRef, url: AutomergeUrl): void {
+  let record: Partial<CachedRootWorkspace> | null
+  try {
+    const raw = localStorage.getItem(rootWorkspaceCacheKey(ref))
+    record = raw ? (JSON.parse(raw) as Partial<CachedRootWorkspace>) : null
+  } catch {
+    return
+  }
+  if (!record || record.rootUrl !== url) return
+  if (record.landscapeId !== ref.landscapeId) return
+  if (typeof record.versionId !== 'string' || !record.versionId) return
+  rememberResolvedWorkspace(
+    ref,
+    { landscapeId: record.landscapeId, versionId: record.versionId },
+    { from: 'root-cache', rootUrl: url },
+  )
 }
 
 /** The last root url a resolution ATTEMPTED for a ref (materialized or not) —
@@ -399,6 +477,7 @@ async function fetchRootUrl(ref: WorkspaceRef = DEFAULT_WORKSPACE_REF): Promise<
     if (cached) {
       console.warn('[repo] boot fallback: resolving the last locally materialized root for', key)
       lastAttemptedRootUrls.set(key, cached)
+      restoreCachedRootWorkspace(ref, cached)
       return cached
     }
   }
@@ -424,7 +503,11 @@ async function fetchRootUrl(ref: WorkspaceRef = DEFAULT_WORKSPACE_REF): Promise<
       // server that does not send it leaves the detector unarmed rather than
       // wrong — `rememberResolvedWorkspace` ignores a null.
       if (body.landscapeId && body.versionId) {
-        rememberResolvedWorkspace(ref, { landscapeId: body.landscapeId, versionId: body.versionId })
+        rememberResolvedWorkspace(
+          ref,
+          { landscapeId: body.landscapeId, versionId: body.versionId },
+          { from: 'root-fetch', rootUrl: url },
+        )
       }
       return url as AutomergeUrl
     })
@@ -436,6 +519,7 @@ async function fetchRootUrl(ref: WorkspaceRef = DEFAULT_WORKSPACE_REF): Promise<
     if (cached) {
       console.warn('[repo] root url fetch failed; using cached url for offline boot', err)
       lastAttemptedRootUrls.set(key, cached)
+      restoreCachedRootWorkspace(ref, cached)
       return cached
     }
     throw err

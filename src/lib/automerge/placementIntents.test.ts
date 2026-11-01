@@ -422,3 +422,53 @@ describe('PendingPlacementIntents', () => {
     await persistPlacementIntents(store, ws)
   })
 })
+
+// SENT: the DiagramDoc was flushed locally, the server has not said so. A
+// repoint must be able to put a drag back — measured 2026-10-31 (architect
+// lens): offline geometry of an EXISTING diagram otherwise reached nobody.
+describe('PendingPlacementIntents — the SENT stage', () => {
+  const V1 = 'default/V1'
+  const V2 = 'default/V2'
+  const doc = { documentId: 'diagram-doc', heads: ['h1'] }
+  const drag = (x: number) => ({ objects: [{ id: 'o1', position: { x, y: 0 }, size: { width: 10, height: 10 } }] })
+
+  it('markSentWhere takes records out of everything a boot drains, counts or projects, and keeps them on disk', () => {
+    const intents = new PendingPlacementIntents()
+    intents.record(workspace, 'd1', '2d', drag(5))
+    intents.markSentWhere(workspace, 'd1', intents.revisionNow, () => true, { workspace: V1, carriers: [doc] })
+    expect(intents.hasPending(workspace)).toBe(false)
+    expect(intents.pendingCount(workspace)).toBe(0)
+    expect(intents.snapshot(workspace, 'd1')).toBeUndefined()
+    expect(intents.sentCount(workspace)).toBe(1)
+    const reloaded = new PendingPlacementIntents()
+    reloaded.hydrate(workspace, intents.serialize(workspace))
+    expect(reloaded.hasPending(workspace)).toBe(false)
+    expect(reloaded.sentCount(workspace)).toBe(1)
+  })
+
+  it('a new drag supersedes the SENT copy; an outright acknowledge (diagram gone) removes it', () => {
+    const intents = new PendingPlacementIntents()
+    intents.record(workspace, 'd1', '2d', drag(5))
+    intents.markSentWhere(workspace, 'd1', intents.revisionNow, () => true, { workspace: V1, carriers: [doc] })
+    intents.record(workspace, 'd1', '2d', drag(9))
+    expect(intents.sentCount(workspace)).toBe(0)
+    expect(intents.snapshot(workspace, 'd1')?.objects[0].position.x).toBe(9)
+    intents.markSentWhere(workspace, 'd1', intents.revisionNow, () => true, { workspace: V1, carriers: [doc] })
+    intents.acknowledge(workspace, 'd1', intents.revisionNow)
+    expect(intents.sentCount(workspace)).toBe(0)
+    expect(intents.requeueSent(workspace, V2)).toEqual([])
+  })
+
+  it('requeueSent puts another workspace\'s records back for the same diagram id; release needs a proof made before the ask', () => {
+    const intents = new PendingPlacementIntents()
+    intents.record(workspace, 'd1', '2d', drag(5))
+    intents.markSentWhere(workspace, 'd1', intents.revisionNow, () => true, { workspace: V1, carriers: [doc] })
+    intents.record(workspace, 'd2', '2d', drag(7))
+    intents.markSentWhere(workspace, 'd2', intents.revisionNow, () => true, { workspace: V2, carriers: [doc] })
+    expect(intents.requeueSent(workspace, V2)).toEqual(['d1'])
+    expect(intents.snapshot(workspace, 'd1')?.objects[0].position.x).toBe(5)
+    // d2 is V2's own: released only by an answer whose ask came after its mark.
+    expect(intents.releaseSent(workspace, V2, () => true, 0)).toBe(0)
+    expect(intents.releaseSent(workspace, V2, () => true, intents.sentSequenceNow)).toBe(1)
+  })
+})

@@ -114,6 +114,43 @@ describe('Tag catalog development access', () => {
   })
 })
 
+describe('Tag capability check — a registry that cannot be read', () => {
+  const previousAuth = process.env.AUTH
+  afterAll(() => {
+    if (previousAuth === undefined) delete process.env.AUTH
+    else process.env.AUTH = previousAuth
+  })
+
+  it('answers the shared 503 when the workspace of a workspace-scoped write cannot be canonicalised', async () => {
+    // A member creating a tag in a workspace: membership, catalog scope and
+    // policy all read fine, then the workspace's registry read fails. It used
+    // to read as "no such workspace", i.e. 403 `writable_workspace_required`.
+    process.env.AUTH = 'on'
+    const asked: string[] = []
+    const pool = {
+      query: async (text: string) => {
+        if (text.includes('FROM users u')) { asked.push('membership'); return { rows: [{ user_status: 'active', org_status: 'active', role: 'member' }] } }
+        if (text.includes("kind = 'org'")) { asked.push('catalog'); return { rows: [] } }
+        if (text.includes('org_tag_settings')) { asked.push('policy'); return { rows: [] } }
+        if (text.includes('FROM landscapes')) { asked.push('registry'); throw new Error('connection terminated') }
+        throw new Error(`unexpected query: ${text}`)
+      },
+    } as unknown as Pool
+    const sent: { status?: number; headers: Record<string, string>; body?: unknown } = { headers: {} }
+    const response = {
+      headersSent: false,
+      setHeader: (name: string, value: string) => { sent.headers[name] = value },
+      status: (status: number) => { sent.status = status; return { json: (body: unknown) => { sent.body = body } } },
+    } as unknown as Response
+    const request = { auth: { userId: 'u', orgId: 'o', isPlatformAdmin: false } } as unknown as Request
+
+    const actor = await requireTagCapability(pool, request, response, 'tag.create', 'o', { landscapeId: 'L', versionId: 'current' })
+    expect(asked, 'the read that failed is the registry read, after the others').toEqual(['membership', 'catalog', 'policy', 'registry'])
+    expect(actor).toBeNull()
+    expect(sent).toMatchObject({ status: 503, headers: { 'Retry-After': '1' }, body: { code: 'workspace-registry-unavailable' } })
+  })
+})
+
 const connectionString = process.env.TEST_DATABASE_URL
 
 describe.skipIf(!connectionString)('Tag catalog PostgreSQL invariants', () => {

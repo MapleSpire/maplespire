@@ -18,6 +18,7 @@ import {
   changeWithDurabilityTracking,
   DurableHeadLedger,
   durableConnectionStatus,
+  mergeDurableHeadSnapshots,
   pendingDurabilityDebts,
   setLocalDocumentChangeListener,
 } from './durableSync'
@@ -34,6 +35,7 @@ describe('durable sync ledger', () => {
   it('counts EVERY durability debt — journaled entity intents and an unread journal included', () => {
     const clean = {
       durableHeadCount: 0,
+      durableLedgerHydrated: true,
       writeSchedulerPending: false,
       entityIntentCount: 0,
       entityIntentsHydrated: true,
@@ -53,6 +55,9 @@ describe('durable sync ledger', () => {
     // badge saying 'Synced' over unsaved geometry.
     expect(pendingDurabilityDebts({ ...clean, placementIntentCount: 3 })).toBe(3)
     expect(pendingDurabilityDebts({ ...clean, placementIntentsHydrated: false })).toBeGreaterThan(0)
+    // Before the persisted ledger is read, the documents an earlier session
+    // left unacknowledged are not in durableHeadCount.
+    expect(pendingDurabilityDebts({ ...clean, durableLedgerHydrated: false })).toBeGreaterThan(0)
   })
 
   it('clears only the exact frontier sent to the server', () => {
@@ -103,8 +108,169 @@ describe('durable sync ledger', () => {
       { documentId, heads: ['a'.repeat(64)] },
       { documentId: 'doc-2' as never, heads: ['invalid'] },
     ])
-    expect(ledger.snapshot()).toEqual([
+    expect(ledger.persisted()).toEqual([
       { documentId, heads: ['a'.repeat(64)] },
     ])
+  })
+
+  it('hydrating keeps what was marked during the read, with its newer frontier', () => {
+    const memory = new Repo({ network: [] })
+    const editedDuringRead = memory.create({ value: 1 }).documentId
+    const leftByEarlierSession = memory.create({ value: 2 }).documentId
+    const ledger = new DurableHeadLedger()
+    ledger.mark(editedDuringRead, ['b'.repeat(64)])
+
+    ledger.hydrate([
+      { documentId: editedDuringRead, heads: ['a'.repeat(64)] },
+      { documentId: leftByEarlierSession, heads: ['c'.repeat(64)] },
+    ])
+
+    expect(ledger.persisted()).toEqual([
+      { documentId: editedDuringRead, heads: ['b'.repeat(64)] },
+      { documentId: leftByEarlierSession, heads: ['c'.repeat(64)] },
+    ])
+  })
+
+  it('a write before the read only adds to the persisted ledger', () => {
+    const memory = new Repo({ network: [] })
+    const persistedOnly = memory.create({ value: 1 }).documentId
+    const both = memory.create({ value: 2 }).documentId
+    const localOnly = memory.create({ value: 3 }).documentId
+    const persisted = [
+      { documentId: persistedOnly, heads: ['a'.repeat(64)] },
+      { documentId: both, heads: ['b'.repeat(64)] },
+      { documentId: 'not-a-document', heads: ['c'.repeat(64)] },
+    ]
+
+    expect(mergeDurableHeadSnapshots(persisted, [
+      { documentId: both, heads: ['d'.repeat(64)] },
+      { documentId: localOnly, heads: ['e'.repeat(64)] },
+    ])).toEqual([
+      { documentId: persistedOnly, heads: ['a'.repeat(64)] },
+      { documentId: both, heads: ['d'.repeat(64)] },
+      { documentId: localOnly, heads: ['e'.repeat(64)] },
+    ])
+    // An empty local snapshot changes nothing — the shape of StrictMode's stop.
+    expect(mergeDurableHeadSnapshots(persisted, [])).toHaveLength(2)
+    expect(mergeDurableHeadSnapshots(undefined, [])).toEqual([])
+    expect(mergeDurableHeadSnapshots('garbage', [])).toEqual([])
+    expect(mergeDurableHeadSnapshots({ length: 1 }, [])).toEqual([])
+  })
+
+  it('drops every malformed persisted entry, one condition at a time, without throwing', () => {
+    // Browser storage: a value that THROWS here leaves the session unhydrated,
+    // i.e. a badge on 'saving' for the rest of it. Each entry breaks ONE rule.
+    const documentId = new Repo({ network: [] }).create({ value: 1 }).documentId
+    const good = { documentId, heads: ['a'.repeat(64)] }
+    const malformed: unknown[] = [
+      null,
+      'not an object',
+      { documentId, heads: 'a'.repeat(64) },
+      { documentId, heads: [] },
+      { documentId, heads: ['A'.repeat(64)] },
+      { documentId, heads: ['a'.repeat(63)] },
+      { documentId, heads: ['a'.repeat(64), 7] },
+      { documentId: 42, heads: ['a'.repeat(64)] },
+    ]
+    for (const entry of malformed) {
+      expect(mergeDurableHeadSnapshots([entry], []), JSON.stringify(entry)).toEqual([])
+      const ledger = new DurableHeadLedger()
+      ledger.hydrate([entry])
+      expect(ledger.persisted(), JSON.stringify(entry)).toEqual([])
+    }
+    // Control: the same document, well formed, is kept by both.
+    expect(mergeDurableHeadSnapshots([good], [])).toEqual([good])
+    const ledger = new DurableHeadLedger()
+    ledger.hydrate([good])
+    expect(ledger.persisted()).toEqual([good])
+  })
+
+  it('hydrating nothing, or something that is not a list, leaves the ledger as it was', () => {
+    const documentId = new Repo({ network: [] }).create({ value: 1 }).documentId
+    const ledger = new DurableHeadLedger()
+    ledger.mark(documentId, ['a'.repeat(64)])
+    for (const entries of [undefined, null, {}, { length: 1 }, 'x']) {
+      ledger.hydrate(entries)
+      expect(ledger.snapshot(), String(entries)).toEqual([{ documentId, heads: ['a'.repeat(64)] }])
+    }
+  })
+
+  // The workspace tag is what tells a repointed session's documents from the
+  // old version's (bridge.ts `partitionDurableLedger`): lost on any of these
+  // paths, an old-version document reads as untagged and is re-presented on
+  // the new version's socket — the measured split.
+  it('the workspace tag survives persistence, hydration and the add-only merge', () => {
+    const repo = new Repo({ network: [] })
+    const tagged = repo.create({ value: 1 }).documentId
+    const untagged = repo.create({ value: 2 }).documentId
+    const heads = ['b'.repeat(64)]
+    const ledger = new DurableHeadLedger()
+    ledger.mark(tagged, heads, 'L/V1')
+    ledger.mark(untagged, heads)
+    // An unknown workspace on a later mark leaves the tag as it was.
+    ledger.mark(tagged, heads, undefined)
+    expect(ledger.workspaceOf(tagged)).toBe('L/V1')
+    expect(ledger.workspaceOf(untagged)).toBeUndefined()
+    const persisted = ledger.persisted()
+    expect(persisted).toEqual([
+      { documentId: tagged, heads, workspace: 'L/V1' },
+      { documentId: untagged, heads },
+    ])
+
+    const reloaded = new DurableHeadLedger()
+    reloaded.hydrate(persisted)
+    expect(reloaded.workspaceOf(tagged)).toBe('L/V1')
+    expect(reloaded.workspaceOf(untagged)).toBeUndefined()
+    expect(reloaded.dormantEntries()).toEqual(persisted)
+
+    // A local entry with no tag keeps the persisted one; a local tag wins.
+    const newer = ['c'.repeat(64)]
+    expect(mergeDurableHeadSnapshots(persisted, [{ documentId: tagged, heads: newer }]))
+      .toContainEqual({ documentId: tagged, heads: newer, workspace: 'L/V1' })
+    expect(mergeDurableHeadSnapshots(persisted, [{ documentId: untagged, heads: newer, workspace: 'L/V2' }]))
+      .toContainEqual({ documentId: untagged, heads: newer, workspace: 'L/V2' })
+
+    // A malformed tag reads as none.
+    const odd = new DurableHeadLedger()
+    odd.hydrate([{ documentId: tagged, heads, workspace: 42 }])
+    expect(odd.workspaceOf(tagged)).toBeUndefined()
+  })
+
+  // DORMANT: hydrated entries are held but not owed until the session names
+  // its workspace and activates its own (bridge.ts `partitionDurableLedger`).
+  // Owed too early, an old version's document is asked about, re-presented
+  // and counted in the new version's session; dropped instead, a move back to
+  // the old version freezes it (the withhold-for-good defect both lenses found).
+  it('hydrated entries are dormant until activated: persisted, but not owed, asked about or counted', () => {
+    const repo = new Repo({ network: [] })
+    const mine = repo.create({ value: 1 }).documentId
+    const elsewhere = repo.create({ value: 2 }).documentId
+    const markedNow = repo.create({ value: 3 }).documentId
+    const heads = ['d'.repeat(64)]
+    const ledger = new DurableHeadLedger()
+    ledger.mark(markedNow, heads, 'L/V2')
+    ledger.hydrate([
+      { documentId: mine, heads, workspace: 'L/V2' },
+      { documentId: elsewhere, heads, workspace: 'L/V1' },
+    ])
+    expect(ledger.snapshot().map((entry) => entry.documentId)).toEqual([markedNow])
+    expect(ledger.size).toBe(1)
+    expect(ledger.dormantEntries().map((entry) => entry.documentId)).toEqual([mine, elsewhere])
+    expect(ledger.persisted()).toHaveLength(3)
+
+    ledger.activate([mine])
+    expect(ledger.snapshot().map((entry) => entry.documentId)).toEqual([markedNow, mine])
+    expect(ledger.size).toBe(2)
+    // A dormant entry is never sent, so an acknowledgement cannot clear it;
+    // an activated one clears as ever.
+    ledger.acknowledge(ledger.snapshot(), [{ documentId: mine, durable: true }, { documentId: elsewhere, durable: true }])
+    expect(ledger.persisted().map((entry) => entry.documentId)).toEqual([markedNow, elsewhere])
+    expect(ledger.dormantEntries().map((entry) => entry.documentId)).toEqual([elsewhere])
+    // A later mark of a dormant document keeps it dormant (and owed nowhere) —
+    // and keeps its tag, even when the late write names the NEW version: the
+    // next boot would otherwise activate it there.
+    ledger.mark(elsewhere, ['e'.repeat(64)], 'L/V2')
+    expect(ledger.size).toBe(1)
+    expect(ledger.workspaceOf(elsewhere)).toBe('L/V1')
   })
 })

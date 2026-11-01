@@ -92,6 +92,7 @@ const AFFINE_ROUTES: ReadonlyArray<readonly [string, Classification, string]> = 
   ['POST /api/automerge/gc', 'routed', 'accepted only by the sole ready partition owner'],
   ['POST /api/model/durability-witness', 'routed', 'reads the workspace’s durable heads'],
   ['POST /api/model/related-diagram-object-ids', 'routed', 'reads the workspace’s read model'],
+  ['POST /api/model/spotlight', 'routed', 'reads the workspace’s read model (POST only to carry the client’s vocabulary)'],
   ['POST /api/automerge/durable-heads', 'routed', 'reads the workspace’s durable heads'],
 
   // ── Placed from the BODY or by a lookup, not the query ────────────────────

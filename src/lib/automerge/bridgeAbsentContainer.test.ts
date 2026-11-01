@@ -235,6 +235,37 @@ function resetStores(): void {
 const CLASSIC_REF = { landscapeId: 'absent-container', versionId: 'current' }
 
 /**
+ * Calls `onLeave` the first time the intent for `idOf()` leaves the journal's
+ * OWED set, whichever way it leaves: `acknowledge` (forgotten outright) or
+ * `markSent` (its carrier's local flush expressed it; since the SENT stage the
+ * flush no longer forgets, it hands the intent to the server's answer). Both
+ * are the journal declaring the value written, so the witness rule reads the
+ * document at either one. Both calls pass through untouched.
+ */
+function watchLeavesOwed(kind: EntityIntentKind, idOf: () => string, onLeave: () => void): void {
+  let left = false
+  const observe = (workspaceKey: string, run: () => void) => {
+    const id = idOf()
+    const before = id !== '' && pendingEntityIntents.has(workspaceKey, kind, id)
+    run()
+    if (!left && before && !pendingEntityIntents.has(workspaceKey, kind, id)) {
+      left = true
+      onLeave()
+    }
+  }
+  const acknowledge = pendingEntityIntents.acknowledge.bind(pendingEntityIntents)
+  vi.spyOn(pendingEntityIntents, 'acknowledge').mockImplementation((workspaceKey, ackKind, ids, through) => {
+    observe(workspaceKey, () => acknowledge(workspaceKey, ackKind, ids, through))
+  })
+  const markSent = pendingEntityIntents.markSent.bind(pendingEntityIntents)
+  vi.spyOn(pendingEntityIntents, 'markSent').mockImplementation((workspaceKey, sentKind, ids, through, mark) => {
+    let moved = 0
+    observe(workspaceKey, () => { moved = markSent(workspaceKey, sentKind, ids, through, mark) })
+    return moved
+  })
+}
+
+/**
  * Session 1 (boot-from-server, the mode that journals) records `act`'s intent
  * and never reaches durable storage; the kill is then reconstructed on the
  * DOCUMENTS by `wound` (the field the write created in memory is gone, so the
@@ -277,20 +308,15 @@ async function crashThenReplay(options: {
   // hides an empty replay write behind a green end state while the intent was
   // forgotten over a document that held nothing (measured on the unfixed
   // bridge: the replay's change left `comments: {}`, the 150 ms flushWrite
-  // filled it). Read through the journal's own `acknowledge`, the one place
-  // an intent is forgotten, with the call passed through untouched.
+  // filled it). Read where the journal declares the value written: the intent
+  // leaving the owed set (`watchLeavesOwed`).
   let carriedWhenForgotten: unknown
   let containerWhenForgotten = 'never forgotten'
   let forgotten = false
-  const acknowledge = pendingEntityIntents.acknowledge.bind(pendingEntityIntents)
-  vi.spyOn(pendingEntityIntents, 'acknowledge').mockImplementation((workspaceKey, ackKind, ids, through) => {
-    const before = pendingEntityIntents.has(workspaceKey, kind, id)
-    acknowledge(workspaceKey, ackKind, ids, through)
-    if (!forgotten && before && !pendingEntityIntents.has(workspaceKey, kind, id)) {
-      forgotten = true
-      carriedWhenForgotten = carried(id)
-      containerWhenForgotten = `${kind} container when forgotten: ${JSON.stringify(container())}`
-    }
+  watchLeavesOwed(kind, () => id, () => {
+    forgotten = true
+    carriedWhenForgotten = carried(id)
+    containerWhenForgotten = `${kind} container when forgotten: ${JSON.stringify(container())}`
   })
   localStorage.removeItem(BFS_FLAG)
   resetStores()
@@ -577,16 +603,11 @@ describe('a write into a container the document does not hold yet', () => {
     let forgotten = false
     let carriedWhenForgotten: unknown
     let containerWhenForgotten = 'never forgotten'
-    const acknowledge = pendingEntityIntents.acknowledge.bind(pendingEntityIntents)
-    vi.spyOn(pendingEntityIntents, 'acknowledge').mockImplementation((workspaceKey, kind, ids, through) => {
-      const before = id !== '' && pendingEntityIntents.has(workspaceKey, 'group', id)
-      acknowledge(workspaceKey, kind, ids, through)
-      if (!forgotten && before && !pendingEntityIntents.has(workspaceKey, 'group', id)) {
-        forgotten = true
-        const groups = (meta.doc() as any).groups
-        carriedWhenForgotten = groups?.[id]
-        containerWhenForgotten = `groups when forgotten: ${JSON.stringify(groups)}`
-      }
+    watchLeavesOwed('group', () => id, () => {
+      forgotten = true
+      const groups = (meta.doc() as any).groups
+      carriedWhenForgotten = groups?.[id]
+      containerWhenForgotten = `groups when forgotten: ${JSON.stringify(groups)}`
     })
 
     id = useModelStore.getState().addGroup({ name: 'Payments', color: '#336699', objectIds: [] } as any)

@@ -150,14 +150,19 @@ test.describe('session epoch — invites and revocation', () => {
       await expect(banner).toContainText(/access in this organization changed/)
       await s.owner.screenshot({ path: test.info().outputPath('owner-session-ended.png') })
 
+      // The demoted owner cannot undo their own demotion with the old cookie:
+      // cookie HTTP checks every epoch (requireAuth isSessionCurrent), so the
+      // call is a 401, not merely a 403 for a member.
+      expect(await setRole(s.owner, s.orgId, s.ownerId, 'admin')).toBe(401)
+
       // Revocation is per user: the admin who demoted the owner keeps their own
       // session — no banner on their page, and their next call goes through
-      // without signing in again. HTTP itself checks no epoch; what made this
-      // call a 401 when the epoch was org-wide (verified by restoring that
-      // trigger, 2026-10-16) is the guest's OWN page: its socket was closed as
-      // revoked, its session check answered session_stale and cleared the
-      // cookie. The 3 s wait covers that close + probe while LISTEN is up; with
-      // LISTEN down the revocation would come from the 60 s poll instead.
+      // without signing in again. What made this call a 401 when the epoch was
+      // org-wide (verified by restoring that trigger, 2026-10-16) is the
+      // guest's own session carrying a now-stale org epoch: their socket was
+      // closed as revoked and their cookie refused. The 3 s wait covers that
+      // close + probe while LISTEN is up; with LISTEN down the revocation
+      // would come from the 60 s poll instead.
       await s.guest.waitForTimeout(3_000)
       await expect(s.guest.getByTestId('session-ended-banner')).toHaveCount(0)
       expect(await setRole(s.guest, s.orgId, s.ownerId, 'admin')).toBe(200)

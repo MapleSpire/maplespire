@@ -13,6 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import type { WorkspaceRef } from './workspace'
+import { forgetWorkspaceBindingFrom } from './workspaceBinding'
 
 export interface NetworkAdapterLike {
   disconnect(): void
@@ -59,7 +60,14 @@ export class WorkspaceNetworkRouter<TAdapter extends NetworkAdapterLike> {
     const previous = this.adapter
     this.adapter = null
     this.routeKey = null
-    if (previous) this.network.removeNetworkAdapter(previous)
+    if (previous) {
+      this.network.removeNetworkAdapter(previous)
+      // A binding frame it sent that no handler took is about a socket that no
+      // longer exists, and must not be replayed into the next session
+      // (workspaceBinding.ts). Here rather than in the adapter's disconnect so
+      // it holds for any network, not only one whose removal disconnects.
+      forgetWorkspaceBindingFrom(previous)
+    }
 
     const next = this.createAdapter(workspaceWebSocketUrl(this.baseUrl, ref))
     this.adapter = next

@@ -15,6 +15,7 @@
 import type { C4Object, Group } from '../../types'
 import type { KvStore } from './kvStore'
 import { accountDatabaseName } from '../auth/accountNamespace'
+import { requestResult, transactionDone } from './idbSchema'
 
 /** Crash marker stored with the flat model index. Cross-database writes cannot be
  * one browser transaction, so a warm boot rebuilds postings if a delta stopped
@@ -120,21 +121,6 @@ function openDatabase(): Promise<IDBDatabase> {
     request.onerror = () => reject(request.error ?? new Error('Unable to open technology postings database'))
   })
   return databasePromise
-}
-
-function requestResult<T>(request: IDBRequest<T>): Promise<T> {
-  return new Promise((resolve, reject) => {
-    request.onsuccess = () => resolve(request.result)
-    request.onerror = () => reject(request.error ?? new Error('IndexedDB request failed'))
-  })
-}
-
-function transactionDone(transaction: IDBTransaction): Promise<void> {
-  return new Promise((resolve, reject) => {
-    transaction.oncomplete = () => resolve()
-    transaction.onabort = () => reject(transaction.error ?? new Error('IndexedDB transaction aborted'))
-    transaction.onerror = () => reject(transaction.error ?? new Error('IndexedDB transaction failed'))
-  })
 }
 
 class IndexedDbTechnologyPostingsStore implements TechnologyPostingsStore {

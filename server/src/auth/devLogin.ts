@@ -15,7 +15,16 @@
 import type { Express, Request, Response } from 'express'
 import { pool } from '../db.js'
 import { findOrCreateUser, bootstrapPlatformAdmin } from './users.js'
-import { verifySession, setSessionCookie, clearSessionCookie, readSessionCookie } from './tokens.js'
+import {
+  verifySession,
+  setSessionCookie,
+  clearSessionCookie,
+  readSessionCookie,
+  sessionEndedPending,
+  rememberSessionEnded,
+  sessionEndedCookieName,
+  clearNamedCookie,
+} from './tokens.js'
 import { appendAudit } from './audit.js'
 import { resolveLoginOrg } from './provisioning.js'
 import { isSessionEpochCurrent, mintRefusalBody, signCurrentSession } from './sessionEpoch.js'
@@ -99,12 +108,22 @@ export function registerAuthRoutes(app: Express): void {
 
   app.post('/api/auth/logout', (_req: Request, res: Response) => {
     clearSessionCookie(res)
+    // A deliberate sign-out is not "your session ended": drop the marker too.
+    clearNamedCookie(res, sessionEndedCookieName())
     res.json({ success: true })
   })
 
   app.get('/api/auth/me', async (req: Request, res: Response) => {
     const token = readSessionCookie(req)
     if (!token) {
+      // No session cookie. If a STALE one was cleared a moment ago (another
+      // request of the same page load, or another tab, got there first), say
+      // so: the client tells "your access changed" from "never signed in" by
+      // this code. The marker is left to expire, so every tab gets the answer.
+      if (sessionEndedPending(req)) {
+        res.status(401).json({ error: 'Session permissions changed; sign in again', code: 'session_stale' })
+        return
+      }
       res.status(401).json({ error: 'Not authenticated' })
       return
     }
@@ -115,11 +134,12 @@ export function registerAuthRoutes(app: Express): void {
         return
       }
       if (authStage() === 'on' && !(await isSessionEpochCurrent(pool, claims))) {
+        rememberSessionEnded(res)
         clearSessionCookie(res)
         res.status(401).json({ error: 'Session permissions changed; sign in again', code: 'session_stale' })
         return
       }
-      const { rows } = await pool.query(
+      const { rows }= await pool.query(
         'SELECT id, email, name, given_name, family_name, locale, is_platform_admin, status FROM users WHERE id = $1',
         [claims.userId]
       )

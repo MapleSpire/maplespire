@@ -63,7 +63,7 @@
     "verify:sync-active-active": "node scripts/verify-sync-cell-active-active.mjs",
     "verify:sync-load-soak": "node scripts/verify-sync-cell-load-soak.mjs",
     "bench:sync-cell": "node scripts/sync-cell-bench.mjs",
-    "test:sync-load-soak-harness": "node --test qa/loadUsersCore.test.mjs qa/loadBarrier.test.mjs qa/loadUserSnapshots.test.mjs qa/loadUserCohort.test.mjs qa/loadUsersWorker.integration.test.mjs scripts/verify-sync-cell-load-soak.test.mjs",
+    "test:sync-load-soak-harness": "node --test qa/loadUsersCore.test.mjs qa/loadBarrier.test.mjs qa/loadUserSnapshots.test.mjs qa/loadUserCohort.test.mjs qa/loadUsersWorker.integration.test.mjs scripts/verify-sync-cell-load-soak.test.mjs scripts/sync-bench-runtime.test.mjs",
     "test:diagram-peer-harness": "node --test qa/diagramPeersCore.test.mjs qa/diagramPeersTiers.test.mjs qa/diagramBrowserCore.test.mjs qa/diagramPeersInstrument.test.mjs qa/diagramSeed.test.mjs",
     "test:qa-gate-harness": "node --test qa/qaGates.test.mjs qa/evictionFireDrillCore.test.mjs qa/placement-shadow-observer.test.mjs qa/placement-shadow-summary.test.mjs scripts/sync-cell-dedicated-contract.test.mjs scripts/sync-cell-dedicated-window.test.mjs scripts/verify-sync-cell-dedicated.test.mjs scripts/sync-cell-dedicated-runtime.test.mjs",
     "verify:diagram-peer-tiers": "node scripts/verify-diagram-peer-tiers.mjs",

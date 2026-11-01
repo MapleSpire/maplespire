@@ -17,6 +17,7 @@ import type { Pool } from 'pg'
 import { authStage } from '../auth/middleware.js'
 import { explainAccess } from '../rbac/access.js'
 import { canonicalWorkspaceKey, workspaceAccessForRequest } from '../rbac/workspaceGate.js'
+import { sendDependencyOutage } from '../runtime/dependencyOutageResponse.js'
 import type { TagActor, TagCapability, TagWorkspaceContext } from './types.js'
 
 const ADMIN_ONLY = new Set<TagCapability>(['tag.audit_view', 'tag.archive', 'tag.merge', 'tag.restore', 'tag.manage_policy'])
@@ -126,6 +127,10 @@ export async function requireTagCapability(
     res.status(403).json({ error: 'writable_workspace_required' })
     return null
   } catch (error) {
+    // A dependency outage — the registry read that canonicalises the
+    // workspace of a workspace-scoped write (`hasWorkspaceWrite`) — is the
+    // shared 503, not a failed check.
+    if (sendDependencyOutage(res, error)) return null
     console.error('[tags] capability check failed:', error)
     res.status(500).json({ error: 'tag_access_check_failed' })
     return null

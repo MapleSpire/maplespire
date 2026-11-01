@@ -23,8 +23,10 @@ import {
   forgetIntentsOnceDurable,
   hydrateEntityIntents,
   isEntityPlannerKind,
+  mergeChangedFields,
   pendingEntityIntents,
   persistEntityIntents,
+  planCarriedUpsert,
   planEntityIntentReplay,
   planSmallCollectionIntentReplay,
   splitResidentPlannableIntents,
@@ -170,6 +172,292 @@ describe('PendingEntityIntents — latest-wins journal', () => {
     } satisfies SerializedEntityIntent]
     journal.hydrate(WS, foreign)
     expect(journal.hasPending(WS)).toBe(false)
+  })
+})
+
+// SENT: the carrier's local flush happened, the server has not said so. These
+// pin when a SENT entry dies, comes back, or is never there at all.
+describe('PendingEntityIntents — the SENT stage', () => {
+  const V1 = 'default/V1'
+  const V2 = 'default/V2'
+  const shard = { documentId: 'shard-1', heads: ['h1'] }
+  const doc = { documentId: 'doc-1', heads: ['h2'] }
+
+  it('markSent takes the intent out of everything a boot replays or counts, and keeps it on disk', () => {
+    const journal = new PendingEntityIntents()
+    journal.recordUpsert(WS, 'diagram', 'd1', { id: 'd1', name: 'New' } as never)
+    expect(journal.markSent(WS, 'diagram', ['d1'], journal.revisionNow, { workspace: V1, carriers: [shard] })).toBe(1)
+    expect(journal.pending(WS)).toEqual([])
+    expect(journal.hasPending(WS)).toBe(false)
+    expect(journal.pendingCount(WS)).toBe(0)
+    expect(journal.has(WS, 'diagram', 'd1')).toBe(false)
+    expect(journal.sentCount(WS)).toBe(1)
+    const [onDisk] = journal.serialize(WS)
+    expect(onDisk.sent).toEqual({ workspace: V1, carriers: [shard] })
+
+    const reloaded = new PendingEntityIntents()
+    reloaded.hydrate(WS, journal.serialize(WS))
+    expect(reloaded.pending(WS)).toEqual([])
+    expect(reloaded.sentCount(WS)).toBe(1)
+  })
+
+  it('markSent respects the captured revision: an edit recorded during the flush stays PENDING', () => {
+    const journal = new PendingEntityIntents()
+    journal.recordUpsert(WS, 'object', 'o1', obj('o1', 'v1'))
+    const captured = journal.revisionNow
+    journal.recordUpsert(WS, 'object', 'o1', obj('o1', 'v2'))
+    expect(journal.markSent(WS, 'object', ['o1'], captured, { workspace: V1, carriers: [shard] })).toBe(0)
+    expect(upsertName(journal.pending(WS)[0])).toBe('v2')
+    expect(journal.sentCount(WS)).toBe(0)
+  })
+
+  it('a new record of the key supersedes its SENT entry', () => {
+    const journal = new PendingEntityIntents()
+    journal.recordUpsert(WS, 'object', 'o1', obj('o1', 'v1'), obj('o1', 'v0'))
+    journal.markSent(WS, 'object', ['o1'], journal.revisionNow, { workspace: V1, carriers: [shard] })
+    journal.recordDelete(WS, 'object', 'o1')
+    expect(journal.sentCount(WS)).toBe(0)
+    expect(journal.pending(WS).map((intent) => intent.op)).toEqual(['delete'])
+  })
+
+  it('a baselined edit over a SENT creation keeps its baseline and owes the creation (createIfAbsent)', () => {
+    // The object capture reseeds its baseline at the flush, so the edit after
+    // the creation's flush arrives baselined. As a bare patch, a repoint would
+    // replay a patch for an entity the new version never had. Dropping the
+    // baseline instead turned ordinary crash replays into whole-value writes.
+    const journal = new PendingEntityIntents()
+    journal.recordUpsert(WS, 'object', 'o1', obj('o1', 'created'))
+    journal.markSent(WS, 'object', ['o1'], journal.revisionNow, { workspace: V1, carriers: [shard] })
+    journal.recordUpsert(WS, 'object', 'o1', obj('o1', 'renamed'), obj('o1', 'created'))
+    const [only] = journal.pending(WS)
+    expect(only.op === 'upsert' && only.baseline && upsertName({ ...only, snapshot: only.baseline } as never)).toBe('created')
+    expect(only.createIfAbsent).toBe(true)
+    expect(upsertName(only)).toBe('renamed')
+    // The flag survives a further re-record while still unconfirmed…
+    journal.recordUpsert(WS, 'object', 'o1', obj('o1', 'again'), obj('o1', 'created'))
+    expect(journal.pending(WS)[0].createIfAbsent).toBe(true)
+    // …and a SENT EDIT does not make later edits owe a creation.
+    journal.recordUpsert(WS, 'object', 'o2', obj('o2', 'b'), obj('o2', 'a'))
+    journal.markSent(WS, 'object', ['o2'], journal.revisionNow, { workspace: V1, carriers: [shard] })
+    journal.recordUpsert(WS, 'object', 'o2', obj('o2', 'c'), obj('o2', 'b'))
+    const o2 = journal.pending(WS).find((intent) => intent.id === 'o2')!
+    expect(o2.createIfAbsent).toBeUndefined()
+  })
+
+  it('a release round releases only what was marked BEFORE it asked', () => {
+    // Reviewer lens: B marked SENT at newer heads during the round must not be
+    // released by the answer about the older heads.
+    const journal = new PendingEntityIntents()
+    journal.recordUpsert(WS, 'object', 'a', obj('a', 'x'))
+    journal.markSent(WS, 'object', ['a'], journal.revisionNow, { workspace: V1, carriers: [{ documentId: 'D', heads: ['h1'] }] })
+    const askedThrough = journal.sentSequenceNow
+    expect(journal.sentCarriers(WS, V1, askedThrough)).toEqual([{ documentId: 'D', heads: ['h1'] }])
+    journal.recordUpsert(WS, 'object', 'b', obj('b', 'y'))
+    journal.markSent(WS, 'object', ['b'], journal.revisionNow, { workspace: V1, carriers: [{ documentId: 'D', heads: ['h2'] }] })
+    expect(journal.releaseSent(WS, V1, () => true, askedThrough)).toBe(1)
+    expect(journal.sentCarriers(WS, V1)).toEqual([{ documentId: 'D', heads: ['h2'] }])
+    // A hydrated SENT intent was marked in an earlier page: before any ask.
+    const reloaded = new PendingEntityIntents()
+    reloaded.hydrate(WS, journal.serialize(WS))
+    expect(reloaded.releaseSent(WS, V1, () => true, 0)).toBe(1)
+  })
+
+  it('a SENT intent tagged null is releasable in whatever workspace the session names', () => {
+    const journal = new PendingEntityIntents()
+    journal.recordUpsert(WS, 'object', 'o1', obj('o1', 'x'))
+    journal.markSent(WS, 'object', ['o1'], journal.revisionNow, { workspace: null, carriers: [shard] })
+    expect(journal.sentCarriers(WS, V2)).toEqual([shard])
+    expect(journal.releaseSent(WS, V2, () => false)).toBe(0)
+    expect(journal.releaseSent(WS, V2, () => true)).toBe(1)
+  })
+
+  it('pendingCreation and pendingOp see a SENT entry; has() does not', () => {
+    const journal = new PendingEntityIntents()
+    journal.recordUpsert(WS, 'diagram', 'd1', { id: 'd1' } as never)
+    journal.recordDelete(WS, 'group', 'g1')
+    journal.markSent(WS, 'diagram', ['d1'], journal.revisionNow, { workspace: V1, carriers: [shard] })
+    journal.markSent(WS, 'group', ['g1'], journal.revisionNow, { workspace: V1, carriers: [shard] })
+    expect(journal.pendingCreation(WS, 'diagram', 'd1')).toBe(true)
+    expect(journal.pendingOp(WS, 'diagram', 'd1')).toBe('upsert')
+    expect(journal.pendingOp(WS, 'group', 'g1')).toBe('delete')
+    expect(journal.has(WS, 'diagram', 'd1')).toBe(false)
+  })
+
+  it('acknowledge removes a SENT entry too: a create-then-delete must not come back on a repoint', () => {
+    const journal = new PendingEntityIntents()
+    journal.recordUpsert(WS, 'diagram', 'd1', { id: 'd1' } as never)
+    journal.markSent(WS, 'diagram', ['d1'], journal.revisionNow, { workspace: V1, carriers: [shard] })
+    journal.acknowledge(WS, 'diagram', ['d1'], journal.revisionNow)
+    expect(journal.sentCount(WS)).toBe(0)
+    expect(journal.requeueSent(WS, V2)).toEqual([])
+    expect(journal.pending(WS)).toEqual([])
+  })
+
+  it('releaseSent needs every carrier durable, and only for the workspace asked about', () => {
+    const journal = new PendingEntityIntents()
+    journal.recordUpsert(WS, 'diagram', 'd1', { id: 'd1' } as never)
+    journal.recordUpsert(WS, 'object', 'o1', obj('o1', 'x'))
+    journal.recordUpsert(WS, 'object', 'o2', obj('o2', 'y'))
+    const through = journal.revisionNow
+    journal.markSent(WS, 'diagram', ['d1'], through, { workspace: V1, carriers: [shard, doc] })
+    journal.markSent(WS, 'object', ['o1'], through, { workspace: V1, carriers: [shard] })
+    journal.markSent(WS, 'object', ['o2'], through, { workspace: V2, carriers: [shard] })
+    expect(journal.sentCarriers(WS, V1)).toEqual([shard, doc])
+
+    const durable = (carrier: { documentId: string }) => carrier.documentId === 'shard-1'
+    expect(journal.releaseSent(WS, V1, durable)).toBe(1)
+    // o1 is gone, d1 still waits for its DiagramDoc, o2 belongs to V2.
+    expect(journal.sentCount(WS)).toBe(2)
+    expect(journal.releaseSent(WS, V1, () => true)).toBe(1)
+    expect(journal.releaseSent(WS, V2, () => true)).toBe(1)
+    expect(journal.sentCount(WS)).toBe(0)
+  })
+
+  it('sentCarriers asks once per document, with its LATEST capture', () => {
+    // The endpoint refuses a repeated id, and the union of every capture would
+    // grow with the journal; the latest descends from the earlier ones.
+    const journal = new PendingEntityIntents()
+    journal.recordUpsert(WS, 'object', 'o1', obj('o1', 'a'))
+    journal.markSent(WS, 'object', ['o1'], journal.revisionNow, { workspace: V1, carriers: [{ documentId: 'shard-1', heads: ['early'] }] })
+    journal.recordUpsert(WS, 'object', 'o2', obj('o2', 'b'))
+    journal.markSent(WS, 'object', ['o2'], journal.revisionNow, { workspace: V1, carriers: [{ documentId: 'shard-1', heads: ['late'] }] })
+    expect(journal.sentCarriers(WS, V1)).toEqual([{ documentId: 'shard-1', heads: ['late'] }])
+  })
+
+  it('requeueSent puts ANOTHER workspace\'s SENT intents back, fresh revision, no batch stamp', () => {
+    const journal = new PendingEntityIntents()
+    journal.recordUpsert(WS, 'object', 'o1', obj('o1', 'offline'))
+    journal.markWritten(WS, 'object', ['o1'], journal.revisionNow, 'batch-in-V1')
+    journal.recordUpsert(WS, 'object', 'o2', obj('o2', 'here'))
+    journal.recordUpsert(WS, 'object', 'o3', obj('o3', 'unknown'))
+    const through = journal.revisionNow
+    journal.markSent(WS, 'object', ['o1'], through, { workspace: V1, carriers: [shard] })
+    journal.markSent(WS, 'object', ['o2'], through, { workspace: V2, carriers: [shard] })
+    journal.markSent(WS, 'object', ['o3'], through, { workspace: null, carriers: [shard] })
+    const before = journal.revisionNow
+
+    expect(journal.requeueSent(WS, V2)).toEqual(['object:o1'])
+    const [requeued] = journal.pending(WS)
+    expect(requeued.id).toBe('o1')
+    expect(requeued.sent).toBeUndefined()
+    expect(requeued.writtenInBatchId).toBeUndefined()
+    expect(requeued.carried, 'a requeued intent replays conflict-averse').toBe(true)
+    expect(requeued.revision).toBeGreaterThan(before)
+    // An ack captured before the requeue cannot retire it.
+    journal.acknowledge(WS, 'object', ['o1'], before)
+    expect(journal.pending(WS)).toHaveLength(1)
+    // V2's own and the unnamed one stay SENT.
+    expect(journal.sentCount(WS)).toBe(2)
+  })
+
+  it('hydration keeps a key in one stage, newest wins, and a malformed mark falls back to PENDING', () => {
+    const journal = new PendingEntityIntents()
+    const base = { workspaceKey: WS, kind: 'object' as const, op: 'upsert' as const }
+    journal.hydrate(WS, [
+      { ...base, id: 'o1', revision: 1, recordedAt: 100, snapshot: obj('o1', 'old'), sent: { workspace: V1, carriers: [shard] } },
+      { ...base, id: 'o1', revision: 2, recordedAt: 200, snapshot: obj('o1', 'new') },
+      { ...base, id: 'o2', revision: 3, recordedAt: 300, snapshot: obj('o2', 'bad'), sent: { workspace: 7, carriers: 'x' } as never },
+    ])
+    expect(journal.sentCount(WS)).toBe(0)
+    expect(journal.pending(WS).map((intent) => upsertName(intent))).toEqual(['new', 'bad'])
+    journal.hydrate(WS, [
+      { ...base, id: 'o1', revision: 4, recordedAt: 400, snapshot: obj('o1', 'newest-sent'), sent: { workspace: V1, carriers: [shard] } },
+    ])
+    expect(journal.sentCount(WS)).toBe(1)
+    expect(journal.pending(WS).map((intent) => intent.id)).toEqual(['o2'])
+  })
+
+  it('a SENT intent survives a reload through the per-tab persistence', async () => {
+    const store = createMemoryKvStore()
+    const ws = `${WS}:sent-reload`
+    pendingEntityIntents.recordUpsert(ws, 'diagram', 'dR', { id: 'dR' } as never)
+    pendingEntityIntents.markSent(ws, 'diagram', ['dR'], pendingEntityIntents.revisionNow, { workspace: V1, carriers: [shard] })
+    await persistEntityIntents(store, ws)
+    expect(await store.get(`pending-entity-intents:v4:tab:${entityIntentTabId}`)).toHaveLength(1)
+    // Same module (the reload adopts its own previous key): the SENT entry is
+    // still there, still SENT, and requeueable.
+    await hydrateEntityIntents(store, ws)
+    expect(pendingEntityIntents.sentCount(ws)).toBe(1)
+    expect(pendingEntityIntents.requeueSent(ws, V2)).toEqual(['diagram:dR'])
+    pendingEntityIntents.acknowledge(ws, 'diagram', ['dR'], pendingEntityIntents.revisionNow)
+    await flushEntityIntentPersistence(store, ws)
+  })
+})
+
+// A CARRIED intent may have reached the old version before the fork copied it:
+// where the new version differs from what the user saw, the new version wins.
+describe('planCarriedUpsert — conflict-averse replay into the new version', () => {
+  const user = { id: 'o1', name: 'user', note: 'mine' }
+  const seen = { id: 'o1', name: 'before', note: 'mine' }
+
+  it('creates an absent entity, unless the new version tombstoned it', () => {
+    expect(planCarriedUpsert({ snapshot: user, baseline: undefined, current: undefined, tombstoned: false, createIfAbsent: false }))
+      .toEqual({ write: true, value: user, created: true })
+    expect(planCarriedUpsert({ snapshot: user, baseline: undefined, current: undefined, tombstoned: true, createIfAbsent: false }))
+      .toEqual({ write: false })
+    // A patch of an absent entity has nothing left to patch — unless it owes a creation.
+    expect(planCarriedUpsert({ snapshot: user, baseline: seen, current: undefined, tombstoned: false, createIfAbsent: false }))
+      .toEqual({ write: false })
+    expect(planCarriedUpsert({ snapshot: user, baseline: seen, current: undefined, tombstoned: false, createIfAbsent: true }))
+      .toEqual({ write: true, value: user, created: true })
+  })
+
+  it('never writes a creation over an entity the new version already holds', () => {
+    const colleagues = { id: 'o1', name: 'theirs', note: 'theirs' }
+    expect(planCarriedUpsert({ snapshot: user, baseline: undefined, current: colleagues, tombstoned: false, createIfAbsent: false }))
+      .toEqual({ write: false })
+  })
+
+  it('patches only the fields the new version still holds at the user\'s baseline', () => {
+    const forked = { id: 'o1', name: 'before', note: 'mine' }
+    expect(planCarriedUpsert({ snapshot: user, baseline: seen, current: forked, tombstoned: false, createIfAbsent: false }))
+      .toEqual({ write: true, value: user, created: false })
+    // Someone renamed it in the new version since: their name stays.
+    const renamed = { id: 'o1', name: 'theirs', note: 'mine' }
+    expect(planCarriedUpsert({ snapshot: user, baseline: seen, current: renamed, tombstoned: false, createIfAbsent: false }))
+      .toEqual({ write: false })
+    // The ordinary merge would have overwritten it — the contrast this exists for.
+    expect(mergeChangedFields(user, seen, renamed).name).toBe('user')
+  })
+})
+
+describe('the planners replay a CARRIED intent conflict-averse', () => {
+  it('entity planner: a carried creation the fork already holds is satisfied, not rewritten', () => {
+    const colleagues = obj('o1', 'theirs')
+    const intent = {
+      workspaceKey: WS, revision: 1, recordedAt: 1, kind: 'object', op: 'upsert', id: 'o1',
+      snapshot: obj('o1', 'offline'), carried: true,
+    } as SerializedEntityIntent
+    const plan = planEntityIntentReplay({ ...emptyReplayState, intents: [intent], currentObjects: new Map([['o1', colleagues]]) })
+    expect(plan.replayObjects).toEqual([])
+    expect(plan.satisfied.map((done) => done.id)).toEqual(['o1'])
+    // The same intent, NOT carried (an ordinary crash replay): written.
+    const ordinary = planEntityIntentReplay({ ...emptyReplayState, intents: [{ ...intent, carried: undefined }], currentObjects: new Map([['o1', colleagues]]) })
+    expect(ordinary.replayObjects).toHaveLength(1)
+  })
+
+  it('entity planner: a carried creation is created when absent, and never un-tombstones', () => {
+    const intent = {
+      workspaceKey: WS, revision: 1, recordedAt: 1, kind: 'object', op: 'upsert', id: 'o1',
+      snapshot: obj('o1', 'offline'), carried: true,
+    } as SerializedEntityIntent
+    expect(planEntityIntentReplay({ ...emptyReplayState, intents: [intent] }).replayObjects.map((o) => o.name)).toEqual(['offline'])
+    const deletedThere = planEntityIntentReplay({ ...emptyReplayState, intents: [intent], deletedObjectIds: new Set(['o1']) })
+    expect(deletedThere.replayObjects).toEqual([])
+    expect(deletedThere.unTombObjectIds).toEqual([])
+  })
+
+  it('small-collection planner: a carried patch keeps a colleague\'s later value', () => {
+    const intent = {
+      workspaceKey: WS, revision: 1, recordedAt: 1, kind: 'group', op: 'upsert', id: 'g1',
+      snapshot: { id: 'g1', name: 'mine' }, baseline: { id: 'g1', name: 'before' }, carried: true,
+    } as unknown as SerializedEntityIntent
+    const current = {
+      group: new Map([['g1', { id: 'g1', name: 'theirs' }]]), domain: new Map(), tagSnapshot: new Map(), decisionRecord: new Map(),
+    }
+    const plan = planSmallCollectionIntentReplay({ intents: [intent], current, deletedDecisionRecordIds: new Set() })
+    expect(plan.replayUpserts.group).toEqual([])
+    expect(plan.satisfied.map((done) => done.id)).toEqual(['g1'])
   })
 })
 

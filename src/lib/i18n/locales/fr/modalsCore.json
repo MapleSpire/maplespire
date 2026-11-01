@@ -65,16 +65,6 @@
       },
       "mintShortfall": "{{count}} des éléments importés n'ont pas pu réserver d'identifiant de synchronisation et ont été créés avec un identifiant temporaire. Ils sont bien là — gardez cet onglet ouvert quelques secondes, puis rechargez la page si l'un d'eux manque ensuite."
     },
-    "search": {
-      "placeholder": "Rechercher des objets, connexions, technologies…",
-      "esc": "ÉCHAP",
-      "tooShort": "Saisissez au moins {{count}} caractères pour lancer la recherche",
-      "noResults": "Aucun résultat pour « {{query}} »",
-      "tryLabel": "Essayez de rechercher :",
-      "trySuggestions": ["Utilisateur", "Service API", "React", "PostgreSQL", "Connexion"],
-      "connectionFallbackLabel": "Connexion",
-      "resultCount": "{{count}} résultat{{plural}}"
-    },
     "settings": {
       "title": "Paramètres",
       "closeAria": "Fermer les paramètres",

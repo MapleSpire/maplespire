@@ -914,7 +914,7 @@ describe.skipIf(!TEST_DATABASE_URL)('platform routes (live Postgres)', () => {
         const me = await fetch(`${url}/api/auth/me`, { headers })
         const meBody = (await me.json()) as { code?: string }
         const claims = await verifySession(token)
-        const cleared = (r: Response) => (r.headers.get('set-cookie') ?? '').startsWith('maplespire_session=;')
+        const cleared = (r: Response) => r.headers.getSetCookie().some((c) => c.startsWith('maplespire_session=;'))
         return {
           http: http.status,
           httpCleared: cleared(http),
@@ -982,6 +982,100 @@ describe.skipIf(!TEST_DATABASE_URL)('platform routes (live Postgres)', () => {
     } finally {
       await dropOrg(orgId)
       for (const id of [target, revokedAdmin, actor]) await dropUser(id)
+    }
+  })
+
+  // Regression (e2e on the merged branch, 2026-10-17): a page opened on a
+  // revoked session fires several requests at once. The HTTP gate clears the
+  // stale cookie on whichever answers first, so GET /api/auth/me — the call the
+  // client asks "why am I signed out?" — then arrived with NO cookie and could
+  // only say "not authenticated": the login page lost the reason.
+  it("a stale cookie cleared by an ordinary route first still lets /api/auth/me say why, in every tab", async () => {
+    const actor = await makeUser('marker-actor@example.com', { isPlatformAdmin: true })
+    const revokedAdmin = await makeUser('marker-revoked@example.com', { isPlatformAdmin: true })
+    try {
+      const { signCurrentSession } = await import('./sessionEpoch.js')
+      const stale = await signCurrentSession(realPool, { userId: revokedAdmin, orgId: null, isPlatformAdmin: true })
+      await withServer({ userId: actor, orgId: null, isPlatformAdmin: true, epoch: 1 }, async (url) => {
+        const res = await fetch(`${url}/api/platform/users/${revokedAdmin}/platform-admin`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ grant: false }),
+        })
+        expect(res.status).toBe(200)
+      })
+
+      const savedAuth = process.env.AUTH
+      process.env.AUTH = 'on'
+      const { requireAuth } = await import('./middleware.js')
+      const { registerAuthRoutes } = await import('./devLogin.js')
+      const { createSessionEpochValidator } = await import('./sessionEpoch.js')
+      const app = express()
+      app.use(express.json())
+      app.use('/api', requireAuth({ isSessionCurrent: createSessionEpochValidator(realPool, { cacheTtlMs: 0 }) }))
+      registerAuthRoutes(app)
+      app.get('/api/probe', (_req, res) => res.json({ ok: true }))
+      const server: Server = await new Promise((resolve) => {
+        const s = app.listen(0, () => resolve(s))
+      })
+      try {
+        const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
+        const setCookies = (r: Response) => r.headers.getSetCookie()
+
+        // 1. The race: an ordinary route meets the stale cookie first.
+        const first = await fetch(`${url}/api/probe`, { headers: { Cookie: `maplespire_session=${encodeURIComponent(stale)}` } })
+        expect(first.status).toBe(401)
+        expect(setCookies(first).some((c) => c.startsWith('maplespire_session=;'))).toBe(true)
+        const marker = setCookies(first).find((c) => c.startsWith('maplespire_session_ended='))
+        expect(marker, 'the cleared cookie must leave the reason behind').toBeTruthy()
+
+        // The marker is written BEFORE the clear, so no response leaves neither.
+        const setOrder = setCookies(first).map((c) => c.split('=')[0])
+        expect(setOrder.indexOf('maplespire_session_ended')).toBeLessThan(setOrder.indexOf('maplespire_session'))
+        // Exact attributes (Path/SameSite/Max-Age): a browser sends it to /api/auth/me only if these hold.
+        expect(marker).toMatch(/^maplespire_session_ended=stale; Path=\/; HttpOnly; SameSite=Lax; Max-Age=120$/)
+
+        // 2. The browser now holds ONLY the marker (the session cookie is gone).
+        const cookie = marker!.split(';')[0]
+        const me = await fetch(`${url}/api/auth/me`, { headers: { Cookie: cookie } })
+        expect(me.status).toBe(401)
+        expect(await me.json()).toMatchObject({ code: 'session_stale' })
+        // Not consumed here: only logout and the 120 s expiry remove it.
+        expect(setCookies(me).some((c) => c.includes('_ended='))).toBe(false)
+
+        // 3. A SECOND tab shares the cookie jar and is told too (this step used to send no
+        // cookie at all, so it could not tell consumed from kept).
+        const secondTab = await fetch(`${url}/api/auth/me`, { headers: { Cookie: cookie } })
+        expect(await secondTab.json()).toMatchObject({ code: 'session_stale' })
+
+        // 3b. /me meeting the stale cookie itself also leaves the marker, so the next tab hears why.
+        const meStale = await fetch(`${url}/api/auth/me`, { headers: { Cookie: `maplespire_session=${encodeURIComponent(stale)}` } })
+        expect(meStale.status).toBe(401)
+        expect(setCookies(meStale).some((c) => c.startsWith('maplespire_session_ended=stale'))).toBe(true)
+
+        // 3c. A valid session plus a leftover marker (re-login within 120 s) is a normal 200:
+        // the marker is only read when there is NO session cookie.
+        const fresh = await signCurrentSession(realPool, { userId: actor, orgId: null, isPlatformAdmin: true })
+        const relogged = await fetch(`${url}/api/auth/me`, {
+          headers: { Cookie: `maplespire_session=${encodeURIComponent(fresh)}; ${cookie}` },
+        })
+        expect(relogged.status).toBe(200)
+
+        // 4. A visitor who never had a session never sees the notice.
+        const stranger = await fetch(`${url}/api/auth/me`, { headers: { Cookie: 'other=1' } })
+        expect((await stranger.json()) as { code?: string }).not.toHaveProperty('code')
+
+        // 5. Signing out is not "your session ended": logout drops a pending marker.
+        const logout = await fetch(`${url}/api/auth/logout`, { method: 'POST', headers: { Cookie: cookie } })
+        expect(setCookies(logout).some((c) => c.startsWith('maplespire_session_ended=;'))).toBe(true)
+      } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()))
+        if (savedAuth === undefined) delete process.env.AUTH
+        else process.env.AUTH = savedAuth
+      }
+    } finally {
+      await dropUser(revokedAdmin)
+      await dropUser(actor)
     }
   })
 

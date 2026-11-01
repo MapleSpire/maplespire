@@ -37,6 +37,7 @@
     "test:harness-suites": "node scripts/run-harness-suites.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
+    "gen:layout-preview": "vitest run --config vitest.genpreview.config.ts",
     "ci:local": "node scripts/ci-local.mjs",
     "ci:local:down": "node scripts/ci-local.mjs --down",
     "test:skips": "node scripts/check-test-skips.mjs --report reports/vitest-frontend.json --report reports/vitest-server.json",
