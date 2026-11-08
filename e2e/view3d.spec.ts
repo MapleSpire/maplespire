@@ -781,7 +781,7 @@ test.describe('3D board', () => {
     const equip = async (skinId: string) => {
       const current = await page.evaluate(() => window.__canvasEngine!.skin?.id)
       if (current === skinId) return
-      await page.locator('[data-testid="open-theme-shop"]').click()
+      await page.locator('[data-testid="open-theme-shop"]').dispatchEvent('click') // button hidden in the pill for now
       await page.locator('[data-testid="shop-tab-collection"]').click()
       await page.locator(`[data-testid="skin-equip-${skinId}"]`).click()
       await page.locator('[data-testid="shop-close"]').click()
@@ -1334,7 +1334,7 @@ test.describe('3D board', () => {
       const current = await page.evaluate(() => window.__canvasEngine!.skin?.id)
       if (current === skinId) return
       const community = skinId.startsWith('community:')
-      await page.locator('[data-testid="open-theme-shop"]').click()
+      await page.locator('[data-testid="open-theme-shop"]').dispatchEvent('click') // button hidden in the pill for now
       await page.locator(`[data-testid="shop-tab-${community ? 'community' : 'collection'}"]`).click()
       await page.locator(`[data-testid="${community ? 'community-equip' : 'skin-equip'}-${skinId}"]`).click()
       await page.locator('[data-testid="shop-close"]').click()

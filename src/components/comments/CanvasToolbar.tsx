@@ -12,7 +12,7 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU Affero General Public License for more details.
 
-import { Plus, MessageSquare, Sparkles, Move, Wand2, History } from 'lucide-react'
+import { Plus, MessageSquare, Sparkles, Wand2, History } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { cn } from '../../lib/utils'
 import { useUIStore } from '../../stores/uiStore'
@@ -20,7 +20,7 @@ import { useModelStore } from '../../stores/modelStore'
 import { useAutoLayout } from '../../hooks/useAutoLayout'
 
 /**
- * Floating left vertical tool stack (design: a rounded card of AI / Move /
+ * Floating left vertical tool stack (design: a rounded card of AI /
  * Auto-layout / Comments / History, plus a separate Add card below). Vertically
  * centered, sitting just right of the floating left panel.
  */
@@ -37,8 +37,6 @@ export function CanvasToolbar({
   const toggleAIAssist = useUIStore((s) => s.toggleAIAssist)
   const createPaletteOpen = useUIStore((s) => s.createPaletteOpen)
   const toggleCreatePalette = useUIStore((s) => s.toggleCreatePalette)
-  const toolMode = useUIStore((s) => s.toolMode)
-  const setToolMode = useUIStore((s) => s.setToolMode)
   const setHistoryOpen = useUIStore((s) => s.setHistoryOpen)
   const { autoLaying, autoLayout } = useAutoLayout()
 
@@ -71,13 +69,6 @@ export function CanvasToolbar({
 
         <span className="my-0.5 h-px w-5 bg-line" />
 
-        <button
-          onClick={() => setToolMode(toolMode === 'pan' ? 'select' : 'pan')}
-          title={t('comments.toolbar.movePan')}
-          className={cn(btn, toolMode === 'pan' ? 'bg-surface-200 text-fg' : ghost)}
-        >
-          <Move className="h-[18px] w-[18px]" />
-        </button>
         <button
           onClick={() => void autoLayout()}
           disabled={autoLaying}
