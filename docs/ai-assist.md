@@ -220,6 +220,16 @@ Tokens: **Account settings → API tokens** (`bvr_…`, shown once, sha256-store
 revocable). Below `AUTH=on` the API is open (same posture as every surface);
 an invalid presented token is still rejected.
 
+**Scopes are enforced** (`server/src/ai/core/tokenScopes.ts`). Every token
+minted today carries the `mcp` scope, which reaches `/mcp` and the AI surface
+`/api/ai/*`: tools, `run`, `skill`, `status`, `chat` and conversations. Any
+other `/api` route answers **403** `insufficient_scope` with a
+`WWW-Authenticate: Bearer error="insufficient_scope"` header, at every
+`AUTH` stage. That covers the model and landscape REST routes, org settings and
+`ai-config`. No scope ever reaches `/api/platform/*` or `/api/me/ai-tokens*`: a
+token cannot mint or revoke tokens. Scripts that used a PAT on other REST
+routes must use a browser session instead.
+
 ### Remote MCP (Streamable HTTP + Bearer/OAuth)
 
 ```bash
@@ -258,6 +268,9 @@ Zero business logic — proxies `GET /api/ai/tools?format=mcp` and
 
 - Key encryption AES-256-GCM; hash-only bearer tokens; PKCE-only OAuth with
   rotating refresh; the key never returns to a browser.
+- Bearer tokens are scope-limited, deny-by-default (see "Adapters for AI
+  agents"); `bearerAuth.scopes.test.ts` pins it, including dot-segment,
+  encoded-separator and case variants.
 - `executeAiTool` enforces the write gate centrally; `resolveAiToolCtx` applies
   the same canonical-workspace read gates as `/api/model/*`. Below `AUTH=on`
   the AI mirrors the editor's permissiveness exactly (never more).
