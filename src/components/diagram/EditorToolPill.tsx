@@ -45,6 +45,9 @@ import { cn } from '../../lib/utils'
 import { undoHistory } from '../../lib/history/undoHistory'
 import { isMacPlatform, shortcutLabel } from './canvasShortcuts'
 
+/** Theme shop button visibility in the pill — hidden for now, the shop itself is intact. */
+const SHOW_THEME_SHOP = false
+
 /**
  * The single floating, centered editor pill (the design's tool surface, with the
  * leftover global utilities merged in): Select/Connection/Pan · Undo/Redo · Add ·
@@ -299,7 +302,9 @@ export function EditorToolPill({ editReady = true }: EditorToolPillProps) {
           <GitBranch className="h-4 w-4" />
         </button>
       )}
-      <button data-testid="open-theme-shop" onClick={() => setShopOpen(true)} title={t('diagramChrome.toolPill.themeShop')} className={ghost}>
+      {/* Theme shop entry temporarily hidden (owner request 2026-11-08). Kept in
+          the DOM so the shop stays reachable for e2e; flip SHOW_THEME_SHOP to restore. */}
+      <button data-testid="open-theme-shop" onClick={() => setShopOpen(true)} title={t('diagramChrome.toolPill.themeShop')} className={SHOW_THEME_SHOP ? ghost : 'hidden'} aria-hidden={!SHOW_THEME_SHOP} tabIndex={SHOW_THEME_SHOP ? undefined : -1}>
         <ShoppingBag className="h-4 w-4" />
       </button>
       <button onClick={() => setSettingsOpen(true)} title={t('diagramChrome.toolPill.settings')} className={ghost}>
