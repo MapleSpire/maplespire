@@ -17,13 +17,16 @@ import { pool } from '../../db.js'
 import { TOKEN_PREFIX } from '../core/tokens.js'
 import { identityToClaims, verifyBearerIdentity } from '../core/identity.js'
 import type { AiIdentity } from '../core/identity.js'
+import { routeAllowedForScopes } from '../core/tokenScopes.js'
 
 /**
  * Bearer→session bridge for `/api`: a valid `Authorization: Bearer bvr_…`
  * token authenticates the request AS ITS OWNING USER by setting `req.auth`
  * before `requireAuth` runs (which passes through when `req.auth` is already
  * set). Lets MCP hosts, scripts and the local stdio adapter call the tool
- * REST API with the same RBAC identity as a browser session.
+ * REST API with the same RBAC identity as a browser session — but only on the
+ * routes the token's scopes cover (`core/tokenScopes.ts`); any other route
+ * answers 403 `insufficient_scope`.
  *
  * Non-`bvr_` Authorization headers are ignored (not our scheme); an INVALID
  * `bvr_` token is also passed through unauthenticated — `requireAuth` then
@@ -41,7 +44,7 @@ declare global {
 }
 
 export function aiBearerBridge(): RequestHandler {
-  return (req: Request, _res: Response, next: NextFunction) => {
+  return (req: Request, res: Response, next: NextFunction) => {
     const header = req.headers.authorization
     if (!header?.startsWith('Bearer ') || req.auth) {
       next()
@@ -55,6 +58,19 @@ export function aiBearerBridge(): RequestHandler {
     verifyBearerIdentity(pool, token)
       .then((identity) => {
         if (identity) {
+          // Scopes are enforced here, before any handler: a valid token
+          // outside its scopes is refused outright, never downgraded to an
+          // anonymous request (which `AUTH=off` would let through).
+          if (!routeAllowedForScopes(req.method, req.originalUrl, identity.scopes)) {
+            res
+              .status(403)
+              .set(
+                'WWW-Authenticate',
+                'Bearer error="insufficient_scope", error_description="This token\'s scopes do not cover this route"'
+              )
+              .json({ error: 'insufficient_scope' })
+            return
+          }
           req.auth = identityToClaims(identity)
           req.aiIdentity = identity
         }
