@@ -71,14 +71,20 @@ describe('the capture is inert when the knob is off', () => {
     const script = [
       "import inspector from 'node:inspector'",
       "import { getActiveResourcesInfo } from 'node:process'",
-      'const before = getActiveResourcesInfo().length',
+      'const before = getActiveResourcesInfo()',
       "await import('./src/diagnostics/cpuProfile.install.ts')",
-      'console.log(JSON.stringify({ inspectorUrl: inspector.url() ?? null, resourcesAdded: getActiveResourcesInfo().length - before }))',
+      // Compare per resource TYPE: loader handles closing during the import made
+      // a plain length difference go negative (-2 on the GitHub runner), which
+      // could also hide a timer the module started.
+      'const counts = (list) => list.reduce((m, t) => m.set(t, (m.get(t) ?? 0) + 1), new Map())',
+      'const was = counts(before)',
+      'const resourcesAdded = [...counts(getActiveResourcesInfo())].filter(([t, n]) => n > (was.get(t) ?? 0)).map(([t]) => t)',
+      'console.log(JSON.stringify({ inspectorUrl: inspector.url() ?? null, resourcesAdded }))',
     ].join('\n')
     const out = execFileSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', script], {
       cwd: serverRoot, encoding: 'utf8', env: { ...process.env, [CPU_PROFILE_FLAG]: '', SYNC_DIAG_CPU_PROFILE_DIR: '/nowhere' },
     })
-    expect(JSON.parse(out.trim().split('\n').pop()!)).toEqual({ inspectorUrl: null, resourcesAdded: 0 })
+    expect(JSON.parse(out.trim().split('\n').pop()!)).toEqual({ inspectorUrl: null, resourcesAdded: [] })
   }, 60_000)
   it('is imported right after dotenv, before anything that evaluates Automerge', () => {
     const source = readFileSync(new URL('../index.ts', import.meta.url), 'utf8')

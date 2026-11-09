@@ -67,7 +67,7 @@ if (!have && required) {
       assert.ok(findings.length >= 1)
     })
 
-    it('still catches it in a *.test.ts file: allowlists are path AND regex, not path alone', () => {
+    it('still catches it in a *.test.ts file: no global allowlist skips a file by its path', () => {
       const { status } = scan({ 'fixture.test.ts': `const token = '${plantedToken()}'\n` })
       assert.equal(status, 7)
     })
