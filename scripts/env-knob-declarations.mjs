@@ -31,7 +31,7 @@ export const DECLARED_OFF_BY_DEFAULT_FLAGS = [{
   why: 'Missing, blank and off compute no stats and rotate nothing; shadow only logs; on rotates allow-listed heads and refuses the * allow-list at boot.',
   // The one manifest allowed to name it: the bench harness, as pass-throughs
   // whose unset value is off (the flag) or blank (the list and thresholds).
-  // deploy-parity.test.mjs checks both halves; no shipped manifest may be here.
+  // The deploy-parity check enforces both halves; no shipped manifest may be here.
   benchManifests: ['infra/compose/sync-cell-failover.yml'],
   benchWhy: 'G4-16b A/B arm: sync-cell-bench.mjs --ordinary-head-rotation sets it with an allow-list of the two preselected hot workspaces.',
 }, {
