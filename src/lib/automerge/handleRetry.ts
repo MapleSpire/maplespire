@@ -189,6 +189,23 @@ async function awaitPeerWithinBudget(
   return 'exhausted'
 }
 
+/** A remainder smaller than this is a SPENT budget, not a window. Every
+ * budget decision uses it — starting an attempt, pausing, waiving, the
+ * productive-ceiling spin guards and the which-wall classification after the
+ * loop — so they cannot disagree about whether the wall was reached.
+ *
+ * A window clamped to `remainingMs()` is a `setTimeout`, and a timer can fire
+ * BEFORE its delay has elapsed on `performance.now()`: Node truncates a
+ * fractional delay to whole milliseconds and schedules against libuv's cached
+ * loop time. Measured 2026-11-08 on Node 22.23.1 (darwin-arm64) only, 400
+ * timers of 5–10 ms behind 0–3 ms of busy work: 121 fired early, the worst by
+ * 1.354 ms. Browsers were not measured. Read with `<= 0`, that sliver of
+ * "remaining" budget started a second `find()` with a sub-millisecond
+ * ceiling — the failure CI hit on MapleSpire/maplespire run 42516280078 (T2:
+ * `find` called 2 times, not 1). 2 ms clears the measured worst case; the
+ * attempt it drops would have had under 2 ms to resolve. */
+const SPENT_BUDGET_EPSILON_MS = 2
+
 /** MONOTONE by construction: `performance.now()` cannot go backwards, while
  * `Date.now()` jumps with an NTP correction or a manual clock change — and a
  * backwards jump on a wall-clock budget is an unbounded wait.
@@ -419,7 +436,7 @@ export async function resolveReadyHandleWithRetry<T>(
   const pause = async (): Promise<void> => {
     if (attempt >= tries - 1) return
     const left = remainingMs()
-    if (left <= 0) return
+    if (left < SPENT_BUDGET_EPSILON_MS) return
     await sleep(Math.min(delayMs, left))
   }
 
@@ -431,7 +448,7 @@ export async function resolveReadyHandleWithRetry<T>(
     // a productive ceiling gives `attempt` back, so a loop guarded on
     // `attempt` would stop consulting the walls at the exact moment they
     // become the only thing bounding the call.
-    if (findAttempts > 0 && remainingMs() <= 0) break
+    if (findAttempts > 0 && remainingMs() < SPENT_BUDGET_EPSILON_MS) break
     const controller = new AbortController()
     let deadlineTimer: ReturnType<typeof setTimeout> | null = null
     // findTimeoutMs: 0 disables the ceiling explicitly, for a caller that
@@ -490,13 +507,13 @@ export async function resolveReadyHandleWithRetry<T>(
       //    would otherwise hold the wall open forever (see progressBudget.ts);
       //  - `maxBudgetMs !== null`, because extending without an absolute wall
       //    is the unbounded boot wait this helper exists to forbid;
-      //  - `hardRemainingMs() > 0`, because once the absolute wall is spent a
+      //  - `hardRemainingMs() >= SPENT_BUDGET_EPSILON_MS`, because once the absolute wall is spent a
       //    fast transport would keep handing `attempt` back at a 0 ms window —
       //    a CPU spin. The `findAttempts` loop guard closes the same door; the
       //    two checks are deliberately redundant.
       const deliveredBytes = noteProgress()
       const productive = maxBudgetMs !== null
-        && hardRemainingMs() > 0
+        && hardRemainingMs() >= SPENT_BUDGET_EPSILON_MS
         && (peers?.connectedPeerCount() ?? 0) > 0
       if (productive) {
         // The anchor moves in `noteProgress()` and NOWHERE else. Moving it
@@ -550,7 +567,7 @@ export async function resolveReadyHandleWithRetry<T>(
       const noPeerButOneIsComing = canWaive
         && peers!.connectedPeerCount() === 0
         && peers!.peerExpected()
-      const waived = noPeerButOneIsComing && waiverRemainingMs() > 0
+      const waived = noPeerButOneIsComing && waiverRemainingMs() >= SPENT_BUDGET_EPSILON_MS
       /**
        * A "bounced" rejection: the socket dropped mid-transfer after the
        * shared waiver allowance was already spent. Two separate questions:
@@ -568,7 +585,7 @@ export async function resolveReadyHandleWithRetry<T>(
        * DURING THIS CALL. Against a server that is down `inboundBytes()` never
        * moves, nothing is forgiven, and `tries` ends the boot in ~1.4 s.
        *
-       * `hardRemainingMs() > 0` is the same deliberately redundant spin guard
+       * `hardRemainingMs() >= SPENT_BUDGET_EPSILON_MS` is the same deliberately redundant spin guard
        * as in the ceiling limb.
        */
       const deliveredThisCall = progressAtCallStart === null
@@ -580,7 +597,7 @@ export async function resolveReadyHandleWithRetry<T>(
       const bounced = !waived
         && noPeerButOneIsComing
         && maxBudgetMs !== null
-        && hardRemainingMs() > 0
+        && hardRemainingMs() >= SPENT_BUDGET_EPSILON_MS
         && deliveredThisCall >= progressMinBytes
       markRetry(attempt + 1, 'reject', waived, bounced ? deliveredThisCall : undefined)
       await releaseUnavailableDocument(repo, url)
@@ -641,7 +658,7 @@ export async function resolveReadyHandleWithRetry<T>(
   // delivering when the client gave up, so no client setting fixes it.
   recordResolutionEnd(
     extendedMs,
-    hardRemainingMs() <= 0 ? 'hard-cap' : stallRemainingMs() <= 0 ? 'stall' : null,
+    hardRemainingMs() < SPENT_BUDGET_EPSILON_MS ? 'hard-cap' : stallRemainingMs() < SPENT_BUDGET_EPSILON_MS ? 'stall' : null,
   )
   // Retryable to the end: the caller may try again later (a peer can still show
   // up). The message keeps the repo's "is unavailable" wording and `cause`

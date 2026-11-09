@@ -587,7 +587,7 @@ describe('resolveReadyHandleWithRetry wall-clock budget', () => {
     //
     // Real timers and small numbers on purpose: the wall being asserted is the
     // real one. `tries` is far out of reach, so the ONLY thing that can end
-    // this call is the budget — remove the `remainingMs() <= 0` break and
+    // this call is the budget — remove the `remainingMs() < SPENT_BUDGET_EPSILON_MS` break and
     // `find` is called 500 times instead of once.
     const { repo, find } = neverSettlingRepo()
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
@@ -607,6 +607,44 @@ describe('resolveReadyHandleWithRetry wall-clock budget', () => {
       warn.mockRestore()
     }
   }, 10_000)
+
+  it('T2b: a window timer that fires EARLY leaves a sliver, and the sliver is a spent budget — not a second find()', async () => {
+    // The CI failure behind T2 (MapleSpire/maplespire run 42516280078): the
+    // clamped window is a setTimeout, and a timer can fire up to ~1.35 ms
+    // before its delay has elapsed on performance.now() (measured, see
+    // SPENT_BUDGET_EPSILON_MS). Read with `<= 0`, the 0.5 ms left over started
+    // a second find(). Made deterministic here: fake timers fire the window
+    // exactly at 300 ms, while the injected budget clock reads 0.5 ms behind
+    // from then on — the early fire, reproduced on every run.
+    vi.useFakeTimers()
+    resetProgressTelemetry()
+    const { repo, find } = neverSettlingRepo()
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    const t0 = Date.now()
+    const now = () => {
+      const elapsed = Date.now() - t0
+      return elapsed === 0 ? 0 : elapsed - 0.5
+    }
+    try {
+      const settled = resolveReadyHandleWithRetry(repo, url, {
+        budgetMs: 300, findTimeoutMs: 1_000, delayMs: 10, tries: 500,
+        now, sleep: async () => undefined,
+      }).then(() => null, (thrown: unknown) => thrown)
+      await vi.advanceTimersByTimeAsync(400)
+      const error = await settled
+
+      expect(error).toBeInstanceOf(DocumentTemporarilyUnavailableError)
+      expect(find).toHaveBeenCalledTimes(1)
+      // …and the call still SAYS the stall wall ended it. The classifier after
+      // the loop must read the sliver the way the loop did, or a budget-ended
+      // call is recorded as "tries ended it".
+      expect(readProgressTelemetry().stallEnded).toBe(1)
+    } finally {
+      warn.mockRestore()
+      vi.useRealTimers()
+      resetProgressTelemetry()
+    }
+  })
 
   it('a caller with no budget keeps the attempt counter it always had', async () => {
     // Backwards compatibility is load-bearing here: the shard, diagram and
@@ -1793,6 +1831,32 @@ describe('resolveReadyHandleWithRetry progress-aware stall budget (#37ter)', () 
     expect(telemetry.stallEnded).toBe(1)
     expect(telemetry.hardCapped).toBe(0)
     expect(telemetry.extended).toBe(0)
+  })
+
+  it('P4b: the absolute wall is still REPORTED when an early timer leaves a sliver of it', async () => {
+    // P4 with the budget clock reading 0.5 ms behind the timers — the early
+    // fire behind SPENT_BUDGET_EPSILON_MS. The loop ends inside the sliver;
+    // a classifier still reading `<= 0` recorded that as no wall at all, and
+    // `hardCapped` — the early warning — went silent.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    try {
+      const { repo, peers } = servingRepo({ servedAtMs: Number.MAX_SAFE_INTEGER, bytesPerMs: 100 })
+      const now = () => {
+        const elapsed = Date.now() - FAKE_EPOCH
+        return FAKE_EPOCH + (elapsed === 0 ? 0 : elapsed - 0.5)
+      }
+      const { error } = await settle(resolveReadyHandleWithRetry(repo, url, {
+        ...BOOT, maxBudgetMs: 40_000, peers, now,
+      }), 200_000)
+
+      expect(error).toBeInstanceOf(DocumentTemporarilyUnavailableError)
+      const telemetry = readProgressTelemetry()
+      expect(telemetry.hardCapped).toBe(1)
+      expect(telemetry.stallEnded).toBe(0)
+      expect(warn.mock.calls.some((call) => String(call[0]).includes('ABSOLUTE wall'))).toBe(true)
+    } finally {
+      warn.mockRestore()
+    }
   })
 
   it('P3: CHATTER below the threshold cannot hold the wall open', async () => {
