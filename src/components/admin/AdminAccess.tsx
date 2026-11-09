@@ -13,6 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import { useEffect, useMemo, useState } from 'react'
+import { useDepsChanged } from '../../hooks/useDepsChanged'
 import { useParams } from '@tanstack/react-router'
 import { ChevronDown, ChevronRight, X } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
@@ -116,9 +117,21 @@ export function AdminAccess({ orgId: orgIdProp, embedded }: { orgId?: string; em
   const [pending, setPending] = useState<Map<string, PendingEdit>>(new Map())
   const [reviewOpen, setReviewOpen] = useState(false)
 
+  // The loading reset for an org change happens during render (below), so the
+  // effect only fetches; "Retry" and the post-save reload reset explicitly.
   const load = () => {
     setStatus('loading')
     setError(null)
+    fetchMatrix()
+  }
+
+  const orgChanged = useDepsChanged([orgId])
+  if (orgChanged) {
+    setStatus('loading')
+    setError(null)
+  }
+
+  const fetchMatrix = () => {
     Promise.all([api.getAccessMatrix(orgId), api.getLandscapes()])
       .then(([m, ls]) => {
         setMatrix(m)
@@ -138,7 +151,7 @@ export function AdminAccess({ orgId: orgIdProp, embedded }: { orgId?: string; em
   // every language switch would be wasteful, and "Retry" already re-runs load() with the
   // current t.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  useEffect(load, [orgId])
+  useEffect(fetchMatrix, [orgId])
 
   const tree = useMemo(() => (matrix ? buildScopeTree(matrix.scopes, landscapes, t) : []), [matrix, landscapes, t])
   const visibleRows = useMemo(() => flattenVisible(tree, expanded), [tree, expanded])

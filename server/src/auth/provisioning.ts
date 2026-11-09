@@ -21,6 +21,7 @@ import { upsertVersionScope } from '../rbac/schema.js'
 import { notifyWorkspaceCreated } from '../rbac/docScope.js'
 import { claimAndCoverNewWorkspace } from '../landscapes.js'
 import { appendAudit } from './audit.js'
+import { tenantAllowedSql } from './tenantPolicy.js'
 
 /**
  * First-login / user-initiated org provisioning: one call creates an org, its
@@ -218,13 +219,16 @@ export type LoginOrgResolution =
   | { kind: 'org'; orgId: string }
   | { kind: 'none' } // org-less session (invite intent, nothing joined yet)
   | { kind: 'suspended' } // has memberships, but every org is suspended
+  | { kind: 'tenant_not_allowed' } // has active memberships, but none admits the user's Entra tenant
 
 /**
  * Which org a fresh login session gets pinned to — shared by the OIDC callback
  * and dev-login so the two stay byte-identical:
  *   - ≥1 membership → `users.last_org_id` when it's still an ACTIVE
  *     membership, else the earliest active membership; all-suspended →
- *     'suspended' (login refused, same as the old single-org behavior).
+ *     'suspended' (login refused, same as the old single-org behavior). An
+ *     org whose Entra tenant allowlist refuses the user is not "active" for
+ *     them; if that leaves none → 'tenant_not_allowed' (tenantPolicy.ts).
  *   - 0 memberships + invite intent → 'none' (no personal org — the user is
  *     on their way to accept an invitation; accepting re-pins the session).
  *   - 0 memberships otherwise → provision the personal org (org + admin
@@ -235,8 +239,8 @@ export async function resolveLoginOrg(
   user: { id: string; email: string; givenName?: string | null },
   opts: { inviteIntent: boolean }
 ): Promise<LoginOrgResolution> {
-  const { rows } = await pool.query<{ org_id: string; status: string; last_org_id: string | null }>(
-    `SELECT om.org_id, o.status, u.last_org_id
+  const { rows } = await pool.query<{ org_id: string; status: string; last_org_id: string | null; tenant_ok: boolean }>(
+    `SELECT om.org_id, o.status, u.last_org_id, ${tenantAllowedSql('u', 'o')} AS tenant_ok
      FROM org_members om
      JOIN orgs o ON o.id = om.org_id
      JOIN users u ON u.id = om.user_id
@@ -246,8 +250,12 @@ export async function resolveLoginOrg(
   )
 
   if (rows.length > 0) {
-    const active = rows.filter((r) => r.status !== 'suspended')
-    if (active.length === 0) return { kind: 'suspended' }
+    const unsuspended = rows.filter((r) => r.status !== 'suspended')
+    if (unsuspended.length === 0) return { kind: 'suspended' }
+    // Strictly `false` — see signCurrentSession: Postgres never answers NULL
+    // here (COALESCEd), the DB-free tests stub the read without the column.
+    const active = unsuspended.filter((r) => r.tenant_ok !== false)
+    if (active.length === 0) return { kind: 'tenant_not_allowed' }
     const last = rows[0].last_org_id
     const pick = (last && active.find((r) => r.org_id === last)) || active[0]
     return { kind: 'org', orgId: pick.org_id }
@@ -264,12 +272,15 @@ export async function resolveLoginOrg(
 
   // Lost the provisioning race — a concurrent login won; re-resolve from the
   // memberships that now exist (never recurse into provisioning again).
-  const { rows: after } = await pool.query<{ org_id: string; status: string }>(
-    `SELECT om.org_id, o.status FROM org_members om JOIN orgs o ON o.id = om.org_id
+  const { rows: after } = await pool.query<{ org_id: string; status: string; tenant_ok: boolean }>(
+    `SELECT om.org_id, o.status, ${tenantAllowedSql('u', 'o')} AS tenant_ok
+     FROM org_members om JOIN orgs o ON o.id = om.org_id JOIN users u ON u.id = om.user_id
      WHERE om.user_id = $1 ORDER BY om.created_at`,
     [user.id]
   )
-  const active = after.filter((r) => r.status !== 'suspended')
+  const unsuspended = after.filter((r) => r.status !== 'suspended')
+  const active = unsuspended.filter((r) => r.tenant_ok !== false)
   if (active.length > 0) return { kind: 'org', orgId: active[0].org_id }
+  if (unsuspended.length > 0) return { kind: 'tenant_not_allowed' }
   return after.length > 0 ? { kind: 'suspended' } : { kind: 'none' }
 }

@@ -13,6 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import { useEffect, useState } from 'react'
+import { useDepsChanged } from '../../hooks/useDepsChanged'
 import { CircleAlert, CircleCheck, Loader2, ShieldCheck, Trash2 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import type { TFunction } from 'i18next'
@@ -58,9 +59,11 @@ export function AiConfigForm({ orgId, onSaved }: { orgId: string; onSaved?: (con
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
   const [probe, setProbe] = useState<AiProbeResult | null>(null)
 
+  // An org change shows the loader again — reset during render; the effect fetches.
+  const orgChanged = useDepsChanged([orgId])
+  if (orgChanged) setLoading(true)
   useEffect(() => {
     let cancelled = false
-    setLoading(true)
     getAiConfig(orgId)
       .then((res) => {
         if (cancelled) return

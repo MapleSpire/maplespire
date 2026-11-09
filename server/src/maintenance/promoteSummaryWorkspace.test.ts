@@ -228,6 +228,7 @@ function promotableFacts(overrides: Partial<PromotionFacts> = {}): PromotionFact
     crdtDiagrams: diagrams,
     readModelDiagrams: new Map(diagrams),
     unresolvedRegistryShards: [],
+    ordinaryHeadRetirements: 0,
     ...overrides,
   }
 }
@@ -351,6 +352,16 @@ describe('evaluatePromotionPreconditions', () => {
     })).find((blocker) => blocker.code === 'already-summary')!
     expect(hybrid.detail).toContain('repair-summary-flag')
     expect(hybrid.detail).toContain('HYBRID')
+  })
+
+  it('refuses a workspace whose ordinary write heads were rotated, and one whose rows could not be counted', () => {
+    // The static plane projects every overlay segment directly and knows
+    // nothing of the ordinary forwarder's rows (ordinaryHeadForwarding.ts).
+    expect(codes(promotableFacts({ ordinaryHeadRetirements: 0 }))).toEqual([])
+    const rotated = evaluatePromotionPreconditions(promotableFacts({ ordinaryHeadRetirements: 1 }))
+    expect(rotated.map((blocker) => blocker.code)).toEqual(['ordinary-head-retirements'])
+    expect(rotated[0]!.detail).toContain('AM_ORDINARY_HEAD_ROTATION')
+    expect(codes(promotableFacts({ ordinaryHeadRetirements: null }))).toEqual(['ordinary-head-retirements'])
   })
 
   it('refuses a connected peer, and NAMES the reason (a classic tab journals no entity write)', () => {

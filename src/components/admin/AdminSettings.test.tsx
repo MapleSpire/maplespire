@@ -23,6 +23,8 @@ const mocks = vi.hoisted(() => ({
 }))
 
 vi.mock('@tanstack/react-router', () => ({ useParams: () => ({ orgId: 'org-1' }) }))
+// Its own suite: AdminEntraTenants.test.tsx.
+vi.mock('./AdminEntraTenants', () => ({ AdminEntraTenants: () => null }))
 vi.mock('../../lib/tags/api', async (importOriginal) => ({
   ...await importOriginal<typeof import('../../lib/tags/api')>(),
   getTagSettings: mocks.getTagSettings,

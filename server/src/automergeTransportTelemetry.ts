@@ -13,7 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import { monitorEventLoopDelay, PerformanceObserver } from 'node:perf_hooks'
-import { getHeapStatistics } from 'node:v8'
+import { processWasmMemoryGauge, type WasmMemorySnapshot } from './wasmMemoryGauge.js'
 
 export interface AutomergeTransportConfig {
   backpressureWarnBytes: number
@@ -106,7 +106,9 @@ export interface AutomergeTransportSnapshot {
    * window or an intervening explicit consumer, including after an HTTP timeout.
    */
   eventLoopWindow: { consumer: 'periodic' | 'qualification'; startedAt: string; resetCount: number; lastResetBy: 'boot' | 'consume' | 'periodic-log' }
-  processMemoryBytes: { rss: number; heapUsed: number; external: number; arrayBuffers: number | null }
+  /** `wasm` is a subset of `external`; null when no wasm instance was observed
+   * (the gauge was installed too late), never a fabricated 0. */
+  processMemoryBytes: { rss: number; heapUsed: number; heapTotal: number; external: number; arrayBuffers: number; wasm: number | null; wasmInstances: number }
 }
 
 interface EventLoopDelayMonitor {
@@ -343,21 +345,36 @@ function milliseconds(nanoseconds: number): number {
 }
 
 /**
- * Avoid process.memoryUsage() on the 500 ms transport health path. That API
- * walks process pages and can itself block a large sync cell long enough to
- * violate the event-loop SLO. RSS and V8 heap statistics are constant-cost;
- * ArrayBuffer attribution is deliberately unavailable instead of fabricated.
+ * Process memory for the transport snapshot.
+ *
+ * e116292a replaced process.memoryUsage() here with rss() + getHeapStatistics()
+ * on the premise that the former "walks process pages", and so reported
+ * `arrayBuffers: null`. Measured 2026-11-04 (Node 22, 2 000 calls after warm-up,
+ * 64 MiB and 1 GiB live heaps): Linux (node:22-alpine) memoryUsage() 2.22 / 2.92
+ * us vs the pair 2.23 / 2.58 us; macOS 1.25 / 0.91 us vs 1.03 / 0.93 us. Both
+ * read RSS the same way and both call GetHeapStatistics; memoryUsage() adds only
+ * the ArrayBuffer allocator counter. So `arrayBuffers` is reported again.
+ *
+ * `wasm` is Automerge's linear memory (see wasmMemoryGauge.ts). It is INSIDE
+ * `external` — measured 1:1 — and never shrinks, so `external - wasm` is the
+ * part a native leak elsewhere would show up in. Not in `wasm`: undici's
+ * llhttp (async instantiate) and any worker thread's Automerge — see the
+ * gauge's header.
  */
 export function lightweightProcessMemoryBytes(
-  rss: () => number = process.memoryUsage.rss,
-  heapStatistics: () => ReturnType<typeof getHeapStatistics> = getHeapStatistics,
+  memoryUsage: () => NodeJS.MemoryUsage = process.memoryUsage,
+  wasm: () => WasmMemorySnapshot = () => processWasmMemoryGauge.snapshot(),
 ): AutomergeTransportSnapshot['processMemoryBytes'] {
-  const heap = heapStatistics()
+  const memory = memoryUsage()
+  const wasmMemory = wasm()
   return {
-    rss: rss(),
-    heapUsed: heap.used_heap_size,
-    external: heap.external_memory,
-    arrayBuffers: null,
+    rss: memory.rss,
+    heapUsed: memory.heapUsed,
+    heapTotal: memory.heapTotal,
+    external: memory.external,
+    arrayBuffers: memory.arrayBuffers,
+    wasm: wasmMemory.bytes,
+    wasmInstances: wasmMemory.instances,
   }
 }
 
@@ -611,12 +628,7 @@ export class AutomergeTransportTelemetry {
         resetCount: this.eventLoopWindowResets,
         lastResetBy: this.eventLoopWindowLastResetBy,
       },
-      processMemoryBytes: {
-        rss: memory.rss,
-        heapUsed: memory.heapUsed,
-        external: memory.external,
-        arrayBuffers: memory.arrayBuffers,
-      },
+      processMemoryBytes: memory,
     }
   }
 
@@ -689,8 +701,10 @@ export class AutomergeTransportTelemetry {
       eventLoopMaxMs: snapshot.eventLoopDelayMs.max,
       rssBytes: snapshot.processMemoryBytes.rss,
       heapUsedBytes: snapshot.processMemoryBytes.heapUsed,
+      heapTotalBytes: snapshot.processMemoryBytes.heapTotal,
       externalBytes: snapshot.processMemoryBytes.external,
       arrayBufferBytes: snapshot.processMemoryBytes.arrayBuffers,
+      wasmMemoryBytes: snapshot.processMemoryBytes.wasm,
       ...deltas,
     }
   }

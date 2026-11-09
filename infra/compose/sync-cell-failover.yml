@@ -58,6 +58,9 @@ x-sync-environment: &sync-environment
   BACKUP_BUNDLE_ROOT: /var/lib/maplespire/backups
   BACKUP_DIRECTORY: /var/lib/maplespire/backups
   ORG_SEED: "on"
+  # The server seeds the demo into an empty database on first boot (3e13b8ce);
+  # the G4-7 calibration requires an empty read model before its timer.
+  DEMO_SEED: "off"
   EMAIL_PROVIDER: local
   READ_MODEL: "on"
   AM_SELECTIVE_SYNC: "on"
@@ -146,6 +149,30 @@ x-sync-environment: &sync-environment
   # single event-loop turn. Lease renewals keep their separate concurrency.
   SYNC_CELL_ADMISSION_CONCURRENCY: "${SYNC_FAILOVER_ADMISSION_CONCURRENCY:-8}"
   SYNC_CELL_OWNERSHIP_CONCURRENCY: "${SYNC_FAILOVER_OWNERSHIP_CONCURRENCY:-8}"
+  # THE G4-16b A/B ARM, BENCH ONLY. Unset is `off`, the shipped default
+  # (`compose.maplespire.yml` does not name it). Set by
+  # `sync-cell-bench.mjs --ordinary-head-rotation=…`, which also writes the
+  # allow-list from the two hot workspaces it preselected and recreates the
+  # cells with it; do not set these by hand. Declared for this file only in
+  # `scripts/env-knob-declarations.mjs` (`benchManifests`), which is what
+  # `deploy-parity.test.mjs` admits; blank thresholds take the server defaults.
+  AM_ORDINARY_HEAD_ROTATION: "${SYNC_FAILOVER_ORDINARY_HEAD_ROTATION:-off}"
+  AM_ORDINARY_HEAD_ROTATION_WORKSPACE_ALLOWLIST: "${SYNC_FAILOVER_ORDINARY_HEAD_ROTATION_ALLOWLIST:-}"
+  AM_ORDINARY_HEAD_ROTATION_MAX_ACTORS: "${SYNC_FAILOVER_ORDINARY_HEAD_ROTATION_MAX_ACTORS:-}"
+  AM_ORDINARY_HEAD_ROTATION_MAX_CHANGES: "${SYNC_FAILOVER_ORDINARY_HEAD_ROTATION_MAX_CHANGES:-}"
+  # G4-16b phase 4, same rules: set by `--ordinary-chain-fold=…` on an armed
+  # run only; unset is `off`, and the server refuses `on` without rotation on.
+  AM_ORDINARY_CHAIN_FOLD: "${SYNC_FAILOVER_ORDINARY_CHAIN_FOLD:-off}"
+  AM_ORDINARY_CHAIN_FOLD_RETAIN_HOURS: "${SYNC_FAILOVER_ORDINARY_CHAIN_FOLD_RETAIN_HOURS:-}"
+  # G4 STALL DIAGNOSIS, BENCH ONLY. Unset is off: no inspector session, worker
+  # or observer (`server/src/diagnostics/cpuProfileCapture.ts`). Set by
+  # `sync-cell-bench.mjs --cpu-profile=on`, which also bind-mounts a host
+  # directory at the DIR below (`SYNC_FAILOVER_DIAG_HOST_DIR`, see the cell
+  # volumes); do not set by hand. Declared in `scripts/env-knob-declarations.mjs`.
+  SYNC_DIAG_CPU_PROFILE: "${SYNC_FAILOVER_DIAG_CPU_PROFILE:-off}"
+  SYNC_DIAG_CPU_PROFILE_DIR: "${SYNC_FAILOVER_DIAG_CPU_PROFILE_DIR:-}"
+  SYNC_DIAG_CPU_PROFILE_INTERVAL_US: "${SYNC_FAILOVER_DIAG_CPU_PROFILE_INTERVAL_US:-}"
+  SYNC_DIAG_CPU_PROFILE_CHUNK_SECONDS: "${SYNC_FAILOVER_DIAG_CPU_PROFILE_CHUNK_SECONDS:-}"
   TECHNOLOGY_ASSET_DIR: /var/lib/maplespire/assets/technologies
 
 x-sync-cell: &sync-cell
@@ -184,6 +211,10 @@ x-sync-cell: &sync-cell
       condition: service_healthy
   volumes:
     - technology_assets:/var/lib/maplespire/assets/technologies
+    # The G4 CPU-profile capture's output. Unset, it is a named volume nothing
+    # writes to (the capture is off); `sync-cell-bench.mjs --cpu-profile=on`
+    # sets an absolute host path, which makes it a bind mount the host reads.
+    - "${SYNC_FAILOVER_DIAG_HOST_DIR:-diag_unused}:/var/lib/maplespire/diag"
 
 services:
   postgres:
@@ -445,3 +476,4 @@ volumes:
   postgres_data:
   redis_data:
   technology_assets:
+  diag_unused:

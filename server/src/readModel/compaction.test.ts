@@ -297,6 +297,47 @@ describe('compactOverlay', () => {
     expect(overlayConn.doc()?.connections).toEqual({}) // overlay cleared
   })
 
+  it('a CONNECTION late write pending refuses the pass BEFORE the objects pass writes anything', async () => {
+    // Phase-3 review: the objects pass used to fold and flush, and only then
+    // did the connections pass ask `lateWritesPending` and refuse — while the
+    // caller logged "nothing was written". Both collections are asked first.
+    const repo = new Repo({})
+    const baseObj = repo.create<ObjShard>({ objects: { o0: { id: 'o0', name: 'A' } } })
+    const overlayObj = repo.create<ObjShard>({ objects: { o0: { id: 'o0', name: 'A-edited' } } })
+    const baseConn = repo.create<ConnShard>({ connections: { c0: { id: 'c0', fromId: 'o0', toId: 'o1' } } })
+    const retiredConn = repo.create<ConnShard>({ connections: { c0: { id: 'c0', fromId: 'o0', toId: 'o2' } } })
+    const currentConn = repo.create<ConnShard>({ connections: {} })
+    const meta = repo.create({
+      objectShardUrls: [baseObj.url, overlayObj.url],
+      connectionShardUrls: [baseConn.url, retiredConn.url, currentConn.url],
+      editsObjectShardUrl: overlayObj.url,
+      editsConnectionShardUrl: currentConn.url,
+      editsConnectionShardUrls: [retiredConn.url, currentConn.url],
+    })
+    const root = repo.create({ modelMetaUrl: meta.url, modelUrl: '', shardUrls: [] as string[] })
+    await Promise.all([baseObj, overlayObj, baseConn, retiredConn, currentConn, meta, root].map((h) => h.whenReady()))
+    const heads = (h: DocHandle<unknown>) => JSON.stringify(h.heads())
+    const before = [baseObj, overlayObj, baseConn, retiredConn, currentConn, meta].map(heads)
+    const asked: string[] = []
+    const res = await compactOverlay(repo, root.url, {
+      mode: 'apply',
+      lateWritesPending: async (collection, segments) => {
+        asked.push(collection)
+        return collection === 'connection'
+          ? segments.filter((s) => s.documentId === String(retiredConn.documentId)).map((s) => s.documentId)
+          : []
+      },
+    })
+    expect(res.skippedReason).toBe('retired_head_forward_pending')
+    // Anti-void: both collections were asked, the objects pass had work to do.
+    expect(asked.sort()).toEqual(['connection', 'object'])
+    expect(res.objectsFolded).toBe(0)
+    expect(baseObj.doc()?.objects.o0.name).toBe('A')
+    expect(overlayObj.doc()?.objects.o0.name).toBe('A-edited')
+    // NOTHING written, in any document.
+    expect([baseObj, overlayObj, baseConn, retiredConn, currentConn, meta].map(heads)).toEqual(before)
+  })
+
   it('folds bounded overlay segments oldest to newest and clears every captured segment', async () => {
     const repo = new Repo({})
     const base = repo.create<ObjShard>({ objects: { o0: { id: 'o0', name: 'base' } } })

@@ -155,7 +155,7 @@ function summaryFixture(options: {
   vi.spyOn(repoModule, 'findModelMetaHandle').mockResolvedValue(meta as any)
   vi.spyOn(repoModule, 'getRegistryShardHandles').mockResolvedValue([] as any)
   vi.spyOn(repoModule, 'getModelShardHandles').mockResolvedValue([] as any)
-  return { objectHead, connectionHead }
+  return { objectHead, connectionHead, writeHead }
 }
 
 /**
@@ -392,6 +392,31 @@ describe('a write into a container the document does not hold yet', () => {
     expect([...(head.writeBatchIds ?? [])]).toHaveLength(1)
   })
 
+  it('an N-1 edit of an object already in the overlay head keeps a newer client\'s field (V0-08)', async () => {
+    const { objectHead } = summaryFixture()
+    const { startBridge, isRegistrySummaryOnlyActive } = await import('./bridge')
+    await startBridge(DEFAULT_WORKSPACE_REF)
+    expect(isRegistrySummaryOnlyActive()).toBe(true)
+    const id = useModelStore.getState().addObject({
+      type: 'system', name: 'Billing', position: { x: 0, y: 0 }, size: { width: 200, height: 100 },
+    } as any)
+    await settleWrites()
+    // A newer client's field on the stored entity; this build's store object
+    // (rebuilt from its own type) does not carry it.
+    objectHead.change((d: any) => { d.objects[id].criticalityV2 = 'high' })
+    // The summary store does not keep the written object in its window
+    // (measured: absent after the first write), so the N-1 copy is put back
+    // explicitly — the stored entity minus the field this build lacks.
+    const { criticalityV2: _c, ...known } = JSON.parse(JSON.stringify((objectHead.doc() as any).objects[id]))
+    useModelStore.setState((state) => ({ objects: [...state.objects.filter((o) => o.id !== id), known] }))
+    useModelStore.getState().updateObject(id, { name: 'Billing v2' })
+    await settleWrites()
+    const stored = (objectHead.doc() as any).objects[id]
+    // Anti-void guard: the edit really went through this write.
+    expect(stored.name).toBe('Billing v2')
+    expect(stored.criticalityV2).toBe('high')
+  })
+
   it('a connection edit on an overlay head with no `writeBatchIds` records its batch id in the document', async () => {
     const { connectionHead } = summaryFixture()
     const { startBridge, isRegistrySummaryOnlyActive } = await import('./bridge')
@@ -409,6 +434,51 @@ describe('a write into a container the document does not hold yet', () => {
     const head = connectionHead.doc() as any
     expect(head.connections[id]).toMatchObject({ id, fromId: from, toId: to })
     expect([...(head.writeBatchIds ?? [])]).toHaveLength(1)
+  })
+
+  it('an N-1 edit of a connection already in the overlay head keeps a newer client\'s field (V0-08)', async () => {
+    const { connectionHead } = summaryFixture()
+    const { startBridge } = await import('./bridge')
+    await startBridge(DEFAULT_WORKSPACE_REF)
+    const store = useModelStore.getState()
+    const size = { width: 200, height: 100 }
+    const from = store.addObject({ type: 'system', name: 'A', position: { x: 0, y: 0 }, size } as any)
+    const to = store.addObject({ type: 'system', name: 'B', position: { x: 300, y: 0 }, size } as any)
+    const id = useModelStore.getState().addConnection({ fromId: from, toId: to, type: 'solid' } as any)
+    await settleWrites()
+    connectionHead.change((d: any) => { d.connections[id].criticalityV2 = 'high' })
+    const { criticalityV2: _c, ...known } = JSON.parse(JSON.stringify((connectionHead.doc() as any).connections[id]))
+    useModelStore.setState((state) => ({ connections: [...state.connections.filter((c) => c.id !== id), known] }))
+    useModelStore.getState().updateConnection(id, { label: 'reads' })
+    await settleWrites()
+    const stored = (connectionHead.doc() as any).connections[id]
+    // Anti-void guard: the edit really went through this write.
+    expect(stored.label).toBe('reads')
+    expect(stored.criticalityV2).toBe('high')
+  })
+
+  it('an N-1 rename of a summary-local registry meta keeps a newer client\'s field (V0-08)', async () => {
+    const { writeHead } = summaryFixture()
+    const { startBridge } = await import('./bridge')
+    await startBridge(DEFAULT_WORKSPACE_REF)
+    const id = useModelStore.getState().addDiagram({
+      name: 'Local', type: 'context', objectIds: [], connectionIds: [], groupIds: [],
+    } as any)
+    await settleWrites()
+    // Anti-void guard: the summary-local write head holds the meta.
+    expect((writeHead.doc() as any).diagrams[id]).toMatchObject({ id, name: 'Local' })
+    writeHead.change((d: any) => { d.diagrams[id].thumbnailV2 = 'kept' })
+    useModelStore.setState((state) => ({
+      diagrams: state.diagrams.map((d) => {
+        const { thumbnailV2: _t, ...known } = d as any
+        return known
+      }),
+    }))
+    useModelStore.getState().updateDiagram(id, { name: 'Local renamed' })
+    await settleWrites()
+    const stored = (writeHead.doc() as any).diagrams[id]
+    expect(stored.name).toBe('Local renamed')
+    expect(stored.thumbnailV2).toBe('kept')
   })
 
   it('a replayed GROUP lands in a ModelMeta that has no `groups` map', async () => {

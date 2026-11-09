@@ -12,12 +12,14 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU Affero General Public License for more details.
 
-import type { Pool } from 'pg'
+import type { Pool, PoolClient } from 'pg'
 
 /**
  * Append-only audit trail writer. `audit_log` itself enforces append-only at
  * the DB level (see schema.ts) — this is just the typed insert helper every
- * mutation in the auth/org/platform surfaces is expected to call.
+ * mutation in the auth/org/platform surfaces is expected to call. Pass a
+ * checked-out client to make the event part of the caller's transaction
+ * (`ai/core/tokens.ts` revokeToken does).
  */
 export interface AuditEvent {
   /** Null for platform-level events with no single owning org (org create, platform-admin grant, …). */
@@ -37,7 +39,7 @@ export interface AuditEvent {
  * uncaught-rejection log) can tell which audited action failed to record,
  * without losing the underlying cause.
  */
-export async function appendAudit(pool: Pool, e: AuditEvent): Promise<void> {
+export async function appendAudit(pool: Pool | PoolClient, e: AuditEvent): Promise<void> {
   try {
     await pool.query(
       `INSERT INTO audit_log (org_id, actor_user_id, impersonator_user_id, action, target_kind, target_id, detail)

@@ -13,6 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import { useEffect, useRef, useState } from 'react'
+import { useDepsChanged } from '../../hooks/useDepsChanged'
 import { useParams } from '@tanstack/react-router'
 import { Search, Trash2, Copy, Check, Plus } from 'lucide-react'
 import { Trans, useTranslation } from 'react-i18next'
@@ -396,8 +397,16 @@ function InvitesTab({ orgId }: { orgId: string }) {
   const [revokingId, setRevokingId] = useState<string | null>(null)
   const [savingId, setSavingId] = useState<string | null>(null)
 
+  // An org change resets to loading during render; the effect only fetches.
+  const orgChanged = useDepsChanged([orgId])
+  if (orgChanged) setStatus('loading')
+
   const load = () => {
     setStatus('loading')
+    fetchInvites()
+  }
+
+  const fetchInvites = () => {
     Promise.all([api.getInvites(orgId), api.getTeams(orgId)])
       .then(([page, teams]) => {
         setInvites(page.invites)
@@ -414,7 +423,7 @@ function InvitesTab({ orgId }: { orgId: string }) {
   // t is only read for the rare non-Error fallback message; refetching from the server on
   // every language switch would be wasteful.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  useEffect(load, [orgId])
+  useEffect(fetchInvites, [orgId])
 
   const handleRoleChange = async (invite: api.OrgInvite, role: 'admin' | 'member') => {
     setSavingId(invite.id)

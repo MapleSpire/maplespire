@@ -13,6 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { useDepsChanged } from '../../hooks/useDepsChanged'
 import { X, FileInput, AlertTriangle, CheckCircle2, Layers, Sparkles, Upload } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import type { TFunction } from 'i18next'
@@ -89,22 +90,24 @@ export function ImportModal({ open, onClose }: ImportModalProps) {
   const chooseTarget = source?.chooseTarget === true
   const mergesById = source?.mergesById === true
 
-  // Reset transient state whenever the modal is (re)opened.
+  // Reset transient state whenever the modal is (re)opened — during render, so
+  // the first open frame never shows the previous session's input.
+  const openChanged = useDepsChanged([open])
+  if (openChanged && open) {
+    setSourceId('structurizr')
+    setText('')
+    setResult(null)
+    setError(null)
+    setBusy(false)
+    setMintShortfall(0)
+    setTarget('current')
+    setNewName('')
+    setDraftLandscapeId('')
+    setDraftLabel('')
+  }
   useEffect(() => {
-    if (open) {
-      setSourceId('structurizr')
-      setText('')
-      setResult(null)
-      setError(null)
-      setBusy(false)
-      setMintShortfall(0)
-      setTarget('current')
-      setNewName('')
-      setDraftLandscapeId('')
-      setDraftLabel('')
-      // The JSON target picker needs the landscape registry (draft target).
-      void useWorkspaceStore.getState().load()
-    }
+    // The JSON target picker needs the landscape registry (draft target).
+    if (open) void useWorkspaceStore.getState().load()
   }, [open])
 
   // The parsed JSON export (for the target section) — null while not parseable.

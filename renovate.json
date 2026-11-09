@@ -1,0 +1,57 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    "helpers:pinGitHubActionDigests"
+  ],
+  "timezone": "America/Toronto",
+  "schedule": ["before 6am on monday"],
+  "prConcurrentLimit": 5,
+  "enabledManagers": ["npm", "github-actions", "dockerfile", "docker-compose"],
+  "npm": {
+    "fileMatch": ["^package\\.json$", "^server/package\\.json$"]
+  },
+  "github-actions": {
+    "fileMatch": ["^\\.github/workflows/[^/]+\\.ya?ml$"]
+  },
+  "dockerfile": {
+    "fileMatch": ["^docker/.*Dockerfile$", "^server/Dockerfile$"]
+  },
+  "docker-compose": {
+    "fileMatch": [
+      "^docker-compose\\.ya?ml$",
+      "^compose\\.[^/]*\\.ya?ml$",
+      "^docker/[^/]*compose[^/]*\\.ya?ml$",
+      "^infra/compose/[^/]+\\.ya?ml$"
+    ]
+  },
+  "packageRules": [
+    {
+      "description": "Group minor and patch npm updates (root and server/ lockfiles) weekly",
+      "matchManagers": ["npm"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "npm minor and patch",
+      "schedule": ["before 6am on monday"]
+    },
+    {
+      "description": "Group minor and patch GitHub Actions updates weekly, digests stay pinned",
+      "matchManagers": ["github-actions"],
+      "matchUpdateTypes": ["minor", "patch", "digest", "pin", "pinDigest"],
+      "groupName": "github-actions minor and patch",
+      "pinDigests": true,
+      "schedule": ["before 6am on monday"]
+    },
+    {
+      "description": "Group minor and patch Docker updates weekly",
+      "matchManagers": ["dockerfile", "docker-compose"],
+      "matchUpdateTypes": ["minor", "patch", "digest"],
+      "groupName": "docker minor and patch",
+      "schedule": ["before 6am on monday"]
+    },
+    {
+      "description": "Major updates are never grouped and need manual review",
+      "matchUpdateTypes": ["major"],
+      "dependencyDashboardApproval": true
+    }
+  ]
+}

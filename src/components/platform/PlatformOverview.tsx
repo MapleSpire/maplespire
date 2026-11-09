@@ -12,7 +12,7 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU Affero General Public License for more details.
 
-import { useEffect, useState } from 'react'
+import { useEffect, useEffectEvent, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import * as api from '../../lib/platform/api'
 import { timeAgo } from '../../lib/orgAdmin/timeAgo'
@@ -29,8 +29,14 @@ export function PlatformOverview() {
     { status: 'loading' } | { status: 'ok'; data: api.ActiveImpersonation[] } | { status: 'error'; message: string }
   >({ status: 'loading' })
 
+  // `load`/`loadImps` reset to loading for the Retry buttons; on mount both
+  // states already start as loading, so the mount effect only fetches.
   const load = () => {
     setState({ status: 'loading' })
+    fetchOverview()
+  }
+
+  const fetchOverview = () => {
     api
       .getOverview()
       .then((data) => setState({ status: 'ok', data }))
@@ -39,15 +45,22 @@ export function PlatformOverview() {
 
   const loadImps = () => {
     setImps({ status: 'loading' })
+    fetchImps()
+  }
+
+  const fetchImps = () => {
     api
       .getActiveImpersonations()
       .then((res) => setImps({ status: 'ok', data: res.impersonations }))
       .catch((err) => setImps({ status: 'error', message: err instanceof Error ? err.message : t('platform.overview.loadImpersonationsFailed') }))
   }
 
+  const fetchAllOnMount = useEffectEvent(() => {
+    fetchOverview()
+    fetchImps()
+  })
   useEffect(() => {
-    load()
-    loadImps()
+    fetchAllOnMount()
   }, [])
 
   return (

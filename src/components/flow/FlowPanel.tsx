@@ -12,7 +12,7 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU Affero General Public License for more details.
 
-import { useState, useRef, useEffect, useMemo } from 'react'
+import { useState, useRef, useEffect, useEffectEvent, useMemo } from 'react'
 import {
   Play,
   X,
@@ -98,10 +98,16 @@ export function FlowPanel() {
     }
   }, [currentFlowStepIndex, isPlaying])
 
-  useEffect(() => {
+  // Auto-select the first flow. Re-checked only when the selection or the
+  // NUMBER of flows changes (not on every new `diagramFlows` array), hence the
+  // effect event reading the latest list.
+  const selectFirstFlowIfNone = useEffectEvent(() => {
     if (!currentFlowId && diagramFlows.length > 0) {
       setCurrentFlow(diagramFlows[0].id)
     }
+  })
+  useEffect(() => {
+    selectFirstFlowIfNone()
   }, [currentFlowId, diagramFlows.length])
 
   useEffect(() => {

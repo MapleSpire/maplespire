@@ -30,6 +30,11 @@ import {
   StoragePoolExhaustedError,
   type StorageFenceRejectionReason,
 } from './automergeStorageErrors.js'
+import {
+  noteStorageWriteCeiling,
+  STORAGE_WRITE_CEILING_RETRY_DELAYS_MS,
+  storageWriteCeilingCode,
+} from './automergeStorageCeiling.js'
 import type { WorkspaceKey } from './rbac/docScope.js'
 import { provisionalPlacementFor } from './rbac/provisionalPlacementSource.js'
 import { bootstrapPlacementFor, placementForFence } from './rbac/serverCreationPlacement.js'
@@ -234,6 +239,23 @@ export interface StorageResidencySnapshot {
 
 interface PostgresStorageAdapterOptions {
   db?: Pool
+  /**
+   * The pool the MUTATIONS borrow from (saves, removals: every operation
+   * behind the permit gate); reads stay on `db`. Unset: `db` for both, as
+   * before. The sync server passes `storageWritePool` (`db.ts`): tagged and
+   * bounded so a new workspace owner can wait for this cell's in-flight saves
+   * after a handover (`storageWritePoolConfig`, `dbConfig.ts`). The permit
+   * bound is then taken against THIS pool, which only the adapter borrows.
+   */
+  writeDb?: Pool
+  /** Test seam: the retry delays after a ceiling failure of a content save
+   * (default `STORAGE_WRITE_CEILING_RETRY_DELAYS_MS`). */
+  ceilingRetryDelaysMs?: readonly number[]
+  /** How long a document's unsaved mark survives refusals that are NOT a
+   * fence mismatch (`ownership-unavailable`: `fencingToken()` answered null,
+   * which a transient `owns() === false` also does) before it is released.
+   * Default `STORAGE_UNSAVED_OWNERSHIP_REFUSAL_GRACE_MS`. */
+  ownershipRefusalGraceMs?: number
   ownership?: Pick<SyncCellOwnership, 'fencingToken'>
   /**
    * Maximum time PostgreSQL may leave a fenced write idle inside its open
@@ -361,8 +383,55 @@ class StorageBorrowFailure extends Error {
   }
 }
 
+/** A pending retry of a content save stopped by a ceiling. */
+interface PendingCeilingRetry {
+  /** The failed save's place in the start order. */
+  seq: number
+  timer: ReturnType<typeof setTimeout>
+}
+
+/** What of one document is not durable yet (`PostgresStorageAdapter.hasUnsavedWrite`). */
+interface UnsavedDocumentState {
+  /** Start order of its content saves in flight. */
+  inFlight: Set<number>
+  /** The latest start order a success covered: a failure that started
+   * before it is covered already. */
+  coveredUpTo: number
+  /** key text -> start order of a failed content save not covered since. */
+  failed: Map<string, number>
+  /** key text -> its pending retry. */
+  retries: Map<string, PendingCeilingRetry>
+  /** When a refusal that is NOT a fence mismatch (ownership unavailable)
+   * first met a save of it, or null: past the grace the mark is released. */
+  refusedSince: number | null
+}
+
+/** A document's unsaved mark outlives an `ownership-unavailable` refusal this
+ * long (a transient `owns() === false` resolves in seconds; a real loss of
+ * the workspace does not, and must not hold the document for ever). */
+export const STORAGE_UNSAVED_OWNERSHIP_REFUSAL_GRACE_MS = 300_000
+
+/** The fence REFUSED this cell: another cell holds the workspace's token.
+ * Not `ownership-unavailable`, which a transient lease blip also raises. */
+function isFenceMismatch(error: unknown): boolean {
+  return error instanceof StaleSyncCellWriteError && error.reason === 'fence-mismatch'
+}
+
 export class PostgresStorageAdapter implements StorageAdapterInterface {
   private readonly db: Pool
+  /** Where mutations borrow: `writeDb`, else `db`. */
+  private readonly writeDb: Pool
+  private readonly ceilingRetryDelaysMs: readonly number[]
+  /** The start order of content saves, over the adapter: a success covers
+   * only what STARTED before it. */
+  private contentSaveSeq = 0
+  /** documentId -> what of it is not durable yet, and the saves in flight
+   * that decide it (`hasUnsavedWrite`). Removed when empty: bounded by the
+   * documents with a save in flight or a failure not yet covered. */
+  private readonly unsaved = new Map<string, UnsavedDocumentState>()
+  /** `close()` ran: no retry is scheduled any more. */
+  private closed = false
+  private readonly ownershipRefusalGraceMs: number
   private readonly gate: PoolConcurrencyGate
   private readonly gateWaitMs: number
   private readonly ownership: Pick<SyncCellOwnership, 'fencingToken'> | undefined
@@ -416,9 +485,20 @@ export class PostgresStorageAdapter implements StorageAdapterInterface {
     // to fill a pool of 2, which would make the gate's own tests unable to
     // observe a queue.
     const poolMax = this.db.options?.max ?? DEFAULT_DB_POOL_MAX_ASSUMED
+    this.writeDb = options.writeDb ?? this.db
+    this.ownershipRefusalGraceMs = Math.max(0, options.ownershipRefusalGraceMs ?? STORAGE_UNSAVED_OWNERSHIP_REFUSAL_GRACE_MS)
+    this.ceilingRetryDelaysMs = options.ceilingRetryDelaysMs?.length
+      ? options.ceilingRetryDelaysMs
+      : STORAGE_WRITE_CEILING_RETRY_DELAYS_MS
+    // A dedicated write pool is borrowed by this adapter alone: no clamp
+    // against other borrowers, so the bound IS its `max`
+    // (`AM_STORAGE_WRITE_DB_POOL_MAX`, 4 by default — the shared-pool bound).
+    const writeBound = options.writeDb
+      ? options.writeDb.options?.max ?? DEFAULT_STORAGE_DB_CONCURRENCY
+      : Math.min(DEFAULT_STORAGE_DB_CONCURRENCY, poolMax - 1)
     this.gate = poolConcurrencyGate(
-      this.db,
-      options.dbConcurrency ?? Math.max(1, Math.min(DEFAULT_STORAGE_DB_CONCURRENCY, poolMax - 1)),
+      this.writeDb,
+      options.dbConcurrency ?? Math.max(1, writeBound),
     )
     this.gateWaitMs = Math.max(
       1,
@@ -575,12 +655,14 @@ export class PostgresStorageAdapter implements StorageAdapterInterface {
   private async withClient<T>(
     operation: string,
     fn: (client: PoolClient) => Promise<T>,
+    /** `writeDb` for the mutations (`withBoundedClient`), `db` otherwise. */
+    from: Pool = this.db,
   ): Promise<T> {
     try {
       return await withDbRetry(async () => {
         let client: PoolClient
         try {
-          client = await this.db.connect()
+          client = await from.connect()
         } catch (error) {
           // NOT converted here, and that is the whole reason this wrapper class
           // exists. `withDbRetry` decides on `err.code`, so throwing
@@ -647,7 +729,7 @@ export class PostgresStorageAdapter implements StorageAdapterInterface {
     // arriving and the `finally` that returns it (rule 3), and it is
     // unambiguous because `PoolPermitTimeoutError` has exactly one thrower.
     try {
-      return await this.gate.run(this.gateWaitMs, () => this.withClient(operation, fn))
+      return await this.gate.run(this.gateWaitMs, () => this.withClient(operation, fn, this.writeDb))
     } catch (error) {
       if (error instanceof PoolPermitTimeoutError) {
         throw new StoragePoolExhaustedError(operation, 'queue-timeout', error)
@@ -682,7 +764,7 @@ export class PostgresStorageAdapter implements StorageAdapterInterface {
     // quiet workspace's absence proof refuse PERMANENTLY. They must insert an explicit NULL: the column DEFAULT
     // would mint one otherwise.
     const isContentChunk = key[1] === 'snapshot' || key[1] === 'incremental'
-    await this.withFencedMutation(key, {
+    const mutation: StorageMutation = {
       sql: isContentChunk
         ? (first, permission) => permission
           ? `INSERT INTO automerge_storage (key, data)
@@ -711,17 +793,309 @@ export class PostgresStorageAdapter implements StorageAdapterInterface {
       enqueueDocumentId: this.trackStaticReadModel && isContentChunk
         ? documentId ?? undefined
         : undefined,
-    }, false, isContentChunk)
+    }
+    const seq = isContentChunk && documentId ? this.contentSaveStarted(documentId) : 0
+    try {
+      await this.withFencedMutation(key, mutation, false, isContentChunk)
+    } catch (error) {
+      this.noteWriteFailure(isContentChunk ? 'save' : 'save-sync-state', key, error)
+      if (isContentChunk && documentId) this.contentSaveFailed(key, documentId, seq, mutation, data.byteLength, error)
+      throw error
+    }
+    if (isContentChunk && documentId) this.contentSaveSucceeded(documentId, seq)
     this.recordLoadedChunk(key, data.byteLength)
   }
 
+  /**
+   * True while a CONTENT save of this document failed and nothing covered it
+   * since — no save STARTED after it succeeded (the Repo's next save writes
+   * everything since its last success), its own retry did not land, no fence
+   * refusal said the document is no longer this cell's, no removal took the
+   * document away. Its delta then lives only in the Repo's memory, so eviction
+   * must refuse it (`AutomergeResidencyLeases.evict`, through the storage
+   * probe). O(1).
+   */
+  hasUnsavedWrite(documentId: string): boolean {
+    const state = this.unsaved.get(documentId)
+    if (!state || !(state.failed.size || state.retries.size)) return false
+    if (state.refusedSince !== null && Date.now() - state.refusedSince >= this.ownershipRefusalGraceMs) {
+      // Refused as not-owner for the whole grace: a lost workspace, not a blip.
+      console.warn(JSON.stringify({
+        event: 'automerge.unsaved_write_released',
+        documentId,
+        reason: 'ownership-unavailable',
+        refusedForMs: Date.now() - state.refusedSince,
+      }))
+      this.forgetUnsaved(documentId)
+      return false
+    }
+    return true
+  }
+
+  /** Where the start order is now: what a flush that resolves will cover. */
+  saveCursor(): number {
+    return this.contentSaveSeq
+  }
+
+  /**
+   * A `repo.flush([documentId])` begun at `cursor` RESOLVED: every save it
+   * waited for succeeded, or the Repo had nothing to save (its stored heads
+   * are the document's). Either way a failed save that started before the
+   * flush is no longer only in memory — or no longer in memory at all (the
+   * handle was dropped and re-read from storage: `repoFreshness.ts`, a
+   * fork's rollback, `documentResolution.ts`), where its mark protects
+   * nothing. Those marks go. Pending ceiling RETRIES stay: their bytes may be
+   * the only copy left of a delta whose handle was dropped.
+   */
+  flushSettled(documentId: string, cursor: number): void {
+    const state = this.unsaved.get(documentId)
+    if (!state) return
+    for (const [key, failedSeq] of [...state.failed]) {
+      if (failedSeq <= cursor && !state.retries.has(key)) state.failed.delete(key)
+    }
+    if (!state.failed.size && !state.retries.size) state.refusedSince = null
+    this.settleUnsavedState(documentId)
+  }
+
+  /** Stop every pending retry: at shutdown, before the pools end. Idempotent. */
+  close(): void {
+    this.closed = true
+    for (const state of this.unsaved.values()) {
+      for (const retry of state.retries.values()) clearTimeout(retry.timer)
+      state.retries.clear()
+    }
+  }
+
+  private unsavedState(documentId: string): UnsavedDocumentState {
+    let state = this.unsaved.get(documentId)
+    if (!state) {
+      state = { inFlight: new Set(), coveredUpTo: 0, failed: new Map(), retries: new Map(), refusedSince: null }
+      this.unsaved.set(documentId, state)
+    }
+    return state
+  }
+
+  /** Drop the document's entry once nothing in it is left. */
+  private settleUnsavedState(documentId: string): void {
+    const state = this.unsaved.get(documentId)
+    if (state && !state.inFlight.size && !state.failed.size && !state.retries.size) this.unsaved.delete(documentId)
+  }
+
+  /** A content save of the document starts: its place in the start order. */
+  private contentSaveStarted(documentId: string): number {
+    const seq = ++this.contentSaveSeq
+    this.unsavedState(documentId).inFlight.add(seq)
+    return seq
+  }
+
+  /**
+   * Everything that STARTED before `seq` is covered: a content save writes
+   * every change since the Repo's last successful save, so a later-started
+   * save that succeeds (or the retry of one, `inclusive`) makes the delta of
+   * every earlier failed one durable. Their marks go, their retries are
+   * cancelled (an older retry landing later would only add a redundant chunk,
+   * and spend a 120 s attempt on a four-permit pool). A failure that started
+   * AFTER `seq` is untouched.
+   */
+  private coverUpTo(documentId: string, seq: number, inclusive: boolean): void {
+    const state = this.unsaved.get(documentId)
+    if (!state) return
+    const covered = (other: number) => (inclusive ? other <= seq : other < seq)
+    state.coveredUpTo = Math.max(state.coveredUpTo, seq)
+    for (const [key, failedSeq] of [...state.failed]) if (covered(failedSeq)) state.failed.delete(key)
+    for (const [key, retry] of [...state.retries]) {
+      if (!covered(retry.seq)) continue
+      clearTimeout(retry.timer)
+      state.retries.delete(key)
+    }
+  }
+
+  private contentSaveSucceeded(documentId: string, seq: number): void {
+    const state = this.unsaved.get(documentId)
+    if (!state) return
+    state.inFlight.delete(seq)
+    state.refusedSince = null
+    this.coverUpTo(documentId, seq, false)
+    this.settleUnsavedState(documentId)
+  }
+
+  private contentSaveFailed(
+    key: StorageKey,
+    documentId: string,
+    seq: number,
+    mutation: StorageMutation,
+    byteLength: number,
+    error: unknown,
+  ): void {
+    const state = this.unsavedState(documentId)
+    state.inFlight.delete(seq)
+    if (isFenceMismatch(error)) {
+      // Fenced out: another cell holds the token; the document is no longer
+      // this cell's to write.
+      this.forgetUnsaved(documentId)
+      return
+    }
+    if (seq < state.coveredUpTo) {
+      // A save that started after this one already succeeded: covered.
+      this.settleUnsavedState(documentId)
+      return
+    }
+    const keyText = keyToText(key)
+    state.failed.set(keyText, seq)
+    // Refused as not-owner (`ownership-unavailable`): possibly a blip. The
+    // mark stays, for at most the grace (`hasUnsavedWrite`).
+    if (error instanceof StaleSyncCellWriteError) state.refusedSince ??= Date.now()
+    // The bytes are held for a retry only when a ceiling stopped the save; a
+    // sync-state chunk is never here (the next round trip rewrites it).
+    if (storageWriteCeilingCode(error)) this.scheduleCeilingRetry(key, documentId, mutation, byteLength, seq, 1)
+  }
+
+  /** Nothing of this document is this cell's to make durable any more (a
+   * fence refusal, a removal of its content): marks gone, retries cancelled. */
+  private forgetUnsaved(documentId: string): void {
+    const state = this.unsaved.get(documentId)
+    if (!state) return
+    for (const retry of state.retries.values()) clearTimeout(retry.timer)
+    state.retries.clear()
+    state.failed.clear()
+    state.refusedSince = null
+    // Every save of it started so far is covered: one still in flight that
+    // fails later (a removed document, a cell fenced out) neither marks it
+    // again nor schedules a retry that would write the chunk back.
+    state.coveredUpTo = Math.max(state.coveredUpTo, this.contentSaveSeq + 1)
+    this.settleUnsavedState(documentId)
+  }
+
+  /** Count and log a failed mutation stopped by a ceiling. */
+  private noteWriteFailure(operation: 'save' | 'save-sync-state' | 'remove' | 'removeRange', key: StorageKey, error: unknown): void {
+    const documentId = documentIdFromKey(key, operation === 'removeRange')
+    if (operation !== 'save' && documentId && isFenceMismatch(error)) {
+      // A fence mismatch on any mutation of the document: not this cell's.
+      this.forgetUnsaved(documentId)
+    }
+    const code = storageWriteCeilingCode(error)
+    if (!code) return
+    noteStorageWriteCeiling(code)
+    console.error(JSON.stringify({
+      event: 'automerge.storage_write_ceiling',
+      code,
+      operation,
+      documentId,
+      chunk: key[1] ?? null,
+      error: error instanceof Error ? error.message : String(error),
+    }))
+  }
+
+  /**
+   * A content save stopped by a ceiling is retried with the SAME bytes, on a
+   * backoff (`ceilingRetryDelaysMs`), through the whole fenced path again.
+   * Nobody else would: the Repo saves a document again only on its next edit
+   * or flush, and an idle eviction does not flush. The same key carries the
+   * same content (content-addressed), so the upsert is idempotent. A retry
+   * ends when it lands (and covers what started before it), when a later save
+   * of the document covers it, when a fence refusal or a removal of the
+   * document cancels it, at `close()`, or past the last delay — logged, the
+   * document still unsaved (eviction refuses it and flushes it, see
+   * `AutomergeResidencyLeases.evict`). A pool refusal
+   * (`StoragePoolExhaustedError`) spends no attempt: it backs off at the last
+   * delay and tries again.
+   */
+  private scheduleCeilingRetry(
+    key: StorageKey,
+    documentId: string,
+    mutation: StorageMutation,
+    byteLength: number,
+    seq: number,
+    attempt: number,
+  ): void {
+    if (this.closed) return
+    const state = this.unsavedState(documentId)
+    const keyText = keyToText(key)
+    const previous = state.retries.get(keyText)
+    if (previous) clearTimeout(previous.timer)
+    const delays = this.ceilingRetryDelaysMs
+    const delay = delays[Math.min(attempt, delays.length) - 1]!
+    const retry: PendingCeilingRetry = { seq, timer: setTimeout(() => {
+      const current = () => this.unsaved.get(documentId)?.retries.get(keyText) === retry
+      if (!current()) return
+      void this.withFencedMutation(key, mutation, false, true).then(() => {
+        if (!current()) return
+        this.unsaved.get(documentId)!.retries.delete(keyText)
+        // THESE bytes are durable, and they cover what started before them.
+        this.unsaved.get(documentId)!.refusedSince = null
+        this.coverUpTo(documentId, seq, true)
+        this.settleUnsavedState(documentId)
+        this.recordLoadedChunk(key, byteLength)
+        console.warn(JSON.stringify({
+          event: 'automerge.storage_write_ceiling_recovered',
+          documentId,
+          chunk: key[1] ?? null,
+          attempt,
+        }))
+      }, (error: unknown) => {
+        if (!current()) return
+        this.unsaved.get(documentId)!.retries.delete(keyText)
+        this.noteWriteFailure('save', key, error)
+        if (isFenceMismatch(error)) {
+          this.forgetUnsaved(documentId)
+          return
+        }
+        if (error instanceof StaleSyncCellWriteError) {
+          // Not owner for now (possibly a blip): back off without spending an
+          // attempt; the grace bounds how long this can hold the document.
+          this.unsaved.get(documentId)!.refusedSince ??= Date.now()
+          // Past the grace, `hasUnsavedWrite` releases the document: stop.
+          if (!this.hasUnsavedWrite(documentId)) return
+          this.scheduleCeilingRetry(key, documentId, mutation, byteLength, seq, Math.max(attempt, delays.length))
+          return
+        }
+        if (error instanceof StoragePoolExhaustedError) {
+          this.scheduleCeilingRetry(key, documentId, mutation, byteLength, seq, Math.max(attempt, delays.length))
+          return
+        }
+        if (storageWriteCeilingCode(error) && attempt < delays.length) {
+          this.scheduleCeilingRetry(key, documentId, mutation, byteLength, seq, attempt + 1)
+          return
+        }
+        this.settleUnsavedState(documentId)
+        console.error(JSON.stringify({
+          event: 'automerge.storage_write_ceiling_retry_exhausted',
+          documentId,
+          chunk: key[1] ?? null,
+          attempts: attempt,
+          error: error instanceof Error ? error.message : String(error),
+        }))
+      })
+    }, delay) }
+    retry.timer.unref?.()
+    state.retries.set(keyText, retry)
+  }
+
   async remove(key: StorageKey): Promise<void> {
-    await this.withFencedMutation(key, {
-      sql: (first, permission) => `DELETE FROM automerge_storage
-        WHERE key = $${first}${permission ? ` AND EXISTS (SELECT 1 FROM ${permission})` : ''}
-        RETURNING 1`,
-      params: [keyToText(key)],
-    })
+    try {
+      await this.withFencedMutation(key, {
+        sql: (first, permission) => `DELETE FROM automerge_storage
+          WHERE key = $${first}${permission ? ` AND EXISTS (SELECT 1 FROM ${permission})` : ''}
+          RETURNING 1`,
+        params: [keyToText(key)],
+      })
+    } catch (error) {
+      // Counted, not retried: a chunk left behind is redundant (a snapshot
+      // that covers it is already durable), and the next compaction removes it.
+      this.noteWriteFailure('remove', key, error)
+      throw error
+    }
+    // That chunk is gone: a retry of it would put it back, its mark is moot.
+    const documentId = documentIdFromKey(key)
+    const state = documentId ? this.unsaved.get(documentId) : undefined
+    if (documentId && state) {
+      const keyText = keyToText(key)
+      const retry = state.retries.get(keyText)
+      if (retry) clearTimeout(retry.timer)
+      state.retries.delete(keyText)
+      state.failed.delete(keyText)
+      this.settleUnsavedState(documentId)
+    }
     this.removeLoadedChunk(key)
   }
 
@@ -749,13 +1123,25 @@ export class PostgresStorageAdapter implements StorageAdapterInterface {
   async removeRange(keyPrefix: StorageKey): Promise<void> {
     const prefix = keyToText(keyPrefix)
     const escaped = prefix.replace(/([%_\\])/g, '\\$1')
-    await this.withFencedMutation(keyPrefix, {
-      sql: (first, permission) => `DELETE FROM automerge_storage
-        WHERE (key = $${first} OR key LIKE $${first + 1} || '/%' ESCAPE '\\')
-          ${permission ? `AND EXISTS (SELECT 1 FROM ${permission})` : ''}
-        RETURNING 1`,
-      params: [prefix, escaped],
-    }, true)
+    try {
+      await this.withFencedMutation(keyPrefix, {
+        sql: (first, permission) => `DELETE FROM automerge_storage
+          WHERE (key = $${first} OR key LIKE $${first + 1} || '/%' ESCAPE '\\')
+            ${permission ? `AND EXISTS (SELECT 1 FROM ${permission})` : ''}
+          RETURNING 1`,
+        params: [prefix, escaped],
+      }, true)
+    } catch (error) {
+      this.noteWriteFailure('removeRange', keyPrefix, error)
+      throw error
+    }
+    // The document's content removed (`removeDoc`, a fork's rollback): a
+    // pending retry would resurrect a chunk of it — and queue a read-model
+    // revision for a document that no longer exists.
+    const documentId = documentIdFromKey(keyPrefix, true)
+    if (documentId && (keyPrefix.length === 1 || keyPrefix[1] === 'snapshot' || keyPrefix[1] === 'incremental')) {
+      this.forgetUnsaved(documentId)
+    }
     this.removeLoadedRange(keyPrefix)
   }
 

@@ -386,3 +386,97 @@ describe('Automerge GC — les segments overlay retenus (D3)', () => {
     expect(result.incompleteReasons).toEqual([])
   })
 })
+
+/**
+ * G4-16b phase 4: an ordinary chain fold removes its sources from ModelMeta,
+ * and a `folded` retirement row is then their only anchor. The projector
+ * still carries a late write a client syncs into one, but only while its
+ * document and claim exist.
+ */
+describe('Automerge GC — folded ordinary heads (G4-16b phase 4)', () => {
+  async function foldedWorkspace() {
+    const repo = new Repo({ network: [] })
+    repos.push(repo)
+    const head = repo.create({ objects: {} })
+    const folded = repo.create({ objects: { kept: { id: 'kept' } } })
+    const registry = repo.create({ diagrams: {} })
+    const meta = repo.create({
+      objectShardUrls: [head.url] as string[],
+      connectionShardUrls: [] as string[],
+      // The fold already happened: `folded` is named in NO list.
+      editsObjectShardUrls: [head.url],
+      editsObjectShardUrl: head.url,
+    })
+    const root = repo.create({ modelMetaUrl: meta.url, shardUrls: [registry.url] })
+    await Promise.all([head.whenReady(), folded.whenReady(), registry.whenReady(),
+      meta.whenReady(), root.whenReady()])
+    return { repo, head, folded, registry, meta, root }
+  }
+
+  /** `foldedRows` are returned only when asked for through `versions`, with
+   * `status = 'folded'` and a retention predicate: the fake models the query
+   * instead of answering it, so an unjoined or unfiltered query finds nothing. */
+  function poolFor(rootUrl: string, documents: { documentId: string }[], foldedRows: { document_id: string }[] | 'absent',
+    recordedProducts: { document_id: string }[] = []) {
+    return vi.fn(async (sql: string) => {
+      if (sql.includes('FROM read_model_ordinary_chain_folds')) {
+        return { rows: sql.includes('JOIN versions') && sql.includes('product_document_id AS document_id') ? recordedProducts : [] }
+      }
+      if (sql.includes("'.read_model_ordinary_chain_folds'")) return { rows: [{ present: true }] }
+      if (sql.includes('FROM read_model_ordinary_head_retirements')) {
+        const asked = sql.includes('JOIN versions') && sql.includes("status = 'folded'")
+          && sql.includes('retain_until > now()')
+        return { rows: foldedRows === 'absent' || !asked ? [] : foldedRows }
+      }
+      if (sql.includes("'.read_model_ordinary_head_retirements'")) return { rows: [{ present: foldedRows !== 'absent' }] }
+      if (sql.includes('FROM versions')) return { rows: [{ root_url: rootUrl }] }
+      if (sql.includes("'.read_model_static_workspaces'")) return { rows: [{ present: false }] }
+      if (sql.includes("'.read_model_overlay_segments'")) return { rows: [{ present: false }] }
+      if (sql.includes('FROM automerge_meta')) return { rows: [] }
+      if (sql.includes('FROM landscape_versions')) return { rows: [] }
+      if (sql.includes('FROM automerge_storage')) {
+        return { rows: documents.map((d) => ({ doc: d.documentId, updated_at: new Date(0) })) }
+      }
+      return { rows: [] }
+    })
+  }
+
+  const run = (repo: Repo, query: ReturnType<typeof poolFor>) => gcOrphanedDocs(repo, {
+    db: { query } as never,
+    minimumAgeMs: 0,
+    now: new Date('2026-11-02T00:00:00Z'),
+    reportOnly: true,
+    includeCandidateDocumentIds: true,
+  })
+
+  it('a FOLDED head within retention is reachable: the sweep keeps it', async () => {
+    const { repo, head, folded, registry, meta, root } = await foldedWorkspace()
+    const result = await run(repo, poolFor(root.url, [root, meta, registry, head, folded], [{ document_id: folded.documentId }]))
+    expect(result.aborted).toBe(false)
+    // root, meta, registry, head by the walk; the folded head by the row only.
+    expect(result.reachable).toBe(5)
+  })
+
+  it('without its row (retention over, or never folded) it is not reachable', async () => {
+    const { repo, head, folded, registry, meta, root } = await foldedWorkspace()
+    const result = await run(repo, poolFor(root.url, [root, meta, registry, head, folded], []))
+    expect(result.reachable).toBe(4)
+  })
+
+  // Phase 4 step 5: a recorded product that ModelMeta does not list (a splice
+  // that reached a client before its flush) is kept while its record lives.
+  it('a RECORDED fold product is reachable by its record alone, and not without it', async () => {
+    const { repo, head, folded, registry, meta, root } = await foldedWorkspace()
+    const kept = await run(repo, poolFor(root.url, [root, meta, registry, head, folded], [], [{ document_id: folded.documentId }]))
+    expect(kept.reachable).toBe(5)
+    const swept = await run(repo, poolFor(root.url, [root, meta, registry, head, folded], [], []))
+    expect(swept.reachable).toBe(4)
+  })
+
+  it('a base without the table sweeps normally and is NOT incomplete', async () => {
+    const { repo, head, registry, meta, root } = await foldedWorkspace()
+    const result = await run(repo, poolFor(root.url, [root, meta, registry, head], 'absent'))
+    expect(result.aborted).toBe(false)
+    expect(result.incompleteReasons).toEqual([])
+  })
+})

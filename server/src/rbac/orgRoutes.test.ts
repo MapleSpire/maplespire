@@ -181,6 +181,27 @@ describe('org admin routes: authorization surfaces', () => {
     })
   }
 
+  it('403s an admin of a SUSPENDED org; the same admin of an active org passes the guard', async () => {
+    const memberAdmin = { ...memberAuth, orgId: 'org1' }
+    // The lookup now joins orgs, so the row carries the org's status.
+    queryMock.mockResolvedValueOnce({ rows: [{ role: 'admin', status: 'suspended' }] })
+    vi.resetModules()
+    const { registerOrgAdminRoutes } = await import('./orgRoutes.js')
+    const { url, close } = await startServer(registerOrgAdminRoutes, memberAdmin)
+    try {
+      const suspended = await fetch(`${url}/api/orgs/org1/members`)
+      expect(suspended.status).toBe(403)
+      // Control: identical request, org active -> the guard lets it through.
+      queryMock.mockReset()
+      queryMock.mockResolvedValue({ rows: [{ role: 'admin', status: 'active' }] })
+      const active = await fetch(`${url}/api/orgs/org1/members`)
+      expect(active.status).not.toBe(403)
+      expect(active.status).not.toBe(401)
+    } finally {
+      await close()
+    }
+  })
+
   it('a platform admin skips the org_members DB lookup entirely for overview', async () => {
     queryMock
       .mockResolvedValueOnce({ rows: [{ id: 'org1', name: 'Org One', slug: 'org-one', status: 'active', settings: {} }] }) // org lookup

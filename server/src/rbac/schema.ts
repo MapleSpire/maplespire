@@ -14,6 +14,7 @@
 
 import type { Pool } from 'pg'
 import { randomBytes } from 'node:crypto'
+import { tenantAllowedSql } from '../auth/tenantPolicy.js'
 
 /**
  * RBAC schema: teams, scopes +
@@ -417,6 +418,16 @@ export async function ensureRbacSchema(pool: Pool): Promise<void> {
         END IF;
 
         SELECT id INTO v_org_scope_id FROM scopes WHERE org_id = v_org_id AND kind = 'org';
+
+        -- V0-02: an Entra identity the owning org's tenant allowlist refuses
+        -- has no access there at all — neither the admin bypass nor a team
+        -- grant (auth/tenantPolicy.ts, the same predicate).
+        IF NOT EXISTS (
+          SELECT 1 FROM users u JOIN orgs o ON o.id = v_org_id
+          WHERE u.id = p_user_id AND ${tenantAllowedSql('u', 'o')}
+        ) THEN
+          RETURN;
+        END IF;
 
         -- Org admin bypass: full read+write on everything in their org.
         IF EXISTS (

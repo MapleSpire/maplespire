@@ -21,6 +21,7 @@ import {
 import { findReadyDocument } from './automergeRepoCompat.js'
 import { envNumber } from './envNumber.js'
 import { notifyWorkspaceDocumentCreated, type WorkspaceKey } from './rbac/docScope.js'
+import { noteServerCreationPlacement } from './rbac/serverCreationPlacement.js'
 import type { SealedRepo } from './rbac/sealedRepo.js'
 import type { BootstrapScope } from './bootstrapScope.js'
 import { OVERLAY_WRITE_HEAD_VERSION } from './modelMeta.js'
@@ -44,6 +45,15 @@ export interface OverlaySegmentClaim {
    * sealed `modelOps` caller does not and falls back to `repo.create`.
    */
   scope?: BootstrapScope
+  /**
+   * The creator is the workspace's OWNER writing into its own workspace (the
+   * ordinary projector's head rotation, `ordinaryHeadRotator.ts`): take the
+   * owner-tier placement note `createClaimedDocument` takes, in the same
+   * synchronous frame as the mint, so the segment's first save reaches the
+   * storage fence with this workspace's lease to check. Ignored with `scope`.
+   * Off for the existing callers, whose behaviour this does not change.
+   */
+  ownerPlacement?: boolean
 }
 
 export interface OverlayMetaLike {
@@ -121,14 +131,84 @@ async function findShard(
   return handle
 }
 
-async function createSegment(
+/**
+ * At most this much of a segment's entities (their JSON) per change when a
+ * segment is created WITH content (`createClaimedOverlaySegment`, a fold
+ * product). Measured on the Mac (automerge 3.2.6, a fold of 8 fleet-shaped
+ * heads: 80 entities, 130 KB of JSON, strings as text): one creating change
+ * of all of them 45–50 ms (`Automerge.from` alone), ~96 ms as the one task
+ * the fold ran; 16 KiB through `DocHandle.change` (10 entities) 22 ms for
+ * the first change, 7–14 after; 8 KiB (5 entities) 14 ms for the first,
+ * 4–9 after. The PC under the profiler runs about 1.7× slower.
+ */
+export const OVERLAY_CONTENT_CHUNK_BYTES = 8_192
+
+/** `entities` cut into runs of at most `budget` bytes of JSON each, in
+ * insertion order; an entity larger than the budget is a run of its own.
+ * Pure. */
+export function overlayContentChunks(
+  entities: Record<string, unknown>,
+  budget = OVERLAY_CONTENT_CHUNK_BYTES,
+): Array<Array<[string, unknown]>> {
+  const chunks: Array<Array<[string, unknown]>> = []
+  let chunk: Array<[string, unknown]> = []
+  let bytes = 0
+  for (const entry of Object.entries(entities)) {
+    const size = (JSON.stringify(entry[1]) ?? '').length + entry[0].length
+    if (chunk.length && bytes + size > budget) {
+      chunks.push(chunk)
+      chunk = []
+      bytes = 0
+    }
+    chunk.push(entry)
+    bytes += size
+  }
+  if (chunk.length) chunks.push(chunk)
+  return chunks
+}
+
+/** A segment build stopped by its `proceed` (see
+ * {@link createClaimedOverlaySegment}): `documentId` names the unclaimed,
+ * unnamed document it leaves, for the caller to give its lease back. */
+export class OverlaySegmentAbortedError extends Error {
+  constructor(readonly documentId: string) {
+    super(`overlay segment ${documentId}: build stopped before its claim`)
+    this.name = 'OverlaySegmentAbortedError'
+  }
+}
+
+/**
+ * The first half of {@link createSegment}: an EMPTY overlay segment, made
+ * durable, then claimed for its workspace — and NOT yet named by anything.
+ * Exported for a caller that has its own steps to take between the claim and
+ * the ModelMeta change ({@link publishOverlaySegment}): the ordinary head
+ * rotator records the retirement of the head it replaces in between
+ * (`ordinaryHeadRotator.ts`). A failure here leaves at worst a flushed,
+ * unreferenced orphan for GC; nothing points at it.
+ */
+export async function createClaimedOverlaySegment(
   repo: SealedRepo,
-  metaHandle: DocHandle<OverlayMetaLike>,
   collection: OverlayCollection,
   onDocumentTouched?: DocumentTouched,
   claim?: OverlaySegmentClaim,
+  /** The segment's content at birth (an ordinary chain fold's product and
+   * its `foldedFromUrls`, `ordinaryChainFoldWriter.ts`): the extra top-level
+   * fields in its creating change, the collection's entities in the changes
+   * after it, `OVERLAY_CONTENT_CHUNK_BYTES` of them each, one macrotask
+   * apiece (`overlayContentChunks`), every one before the flush. Absent: an
+   * empty segment, in one creating change, as before. `proceed`, asked
+   * before every chunk and before the claim: false stops the build there
+   * (no further change, no claim) with {@link OverlaySegmentAbortedError} —
+   * a projector stopped mid-build. `beforeClaim`, awaited after the flush
+   * and before the claim: whatever it throws stops the build there, unclaimed
+   * (the fold's write-fence check). */
+  content?: {
+    entities?: Record<string, unknown>
+    fields?: Record<string, unknown>
+    proceed?: () => boolean
+    beforeClaim?: () => Promise<void>
+  },
 ): Promise<DocHandle<ShardDoc>> {
-  const field = fields(collection)
   // One of the widenings back to `Repo` listed in `sealedRepo.ts`. An overlay
   // segment must take its residency lease (`onDocumentTouched`) between
   // `whenReady` and `flush` — `Repo.flush` silently skips any id whose handle
@@ -140,13 +220,44 @@ async function createSegment(
   // `writeBatchIds` from birth: every writer pushes its batch id there, and two
   // writers creating the list lazily on a fresh head hide one batch id (see
   // `buildModelMeta`'s tombstone lists, the same loss).
-  const initial = { [collection]: {}, writeBatchIds: [] } as unknown as ShardDoc
+  const initial = {
+    ...content?.fields, [collection]: {}, writeBatchIds: [],
+  } as unknown as ShardDoc
   const handle = claim?.scope
     ? claim.scope.create<ShardDoc>(repo as Repo, initial)
     : (repo as Repo).create<ShardDoc>(initial)
+  // Synchronous, before any await — see `OverlaySegmentClaim.ownerPlacement`
+  // and `createClaimedDocument` for why one await here would let the first
+  // save land unfenced.
+  if (claim?.ownerPlacement && !claim.scope) {
+    noteServerCreationPlacement(String(handle.documentId), claim.workspace)
+  }
   await handle.whenReady()
   onDocumentTouched?.(handle as DocHandle<unknown>)
+  // The entities, a bounded change per macrotask (G4-16, M3): one creating
+  // change holding a whole fold product was ONE synchronous wasm call
+  // (`Automerge.from` plus its patches), 45–80 ms for 80 fleet-shaped
+  // entities, on the owner cell's event loop. Nothing names this document
+  // before the flush and the claim below, so no reader sees it part-built;
+  // a crash mid-way leaves an unnamed orphan, as a crash before the flush
+  // always could. Last wins within the map, as in one change: ids are
+  // distinct keys. A TIMER, not `setImmediate`: called from an I/O callback,
+  // the first `setImmediate` runs in the same loop iteration, before any
+  // timer, and the first chunk would join the work before it in one block.
+  const proceedOrAbort = () => {
+    if (content?.proceed && !content.proceed()) throw new OverlaySegmentAbortedError(String(handle.documentId))
+  }
+  for (const chunk of overlayContentChunks(content?.entities ?? {})) {
+    await new Promise<void>((resolve) => { setTimeout(resolve, 0) })
+    proceedOrAbort()
+    handle.change((doc) => {
+      const map = doc[collection]!
+      for (const [id, value] of chunk) map[id] = value as Record<string, unknown>
+    })
+  }
   await repo.flush([handle.documentId])
+  proceedOrAbort()
+  await content?.beforeClaim?.()
   // Order: durable → claimed → only then does ModelMeta learn the URL. A
   // claim failure aborts the write before any pointer exists; the flushed
   // orphan is left for GC rather than published as a dangling reference.
@@ -157,18 +268,45 @@ async function createSegment(
       documentId: String(handle.documentId),
     })
   }
+  return handle
+}
+
+/**
+ * The second half of {@link createSegment}: ONE ModelMeta change that makes
+ * `url` the current write head of `collection`, appended to the segment list
+ * and to the shard list (so it is overlaid last and stays reachable for GC).
+ * The caller owns the precondition — `url` durable and claimed — which is
+ * what {@link createClaimedOverlaySegment} establishes.
+ */
+export function publishOverlaySegment(
+  metaHandle: Pick<DocHandle<OverlayMetaLike>, 'change'>,
+  collection: OverlayCollection,
+  url: string,
+): void {
+  const field = fields(collection)
   metaHandle.change((meta) => {
     const segments = overlaySegmentUrls(meta, collection)
-    if (!segments.includes(handle.url)) segments.push(handle.url)
+    if (!segments.includes(url)) segments.push(url)
     meta[field.segments] = segments
-    meta[field.current] = handle.url
+    meta[field.current] = url
     meta.editsOverlayWriteHeadVersion = OVERLAY_WRITE_HEAD_VERSION
     // Assign, then RE-READ: `meta[f] ?? (meta[f] = [])` yields the plain `[]`,
     // not the document's list, and the push into it is lost.
     if (!meta[field.shards]) meta[field.shards] = []
     const shardUrls = meta[field.shards] as string[]
-    if (!shardUrls.includes(handle.url)) shardUrls.push(handle.url)
+    if (!shardUrls.includes(url)) shardUrls.push(url)
   })
+}
+
+async function createSegment(
+  repo: SealedRepo,
+  metaHandle: DocHandle<OverlayMetaLike>,
+  collection: OverlayCollection,
+  onDocumentTouched?: DocumentTouched,
+  claim?: OverlaySegmentClaim,
+): Promise<DocHandle<ShardDoc>> {
+  const handle = await createClaimedOverlaySegment(repo, collection, onDocumentTouched, claim)
+  publishOverlaySegment(metaHandle, collection, handle.url)
   return handle
 }
 

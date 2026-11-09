@@ -40,6 +40,12 @@
  */
 
 import { isValidAutomergeUrl, type Repo } from '@automerge/automerge-repo'
+import { stats as automergeStats } from '@automerge/automerge'
+import {
+  ordinaryHeadRotationAdmits,
+  ordinaryHeadRotationConfig,
+  type OrdinaryHeadRotationConfig,
+} from '../readModel/ordinaryHeadRotation.js'
 import type { WorkspaceKey } from '../readModel/projector.js'
 import type { Queryable } from '../readModel/types.js'
 import { findReadyDocument } from '../automergeRepoCompat.js'
@@ -90,6 +96,7 @@ export const FSCK_CHECKS = {
   'registry-head-projected': 'Every diagram in the registry write head has a ro_diagrams row.',
   'overlay-chain-bounded': 'The overlay segment chains are short enough that the D3 folder is running.',
   'overlay-head-bounded': 'The current overlay write heads are small enough that the rotation is running.',
+  'ordinary-head-actors-bounded': 'With ordinary head rotation on, the current write heads stay near their actor/change thresholds.',
   'overlay-segment-bounded': 'No LISTED overlay segment has grown past the size the fold bounds it to.',
   'overlay-segment-retained': 'Every overlay segment still inside its retention window exists in storage.',
   'write-head-writable': 'The registry write head is listed with a WRITABLE kind, never a baseline kind.',
@@ -155,6 +162,13 @@ export interface OverlayWriteHeadSize {
    * needs no quiescence, so it reports on one edited around the clock.
    */
   bytes: number | null
+  /**
+   * `A.stats(head)` — what ORDINARY head rotation bounds
+   * (`ordinaryHeadRotation.ts`). `null` when the head did not resolve or is
+   * not an Automerge document; omitted by callers that did not look.
+   */
+  numActors?: number | null
+  numChanges?: number | null
 }
 
 export interface FsckFinding {
@@ -540,6 +554,13 @@ export interface StructureCheckInput {
    * a current head, so nothing above can see it.
    */
   overlaySegmentSizes?: readonly OverlaySegmentSize[]
+  /**
+   * Whether ORDINARY head rotation serves this workspace (`on` and
+   * allow-listed) and its thresholds. Omitted reads as "not on" — the
+   * production entry point (`fsckWorkspace`) always supplies it, from the
+   * process environment unless told otherwise.
+   */
+  ordinaryHeadRotation?: { rotates: boolean; maxActors: number; maxChanges: number }
 }
 
 /**
@@ -1237,10 +1258,11 @@ export function checkWorkspaceStructure(input: StructureCheckInput): {
   //
   // They are not variants of one alarm, and the chain check cannot stand in for
   // this one — it is blind to this fault by construction and gets GREENER as it
-  // worsens. Rotation is the only thing that appends to `edits*ShardUrls`
-  // (`rotateOverlayHead` → `publishAdmittedRotation`; the browser explicitly
-  // declines, `bridge.ts`'s `overlay.rotation.deferred` carries `owner:
-  // 'server'`). So a rotation refused for ever leaves a SHORT chain with one
+  // worsens. On the STATIC plane, rotation is the only thing that appends to
+  // `edits*ShardUrls` (`rotateOverlayHead` → `publishAdmittedRotation`; the
+  // browser explicitly declines, `bridge.ts`'s `overlay.rotation.deferred`
+  // carries `owner: 'server'`; on the ordinary plane compaction, server batch
+  // writes and the ordinary rotator append too). So a rotation refused for ever leaves a SHORT chain with one
   // unbounded head: the chain stops growing, the fold finds nothing to fold,
   // and every quantity `overlay-chain-bounded` reads moves the right way while
   // the workspace degrades.
@@ -1273,7 +1295,15 @@ export function checkWorkspaceStructure(input: StructureCheckInput): {
     // fastest way to get a checker ignored. `overlayWriteHeadBytes` still reports for these
     // workspaces: a number is the right shape for growth nobody bounded, and
     // it is what would settle the question.
-    skip('overlay-head-bounded', 'ordinary workspace: overlay rotation is a static-plane mechanism')
+    // Ordinary head rotation (`ordinaryHeadRotator.ts`, `AM_ORDINARY_HEAD_ROTATION=on`)
+    // does not change this: it bounds a head's ACTORS and CHANGES — the cost
+    // of a new actor's first change — not its entity or batch count, so a bulk
+    // import written by one actor stays one over-full head by design. Holding
+    // it to this ceiling would be an alarm on a state nothing promises to
+    // avoid; `ordinary-head-actors-bounded` checks what that rotator promises.
+    skip('overlay-head-bounded', input.ordinaryHeadRotation?.rotates
+      ? 'ordinary workspace: its rotation bounds actors and changes, not entities (ordinary-head-actors-bounded)'
+      : 'ordinary workspace: overlay rotation is a static-plane mechanism')
   } else if (!input.overlayWriteHeads) {
     skip('overlay-head-bounded', 'the overlay write heads were not measured')
   } else if (input.overlayWriteHeads.length === 0) {
@@ -1361,6 +1391,58 @@ export function checkWorkspaceStructure(input: StructureCheckInput): {
         + 'no projector attached, ownership never acquired, or every pass refusing a contended '
         + 'advisory key. The browser will not rotate on its own (it defers, `owner: server`), so '
         + 'the head grows without bound and every editing client materializes all of it.')
+    }
+  }
+
+  // ── ordinary-head-actors-bounded ──────────────────────────────────────────
+  // What ORDINARY head rotation promises (`ordinaryHeadRotation.ts`): the
+  // owner cell's projector asks for a rotation on the first published pass
+  // that finds a CURRENT head at `maxActors` actors or `maxChanges` changes,
+  // and again on every later pass and on a capped backoff while it is
+  // refused. A head that reaches TWICE a threshold has taken at least as many
+  // new actors (or changes) again since it became due, each of them a pass
+  // that asked — so the rotation is not running: no projector attached, the
+  // lock held for ever, or every attempt failing (its log line is
+  // `read_model.ordinary_head_rotation_failed`).
+  //
+  // TWICE is a chosen margin, not a measured one: the excess a WORKING
+  // rotation leaves is what lands while one rotation runs, which has not been
+  // measured under load. Only meaningful where rotation is on; elsewhere the
+  // check does not apply.
+  if (!input.root) {
+    skip('ordinary-head-actors-bounded', 'the root document did not resolve')
+  } else if (!namesMeta) {
+    skip('ordinary-head-actors-bounded', 'monolith workspace: the root names no ModelMeta')
+  } else if (input.modelMetaUnresolved || !input.modelMeta) {
+    skip('ordinary-head-actors-bounded', 'the ModelMeta did not resolve')
+  } else if (input.staticSource !== null) {
+    skip('ordinary-head-actors-bounded', 'static workspace: its heads are bounded by overlay-head-bounded')
+  } else if (!input.ordinaryHeadRotation?.rotates) {
+    skip('ordinary-head-actors-bounded', 'ordinary workspace: AM_ORDINARY_HEAD_ROTATION is not on for it')
+  } else if (!input.overlayWriteHeads) {
+    skip('ordinary-head-actors-bounded', 'the overlay write heads were not measured')
+  } else if (input.overlayWriteHeads.length === 0) {
+    skip('ordinary-head-actors-bounded', 'no overlay write head: the ModelMeta names neither')
+  } else {
+    ran('ordinary-head-actors-bounded')
+    const { maxActors, maxChanges } = input.ordinaryHeadRotation
+    for (const head of input.overlayWriteHeads) {
+      const report = (detail: string) => findings.push({
+        check: 'ordinary-head-actors-bounded', severity: 'degraded', detail, documentUrl: head.url,
+      })
+      if (head.numActors === null || head.numActors === undefined
+        || head.numChanges === null || head.numChanges === undefined) {
+        report(`${head.field} could not be measured (A.stats), so whether ordinary rotation bounds it is UNVERIFIED`)
+        continue
+      }
+      const past: string[] = []
+      if (head.numActors >= 2 * maxActors) past.push(`${head.numActors} actors (rotation at ${maxActors})`)
+      if (head.numChanges >= 2 * maxChanges) past.push(`${head.numChanges} changes (rotation at ${maxChanges})`)
+      if (past.length === 0) continue
+      report(`${head.field} carries ${past.join(' and ')}: at least twice the threshold, so ordinary head `
+        + 'rotation is not running for this workspace — no projector attached on the owner cell, the '
+        + '`overlay-rotation:` lock held by another writer for ever, or every attempt failing '
+        + '(`read_model.ordinary_head_rotation_failed`).')
     }
   }
 
@@ -1863,9 +1945,20 @@ export async function measureOverlayWriteHeads(
           : []).size,
       quietForMs: await quietForMs(documentIdOf(headUrl)),
       bytes: await bytes(documentIdOf(headUrl)),
+      ...headStats(head),
     })
   }
   return measured
+}
+
+function headStats(head: PlainDoc): { numActors: number | null; numChanges: number | null } {
+  if (head === undefined) return { numActors: null, numChanges: null }
+  try {
+    const { numActors, numChanges } = automergeStats(head as never)
+    return { numActors, numChanges }
+  } catch {
+    return { numActors: null, numChanges: null }
+  }
 }
 
 /** Resolve a document without ever risking the never-settling `repo.find()`. */
@@ -1882,6 +1975,9 @@ async function tryResolve(repo: Repo, target: string, timeoutMs: number): Promis
 export interface WorkspaceFsckOptions {
   /** Per-document ceiling. `repo.find()` never settles with no peer connected. */
   resolveTimeoutMs?: number
+  /** `AM_ORDINARY_HEAD_ROTATION` and its knobs; read from the process
+   * environment when omitted, so no caller has to remember it. */
+  ordinaryHeadRotation?: OrdinaryHeadRotationConfig
 }
 
 /**
@@ -1900,6 +1996,7 @@ export async function fsckWorkspace(
   options: WorkspaceFsckOptions = {},
 ): Promise<WorkspaceFsckReport> {
   const timeoutMs = options.resolveTimeoutMs ?? 8_000
+  const rotation = options.ordinaryHeadRotation ?? ordinaryHeadRotationConfig()
   const root = await tryResolve(repo, rootUrl, timeoutMs)
 
   const metaUrl = url(root?.modelMetaUrl)
@@ -2261,6 +2358,11 @@ export async function fsckWorkspace(
     retainedOverlaySegments,
     overlayWriteHeads,
     overlaySegmentSizes,
+    ordinaryHeadRotation: {
+      rotates: rotation.mode === 'on' && ordinaryHeadRotationAdmits(rotation, key),
+      maxActors: rotation.maxActors,
+      maxChanges: rotation.maxChanges,
+    },
   })
 
   // Status is decided HERE, from the completed pass, never from inside it.

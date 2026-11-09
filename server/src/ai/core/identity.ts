@@ -14,7 +14,7 @@
 
 import type { Queryable } from '../../readModel/types.js'
 import type { SessionClaims } from '../../auth/tokens.js'
-import { verifyAiToken } from './tokens.js'
+import { loadLiveTokenOwner, verifyAiToken } from './tokens.js'
 
 /**
  * The ONE place caller identity is normalized for the AI feature. Every
@@ -68,16 +68,14 @@ export function identityToClaims(id: AiIdentity): SessionClaims {
 export async function verifyBearerIdentity(db: Queryable, token: string): Promise<AiIdentity | null> {
   const verified = await verifyAiToken(db, token)
   if (!verified) return null
-  const { rows } = await db.query<{ name: string | null; email: string; is_platform_admin: boolean; status: string }>(
-    `SELECT name, email, is_platform_admin, status FROM users WHERE id = $1`,
-    [verified.userId]
-  )
-  const user = rows[0]
-  if (!user || user.status !== 'active') return null
+  // Same refusals as a session: inactive/missing owner, suspended org, stale
+  // epochs, and an org whose Entra tenant allowlist refuses the owner (V0-02).
+  const user = await loadLiveTokenOwner(db, verified)
+  if (!user) return null
   return {
     userId: verified.userId,
     orgId: verified.orgId,
-    isPlatformAdmin: !!user.is_platform_admin,
+    isPlatformAdmin: user.isPlatformAdmin,
     via: verified.kind === 'oauth' ? 'oauth' : 'pat',
     scopes: verified.scopes,
     tokenId: verified.tokenId,

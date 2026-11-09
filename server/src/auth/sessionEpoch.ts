@@ -14,6 +14,7 @@
 
 import type { Pool } from 'pg'
 import { signSession, type SessionClaims } from './tokens.js'
+import { tenantAllowedSql } from './tenantPolicy.js'
 
 type EpochQuery = Pick<Pool, 'query'>
 
@@ -75,7 +76,12 @@ export async function currentGlobalEpoch(db: EpochQuery, userId: string): Promis
 
 /** Why `signCurrentSession` refused to mint. Every mint route answers it as a
  * 403 `{ error: reason }` (`mintRefusalBody`). */
-export type SessionMintRefusal = 'user_inactive' | 'impersonator_not_admin' | 'not_a_member' | 'org_suspended'
+export type SessionMintRefusal =
+  | 'user_inactive'
+  | 'impersonator_not_admin'
+  | 'not_a_member'
+  | 'org_suspended'
+  | 'tenant_not_allowed'
 
 export class SessionMintRefusedError extends Error {
   constructor(readonly reason: SessionMintRefusal) {
@@ -90,7 +96,13 @@ export function mintRefusalBody(err: unknown): { error: SessionMintRefusal } | n
 }
 
 interface UserMintRow { id: string; is_platform_admin: boolean; status: string; gepoch: number | string }
-interface OrgMintRow { status: string; epoch: number | string; uepoch: number | string; member: boolean }
+interface OrgMintRow {
+  status: string
+  epoch: number | string
+  uepoch: number | string
+  member: boolean
+  tenant_ok: boolean
+}
 
 /**
  * THE way to mint a session. Every sign-in, org switch, invite accept and
@@ -115,8 +127,10 @@ interface OrgMintRow { status: string; epoch: number | string; uepoch: number | 
  *
  * So: `isPlatformAdmin` is signed as the caller's AND the database's (never
  * elevated past either; an impersonation session passes false); an inactive
- * user, an org the user is not a member of or that is suspended, and an
- * impersonator who is no longer an active platform admin all REFUSE
+ * user, an org the user is not a member of or that is suspended, an org whose
+ * Entra tenant allowlist does not admit the user's tenant (tenantPolicy.ts —
+ * a policy change bumps the refused members' per-user epochs in the same
+ * transaction), and an impersonator who is no longer an active platform admin all REFUSE
  * (`SessionMintRefusedError`) — which is also what stops a deactivated user
  * from simply signing in again. Old cookies minted without `uepoch`/`gepoch`
  * read them as 1.
@@ -137,7 +151,8 @@ export async function signCurrentSession(
     base.orgId
       ? db.query<OrgMintRow>(
           `SELECT o.status, COALESCE(e.epoch, 1) AS epoch, COALESCE(ue.epoch, 1) AS uepoch,
-                  EXISTS (SELECT 1 FROM org_members m WHERE m.org_id = o.id AND m.user_id = $2) AS member
+                  EXISTS (SELECT 1 FROM org_members m WHERE m.org_id = o.id AND m.user_id = $2) AS member,
+                  COALESCE((SELECT ${tenantAllowedSql('tu', 'o')} FROM users tu WHERE tu.id = $2), false) AS tenant_ok
            FROM orgs o
            LEFT JOIN auth_epochs e ON e.org_id = o.id
            LEFT JOIN auth_user_epochs ue ON ue.org_id = o.id AND ue.user_id = $2
@@ -160,6 +175,9 @@ export async function signCurrentSession(
     const row = org.rows[0]
     if (!row || !row.member) throw new SessionMintRefusedError('not_a_member')
     if (row.status === 'suspended') throw new SessionMintRefusedError('org_suspended')
+    // Strictly `false`: the column is COALESCEd, so Postgres never answers
+    // NULL; the DB-free route tests stub this read without the column.
+    if (row.tenant_ok === false) throw new SessionMintRefusedError('tenant_not_allowed')
     epoch = Number(row.epoch)
     uepoch = Number(row.uepoch)
   }

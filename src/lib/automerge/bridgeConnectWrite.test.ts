@@ -243,6 +243,21 @@ describe('connecting two shapes through the real bridge (sharded classic workspa
     expect(registry.spy).not.toHaveBeenCalled()
   })
 
+  it('a registry meta carrying a newer client\'s field, and nothing edited about it, opens no registry change (V0-08 pre-diff)', async () => {
+    const ws = await boot()
+    // The stub projection drops the unknown field, so the store's desired meta
+    // lacks it: under EXACT the pre-diff would flag d4 and draft the shard.
+    ws.shard.change((doc: any) => { doc.diagrams.d4.thumbnailV2 = 'kept' })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    const registry = watchDraftReads(ws.shard, 'diagrams')
+    useModelStore.getState().updateConnection('c0', { label: 'reads' })
+    await flushByTeardown()
+    // Anti-void guard: the flush ran.
+    expect(read(ws.connectionShard).connections.c0.label).toBe('reads')
+    expect(registry.spy).not.toHaveBeenCalled()
+    expect((read(ws.shard).diagrams.d4 as any).thumbnailV2).toBe('kept')
+  })
+
   it('a NON-active diagram rename is still written (the pre-diff sees scalar drift on any meta)', async () => {
     const ws = await boot()
     useModelStore.getState().updateDiagram('d4', { name: 'Renamed elsewhere' })
@@ -251,14 +266,122 @@ describe('connecting two shapes through the real bridge (sharded classic workspa
     expect(read(ws.shard).diagrams.d3.name).toBe('Diagram d3')
   })
 
-  it('a key the desired meta lacks is still removed from a NON-active meta (the pre-diff sees extra keys)', async () => {
+  // This file used to pin "a key the desired meta lacks is removed from a
+  // NON-active meta" with a peer-written `legacyField` — i.e. the N-1 data loss
+  // V0-08 removes. The pre-diff's half of that (an extra KNOWN key in the
+  // current meta reads as "would write") is pinned in reconcile.test.ts; a
+  // known field written by a peer cannot exercise it here, because it is
+  // projected into the store and becomes authoritative (measured: the store's
+  // d5 read the peer's value after the flush).
+  // V0-08 through the real flush. A newer client's field is written into a
+  // document as a peer would; the projection hands it to the store (it
+  // spreads entities), so the N-1 store is then made to REBUILD the entity
+  // from its own type — what an N-1 editor that constructs a fresh object
+  // does — and the next flush must still leave the field in the document.
+  it('the active DiagramDoc write keeps a newer client\'s root and nested fields (V0-08)', async () => {
     const ws = await boot()
-    // A stale field on d5's meta, written as a peer would (outside the bridge).
-    ws.shard.change((doc: any) => { doc.diagrams.d5.legacyField = 'stale' })
-    useModelStore.getState().addConnection({ fromId: 'o1', toId: 'o3', type: 'solid' })
+    ws.docs.d1.change((d: any) => {
+      d.annotationsV2 = { a1: 'kept' }
+      d.layouts.o1.rotationV2 = 90
+    })
+    await vi.waitFor(() => expect((useModelStore.getState().diagrams.find((d) => d.id === 'd1') as any)?.annotationsV2).toBeDefined())
+    useModelStore.setState((state) => ({
+      diagrams: state.diagrams.map((d) => {
+        if (d.id !== 'd1') return d
+        const { annotationsV2: _a, ...known } = d as any
+        const layouts = Object.fromEntries(Object.entries(known.layouts ?? {}).map(([id, l]: [string, any]) => [id, { position: l.position, size: l.size }]))
+        return { ...known, layouts }
+      }),
+    }))
+    useModelStore.getState().updateDiagram('d1', { description: 'edited by N-1' })
     await flushByTeardown()
-    expect('legacyField' in read(ws.shard).diagrams.d5).toBe(false)
-    expect(read(ws.shard).diagrams.d5.objectIds).toEqual(['o1', 'o2'])
+    expect(read(ws.docs.d1).description).toBe('edited by N-1')
+    expect(plain(read(ws.docs.d1).annotationsV2)).toEqual({ a1: 'kept' })
+    expect(read(ws.docs.d1).layouts.o1.rotationV2).toBe(90)
+  })
+
+  // The ModelMeta collections go through `reconcileMapField`: an absent id must
+  // still be deleted (a map), and the surviving entity's unknown field kept (a
+  // struct inside it). A peer writes x1 (carrying v2Field) and x2; the N-1
+  // store rebuilds x1 without the field; x2 is deleted and x1 edited.
+  const metaCollections = [
+    {
+      field: 'groups', slice: 'groups', key: 'id',
+      entity: (id: string) => ({ id, name: id, color: '#123456', objectIds: [], tagAssignments: {}, tagOrder: [] }),
+      act: () => { useModelStore.getState().deleteGroup('x2'); useModelStore.getState().updateGroup('x1', { name: 'edited' }) },
+      edited: 'name',
+    },
+    {
+      field: 'domains', slice: 'domains', key: 'id',
+      entity: (id: string) => ({ id, name: id }),
+      act: () => { useModelStore.getState().deleteDomain('x2'); useModelStore.getState().updateDomain('x1', { name: 'edited' }) },
+      edited: 'name',
+    },
+    {
+      field: 'decisionRecords', slice: 'decisionRecords', key: 'id',
+      entity: (id: string) => ({
+        id, number: id === 'x1' ? 1 : 2, title: id, summary: '', status: 'in-progress', author: 'a',
+        createdAt: '2026-01-01', updatedAt: '2026-01-01', content: '', related: [],
+      }),
+      act: () => { useModelStore.getState().deleteDecisionRecord('x2'); useModelStore.getState().updateDecisionRecord('x1', { title: 'edited' }) },
+      edited: 'title',
+    },
+    {
+      field: 'tagSnapshots', slice: 'tags', key: 'tagId',
+      entity: (id: string) => ({ tagId: id, value: id, color: '#000000', groupId: 'g', groupName: 'G', catalogRevision: 1 }),
+      act: () => useModelStore.setState((s: any) => ({
+        tags: s.tags.filter((t: any) => t.tagId !== 'x2').map((t: any) => (t.tagId === 'x1' ? { ...t, value: 'edited' } : t)),
+      })),
+      edited: 'value',
+    },
+  ] as const
+
+  it.each(metaCollections)('ModelMeta $field: a deleted id goes, the edited entity keeps a newer client\'s field (V0-08)', async (c) => {
+    const ws = await boot()
+    ws.modelMeta.change((m: any) => {
+      m[c.field].x1 = { ...c.entity('x1'), v2Field: 'kept' }
+      m[c.field].x2 = c.entity('x2')
+    })
+    const slice = () => (useModelStore.getState() as any)[c.slice] as any[]
+    await vi.waitFor(() => expect(slice().map((e) => e[c.key]).sort()).toEqual(['x1', 'x2']))
+    useModelStore.setState(((s: any) => ({
+      [c.slice]: s[c.slice].map((e: any) => {
+        const { v2Field: _v, ...known } = e
+        return known
+      }),
+    })) as any)
+    c.act()
+    await flushByTeardown()
+    const stored = read(ws.modelMeta)[c.field]
+    expect(Object.keys(stored).sort()).toEqual(['x1'])
+    expect(stored.x1[c.edited]).toBe('edited')
+    expect(stored.x1.v2Field).toBe('kept')
+  })
+
+  it('the model-shard write keeps a newer client\'s connection field (V0-08)', async () => {
+    const ws = await boot()
+    ws.connectionShard.change((d: any) => { d.connections.c0.criticalityV2 = 'high' })
+    await vi.waitFor(() => expect((useModelStore.getState().connections[0] as any).criticalityV2).toBe('high'))
+    useModelStore.setState((state) => ({
+      connections: state.connections.map((c) => {
+        const { criticalityV2: _c, ...known } = c as any
+        return known
+      }),
+    }))
+    useModelStore.getState().updateConnection('c0', { label: 'reads' })
+    await flushByTeardown()
+    expect(read(ws.connectionShard).connections.c0.label).toBe('reads')
+    expect(read(ws.connectionShard).connections.c0.criticalityV2).toBe('high')
+  })
+
+  it('a field this build does not know is KEPT on a meta it rewrites (V0-08, N-1 compatibility)', async () => {
+    const ws = await boot()
+    // A newer client's field on d4's meta; this build's DiagramMeta lacks it.
+    ws.shard.change((doc: any) => { doc.diagrams.d4.thumbnailV2 = 'kept' })
+    useModelStore.getState().updateDiagram('d4', { name: 'Renamed by N-1' })
+    await flushByTeardown()
+    expect(read(ws.shard).diagrams.d4.name).toBe('Renamed by N-1')
+    expect((read(ws.shard).diagrams.d4 as any).thumbnailV2).toBe('kept')
   })
 
   it('deleting a connection removes it from its shard (the pre-diff plans removals too)', async () => {

@@ -43,6 +43,8 @@ import { coverWorkspace } from '../rbac/claimCoverage.js'
 import { BASELINE_FENCE_ARMING_BOUND_MS, BASELINE_FENCE_TTL_MS } from '../rbac/docScope.js'
 import { digestOfIds } from '../readModel/contentDigest.js'
 import { assertReadModelPlane } from '../readModel/projectionAuthority.js'
+import { assertReadModelWriteFence } from '../readModel/health.js'
+import { commitOrdinaryHeadRetirement } from '../readModel/ordinaryHeadRotator.js'
 import { fsckWorkspace } from './workspaceFsck.js'
 import { repairReferenceIntegrity, type ReferenceRepairPlan } from './referenceIntegrityRepair.js'
 import { asLegacyStaticOrphan } from '../testing/legacyStaticOrphan.js'
@@ -877,6 +879,205 @@ describe.skipIf(!TEST_DATABASE_URL)('summary promotion (live Postgres + real Aut
     })
     expect(diverged.report.blockers.map((blocker) => blocker.code)).toContain('crdt-sql-divergence')
     expect(diverged.report.applied).toBeNull()
+  })
+
+  it('refuses a workspace with an ordinary write-head retirement row (a rotated workspace), and writes nothing', async () => {
+    // The static plane would project the retired head directly; its late
+    // writes are carried only by the ordinary forwarder this detaches.
+    const L = 'L-rotated'
+    const { rootUrl } = await provision(L, 'V1')
+    const { report: dry } = await promote(L, 'V1')
+    expect(dry.blockers).toEqual([]) // anti-void: promotable without the row
+    await db.pool.query(
+      `INSERT INTO read_model_ordinary_head_retirements
+         (landscape_id, version_id, collection, document_id, retirement_heads, status)
+       VALUES ($1, $2, 'object', 'retired-head', ARRAY['h'], 'retired')`,
+      [L, 'V1'],
+    )
+    const { report } = await promote(L, 'V1', { apply: true })
+    expect(report.blockers.map((blocker) => blocker.code)).toEqual(['ordinary-head-retirements'])
+    expect(report.applied).toBeNull()
+    expect(await staticRow(L, 'V1')).toBeNull()
+    expect((await readRoot(rootUrl)).registrySummaryOnly).toBeUndefined()
+  })
+
+  /** The ordinary rotator's row transaction, verbatim in shape
+   * (`ordinaryHeadRotator.ts` step 7 with `projectorService.ts`'s
+   * `assertTransactionAuthority`): plane, write fence `FOR UPDATE`, the row. */
+  async function rotatorRowTransaction(landscapeId: string, versionId: string, instance: string) {
+    const client = await db.pool.connect()
+    const key = { landscapeId, versionId }
+    await client.query('BEGIN')
+    await assertReadModelPlane(client, key, 'ordinary')
+    await assertReadModelWriteFence(client, key, instance)
+    await commitOrdinaryHeadRetirement(client, key, 'object', 'retired-head', ['h'])
+    return {
+      commit: async () => { try { await client.query('COMMIT') } finally { client.release() } },
+    }
+  }
+
+  it('a rotation that commits its row AFTER the evidence and BEFORE step 3 is refused INSIDE step 3 (TOCTOU)', async () => {
+    // Phase-3 review: the retirement rows were counted outside the step-3
+    // transaction (the verdict and `volatileWitnessesMoved`), so a rotator row
+    // + repoint landing after both let the promotion commit a ROTATED
+    // workspace — its child absent from the allow-list, its retired head
+    // projected directly by the static plane.
+    const L = 'L-rotated-toctou'
+    const { rootUrl } = await provision(L, 'V1')
+    await db.pool.query(
+      `UPDATE read_model_projection_state SET write_fence = 'run-under-test' WHERE landscape_id = $1 AND version_id = 'V1'`,
+      [L],
+    )
+    const steps: string[] = []
+    const { report } = await promote(L, 'V1', {
+      apply: true,
+      hooks: {
+        onStep: async (step) => {
+          steps.push(step)
+          if (step !== 'allow-list-built') return
+          await (await rotatorRowTransaction(L, 'V1', 'run-under-test')).commit()
+        },
+      },
+    })
+    // Anti-void: the row landed after the evidence, so the promotion got as
+    // far as building its allow-list.
+    expect(steps).toContain('allow-list-built')
+    expect(report.blockers.map((blocker) => blocker.code)).toEqual(['ordinary-head-retirements'])
+    expect(report.applied).toBeNull()
+    expect(steps).not.toContain('static-committed')
+    expect(await staticRow(L, 'V1')).toBeNull()
+    expect(await allowListRows(L, 'V1')).toEqual([])
+    expect((await readRoot(rootUrl)).registrySummaryOnly).toBeUndefined()
+    // The fence was rolled back with the rest.
+    const { rows } = await db.pool.query<{ write_fence: string | null }>(
+      `SELECT write_fence FROM read_model_projection_state WHERE landscape_id = $1 AND version_id = 'V1'`, [L])
+    expect(rows[0]?.write_fence).toBe('run-under-test')
+  })
+
+  it('a rotation whose row transaction is OPEN while step 3 runs serializes on the state row and is refused', async () => {
+    // The interleaving the in-transaction count relies on: the rotator holds
+    // `read_model_projection_state` FOR UPDATE (its write-fence assert), so the
+    // promotion's `claimLifecycleWriteFence` WAITS for the rotator's COMMIT,
+    // and the count that follows it sees the row.
+    const L = 'L-rotated-straddle'
+    const { rootUrl } = await provision(L, 'V1')
+    await db.pool.query(
+      `UPDATE read_model_projection_state SET write_fence = 'run-under-test' WHERE landscape_id = $1 AND version_id = 'V1'`,
+      [L],
+    )
+    let waitedOnFence = false
+    let committing: Promise<void> | null = null
+    const { report } = await promote(L, 'V1', {
+      apply: true,
+      hooks: {
+        onStep: async (step) => {
+          if (step !== 'allow-list-built') return
+          const rotator = await rotatorRowTransaction(L, 'V1', 'run-under-test')
+          committing = (async () => {
+            // Commit only once the promotion is observably BLOCKED on the
+            // state row — the witness that the two transactions overlapped.
+            const start = Date.now()
+            while (Date.now() - start < 10_000) {
+              const { rows } = await db.pool.query<{ waiting: string }>(
+                `SELECT count(*)::text AS waiting FROM pg_stat_activity
+                  WHERE wait_event_type = 'Lock' AND query LIKE '%SET write_fence%'`)
+              if (Number(rows[0]?.waiting) > 0) { waitedOnFence = true; break }
+              await new Promise((resolve) => setTimeout(resolve, 20))
+            }
+            await rotator.commit()
+          })()
+        },
+      },
+    })
+    await committing
+    expect(waitedOnFence).toBe(true)
+    expect(report.blockers.map((blocker) => blocker.code)).toEqual(['ordinary-head-retirements'])
+    expect(report.applied).toBeNull()
+    expect(await staticRow(L, 'V1')).toBeNull()
+    expect((await readRoot(rootUrl)).registrySummaryOnly).toBeUndefined()
+  }, 30_000)
+
+  // ── QA lens (mutants PR3, PR4, PR5) ──
+  it('an ADMITTED retirement row blocks promotion too (any status)', async () => {
+    const L = 'L-rot-admitted'
+    const { rootUrl } = await provision(L, 'V1')
+    await db.pool.query(
+      `INSERT INTO read_model_ordinary_head_retirements
+         (landscape_id, version_id, collection, document_id, retirement_heads, status)
+       VALUES ($1, $2, 'object', 'admitted-head', NULL, 'admitted')`,
+      [L, 'V1'],
+    )
+    const { report } = await promote(L, 'V1', { apply: true })
+    expect(report.blockers.map((blocker) => blocker.code)).toEqual(['ordinary-head-retirements'])
+    expect(report.applied).toBeNull()
+    expect(await staticRow(L, 'V1')).toBeNull()
+    expect((await readRoot(rootUrl)).registrySummaryOnly).toBeUndefined()
+  })
+
+  it('retirement rows that cannot be COUNTED block promotion — unreadable is not zero', async () => {
+    const L = 'L-rot-uncountable'
+    await provision(L, 'V1')
+    let refused = 0
+    const failing = new Proxy(db.pool, {
+      get(target, property) {
+        if (property === 'query') {
+          return (sql: unknown, values?: unknown[]) => {
+            if (typeof sql === 'string' && sql.includes('FROM read_model_ordinary_head_retirements')) {
+              refused += 1
+              return Promise.reject(new Error('injected: retirements table unreadable'))
+            }
+            return (target.query as (s: unknown, v?: unknown[]) => Promise<unknown>).call(target, sql, values)
+          }
+        }
+        const value = Reflect.get(target, property, target)
+        return typeof value === 'function' ? value.bind(target) : value
+      },
+    })
+    const { report } = await promote(L, 'V1', { db: failing as never })
+    expect(refused, 'witness: the count was attempted').toBeGreaterThan(0)
+    expect(report.blockers.map((blocker) => blocker.code)).toContain('ordinary-head-retirements')
+  })
+
+  it('a retirement row that APPEARS while the evidence is gathered is caught by the witness re-read, before a write head is minted', async () => {
+    // The step-3 count would also refuse it, but only after minting a
+    // durable write head; the witness re-read refuses with nothing minted.
+    const L = 'L-rot-race'
+    const { rootUrl } = await provision(L, 'V1')
+    let counts = 0
+    const racing = new Proxy(db.pool, {
+      get(target, property) {
+        if (property === 'query') {
+          return async (sql: unknown, values?: unknown[]) => {
+            const result = await (target.query as (s: unknown, v?: unknown[]) => Promise<unknown>).call(target, sql, values)
+            if (typeof sql === 'string' && sql.includes('SELECT count(*)::text AS count FROM read_model_ordinary_head_retirements')) {
+              counts += 1
+              // A rotation commits its row right after the facts were counted.
+              if (counts === 1) {
+                await target.query(
+                  `INSERT INTO read_model_ordinary_head_retirements
+                     (landscape_id, version_id, collection, document_id, retirement_heads, status)
+                   VALUES ($1, $2, 'object', 'raced-head', ARRAY['h'], 'retired')`,
+                  [L, 'V1'],
+                )
+              }
+            }
+            return result
+          }
+        }
+        const value = Reflect.get(target, property, target)
+        return typeof value === 'function' ? value.bind(target) : value
+      },
+    })
+    const steps: string[] = []
+    const { report } = await promote(L, 'V1', {
+      apply: true, db: racing as never, hooks: { onStep: (step) => { steps.push(step) } },
+    })
+    expect(counts, 'witness: the facts were counted before the row landed').toBeGreaterThan(0)
+    expect(report.blockers.map((blocker) => blocker.code)).toEqual(['witness-moved'])
+    expect(steps).not.toContain('write-head-durable')
+    expect(report.applied).toBeNull()
+    expect(await staticRow(L, 'V1')).toBeNull()
+    expect((await readRoot(rootUrl)).registrySummaryOnly).toBeUndefined()
   })
 
   it('report mode gathers every witness and writes NOTHING', async () => {

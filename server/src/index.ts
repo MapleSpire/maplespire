@@ -12,24 +12,27 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU Affero General Public License for more details.
 
+import './wasmMemoryGauge.install.js' // FIRST: must precede any @automerge/automerge evaluation
 import 'dotenv/config' // load server/.env (PORT, DATABASE_URL, …) before anything reads process.env
+import './diagnostics/cpuProfile.install.js' // bench-only CPU/GC capture; inert unless SYNC_DIAG_CPU_PROFILE=on; before Automerge
 import express from 'express'
 import { durableHeadsDecoder } from './readModel/durableHeadsDecoder.js'
 import type { Request, Response } from 'express'
 import cors from 'cors'
 import compression from 'compression'
 import type { Repo } from '@automerge/automerge-repo'
-import { lifecycleApplyPool, pool, readModelPool, syncCellPool } from './db.js'
+import { lifecycleApplyPool, pool, readModelPool, storageWritePool, syncCellPool } from './db.js'
 import { envNumber } from './envNumber.js'
 import { runMigrations, withMigrationLock } from './db/migrations.js'
 import { poolMeterSnapshots } from './db/poolMeter.js'
 import { schemaMigrations } from './db/schemaMigrations.js'
-import { listThemes, getTheme, publishTheme, incrementInstalls, reportTheme, validateThemePayload } from './themes.js'
+import { registerThemeRoutes } from './themeRoutes.js'
 import {
-  createShare, getShare, listShares, updateShare, revokeShare, bumpViewCount, validateCreateShare,
+  createShare, getShare, listShares, revokeShare, bumpViewCount, validateCreateShare,
   checkShareRateLimit, checkShareAudienceAccess, getShareGateInfo, defaultShareAudience,
 } from './shares.js'
 import type { ShareAudience } from './shares.js'
+import { sharePatchHandler } from './shareManageRoutes.js'
 import {
   createVersion, listVersions, getVersion, deleteVersion, validateCreateVersion,
 } from './landscapeVersions.js'
@@ -51,7 +54,6 @@ import { computeDraftChanges } from './draft/changes.js'
 import { applyMerge } from './draft/applyMerge.js'
 import { startAutomergeSync, syncStateLookupMetrics } from './automergeServer.js'
 import { LiveWorkspaceResidency } from './readModel/liveWorkspaceResidency.js'
-import { lightweightSynchronizerPeerSnapshot } from './automergeTransportTelemetry.js'
 import { PostgresStorageAdapter, type StorageFenceSnapshot } from './automergeStorage.js'
 import { currentProcessBootId } from './processIdentity.js'
 import type { DenyLedgerSnapshot } from './rbac/denyLedger.js'
@@ -87,6 +89,9 @@ import {
   parseCompactionAllowlist,
 } from './readModel/compactionAllowlist.js'
 import { compactOverlay } from './readModel/compaction.js'
+import { ordinaryHeadRotationConfig } from './readModel/ordinaryHeadRotation.js'
+import { ordinaryChainUnboundedBootWarning, ordinaryRotationMetricSamples } from './readModel/ordinaryRotationTelemetry.js'
+import { automergeStatsBody, type AutomergeStatsBodyInput } from './automergeStatsBody.js'
 import {
   COMPACTION_QUEUE_ENV,
   DEFAULT_CLAIM_LEASE_MS,
@@ -178,6 +183,7 @@ import {
   type SummaryMigrationCaller,
 } from './maintenance/summaryMigrationRoute.js'
 import { registerOrgAdminRoutes } from './rbac/orgRoutes.js'
+import { registerOrgTenantRoutes } from './auth/orgTenantRoutes.js'
 import { registerPlatformRoutes } from './auth/platformRoutes.js'
 import { authStage, requireAuth } from './auth/middleware.js'
 import { sessionCookieName } from './auth/tokens.js'
@@ -225,6 +231,7 @@ import { bootstrapMintMetricSamples } from './bootstrapMint.js'
 import { bootstrapScopeMetricSamples, bootstrapScopeSnapshot, installBootstrapOwnership } from './bootstrapScope.js'
 import { mintedOrphanReaperMetricSamples, reapMintedOrphans } from './mintedOrphanReaper.js'
 import { overlayRotationLockMetricSamples } from './readModel/overlayRotationLock.js'
+import { documentLoadMetricSamples } from './readModel/documentLoadTelemetry.js'
 import { documentGrowthSnapshot, startDocumentGrowthSampler } from './readModel/documentGrowth.js'
 import { lastDivergenceRun } from './readModel/divergenceRunner.js'
 import { collectCrdtInventory } from './readModel/crdtInventory.js'
@@ -235,6 +242,8 @@ import {
   verifyWorkspaceIntegrity,
 } from './readModel/projectionIntegrity.js'
 import { getFleetReadModelStatusCounts } from './readModel/health.js'
+import { handoverBarrierTimeoutCount, handoverRecheckAbandonedCount } from './readModel/ordinaryFoldedArrivals.js'
+import { storageWriteCeilingCounts } from './automergeStorageCeiling.js'
 import { readDrillHealth, readDrillOverlap } from './backup/drillReport.js'
 // `backupRestore.js` only — NOT `drillRunner.js`, which re-exports
 // `ORPHAN_MINIMUM_AGE_MS` but would drag `coldServer` (an HTTP server),
@@ -290,6 +299,24 @@ const diagramRenderContextLoader = new DiagramRenderContextLoader(pool)
 const boundedReadSingleFlight = new AsyncSingleFlight()
 const coldBuildConfig = coldBuildAdmissionConfig()
 const coldBuildAdmission = new ColdBuildAdmission(coldBuildConfig)
+// Parsed HERE, at module load, rather than inside the read-model `try` below:
+// an invalid value — `on` with the `*` allow-list included — must refuse to
+// boot, not quietly disable the whole fleet behind a logged catch. The fleet
+// hands it to every ordinary projector, which observes (`shadow`) or also
+// rotates (`on`) the current write heads of allow-listed workspaces it owns
+// (`ordinaryHeadRotator.ts`); fsck reads the same variables
+// (`ordinary-head-actors-bounded`).
+const ordinaryHeadRotation = ordinaryHeadRotationConfig()
+// One line, because `shadow` or `on` with an empty allow-list does nothing.
+if (ordinaryHeadRotation.mode !== 'off') {
+  console.log(`[read-model] ordinary head rotation: ${ordinaryHeadRotation.mode}, `
+    + `${ordinaryHeadRotation.allowlist === 'all' ? 'every' : ordinaryHeadRotation.allowlist.size} workspace(s), `
+    + `maxActors=${ordinaryHeadRotation.maxActors} maxChanges=${ordinaryHeadRotation.maxChanges}`)
+}
+// G4-16e: rotation on with the fold off is the configuration under which
+// nothing bounds the chain — said at boot, and as a gauge on /metrics.
+const ordinaryChainUnboundedWarning = ordinaryChainUnboundedBootWarning(ordinaryHeadRotation)
+if (ordinaryChainUnboundedWarning) console.warn(ordinaryChainUnboundedWarning)
 let maintenanceCoordinator: MaintenanceCoordinator | null = null
 let syncCellOwnership: SyncCellOwnershipCoordinator | null = null
 let syncCellOwnershipRedis: RedisRuntime | null = null
@@ -400,6 +427,7 @@ registerInviteRoutes(app)
 registerOrgRoutes(app)
 registerDevOutboxRoutes(app)
 registerOrgAdminRoutes(app)
+registerOrgTenantRoutes(app)
 registerPlatformRoutes(app)
 registerTechnologyRoutes(app, pool)
 registerTagRoutes(app, pool)
@@ -622,6 +650,11 @@ app.get('/metrics', route(async (req, res) => {
   metrics.push(...mintedOrphanReaperMetricSamples())
   // The overlay rotation key.
   metrics.push(...overlayRotationLockMetricSamples())
+  // G4-16 M3: documents the projector had to load from storage, by path.
+  metrics.push(...documentLoadMetricSamples())
+  // G4-16e: the ordinary chain, its fold-off alert and the rotation counter
+  // (no workspace label; the stats body says which).
+  metrics.push(...ordinaryRotationMetricSamples(ordinaryHeadRotation))
   // The two restore detectors (fence divergence, world mismatch).
   //
   // Read the current coordinator, storage counter and projector fleet on each
@@ -659,6 +692,24 @@ app.get('/metrics', route(async (req, res) => {
     type: 'counter',
     values: [{ value: refusedProjectionCount() }],
   })
+  metrics.push({
+    name: 'maplespire_read_model_handover_recheck_barrier_timeouts_total',
+    help: 'Handover re-checks that ran after the barrier\'s maximum wait, with an old owner\'s storage write possibly still open (G4-16d). Each one schedules one follow-up re-check. Non-zero: look for storage-write backends of a dead cell in pg_stat_activity.',
+    type: 'counter',
+    values: [{ value: handoverBarrierTimeoutCount() }],
+  })
+  metrics.push({
+    name: 'maplespire_read_model_handover_recheck_abandoned_total',
+    help: 'Retired heads owed a handover re-check that were given up after repeated failures (G4-16d). Each one may hide a late write of a previous owner; the log line read_model.ordinary_handover_recheck_abandoned names the document.',
+    type: 'counter',
+    values: [{ value: handoverRecheckAbandonedCount() }],
+  })
+  metrics.push({
+    name: 'maplespire_automerge_storage_write_ceiling_total',
+    help: 'Automerge storage writes stopped by a ceiling of the storage write pool, by SQLSTATE: 57014 statement_timeout (or a cancel), 55P03 lock_timeout, 25P03 idle_in_transaction_session_timeout. A failed content save is retried by the adapter; the log line automerge.storage_write_ceiling names the document.',
+    type: 'counter',
+    values: storageWriteCeilingCounts().map(({ code, count }) => ({ labels: { code }, value: count })),
+  })
 
   const statusCounts = await getFleetReadModelStatusCounts(pool)
   metrics.push({
@@ -683,12 +734,13 @@ app.get('/metrics', route(async (req, res) => {
     // like a clean one.
     metrics.push({
       name: 'maplespire_automerge_evictions_total',
-      help: 'Idle-sweep evictions, and the two reasons one is skipped: a peer was still attached, or the document had been replaced since the sweep decided.',
+      help: 'Idle-sweep evictions, and the reasons one is skipped: a peer was still attached, the document had been replaced since the sweep decided, or its last content save failed (an unsaved delta).',
       type: 'counter',
       values: [
         { labels: { outcome: 'evicted' }, value: residency.evictedDocuments },
         { labels: { outcome: 'skipped_active_peer' }, value: residency.evictionSkippedActivePeer },
         { labels: { outcome: 'skipped_stale_handle' }, value: residency.evictionSkippedStaleHandle },
+        { labels: { outcome: 'skipped_unsaved_write' }, value: residency.evictionSkippedUnsavedWrite },
       ],
     })
     metrics.push({
@@ -977,61 +1029,7 @@ app.post('/api/platform/automerge-residency/collect', route(async (req, res) => 
 
 // --- Community theme gallery ---
 
-app.get('/api/themes', async (_req, res) => {
-  try {
-    res.json({ themes: await listThemes() })
-  } catch (err) {
-    console.error('List themes error:', err)
-    res.status(500).json({ error: 'Failed to list themes' })
-  }
-})
-
-app.get('/api/themes/:id', async (req, res) => {
-  try {
-    const theme = await getTheme(req.params.id)
-    if (!theme) {
-      res.status(404).json({ error: 'Theme not found' })
-      return
-    }
-    res.json({ theme })
-  } catch (err) {
-    console.error('Get theme error:', err)
-    res.status(500).json({ error: 'Failed to get theme' })
-  }
-})
-
-app.post('/api/themes', async (req, res) => {
-  try {
-    const error = validateThemePayload(req.body)
-    if (error) {
-      res.status(400).json({ error })
-      return
-    }
-    const theme = await publishTheme(req.body)
-    res.json({ theme })
-  } catch (err) {
-    console.error('Publish theme error:', err)
-    res.status(500).json({ error: 'Failed to publish theme' })
-  }
-})
-
-app.post('/api/themes/:id/install', async (req, res) => {
-  try {
-    await incrementInstalls(req.params.id)
-    res.json({ success: true })
-  } catch {
-    res.json({ success: false })
-  }
-})
-
-app.post('/api/themes/:id/report', async (req, res) => {
-  try {
-    await reportTheme(req.params.id)
-    res.json({ success: true })
-  } catch {
-    res.json({ success: false })
-  }
-})
+registerThemeRoutes(app)
 
 // --- Read model query API (premium tier) ---
 // Served from the Postgres read model so clients answer cross-diagram queries
@@ -2453,9 +2451,10 @@ function setRestrictedEmbedHeaders(res: express.Response): void {
 
 /** Canonicalize a share's stored workspace ('current' → the landscape's real default
  * version id) so the RBAC gates — which are keyed by real version ids — match. Falls
- * back to the raw key when the landscape can't be resolved (a missing landscape makes
- * requireVersionWrite permissive, and its own row lookup 404s downstream). A registry
- * read that FAILS throws (`WorkspaceRegistryUnavailableError`) rather than falling back. */
+ * back to the raw key when the landscape can't be resolved; the share routes then
+ * call requireVersionWrite with `missingLandscape: 'deny'`, which 404s a share whose
+ * landscape is gone instead of letting it through (V0-03). A registry read that
+ * FAILS throws (`WorkspaceRegistryUnavailableError`) rather than falling back. */
 async function shareWorkspaceKey(landscapeId: string | null, versionId: string | null): Promise<WorkspaceKey> {
   const raw: WorkspaceKey = {
     landscapeId: landscapeId ?? DEFAULT_WORKSPACE_KEY.landscapeId,
@@ -2499,12 +2498,13 @@ app.post('/api/shares', async (req, res) => {
     // RBAC: creating a share EXPOSES a workspace's content read-only — a governance
     // action, so it requires WRITE on that workspace (a View-only grant must NOT be
     // able to publish a link). requireVersionWrite writes the 403 itself and is
-    // permissive below stage 'on' (byte-identical pre-auth behavior).
+    // permissive below stage 'on' (byte-identical pre-auth behavior). A share of a
+    // landscape that does not exist is refused (404) from stage 'dual' (V0-03).
     const createKey = await shareWorkspaceKey(
       typeof req.body?.landscapeId === 'string' ? req.body.landscapeId : null,
       typeof req.body?.versionId === 'string' ? req.body.versionId : null
     )
-    if (!(await requireVersionWrite(pool, req, res, createKey.landscapeId, createKey.versionId))) return
+    if (!(await requireVersionWrite(pool, req, res, createKey.landscapeId, createKey.versionId, { missingLandscape: 'deny' }))) return
     // Default a new link to org-restricted once identity is enforceable, so a link
     // is never public-by-accident ("Anyone" must be a deliberate click). An explicit
     // client audience (incl. one inherited when freezing a version) always wins.
@@ -2592,30 +2592,20 @@ app.get('/api/shares/:token', async (req, res) => {
   }
 })
 
-app.patch('/api/shares/:token', async (req, res) => {
-  try {
-    // RBAC manage gate: editing/disabling/repointing a link requires WRITE on the
-    // share's workspace — a View-only grant (or another org) must not touch it.
-    // requireVersionWrite writes the 403; permissive below stage 'on'.
-    const existing = await getShareGateInfo(req.params.token)
-    if (!existing.exists) { res.status(404).json({ error: 'Share not found' }); return }
-    const key = await shareWorkspaceKey(existing.landscapeId, existing.versionId)
-    if (!(await requireVersionWrite(pool, req, res, key.landscapeId, key.versionId))) return
-    const share = await updateShare(req.params.token, { ...(req.body ?? {}), sessionOrgId: req.auth?.orgId })
-    if (!share) { res.status(404).json({ error: 'Share not found' }); return }
-    res.json({ share })
-  } catch (err) {
-    if (sendDependencyOutage(res, err)) return
-    console.error('Update share error:', err)
-    res.status(500).json({ error: 'Failed to update share' })
-  }
-})
+// Body validation + RBAC manage gate live in shareManageRoutes.ts so the real
+// handler is testable over HTTP (shareManageRoutes.integration.test.ts). Its
+// catch consults sendDependencyOutage first, like the other share routes.
+app.patch('/api/shares/:token', sharePatchHandler({ pool, workspaceKey: shareWorkspaceKey }))
 
 app.delete('/api/shares/:token', async (req, res) => {
   try {
     const existing = await getShareGateInfo(req.params.token)
     if (!existing.exists) { res.json({ success: false }); return }
     const key = await shareWorkspaceKey(existing.landscapeId, existing.versionId)
+    // Deliberately NOT `missingLandscape: 'deny'`: revoking an orphan share (its
+    // landscape deleted before V0-03's cleanup) only REMOVES exposure, and denying
+    // it would leave the orphan's snapshot publicly resolvable with no way out
+    // short of a platform admin.
     if (!(await requireVersionWrite(pool, req, res, key.landscapeId, key.versionId))) return
     const ok = await revokeShare(req.params.token)
     res.json({ success: ok })
@@ -3059,6 +3049,7 @@ async function main() {
       await readModelPool.end().catch((error) => console.warn('[server] read-model Postgres pool shutdown failed:', error))
       await syncCellPool.end().catch((error) => console.warn('[server] sync-cell Postgres pool shutdown failed:', error))
       await lifecycleApplyPool.end().catch((error) => console.warn('[server] lifecycle-apply Postgres pool shutdown failed:', error))
+      await storageWritePool.end().catch((error) => console.warn('[server] storage-write Postgres pool shutdown failed:', error))
       clearTimeout(forcedExit)
       console.log('[server] graceful shutdown complete')
       process.exit(0)
@@ -3765,42 +3756,25 @@ async function main() {
       res.status(500).json({ error: 'Failed to merge draft' })
     }
   })
-  // Privacy-minimized process telemetry. The transport snapshot deliberately
-  // exposes no peer, user, organization, workspace or document identifiers.
-  // It reports only bounded fan-out distributions and queue-pressure counters.
+  // Privacy-minimized process telemetry: no peer, user, organization or
+  // document identifier, and no workspace identifier EXCEPT the workspaces
+  // this cell rotates (G4-16e, named by an operator in the rotation
+  // allow-list). The body is assembled, and its rules documented, in
+  // `automergeStatsBody.ts`.
   app.get('/api/automerge/stats', (req, res) => {
     if (!requirePlatformAdminAtStageOn(req, res)) return
-    const handles = Object.values(cachedHandles(repo))
-    const byState: Record<string, number> = {}
-    for (const h of handles) byState[h.state] = (byState[h.state] ?? 0) + 1
     const transport = req.query.eventLoopWindow === 'consume'
       ? transportTelemetry.snapshotAndResetEventLoopDelay()
       : transportTelemetry.snapshot()
-    const synchronizer = repo.synchronizer as unknown as {
-      peers: string[]
-      docSynchronizers: Record<string, { hasPeer(peerId: string): boolean }>
-      retirementMetrics?: () => { count: number; limit: number; overLimit: boolean }
-    }
-    res.json({
-      generatedAt: new Date().toISOString(),
-      // The same per-process identity the residency snapshot carries. The
-      // counters below are diffed by the caller at window edges, so the caller
-      // needs this to detect a restart inside the window (otherwise a reset
-      // `documentsWithPeers` reads as a peer-binding drop).
+    res.json(automergeStatsBody({
       processBootId: currentProcessBootId(),
-      totalHandles: handles.length,
-      // Monotonic, diffed by the caller at the window edges. Never reset
-      // here: a counter reset by a path other than the one that owns the window
-      // describes a different interval than everything it is compared against.
-      syncStateLookup: { ...syncStateLookupMetrics },
-      byState,
+      handleStates: Object.values(cachedHandles(repo)).map((handle) => handle.state),
+      syncStateLookup: syncStateLookupMetrics,
       joinedConnections: connectionRegistry.liveConnectionCount(),
-      synchronizer: {
-        ...lightweightSynchronizerPeerSnapshot(synchronizer),
-        retiredDocuments: synchronizer.retirementMetrics?.() ?? null,
-      },
+      synchronizer: repo.synchronizer as unknown as AutomergeStatsBodyInput['synchronizer'],
       transport,
-    })
+      ordinaryHeadRotation: { config: ordinaryHeadRotation },
+    }))
   })
 
   // Daily off-hours GC uses separate locks for the global Automerge reachable
@@ -3817,6 +3791,7 @@ async function main() {
           ? '[gc] aborted — reachable set incomplete (a root/shard failed to load); nothing deleted'
           : `[gc] deleted ${r.deleted} orphan doc(s) — roots=${r.roots} reachable=${r.reachable} stored=${r.stored}`
             + ` skippedInMemory=${r.skippedInMemory} deferredYoung=${r.deferredYoung}`
+            + ` foldedKeptPending=${r.foldedKeptPending}`
       )
       return r
     }))
@@ -3965,6 +3940,7 @@ async function main() {
         coldBuildAdmission,
         residency,
         ownsWorkspace: (key) => !syncCellOwnership?.enabled || syncCellOwnership.owns(key),
+        ordinaryHeadRotation,
       })
       readModelFleet.pin(defaultWorkspaceKey)
 

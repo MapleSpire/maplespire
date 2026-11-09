@@ -131,6 +131,43 @@ export async function ensureAuthSchema(pool: Pool): Promise<void> {
     await client.query(`ALTER TABLE orgs ADD COLUMN IF NOT EXISTS settings JSONB NOT NULL DEFAULT '{}'`)
     await client.query(`ALTER TABLE orgs ADD COLUMN IF NOT EXISTS default_landscape_id TEXT`)
 
+    // V0-02 (security finding S1) — Microsoft Entra tenant policy per org.
+    // The public `microsoft` provider is multi-tenant (`/common`), so the org
+    // decides which Entra tenants (`tid` claim) may join or use it: one row per
+    // allowed tenant; NO rows = no restriction (pre-V0-02 behaviour, surfaced as
+    // a warning in the org admin). The personal-accounts tenant is never listed:
+    // under a non-empty list it is admitted only by
+    // `microsoft_personal_accounts_allowed`. Enforced in tenantPolicy.ts.
+    await client.query(
+      `ALTER TABLE orgs ADD COLUMN IF NOT EXISTS microsoft_personal_accounts_allowed BOOLEAN NOT NULL DEFAULT false`
+    )
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS org_allowed_idp_tenants (
+        org_id     TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+        provider   TEXT NOT NULL CHECK (provider IN ('microsoft')),
+        tenant_id  TEXT NOT NULL CHECK (tenant_id ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'),
+        added_by   TEXT NOT NULL,
+        added_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (org_id, provider, tenant_id)
+      )
+    `)
+    // The identity's Entra tenant (`tid`) and whether the IdP vouched for its
+    // email (`email_verified` / `xms_edov`), both refreshed on every OIDC
+    // login. NULL = not known (a non-Entra identity, or an Entra one that has
+    // not signed in since V0-02) — every gate reads NULL as "refuse".
+    await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS idp_tenant_id TEXT`)
+    await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN`)
+    // One row per consumed out-of-band platform-admin bootstrap token
+    // (PLATFORM_ADMIN_BOOTSTRAP_TOKEN, users.ts). Only the digest is stored;
+    // the primary key is what makes a token single-use.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS platform_admin_bootstrap_token_uses (
+        token_sha256  TEXT PRIMARY KEY,
+        user_id       TEXT NOT NULL,
+        used_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+      )
+    `)
+
     // Global operator-owned settings. The JSONB bag is intentionally a
     // singleton so future platform settings can be added through a strict
     // endpoint whitelist without a schema migration per preference.

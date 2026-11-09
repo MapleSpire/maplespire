@@ -316,6 +316,27 @@ describe.skipIf(!TEST_DATABASE_URL)('workspaceGate write gates (live Postgres)',
     }
   })
 
+  it("missingLandscape:'deny' (share-link routes): a DELETED landscape is refused with 404 even for its former org admin", async () => {
+    const f = await makeFixture()
+    try {
+      const admin = await makeMember(f.orgId, 'admin')
+      // Sanity: the admin passes while the landscape exists.
+      expect(
+        await requireVersionWrite(pool, reqFor(admin), fakeRes(), f.landscapeId, f.versionId, { missingLandscape: 'deny' })
+      ).toBe(true)
+      await pool.query(`DELETE FROM landscapes WHERE id = $1`, [f.landscapeId])
+      const res = fakeRes()
+      expect(
+        await requireVersionWrite(pool, reqFor(admin), res, f.landscapeId, f.versionId, { missingLandscape: 'deny' })
+      ).toBe(false)
+      expect(res.statusCode).toBe(404)
+      // The default contract (non-share callers) is unchanged: missing passes.
+      expect(await requireVersionWrite(pool, reqFor(admin), fakeRes(), f.landscapeId, f.versionId)).toBe(true)
+    } finally {
+      await dropOrg(f.orgId)
+    }
+  })
+
   // ── requireOrgAdmin (landscape create/delete) ────────────────────────────
 
   it('requireOrgAdmin: member 403, admin passes, platform admin bypasses, suspended org refused', async () => {

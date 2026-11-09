@@ -21,6 +21,7 @@ import { writeTools } from './tools/writeTools.js'
 import { workflowTools } from './tools/workflowTools.js'
 import { validateTools } from './tools/validateTools.js'
 import { architectTools } from './tools/architectTools.js'
+import { scopesNeededForTool, toolDecisionForScopes } from './tokenScopes.js'
 import { catalogTools } from './tools/catalogTools.js'
 
 /**
@@ -81,9 +82,39 @@ export function aiToolRegistry(): Map<string, AiToolDef> {
   return registry
 }
 
-export function listAiTools(opts?: { includeWrite?: boolean }): AiToolDef[] {
-  const all = [...aiToolRegistry().values()]
-  return opts?.includeWrite === false ? all.filter((t) => t.mode === 'read') : all
+export function listAiTools(opts?: { includeWrite?: boolean; scopes?: readonly string[] }): AiToolDef[] {
+  let all = [...aiToolRegistry().values()]
+  if (opts?.includeWrite === false) all = all.filter((t) => t.mode === 'read')
+  // Hide what the token can never call; `allow-in-draft` stays visible because
+  // the workspace can change per call (MCP `versionId`). Execution is still
+  // gated by `assertToolInScope` — this only spares the model dead tools.
+  const scopes = opts?.scopes
+  if (scopes) all = all.filter((t) => toolDecisionForScopes(t, scopes) !== 'deny')
+  return all
+}
+
+/**
+ * The bearer-scope gate (catalog: `tokenScopes.ts`). Scopes come from the
+ * caller's identity; a session identity carries `['mcp']` (every tool), and
+ * a null identity (no auth, `AUTH=off`) has no token to scope. Runs before
+ * the RBAC write gate, so a scope refusal reads as one regardless of role.
+ */
+async function assertToolInScope(ctx: AiToolCtx, def: AiToolDef): Promise<void> {
+  const scopes = ctx.identity?.scopes
+  if (!scopes) return
+  const decision = toolDecisionForScopes(def, scopes)
+  if (decision === 'allow') return
+  if (decision === 'allow-in-draft') {
+    const { rows } = await ctx.db.query<{ kind: string }>(
+      `SELECT kind FROM versions WHERE id = $1 AND landscape_id = $2`,
+      [ctx.workspace.versionId, ctx.workspace.landscapeId]
+    )
+    if (rows[0]?.kind === 'draft') return
+  }
+  throw new AiToolError(
+    `insufficient_scope: this token's scopes do not cover the "${def.name}" tool here (needs ${scopesNeededForTool(def)})`,
+    403
+  )
 }
 
 /**
@@ -106,6 +137,7 @@ export async function executeAiTool(
 ): Promise<unknown> {
   const def = aiToolRegistry().get(name)
   if (!def) throw new AiToolError(`unknown tool "${name}"`, 404)
+  await assertToolInScope(ctx, def)
   if (def.mode === 'write' && !ctx.canWrite) {
     throw new AiToolError('you have read-only access to this workspace — write tools are unavailable', 403)
   }

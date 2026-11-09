@@ -23,6 +23,7 @@ import { withLifecycleApplyLock } from './lifecycleApplyLock.js'
 import type { WorkspaceKey } from '../readModel/projector.js'
 import { findReadyDocument } from '../automergeRepoCompat.js'
 import { copyRootShape } from '../rootShape.js'
+import { emptyMonolithModel, MONOLITH_MODEL_COLLECTIONS } from '../modelCollections.js'
 
 type PlainDocument = Record<string, unknown>
 
@@ -105,8 +106,7 @@ function isRegistry(value: PlainDocument): boolean {
 }
 
 function isLegacyModel(value: PlainDocument): boolean {
-  return ['objects', 'connections', 'groups', 'domains', 'tagSnapshots', 'decisionRecords']
-    .every((key) => key in value)
+  return MONOLITH_MODEL_COLLECTIONS.every((key) => key in value)
 }
 
 function plain(value: PlainDocument | undefined): PlainDocument {
@@ -152,10 +152,7 @@ export async function publishRotatedRoot(
   if (workspace.sparseDraft) {
     const legacyModel = isValidAutomergeUrl(workspace.modelUrl)
       ? await readyDocument(repo, workspace.modelUrl as AutomergeUrl)
-      : {
-          objects: {}, connections: {}, groups: {}, domains: {},
-          tagSnapshots: {}, decisionRecords: {},
-        }
+      : emptyMonolithModel()
     const nextModel = repo.create<PlainDocument>(legacyModel)
     const nextMeta = repo.create<PlainDocument>(await readyDocument(repo, workspace.modelMetaUrl))
     const nextRegistries = []

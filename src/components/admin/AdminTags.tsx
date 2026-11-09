@@ -13,6 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useDepsChanged } from '../../hooks/useDepsChanged'
 import { Activity, Archive, ArrowRight, CheckCircle2, Clock3, CloudOff, Database, FolderInput, FolderTree, GitMerge, History, Link2, Palette, Pencil, Plus, RefreshCw, RotateCcw, Search, ShieldCheck, Tags, Trash2, TriangleAlert } from 'lucide-react'
 import { useParams } from '@tanstack/react-router'
 import { useTranslation } from 'react-i18next'
@@ -136,11 +137,34 @@ export function AdminTags() {
     })
   }, [orgId, refreshOutbox])
 
+  // Each fetch effect below has its loading/error reset done here, during render,
+  // on exactly the deps (and guard) that re-run the effect.
+  const operationsInputsChanged = useDepsChanged([operationWindow, operationsOpen, operationsRefreshKey, orgId, t])
+  if (operationsInputsChanged && operationsOpen) {
+    setOperationsLoading(true)
+    setOperationsError(null)
+  }
+  const readModelInputsChanged = useDepsChanged([operationsOpen, operationsRefreshKey, orgId, t])
+  if (readModelInputsChanged && operationsOpen) {
+    setReadModelHealthLoading(true)
+    setReadModelHealthError(null)
+  }
+  const pageInputsChanged = useDepsChanged([debouncedQuery, groupId, groupStatus, orgId, refreshKey, t, tagStatus, view])
+  if (pageInputsChanged) {
+    setLoading(true)
+    setError(null)
+    setNextCursor(null)
+  }
+  // Was an effect: a new filter drops the selection and any pending bulk action.
+  const selectionScopeChanged = useDepsChanged([debouncedQuery, groupId, orgId, tagStatus, view])
+  if (selectionScopeChanged) {
+    setSelectedIds(new Set())
+    setBulkAction(null)
+  }
+
   useEffect(() => {
     if (!operationsOpen) return
     const controller = new AbortController()
-    setOperationsLoading(true)
-    setOperationsError(null)
     void getTagOperationSummary(orgId, operationWindow, controller.signal)
       .then(setOperationSummary)
       .catch((cause) => {
@@ -156,8 +180,6 @@ export function AdminTags() {
   useEffect(() => {
     if (!operationsOpen) return
     const controller = new AbortController()
-    setReadModelHealthLoading(true)
-    setReadModelHealthError(null)
     void getReadModelHealth(orgId, controller.signal)
       .then(setReadModelHealth)
       .catch((cause) => {
@@ -180,9 +202,6 @@ export function AdminTags() {
 
   useEffect(() => {
     const controller = new AbortController()
-    setLoading(true)
-    setError(null)
-    setNextCursor(null)
     const request = view === 'tags'
       ? listTagPage(orgId, {
           query: debouncedQuery,
@@ -243,11 +262,6 @@ export function AdminTags() {
     groups: total.groups + usage.groupAssignments,
     assignments: total.assignments + usage.totalAssignments,
   }), { objects: 0, groups: 0, assignments: 0 }), [bulkUsage])
-
-  useEffect(() => {
-    setSelectedIds(new Set())
-    setBulkAction(null)
-  }, [debouncedQuery, groupId, orgId, tagStatus, view])
 
   const toggleSelected = (tagId: string) => {
     setSelectedIds((current) => {

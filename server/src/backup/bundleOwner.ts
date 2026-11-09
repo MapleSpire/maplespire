@@ -78,7 +78,7 @@ export async function writeBundleOwner(
 ): Promise<BundleOwner | null> {
   const owner: BundleOwner = { host: hostname(), pid: process.pid, startedAt: now, kind }
   try {
-    await writeFile(join(directory, BUNDLE_OWNER_FILE), JSON.stringify(owner), 'utf8')
+    await writeFile(join(directory, BUNDLE_OWNER_FILE), JSON.stringify(owner), { encoding: 'utf8', mode: 0o600 })
     return owner
   } catch {
     return null

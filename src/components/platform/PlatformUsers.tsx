@@ -12,7 +12,8 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU Affero General Public License for more details.
 
-import { useEffect, useState } from 'react'
+import { useEffect, useEffectEvent, useState } from 'react'
+import { useDepsChanged } from '../../hooks/useDepsChanged'
 import { Search, Eye, ShieldCheck, ShieldOff, UserX, UserCheck } from 'lucide-react'
 import { Trans, useTranslation } from 'react-i18next'
 import * as api from '../../lib/platform/api'
@@ -43,9 +44,20 @@ export function PlatformUsers() {
     return () => clearTimeout(timer)
   }, [query])
 
+  // A new search resets to loading during render; the effect below only fetches.
+  const queryChanged = useDepsChanged([debouncedQuery])
+  if (queryChanged) {
+    setStatus('loading')
+    setError(null)
+  }
+
   const load = (q: string) => {
     setStatus('loading')
     setError(null)
+    fetchUsers(q)
+  }
+
+  const fetchUsers = (q: string) => {
     api
       .getUsers({ q: q || undefined })
       .then((page) => {
@@ -59,8 +71,11 @@ export function PlatformUsers() {
       })
   }
 
+  // An effect event: only a new query refetches, not a re-render that rebuilt
+  // fetchUsers (or a language switch changing `t`).
+  const fetchUsersForQuery = useEffectEvent(fetchUsers)
   useEffect(() => {
-    load(debouncedQuery)
+    fetchUsersForQuery(debouncedQuery)
   }, [debouncedQuery])
 
   const loadMore = () => {

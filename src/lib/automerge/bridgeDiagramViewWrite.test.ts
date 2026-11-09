@@ -102,6 +102,7 @@ type Workspace = ReturnType<typeof workspace>
 const heads = (handle: { doc(): any }) => Automerge.getHeads(handle.doc())
 /** The materialized doc as plain data (every handle here is created ready). */
 const read = (handle: { doc(): unknown }) => handle.doc() as any
+const plainDecor = (value: unknown) => JSON.parse(JSON.stringify(value))
 const viewFlushMarks = () => readClientTimeline().entries.filter((entry) => entry.name === 'diagramView.flush').length
 
 async function boot(): Promise<Workspace> {
@@ -174,6 +175,34 @@ describe('view-settings edit through the real bridge', () => {
     expect(full.shard).not.toHaveBeenCalled()
     expect(heads(ws.d1Doc)).toEqual(d1Before)
     expect(viewFlushMarks()).toBe(0)
+  })
+
+  it('a view-only decor edit keeps a newer client\'s nested sceneDecor field (V0-08)', async () => {
+    const ws = await boot()
+    ws.d1Doc.change((d: any) => { d.sceneDecor.lightingV2 = 'dusk' })
+    await vi.waitFor(() => expect((useModelStore.getState().diagrams.find((d) => d.id === 'd1')?.sceneDecor as any)?.lightingV2).toBe('dusk'))
+    // The N-1 editor builds a fresh decor from the fields it knows.
+    useModelStore.getState().setDiagramSceneDecor('d1', { packId: 'canadiana', background: 'workbench' })
+    await flushByTeardown()
+    expect(plainDecor(read(ws.d1Doc).sceneDecor)).toEqual({ packId: 'canadiana', background: 'workbench', lightingV2: 'dusk' })
+    // Anti-void guard: it was the targeted view path that wrote it.
+    expect(viewFlushMarks()).toBe(1)
+  })
+
+  it('the legacy single-RootModel write keeps a newer client\'s object field (V0-08)', async () => {
+    const ws = await boot()
+    ws.model.change((m: any) => { m.objects.o1.criticalityV2 = 'high' })
+    await vi.waitFor(() => expect((useModelStore.getState().objects[0] as any)?.criticalityV2).toBe('high'))
+    useModelStore.setState((s) => ({
+      objects: s.objects.map((o) => {
+        const { criticalityV2: _c, ...known } = o as any
+        return known
+      }),
+    }))
+    useModelStore.getState().updateObject('o1', { name: 'Renamed by N-1' })
+    await flushByTeardown()
+    expect(read(ws.model).objects.o1.name).toBe('Renamed by N-1')
+    expect(read(ws.model).objects.o1.criticalityV2).toBe('high')
   })
 
   it('a skin + animation + decor edit on the active diagram lands in its DiagramDoc through the TARGETED path', async () => {

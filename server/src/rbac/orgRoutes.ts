@@ -17,8 +17,10 @@ import type { Pool } from 'pg'
 import { pool } from '../db.js'
 import { appendAudit } from '../auth/audit.js'
 import { clampInviteTtlHours } from '../auth/invites.js'
+import { normalizePatMaxDays } from '../ai/core/tokens.js'
 import { explainAccess } from './access.js'
 import { getOrgReadModelHealth } from '../readModel/health.js'
+import { memberAdmittedSql } from '../auth/tenantPolicy.js'
 import { isDeadlockVictim } from '../readModel/projectionAuthority.js'
 
 /** PUT /access attempts when Postgres picks the batch as a deadlock victim. */
@@ -76,11 +78,19 @@ function fail(res: import('express').Response, context: string, err: unknown, st
  * effect immediately, so it is never cached on the token). */
 async function canManageOrg(db: Pool, orgId: string, auth: { userId: string; isPlatformAdmin: boolean }): Promise<boolean> {
   if (auth.isPlatformAdmin) return true
-  const { rows } = await db.query<{ role: string }>(
-    'SELECT role FROM org_members WHERE org_id = $1 AND user_id = $2',
+  // `orgs.status` is 'active' | 'suspended' (auth/schema.ts). A suspended
+  // org's own admin is refused, matching workspaceGate.requireOrgAdmin and the
+  // login/session-mint refusals; a platform admin (above) still passes so the
+  // org can be managed or reinstated. The membership must also be admitted by
+  // the org's Entra tenant policy (V0-02): the org is the one in the URL, not
+  // the session's, so the mint-time check never ran on it — a refused
+  // membership reads as none.
+  const { rows } = await db.query<{ role: string; status?: string | null }>(
+    `SELECT m.role, o.status FROM org_members m JOIN orgs o ON o.id = m.org_id
+     WHERE m.org_id = $1 AND m.user_id = $2 AND ${memberAdmittedSql('m')}`,
     [orgId, auth.userId]
   )
-  return rows[0]?.role === 'admin'
+  return rows[0]?.role === 'admin' && rows[0].status !== 'suspended'
 }
 
 type OrgAdminRequest = import('express').Request
@@ -450,7 +460,7 @@ export function registerOrgAdminRoutes(app: import('express').Express): void {
         res.status(400).json({ error: 'settings must be an object' })
         return
       }
-      const allowed = new Set(['inviteTtlHours'])
+      const allowed = new Set(['inviteTtlHours', 'aiTokenMaxDays'])
       const keys = Object.keys(body.settings as Record<string, unknown>)
       const unknown = keys.filter((k) => !allowed.has(k))
       if (unknown.length > 0) {
@@ -465,6 +475,14 @@ export function registerOrgAdminRoutes(app: import('express').Express): void {
           return
         }
         settingsPatch.inviteTtlHours = clampInviteTtlHours(raw)
+      }
+      if ('aiTokenMaxDays' in (body.settings as Record<string, unknown>)) {
+        const raw = (body.settings as Record<string, unknown>).aiTokenMaxDays
+        if (typeof raw !== 'number' || !Number.isFinite(raw)) {
+          res.status(400).json({ error: 'aiTokenMaxDays must be a number (days)' })
+          return
+        }
+        settingsPatch.aiTokenMaxDays = normalizePatMaxDays(raw)
       }
     }
 

@@ -20,6 +20,7 @@ import { SessionMintRefusedError, signCurrentSession } from './sessionEpoch.js'
 import { appendAudit } from './audit.js'
 import { resolveLoginOrg } from './provisioning.js'
 import { isCurrentLegalVersion, legalRequestAccepted, recordLegalAcceptance } from './legal.js'
+import { TENANT_ID_RE, recordIdpFacts } from './tenantPolicy.js'
 
 /**
  * OIDC SSO (Google, Microsoft/Entra ID) via `openid-client` v6.
@@ -71,9 +72,15 @@ interface ProviderDef {
   issuer: () => URL
   clientId: () => string | undefined
   clientSecret: () => string | undefined
-  /** Google rejects unverified emails outright; Microsoft doesn't reliably
-   * send `email_verified` on the id_token, so we accept its email as-is. */
+  /** Google rejects unverified emails outright. Microsoft doesn't reliably
+   * send `email_verified`, so its sign-in is not refused — but its email is
+   * recorded as verified only when `email_verified` or `xms_edov` is true,
+   * and an unverified one never drives an authorization decision
+   * (tenantPolicy.ts `emailUsableForAuthorization`). */
   requireVerifiedEmail: boolean
+  /** An Entra provider: its `tid` claim is required and recorded, and the
+   * org tenant allowlist applies to the identity (tenantPolicy.ts). */
+  entra: boolean
 }
 
 const PROVIDER_DEFS: ProviderDef[] = [
@@ -85,6 +92,7 @@ const PROVIDER_DEFS: ProviderDef[] = [
     clientId: () => process.env.GOOGLE_CLIENT_ID,
     clientSecret: () => process.env.GOOGLE_CLIENT_SECRET,
     requireVerifiedEmail: true,
+    entra: false,
   },
   {
     id: 'microsoft',
@@ -93,10 +101,13 @@ const PROVIDER_DEFS: ProviderDef[] = [
     // ALWAYS the multi-tenant + personal-accounts endpoint — MS_TENANT is not
     // consulted here (it's reserved for the isolated 'microsoft-sso' entry
     // below), so this provider can never accidentally narrow to one org.
+    // Which tenants may use a given ORG is that org's allowlist
+    // (`org_allowed_idp_tenants`, tenantPolicy.ts), checked on the `tid` claim.
     issuer: () => new URL('https://login.microsoftonline.com/common/v2.0'),
     clientId: () => process.env.MS_CLIENT_ID,
     clientSecret: () => process.env.MS_CLIENT_SECRET,
     requireVerifiedEmail: false,
+    entra: true,
   },
   {
     id: 'microsoft-sso',
@@ -109,6 +120,7 @@ const PROVIDER_DEFS: ProviderDef[] = [
     clientId: () => process.env.MS_SSO_CLIENT_ID || process.env.MS_CLIENT_ID,
     clientSecret: () => process.env.MS_SSO_CLIENT_SECRET || process.env.MS_CLIENT_SECRET,
     requireVerifiedEmail: false,
+    entra: true,
   },
 ]
 
@@ -160,6 +172,7 @@ type OidcErrorCode =
   | 'org_suspended'
   | 'legal_required'
   | 'account_inactive'
+  | 'tenant_not_allowed'
 
 function failureRedirect(code: OidcErrorCode): string {
   return `${appUrl()}/login?error=${code}`
@@ -329,7 +342,8 @@ export function registerOidcRoutes(app: import('express').Express): void {
         return
       }
 
-      const email = (claims.email as string | undefined) ?? (claims.preferred_username as string | undefined)
+      const claimedEmail = typeof claims.email === 'string' && claims.email ? claims.email : undefined
+      const email = claimedEmail ?? (claims.preferred_username as string | undefined)
       if (!email) {
         res.redirect(failureRedirect('no_email'))
         return
@@ -337,6 +351,22 @@ export function registerOidcRoutes(app: import('express').Express): void {
       if (def.requireVerifiedEmail && claims.email_verified !== true) {
         res.redirect(failureRedirect('unverified_email'))
         return
+      }
+      // Whether the IdP vouched for THIS email. `preferred_username` is never
+      // verified; for Entra only `email_verified` or `xms_edov` (the optional
+      // "email domain owner verified" claim) counts.
+      const emailVerified = claimedEmail !== undefined && (claims.email_verified === true || claims.xms_edov === true)
+      // Entra's home tenant of the identity. openid-client already validated
+      // `iss` against this `tid` for the `/common` issuer; an Entra token
+      // without one is refused rather than recorded as "no tenant".
+      let tenantId: string | null = null
+      if (def.entra) {
+        const tid = typeof claims.tid === 'string' ? claims.tid.toLowerCase() : ''
+        if (!TENANT_ID_RE.test(tid)) {
+          res.redirect(failureRedirect('exchange_failed'))
+          return
+        }
+        tenantId = tid
       }
 
       const issuer = def.issuer().toString()
@@ -346,6 +376,8 @@ export function registerOidcRoutes(app: import('express').Express): void {
       const givenName = typeof claims.given_name === 'string' ? claims.given_name : undefined
       const familyName = typeof claims.family_name === 'string' ? claims.family_name : undefined
       const user = await findOrCreateUser(pool, { issuer, subject: claims.sub, email, name, givenName, familyName })
+      // Before any org decision below: resolveLoginOrg and the mint read them.
+      await recordIdpFacts(pool, user.id, { tenantId, emailVerified })
       await recordLegalAcceptance(pool, user.id, cookie.legalVersion)
 
       // Session org selection + first-login provisioning (shared with
@@ -361,9 +393,14 @@ export function registerOidcRoutes(app: import('express').Express): void {
         res.redirect(failureRedirect('org_suspended'))
         return
       }
+      if (resolution.kind === 'tenant_not_allowed') {
+        res.redirect(failureRedirect('tenant_not_allowed'))
+        return
+      }
       const orgId = resolution.kind === 'org' ? resolution.orgId : null
 
-      await bootstrapPlatformAdmin(pool, user.id, user.email)
+      // By (issuer, subject) only — never by the email above (users.ts).
+      await bootstrapPlatformAdmin(pool, { id: user.id, issuer, subject: claims.sub })
 
       // Re-read: bootstrap above may have just changed is_platform_admin since
       // `user` was fetched — a fresh platform admin's first session must
@@ -397,7 +434,8 @@ export function registerOidcRoutes(app: import('express').Express): void {
         res.redirect(failureRedirect(
           err.reason === 'user_inactive' ? 'account_inactive'
             : err.reason === 'org_suspended' ? 'org_suspended'
-              : 'exchange_failed',
+              : err.reason === 'tenant_not_allowed' ? 'tenant_not_allowed'
+                : 'exchange_failed',
         ))
         return
       }

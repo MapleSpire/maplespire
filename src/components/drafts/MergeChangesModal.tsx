@@ -13,6 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import { useEffect, useState } from 'react'
+import { useDepsChanged } from '../../hooks/useDepsChanged'
 import { X, Plus, Pencil, Trash2, AlertTriangle, ArrowRight, GitMerge } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import type { TFunction } from 'i18next'
@@ -76,10 +77,13 @@ export function MergeChangesModal() {
 
   const draft = drafts.find((d) => d.id === ref.versionId && d.landscapeId === ref.landscapeId) ?? null
 
+  // Reset choices each time the modal opens — during render, on the same
+  // inputs the effect below re-runs on; the store calls stay in the effect.
+  const openInputsChanged = useDepsChanged([open, draft, loadChanges, clearError])
+  if (openInputsChanged && open && draft) setResolutions({})
   useEffect(() => {
     if (open && draft) {
       clearError() // drop any stale error from a previous action when (re)opening
-      setResolutions({}) // reset choices each time the modal opens
       void loadChanges(draft.landscapeId, draft.id)
     }
   }, [open, draft, loadChanges, clearError])

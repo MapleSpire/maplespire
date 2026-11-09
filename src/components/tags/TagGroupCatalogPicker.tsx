@@ -13,6 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import { useCallback, useEffect, useState, type RefObject } from 'react'
+import { useDepsChanged } from '../../hooks/useDepsChanged'
 import { FolderTree } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { useAuthStore } from '../../stores/authStore'
@@ -51,10 +52,9 @@ export function TagGroupCatalogPicker({
   const [loadingMore, setLoadingMore] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
-  useEffect(() => {
-    if (!isOpen) return
-    setQuery('')
-  }, [isOpen])
+  // (Re)opening starts from an empty search — reset during render.
+  const openChanged = useDepsChanged([isOpen])
+  if (openChanged && isOpen) setQuery('')
 
   useEffect(() => {
     if (!isOpen || !orgId) return

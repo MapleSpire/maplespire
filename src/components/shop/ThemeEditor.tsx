@@ -13,6 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import { useEffect, useMemo, useState } from 'react'
+import { useDepsChanged } from '../../hooks/useDepsChanged'
 import { motion } from 'framer-motion'
 import { X, Loader2, UploadCloud, AlertTriangle } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
@@ -77,9 +78,12 @@ export function ThemeEditor({ onClose, onPublished }: ThemeEditorProps) {
   const id = useMemo(() => `community:${slug(author)}:${slug(name)}`, [author, name])
 
   // Debounced live preview (compiled + run in the sandbox worker).
+  // Each new code/background shows "rendering" at once — set during render;
+  // the effect only schedules the debounced render.
+  const previewInputsChanged = useDepsChanged([code, bg])
+  if (previewInputsChanged) setRendering(true)
   useEffect(() => {
     let cancelled = false
-    setRendering(true)
     const handle = setTimeout(() => {
       renderThemeThumbnailDetailed(code, 320, 188, bg).then((res) => {
         if (cancelled) return

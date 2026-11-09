@@ -1,0 +1,25 @@
+# gitleaks configuration (V0-12).
+#
+# `useDefault` keeps the whole upstream ruleset. Allowlists below are
+# NARROW: each one pairs a path with a regex, so a file that is a known test
+# fixture is only excused for the specific fake value, and a real secret
+# pasted into the same file still fires. There is deliberately NO global
+# allowlist (no top-level [allowlist] with paths or regexes alone).
+title = "MapleSpire gitleaks config"
+
+[extend]
+useDefault = true
+
+# Fixture: the public, documented Stripe-style/AWS example values used in
+# tests. condition = "AND": the path AND the regex must both match.
+[[allowlists]]
+description = "Documented AWS example key id in test files"
+condition = "AND"
+paths = ['''(^|/)[^/]+\.test\.(ts|tsx|mjs)$''']
+regexes = ['''AKIAIOSFODNN7EXAMPLE''']
+
+[[allowlists]]
+description = "Local-only docker-compose Postgres/Redis dev password"
+condition = "AND"
+paths = ['''^(docker-compose\.yml|compose\.maplespire\.yml|infra/compose/[^/]+\.yml)$''']
+regexes = ['''maplespire:maplespire@''']

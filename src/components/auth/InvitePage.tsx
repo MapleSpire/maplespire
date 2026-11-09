@@ -94,7 +94,12 @@ export function InvitePage() {
         handleSignIn()
         return
       }
-      setAcceptError(t('auth.invite.acceptError'))
+      const code = (err as Error).message
+      setAcceptError(t(
+        code === 'tenant_not_allowed' ? 'auth.invite.tenantNotAllowed'
+          : code === 'email_unverified' ? 'auth.invite.emailUnverified'
+            : 'auth.invite.acceptError',
+      ))
     } finally {
       setAccepting(false)
     }

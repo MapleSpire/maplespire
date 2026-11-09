@@ -13,6 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import { useEffect, useState } from 'react'
+import { useDepsChanged } from '../../hooks/useDepsChanged'
 import { useTranslation } from 'react-i18next'
 import * as api from '../../lib/platform/api'
 import { Button } from '../ui/button'
@@ -39,11 +40,11 @@ export function PlatformDebug() {
     return () => clearTimeout(timer)
   }, [query])
 
+  // An emptied search clears the candidates — during render; the effect fetches.
+  const queryChanged = useDepsChanged([debouncedQuery])
+  if (queryChanged && !debouncedQuery) setCandidates([])
   useEffect(() => {
-    if (!debouncedQuery) {
-      setCandidates([])
-      return
-    }
+    if (!debouncedQuery) return
     let cancelled = false
     api
       .getUsers({ q: debouncedQuery, limit: 10 })

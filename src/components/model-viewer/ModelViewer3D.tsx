@@ -293,6 +293,7 @@ export function ModelViewer3D({
       // Jump-cut: swap and frame, no travel, no fades.
       const nextLevel = pushLevel(toParent)
       void nextLevel
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- the jump-cut swaps the level in the imperative 3D scene (pushLevel, then frame) in this same pass, and requires the scene that only exists after mount; computing it during render would split renderPath from the scene it describes
       setRenderPath(path)
       scene.frame(false)
       drilling.current = false

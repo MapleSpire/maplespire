@@ -394,6 +394,28 @@
         "editorGroupCreationTitle": "Autoriser les Éditeurs à créer des groupes de tags",
         "editorGroupCreationDescription": "Désactivé par défaut, car les groupes modifient la taxonomie de toute l’organisation. Les admins peuvent toujours créer des groupes.",
         "serverEnforced": "Les permissions et ces politiques sont réévaluées par le serveur à chaque mutation."
+      },
+      "entraTenants": {
+        "title": "Locataires Entra autorisés",
+        "description": "Les comptes Microsoft professionnels ou scolaires ne peuvent rejoindre et utiliser cette organisation que depuis les locataires listés ici.",
+        "loadFailed": "Impossible de charger les locataires Entra autorisés",
+        "noRestrictionWarning": "Aucun locataire n’est listé : n’importe quel compte Microsoft (tous les locataires Entra et les comptes personnels) peut accepter une invitation et utiliser cette organisation. Ajoutez l’ID de votre locataire pour la restreindre.",
+        "listLabel": "ID de locataires autorisés",
+        "empty": "Aucune restriction de locataire.",
+        "inputLabel": "ID de locataire Entra",
+        "add": "Ajouter le locataire",
+        "remove": "Retirer le locataire {{tenantId}}",
+        "personalTitle": "Autoriser les comptes Microsoft personnels",
+        "personalDescription": "Comptes Outlook.com, Hotmail et Live. S’applique dès qu’au moins un locataire est listé ; sans liste, tout compte est accepté.",
+        "serverEnforced": "Vérifié par le serveur à chaque connexion, acceptation d’invitation et changement d’organisation. Les membres exclus par un changement sont déconnectés de cette organisation.",
+        "revoked_one": "{{count}} membre a été déconnecté de cette organisation.",
+        "revoked_other": "{{count}} membres ont été déconnectés de cette organisation.",
+        "error": {
+          "lockOutSelf": "Ce changement exclurait votre propre compte. Ajoutez d’abord votre propre locataire.",
+          "alreadyAllowed": "Ce locataire est déjà listé.",
+          "personalTenant": "Utilisez l’interrupteur des comptes personnels plutôt que de lister ce locataire.",
+          "invalidTenant": "Saisissez un ID de locataire (un GUID comme 00000000-0000-0000-0000-000000000000)."
+        }
       }
     },
     "technologies": {

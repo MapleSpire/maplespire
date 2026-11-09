@@ -66,6 +66,7 @@ const BOUNDED_LABEL_KEYS: ReadonlyMap<string, string> = new Map([
   ['cell_id', 'the configured cell identity, one value per process and shared by its workspaces; '
     + 'only ownership.ts snapshot.cellId is admitted as a computed value'],
   ['cause', 'five fixed fence-divergence causes'],
+  ['code', 'the three SQLSTATEs of the storage write pool ceilings (57014, 55P03, 25P03): automergeStorageCeiling.ts STORAGE_WRITE_CEILING_CODES, a closed const tuple'],
   ['quantile', 'a fixed set of quantile names'],
   ['state', 'a fixed lifecycle enumeration'],
   ['kind', 'a fixed kind enumeration'],
@@ -78,6 +79,9 @@ const BOUNDED_LABEL_KEYS: ReadonlyMap<string, string> = new Map([
   ['tool', 'the AI tool REGISTRY — a build-time set of names (34 today) each matching '
     + 'toolRegistry.ts NAME_RE; the only emitter (aiToolCallRelay.ts) labels a name after '
     + 'aiToolRegistry().get() resolved it, and today only the three AI_TOOL_DOORS reach it'],
+  ['collection', 'the two ordinary head collections, object and connection'],
+  ['trigger', 'the four rotation triggers: actors, changes, both, unknown'],
+  ['caller', 'the eleven projector load paths of documentLoadTelemetry.ts DOCUMENT_LOAD_CALLERS, a closed const tuple'],
 ])
 
 /**
@@ -89,6 +93,7 @@ const BOUNDED_LABEL_KEYS: ReadonlyMap<string, string> = new Map([
  * read at its call site, not inferred from the key.
  */
 const BOUNDED_SHORTHAND_LABELS: ReadonlyMap<string, string> = new Map([
+  ['code', 'index.ts maps storageWriteCeilingCounts(), which iterates STORAGE_WRITE_CEILING_CODES (a closed 3-tuple of SQLSTATEs) and zero-fills each: the count is fixed at 3, never an observed error code'],
   ['state', 'index.ts maps over a literal 5-tuple of divergence outcomes; placementProposerHealth '
     + 'maps over the closed PROPOSER_HEALTH_STATES tuple (13 states), never an observed identity'],
   ['outcome', 'placementProposerHealth iterates its fixed results record: admitted, already-admitted, '
@@ -96,12 +101,19 @@ const BOUNDED_SHORTHAND_LABELS: ReadonlyMap<string, string> = new Map([
   ['status', 'health.ts emptyCounts() zero-fills all 7 ReadModelWorkspaceStatus values and '
     + 'getFleetReadModelStatusCounts only overwrites keys already present, so the entry count '
     + 'is fixed at 7 whatever the fleet contains'],
-  ['phase', 'schedulerHeartbeat emits only the CURRENT phase, drawn from a fixed 5-phase enumeration'],
+  ['phase', 'schedulerHeartbeat emits only the CURRENT phase, drawn from a fixed 5-phase enumeration; '
+    + 'documentLoadTelemetry.ts maps over DOCUMENT_LOAD_PHASES, the literal 2-tuple [attach, steady]'],
+  ['caller', 'documentLoadTelemetry.ts maps over DOCUMENT_LOAD_CALLERS, a literal 11-tuple of projector load '
+    + 'paths, inside the DOCUMENT_LOAD_PHASES map: 22 series, zero-filled; never a document or workspace identity'],
   ['reason', 'ownershipMetrics iterates SYNC_CELL_OWNERSHIP_LOSS_REASONS, a closed six-member tuple; '
     + 'no workspace key or arbitrary error message enters this label'],
   ['tool', 'aiToolCallRelay.ts maps over relayedByTool, a Map whose keys are bumped only with '
     + '`def.name` from executeAiTool — a name the registry resolved — and only when the '
     + 'extractor placed it (AI_TOOL_DOORS): bounded by the registry, three names today'],
+  ['collection', 'ordinaryRotationTelemetry.ts maps over KINDS, the literal 2-tuple '
+    + "['object', 'connection']; never a workspace or document identity"],
+  ['trigger', 'ordinaryRotationTelemetry.ts maps over TRIGGERS, a literal 4-tuple of rotation '
+    + 'triggers (actors, changes, both, unknown) inside the KINDS map: 8 series at most'],
 ])
 
 /**

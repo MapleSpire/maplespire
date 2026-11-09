@@ -417,6 +417,33 @@ test('cell ownership and critical Redis alerts retain severity, windows and both
   }
 })
 
+test('the ordinary chain alert (G4-16e) keeps its severity, window, max() and both fixture directions', () => {
+  const name = 'ReadModelOrdinaryChainUnbounded'
+  const block = alertsSource.split(`- alert: ${name}\n`)[1]?.split('- alert:')[0] ?? ''
+  assert.match(block, /severity: ticket[ \t]*$/m)
+  assert.match(block, /for: 10m[ \t]*$/m)
+  // max(), never sum(): a cell keeps a lost workspace's last known chain.
+  assert.match(block, /expr: max\(maplespire_read_model_ordinary_chain_alerts\) > 0[ \t]*$/m)
+  assert.match(block, /runbook: docs\/read-model-projector-health\.md[ \t]*$/m)
+  assert.ok(fixtureSource.includes(`alertname="${name}", alertstate="firing"`), `${name} must be proven to fire`)
+  assert.match(fixtureSource, new RegExp(`alertname: ${name}\\n[ \\t]+exp_alerts: \\[\\]`), `${name} must be proven silent`)
+})
+
+test('the G4-16d storage-write and handover alerts retain severity, windows and both fixture directions', () => {
+  for (const [name, severity, window] of [
+    ['AutomergeStorageWriteCeiling', 'ticket', '5m'],
+    ['ReadModelHandoverBarrierTimeouts', 'ticket', '1m'],
+    ['ReadModelHandoverRecheckAbandoned', 'ticket', '1m'],
+    ['AutomergeUnsavedEvictionsSustained', 'ticket', '15m'],
+  ]) {
+    const block = alertsSource.split(`- alert: ${name}\n`)[1]?.split('- alert:')[0] ?? ''
+    assert.match(block, new RegExp(`severity: ${severity}[ \\t]*$`, 'm'))
+    assert.match(block, new RegExp(`for: ${window}[ \\t]*$`, 'm'))
+    assert.ok(fixtureSource.includes(`alertname="${name}", alertstate="firing"`), `${name} must be proven to fire`)
+    assert.match(fixtureSource, new RegExp(`alertname: ${name}\\n[ \\t]+exp_alerts: \\[\\]`), `${name} must be proven silent`)
+  }
+})
+
 test('a rule that selects on a job selects on a job prometheus.yml defines', () => {
   // `up{job="backup-drill"}` is the only series in the backup group that
   // Prometheus generates rather than the drill emitting — which is what makes
@@ -654,6 +681,8 @@ test('every alert rule BEHAVES — the rules run against fixture series', async 
     'SyncCellFenceRejections', 'SyncCellForeignProjector', 'RedisMemoryNearLimit',
     'PlacementProposerSignalUnknown', 'PlacementProposerDown', 'PlacementProposerMetricsMissing',
     'AlertmanagerEmailDeliveryFailed',
+    // G4-16e: the fold-off chain alert.
+    'ReadModelOrdinaryChainUnbounded',
   ]
   const uncovered = covered.filter((name) => !fixtureSource.includes(name))
   assert.deepEqual(uncovered, [], `alerts.test.yml no longer exercises: ${uncovered.join(', ')}`)

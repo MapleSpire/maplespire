@@ -100,3 +100,68 @@ running a short smoke. The aggregate JSON result deliberately keeps
 `capacityCertified:false`: CPU/memory percentages, managed Redis evidence and
 the production ingress must still be attached from a production-shaped staging
 run before declaring a supported capacity.
+
+### Load clients on another machine (G4-16 M1)
+
+`sync-cell-bench.mjs --load-remote=listen --bind=<LAN IPv4>` keeps the stack,
+the gate, its criteria, the failover pause, stats sampling, calibration and
+any capture on the stack host and runs only the load-client processes
+(`qa/load-users.mjs` cohorts) on a second machine on the same LAN. Example:
+the stack on the Windows PC `192.168.1.20`, the clients on the Mac
+`192.168.1.30`.
+
+What is exposed, and only on the address given to `--bind` (never `0.0.0.0`;
+a public address is refused):
+
+| Port (load-soak leg) | What | Why |
+| --- | --- | --- |
+| `3445` = router port + 5 | the router (HTTP and `/automerge`) | the clients' only server endpoint |
+| `3446` = router port + 6 | the gate's control listener | the agent's control connection |
+
+PostgreSQL, Redis, the cells, the stats endpoints and the frontend stay on
+loopback; the runner checks the resolved Compose configuration before it
+starts anything. The operator — never the bench — allows the two ports from
+the LAN only, once, in an elevated PowerShell on the stack host:
+
+```powershell
+New-NetFirewallRule -DisplayName "MapleSpire remote load (LAN only)" -Direction Inbound -Action Allow -Protocol TCP -LocalAddress 192.168.1.20 -LocalPort 3445,3446 -RemoteAddress 192.168.1.0/24 -Profile Private
+```
+
+Both hosts check out the same commit and run `npm ci` in `server/`. Generate
+one secret and give it to both sides; it is never printed and never crosses
+the wire (HMAC challenge-response in both directions):
+
+```powershell
+# Stack host, from server/
+$env:SYNC_REMOTE_LOAD_SECRET = '<the shared secret>'
+node scripts/sync-cell-bench.mjs --leg=load-soak --load-remote=listen --bind=192.168.1.20 <same flags as the local arm>
+```
+
+```sh
+# Load host, from server/
+SYNC_REMOTE_LOAD_SECRET='<the shared secret>' node scripts/sync-cell-remote-load.mjs --connect=192.168.1.20:3446 --once
+```
+
+The agent may start before or after the bench; it retries every 2 s. The gate
+waits for it (`SYNC_LOAD_REMOTE_CONNECT_TIMEOUT_MS`, default 15 min), refuses
+one whose load-client sources or package versions differ from its own, asks it
+to reach the router's LAN port (a firewall problem fails here, before any
+load), then measures the clock offset. The agent runs only the client script
+with validated flags and QA_* values whose API/WS must be the host it
+connected to; when the control connection drops it stops its cohorts.
+
+Every criterion is computed by the same gate code from the same per-cohort
+records. Each record carries `childProcess.remote` (session, agent pid,
+`clockOffsetMs`, `clockUncertaintyMs`). Timestamps compared within one
+cohort or across cohorts (convergence, barrier, write timeline) all come from
+the load host's clock, so the offset does not enter them. The one comparison
+across hosts — a partition-zero write inside the takeover interval measured by
+the gate — moves the write onto the gate's clock and shrinks the interval by
+the uncertainty. The offset is the minimum-RTT sample of 16 pings at admission
+and of 4 pings every minute; its uncertainty is RTT/2 + 1 ms (about 1-2 ms on
+a LAN), and drift between samples is recorded, not corrected. The gate prints
+`REMOTE_LOAD_SESSION` (agent host, client identity, router probe, every clock
+burst) on every path, and a passing verdict carries it as `remoteLoad`.
+
+Without `--load-remote` nothing changes: the gate gets no new variable, Compose
+gets the one file it always got, and the run line is the historical one.

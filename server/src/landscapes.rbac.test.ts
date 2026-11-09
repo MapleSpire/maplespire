@@ -87,6 +87,18 @@ describe.skipIf(!TEST_DATABASE_URL)('landscapes.ts: RBAC scope soft-delete on de
       )
     `)
 
+    // deleteLandscape also removes the landscape's share links (V0-03), so it
+    // needs db.ts's base shared_links table (ensureShareSchema adds the rest).
+    await realPool.query(`
+      CREATE TABLE IF NOT EXISTS shared_links (
+        token TEXT PRIMARY KEY, mode TEXT NOT NULL DEFAULT 'latest', scope TEXT NOT NULL DEFAULT 'diagram',
+        diagram_id TEXT, limit_to_diagram BOOLEAN NOT NULL DEFAULT true, enabled BOOLEAN NOT NULL DEFAULT true,
+        checkpoint_id TEXT, checkpoint_label TEXT, heads JSONB, snapshot JSONB NOT NULL,
+        view_count INTEGER NOT NULL DEFAULT 0, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), expires_at TIMESTAMPTZ
+      )
+    `)
+
     ;({ deleteLandscape, deleteVersion } = await import('./landscapes.js'))
     ;({ upsertVersionScope } = await import('./rbac/schema.js'))
     ;({ ensureDefaultOrg } = await import('./auth/schema.js'))

@@ -19,6 +19,7 @@ import {
 } from '@automerge/automerge-repo'
 import { findReadyDocument } from './automergeRepoCompat.js'
 import { copyRootShape, type WorkspaceRootShape } from './rootShape.js'
+import { emptyMonolithModel } from './modelCollections.js'
 import { rollbackForkedDocuments } from './forkRollback.js'
 import type { BootstrapScope } from './bootstrapScope.js'
 
@@ -234,9 +235,7 @@ export async function forkRoot(
       // bridge before the workspaceSharded skip) would otherwise poll a 5s timeout,
       // throw, and bounce the user to the default workspace — a fork must always be
       // bootable on its own.
-      newModelUrl = await create({
-        objects: {}, connections: {}, groups: {}, domains: {}, tagSnapshots: {}, decisionRecords: {},
-      })
+      newModelUrl = await create(emptyMonolithModel())
     } else if (srcRoot.modelUrl && isValidAutomergeUrl(srcRoot.modelUrl)) {
       newModelUrl = await cloneDoc(srcRoot.modelUrl)
     }

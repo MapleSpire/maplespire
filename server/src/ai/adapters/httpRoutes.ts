@@ -34,7 +34,10 @@ import { normalizeToolError } from '../core/serialize.js'
 import { logSafeAiError, safeAiStreamErrorText, safeProviderRequestError } from '../core/providerErrors.js'
 import { renderSkillMarkdown } from '../core/skill.js'
 import { identityFromClaims, type AiIdentity } from '../core/identity.js'
-import { createAiToken, listAiTokens, revokeAiToken } from '../core/tokens.js'
+import {
+  createAiToken, listAiTokens, revokeToken, resolvePatExpiry, PatExpiryTooLongError,
+} from '../core/tokens.js'
+import { parseRequestedScopes } from '../core/tokenScopes.js'
 import { requestPublicBaseUrl } from './publicBaseUrl.js'
 import type { AiUiContext } from '../core/systemPrompt.js'
 import {
@@ -594,20 +597,41 @@ export function registerAiHttpRoutes(app: Express, deps: AiRouteDeps): void {
       res.status(401).json({ error: 'Sign in to manage API tokens' })
       return
     }
-    const body = (req.body ?? {}) as { name?: string; expiresInDays?: number }
+    const body = (req.body ?? {}) as { name?: string; expiresInDays?: number; scopes?: unknown }
     const name = str(body.name)
     if (!name) {
       res.status(400).json({ error: 'name required' })
       return
     }
-    const expiresAt =
-      typeof body.expiresInDays === 'number' && body.expiresInDays > 0
-        ? new Date(Date.now() + body.expiresInDays * 24 * 60 * 60 * 1000)
-        : null
+    // Catalog-validated (core/tokenScopes.ts); absent → ['mcp'], stored as given.
+    const scopes = parseRequestedScopes(body.scopes)
+    if (!scopes.ok) {
+      res.status(400).json({ error: scopes.error, ...(scopes.unknown ? { unknown: scopes.unknown } : {}) })
+      return
+    }
+    if (body.expiresInDays !== undefined && body.expiresInDays !== null && typeof body.expiresInDays !== 'number') {
+      res.status(400).json({ error: 'expiresInDays must be a positive number' })
+      return
+    }
+    let expiresAt: Date
+    try {
+      expiresAt = await resolvePatExpiry(pool, req.auth.orgId, body.expiresInDays ?? undefined)
+    } catch (err) {
+      if (err instanceof PatExpiryTooLongError) {
+        res.status(400).json({ error: 'expires_too_long', maxDays: err.maxDays })
+        return
+      }
+      if (err instanceof RangeError) {
+        res.status(400).json({ error: 'expiresInDays must be a positive number' })
+        return
+      }
+      throw err
+    }
     const { token, info } = await createAiToken(pool, {
       userId: req.auth.userId,
       orgId: req.auth.orgId,
       name,
+      scopes: scopes.scopes,
       expiresAt,
     })
     // The plaintext token is returned exactly ONCE.
@@ -619,7 +643,13 @@ export function registerAiHttpRoutes(app: Express, deps: AiRouteDeps): void {
       res.status(401).json({ error: 'Sign in to manage API tokens' })
       return
     }
-    const ok = await revokeAiToken(pool, req.auth.userId, String(req.params.id))
+    // Self-revocation: optional `{ reason }` body, defaulted by revokeToken.
+    const reason = str((req.body as { reason?: unknown } | undefined)?.reason)
+    const ok = await revokeToken(pool, String(req.params.id), reason, {
+      role: 'owner',
+      userId: req.auth.userId,
+      impersonatorUserId: req.auth.imp?.by ?? null,
+    })
     if (!ok) {
       res.status(404).json({ error: 'token not found' })
       return

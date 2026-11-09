@@ -12,16 +12,11 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU Affero General Public License for more details.
 
-export interface PersistentModelSlices {
-  objects: readonly unknown[]
-  connections: readonly unknown[]
-  diagrams: readonly unknown[]
-  flows: readonly unknown[]
-  tags: readonly unknown[]
-  groups: readonly unknown[]
-  domains: readonly unknown[]
-  comments: readonly unknown[]
-  decisionRecords: readonly unknown[]
+import { ENTITY_STORE_SLICES, type EntityStoreSlice } from './entityFamilies'
+
+/** One store slice per registered entity family (`storeSlice` in
+ * entityFamilies.ts), plus the local-only active diagram id. */
+export type PersistentModelSlices = { readonly [S in EntityStoreSlice]: readonly unknown[] } & {
   currentDiagramId: string | null
 }
 
@@ -34,13 +29,8 @@ export function persistentSlicesChanged(
   state: PersistentModelSlices,
   previous: PersistentModelSlices,
 ): boolean {
-  return state.objects !== previous.objects
-    || state.connections !== previous.connections
-    || state.diagrams !== previous.diagrams
-    || state.flows !== previous.flows
-    || state.tags !== previous.tags
-    || state.groups !== previous.groups
-    || state.domains !== previous.domains
-    || state.comments !== previous.comments
-    || state.decisionRecords !== previous.decisionRecords
+  for (const slice of ENTITY_STORE_SLICES) {
+    if (state[slice] !== previous[slice]) return true
+  }
+  return false
 }

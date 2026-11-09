@@ -1,0 +1,14 @@
+# Security-sensitive paths: a change here needs the code owner's review.
+# Later matching patterns take precedence over earlier ones.
+
+# Authentication, sessions, OIDC/SAML, bearer tokens
+/server/src/auth/                 @OlivierAlbertini
+# Authorization: roles, permissions, document scope, workspace gates
+/server/src/rbac/                 @OlivierAlbertini
+# AI tools, tokens, OAuth for MCP clients
+/server/src/ai/                   @OlivierAlbertini
+# Share links
+/server/src/shares.ts             @OlivierAlbertini
+# CI, deployment and dependency automation
+/.github/                         @OlivierAlbertini
+/renovate.json                    @OlivierAlbertini

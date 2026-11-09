@@ -145,3 +145,38 @@ describe('restore keeps the per-diagram scope map (emptied, never deleted)', () 
     })
   }
 })
+
+/**
+ * V0-08: ordinary writes keep fields this build does not know, but a RESTORE
+ * reconciles EXACT — its target is the materialized past document, complete
+ * with every field that existed then, so a field it lacks did not exist at
+ * those heads and restoring means removing it.
+ */
+describe('restore removes a field added after the restore point, known or not (V0-08)', () => {
+  it('restoreTo: an unregistered root field and an unregistered comment field are gone', () => {
+    const handle = fakeHandle<DiagramDoc>({
+      name: 'a', type: 'context', objectIds: [], connectionIds: [], groupIds: [],
+      layouts: {}, comments: { k1: { id: 'k1', text: 't' } }, flows: {}, checkpoints: [],
+    } as unknown as DiagramDoc)
+    const h0 = Automerge.getHeads(handle.doc()!)
+    type Loose = Record<string, unknown> & { comments: Record<string, Record<string, unknown>> }
+    handle.change((d) => {
+      const loose = d as unknown as Loose
+      loose.futureField = 1
+      loose.comments.k1.futureField = 2
+    })
+    restoreTo(handle, h0)
+    const doc = handle.doc() as unknown as Loose
+    expect(doc.name).toBe('a')
+    expect('futureField' in doc).toBe(false)
+    expect('futureField' in doc.comments.k1).toBe(false)
+  })
+
+  it('restoreDocToHeads: an unregistered field is gone', () => {
+    const handle = fakeHandle<Record<string, unknown>>({ name: 'a' })
+    const h0 = Automerge.getHeads(handle.doc()!)
+    handle.change((d) => { d.futureField = 1 })
+    expect(restoreDocToHeads(handle, h0)).toBe(true)
+    expect(handle.doc()).toEqual({ name: 'a' })
+  })
+})

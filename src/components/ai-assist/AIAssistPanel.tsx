@@ -12,7 +12,7 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU Affero General Public License for more details.
 
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import {
   Sparkles,
   X,
@@ -36,6 +36,7 @@ import DOMPurify from 'dompurify'
 import { useChat } from '@ai-sdk/react'
 import { DefaultChatTransport, type UIMessage, type UIMessagePart, type UIDataTypes, type UITools } from 'ai'
 import { useTranslation } from 'react-i18next'
+import { useDepsChanged } from '../../hooks/useDepsChanged'
 import type { TFunction } from 'i18next'
 import { useUIStore } from '../../stores/uiStore'
 import { useModelStore } from '../../stores/modelStore'
@@ -74,6 +75,30 @@ function suggestions(t: TFunction, view: string): string[] {
   ]
 }
 
+/** One transport for the panel's lifetime; the body resolvable reads the
+ * CURRENT workspace + where-the-user-is context at send time, so nothing needs
+ * a remount to change. The thinking toggle and conversation id are panel state
+ * and travel as each request's own `body` (see `requestBody` in the panel);
+ * the SDK merges the two (`{ ...transportBody, ...options.body }`). */
+function createChatTransport() {
+  return new DefaultChatTransport({
+    api: `${AI_API_BASE}/api/ai/chat`,
+    credentials: 'include',
+    body: () => {
+      const ui = useUIStore.getState()
+      const view = ui.currentView
+      return {
+        ...currentWorkspaceRef(),
+        context: {
+          view,
+          diagramId: view === 'diagram' ? useModelStore.getState().currentDiagramId ?? undefined : undefined,
+          decisionRecordId: view === 'decision-records' ? ui.selectedADRId ?? undefined : undefined,
+        },
+      }
+    },
+  })
+}
+
 function newConversationId(): string {
   try {
     return crypto.randomUUID()
@@ -92,8 +117,6 @@ export function AIAssistPanel() {
   const currentView = useUIStore((s) => s.currentView)
   const [draft, setDraft] = useState('')
   const [thinking, setThinking] = useState(false)
-  const thinkingRef = useRef(thinking)
-  thinkingRef.current = thinking
   const [aiStatus, setAiStatus] = useState<AiStatus | null>(null)
   const [statusError, setStatusError] = useState<string | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
@@ -106,41 +129,24 @@ export function AIAssistPanel() {
   // upserts the full message array under it when each response finishes, so
   // a refresh restores exactly where you left off.
   const [conversationId, setConversationId] = useState<string>(newConversationId)
-  const conversationIdRef = useRef(conversationId)
-  conversationIdRef.current = conversationId
   const [historyOpen, setHistoryOpen] = useState(false)
   const [historyItems, setHistoryItems] = useState<AiConversationMeta[] | null>(null)
   const restoredRef = useRef(false)
 
-  // One transport for the panel's lifetime; the body resolvable reads the
-  // CURRENT workspace + thinking toggle + conversation id + where-the-user-is
-  // context at send time, so nothing needs a remount to change.
-  const transport = useMemo(
-    () =>
-      new DefaultChatTransport({
-        api: `${AI_API_BASE}/api/ai/chat`,
-        credentials: 'include',
-        body: () => {
-          const ui = useUIStore.getState()
-          const view = ui.currentView
-          return {
-            ...currentWorkspaceRef(),
-            thinking: thinkingRef.current,
-            conversationId: conversationIdRef.current,
-            context: {
-              view,
-              diagramId: view === 'diagram' ? useModelStore.getState().currentDiagramId ?? undefined : undefined,
-              decisionRecordId: view === 'decision-records' ? ui.selectedADRId ?? undefined : undefined,
-            },
-          }
-        },
-      }),
-    []
-  )
+  const transport = useMemo(() => createChatTransport(), [])
   const { messages, sendMessage, regenerate, status, error, stop, setMessages, clearError } = useChat({ transport })
   const busy = status === 'submitted' || status === 'streaming'
+  // Per-request part of the chat body, read at send time from this render's
+  // state — the values a send handler sees are the committed ones.
+  const requestBody = () => ({ thinking, conversationId })
   const messageCountRef = useRef(0)
-  messageCountRef.current = messages.length
+
+  // Mirror the message count into the ref the restore effect reads from a
+  // promise callback, i.e. after this commit; a layout effect (no deps: every
+  // commit) gives it exactly what the former render-time assignment did.
+  useLayoutEffect(() => {
+    messageCountRef.current = messages.length
+  })
 
   // "Thinking…" must stay visible until the model actually produces something
   // the user can SEE. `status === 'submitted'` alone is useless here: the
@@ -159,11 +165,11 @@ export function AIAssistPanel() {
     )
   const waitingForModel = busy && !assistantHasVisibleOutput
   const [waitSeconds, setWaitSeconds] = useState(0)
+  // The counter restarts from 0 whenever the wait ends — reset during render.
+  const waitingChanged = useDepsChanged([waitingForModel])
+  if (waitingChanged && !waitingForModel) setWaitSeconds(0)
   useEffect(() => {
-    if (!waitingForModel) {
-      setWaitSeconds(0)
-      return
-    }
+    if (!waitingForModel) return
     const t = setInterval(() => setWaitSeconds((s) => s + 1), 1000)
     return () => clearInterval(t)
   }, [waitingForModel])
@@ -229,10 +235,12 @@ export function AIAssistPanel() {
   }, [open, setOpen])
 
   // Gate state (configured? read-only?) refreshed each time the panel opens.
+  // The stale error is cleared during render; the effect only fetches.
+  const openChanged = useDepsChanged([open])
+  if (openChanged && open) setStatusError(null)
   useEffect(() => {
     if (!open) return
     let cancelled = false
-    setStatusError(null)
     const ref = currentWorkspaceRef()
     getAiStatus(ref.landscapeId, ref.versionId)
       .then((s) => {
@@ -290,7 +298,7 @@ export function AIAssistPanel() {
     if (!text || busy || !aiStatus?.configured) return
     // Sending is an explicit "I want to see the answer" — re-pin to the bottom.
     stickToBottomRef.current = true
-    void sendMessage({ text })
+    void sendMessage({ text }, { body: requestBody() })
     setDraft('')
   }
 
@@ -493,7 +501,7 @@ export function AIAssistPanel() {
                 {suggestions(t, currentView).map((s) => (
                   <button
                     key={s}
-                    onClick={() => void sendMessage({ text: s })}
+                    onClick={() => void sendMessage({ text: s }, { body: requestBody() })}
                     className="text-left rounded-lg border border-line bg-surface-50 px-3 py-2 text-[12px] text-fg-strong hover:bg-surface-hover transition-colors"
                   >
                     {s}
@@ -525,7 +533,7 @@ export function AIAssistPanel() {
                 onClick={() => {
                   clearError()
                   stickToBottomRef.current = true
-                  void regenerate()
+                  void regenerate({ body: requestBody() })
                 }}
                 className="mb-2 inline-flex items-center gap-1.5 rounded-lg border border-line px-2.5 py-1 text-[11.5px] font-medium text-fg-secondary transition-colors hover:text-fg hover:bg-surface-100"
                 data-testid="ai-assist-retry"

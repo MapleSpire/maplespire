@@ -13,6 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import { useEffect, useState } from 'react'
+import { useDepsChanged } from '../../hooks/useDepsChanged'
 import { useTranslation } from 'react-i18next'
 import * as api from '../../lib/platform/api'
 import { timeAgo } from '../../lib/orgAdmin/timeAgo'
@@ -38,9 +39,20 @@ export function PlatformAudit() {
     return () => clearTimeout(timer)
   }, [orgIdFilter, actionFilter])
 
+  // New filters reset to loading during render; the effect below only fetches.
+  const filtersChanged = useDepsChanged([debounced])
+  if (filtersChanged) {
+    setStatus('loading')
+    setError(null)
+  }
+
   const load = () => {
     setStatus('loading')
     setError(null)
+    fetchAudit()
+  }
+
+  const fetchAudit = () => {
     api
       .getAudit({ orgId: debounced.orgId || undefined, action: debounced.action || undefined })
       .then((page) => {
@@ -57,8 +69,8 @@ export function PlatformAudit() {
   }
 
   useEffect(() => {
-    load()
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- load is stable enough for this list of deps
+    fetchAudit()
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- fetchAudit is stable enough for this list of deps
   }, [debounced])
 
   const loadMore = () => {

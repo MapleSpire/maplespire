@@ -13,6 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useDepsChanged } from '../../hooks/useDepsChanged'
 import { Activity, Box, ExternalLink, FolderTree, GitMerge, History, Layers3 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import {
@@ -61,10 +62,16 @@ export function TagGovernanceDetails({ orgId, tag, onClose }: TagGovernanceDetai
     return () => controller.abort()
   }, [orgId, tag.id])
 
-  const load = useCallback((signal?: AbortSignal) => {
+  // Resetting for a new tab/filter/tag happens during render, on the same deps
+  // that rebuild `fetchPage` (and so re-run its effect); "Retry" resets in `load`.
+  const pageInputsChanged = useDepsChanged([assignmentFilter, auditAction, orgId, t, tab, tag.id])
+  if (pageInputsChanged) {
     setLoading(true)
     setError(null)
     setNextCursor(null)
+  }
+
+  const fetchPage = useCallback((signal?: AbortSignal) => {
     const request = tab === 'assignments'
       ? listCatalogTagAssignments(orgId, tag.id, { kind: assignmentFilter, limit: 50 }, signal)
       : listCatalogTagAudit(orgId, tag.id, { action: auditAction || undefined, limit: 50 }, signal)
@@ -82,11 +89,18 @@ export function TagGovernanceDetails({ orgId, tag, onClose }: TagGovernanceDetai
       })
   }, [assignmentFilter, auditAction, orgId, t, tab, tag.id])
 
+  const load = () => {
+    setLoading(true)
+    setError(null)
+    setNextCursor(null)
+    fetchPage()
+  }
+
   useEffect(() => {
     const controller = new AbortController()
-    load(controller.signal)
+    fetchPage(controller.signal)
     return () => controller.abort()
-  }, [load])
+  }, [fetchPage])
 
   const loadMore = useCallback(() => {
     if (!nextCursor || loading || loadingMore) return

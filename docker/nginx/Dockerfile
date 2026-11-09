@@ -2,7 +2,7 @@ FROM node:22-alpine AS web-build
 
 WORKDIR /app
 COPY package.json package-lock.json ./
-COPY server/patch-automerge-peer-sync-state.mjs server/patch-automerge-change-observers.mjs server/patch-automerge-document-saves.mjs server/patch-automerge-cooperative-events.mjs server/patch-automerge-inflight-fanout.mjs server/patch-automerge-sync-state-lifetime.mjs ./server/
+COPY server/patch-automerge-peer-sync-state.mjs server/patch-automerge-change-observers.mjs server/patch-automerge-document-saves.mjs server/patch-automerge-cooperative-events.mjs server/patch-automerge-inflight-fanout.mjs server/patch-automerge-sync-state-lifetime.mjs server/patch-automerge-compaction-latch.mjs ./server/
 RUN npm ci
 
 COPY index.html vite.config.ts tsconfig.json tsconfig.app.json tsconfig.node.json tsconfig.image.json ./

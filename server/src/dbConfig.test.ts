@@ -17,7 +17,36 @@ import {
   databasePoolConfig,
   lifecycleApplyDatabasePoolConfig,
   readModelDatabasePoolConfig,
+  STORAGE_WRITE_APPLICATION_PREFIX,
+  storageWriteApplicationName,
+  storageWritePoolConfig,
 } from './dbConfig.js'
+
+describe('storageWritePoolConfig (G4-16d: the tagged, bounded storage write pool)', () => {
+  const BOOT = '0f8e5b8a-3c1d-4e2b-9a7f-1b2c3d4e5f60'
+  it('defaults: max 4, statement 120 s, lock 10 s, idle in transaction 30 s, the name it is given', () => {
+    expect(storageWritePoolConfig('ms-storage:c:b', { DATABASE_URL: 'postgres://x/db' })).toMatchObject({
+      connectionString: 'postgres://x/db', max: 4, application_name: 'ms-storage:c:b',
+      statement_timeout: 120_000, lock_timeout: 10_000, idle_in_transaction_session_timeout: 30_000,
+    })
+  })
+  it('each ceiling is a knob; 0 is PostgreSQL\'s "no limit"; garbage falls back to the default', () => {
+    expect(storageWritePoolConfig('n', {
+      AM_STORAGE_WRITE_STATEMENT_TIMEOUT_MS: '5000', AM_STORAGE_WRITE_LOCK_TIMEOUT_MS: '0',
+      AM_STORAGE_WRITE_IDLE_IN_TRANSACTION_TIMEOUT_MS: '-3', AM_STORAGE_WRITE_DB_POOL_MAX: '6',
+    })).toMatchObject({ statement_timeout: 5_000, lock_timeout: 0, idle_in_transaction_session_timeout: 30_000, max: 6 })
+    expect(storageWritePoolConfig('n', { AM_STORAGE_WRITE_STATEMENT_TIMEOUT_MS: '1.5' }).statement_timeout).toBe(120_000)
+    expect(storageWritePoolConfig('n', { AM_STORAGE_WRITE_STATEMENT_TIMEOUT_MS: '' }).statement_timeout).toBe(120_000)
+  })
+  it('the application name keeps the prefix and the WHOLE boot id within 63 bytes, the cell cut to fit', () => {
+    const name = storageWriteApplicationName(BOOT, { SYNC_CELL_ID: 'Cell A/very-long-cell-identifier-for-the-operator' })
+    expect(name.startsWith(STORAGE_WRITE_APPLICATION_PREFIX)).toBe(true)
+    expect(name.endsWith(`:${BOOT}`)).toBe(true)
+    expect(Buffer.byteLength(name)).toBeLessThanOrEqual(63)
+    expect(name).toBe(`ms-storage:cell-a-very-lon:${BOOT}`)
+    expect(storageWriteApplicationName(BOOT, {})).toBe(`ms-storage:cell:${BOOT}`)
+  })
+})
 
 describe('databasePoolConfig', () => {
   it('preserves DATABASE_URL compatibility for local and existing deployments', () => {

@@ -17,6 +17,12 @@ import type { KvStore } from '../modelQuery/kvStore'
 import { adoptTabJournalNamespace } from './tabJournalAdoption'
 import { stripUndefined } from './docSafe'
 import { startClientTimelineMeasure } from '../observability/clientTimeline'
+import {
+  DIAGRAM_JOURNAL_KINDS,
+  SMALL_JOURNAL_KINDS,
+  type DiagramJournalKind,
+  type SmallJournalKind,
+} from './entityFamilies'
 
 /**
  * Crash-recovery journal for ENTITY edits under boot-from-server — the mirror of
@@ -63,7 +69,7 @@ import { startClientTimelineMeasure } from '../observability/clientTimeline'
  * the same key `writeSmallCollections` uses for the ModelMeta map), not by
  * the local `id` field.
  */
-export type SmallCollectionIntentKind = 'group' | 'domain' | 'tagSnapshot' | 'decisionRecord'
+export type SmallCollectionIntentKind = SmallJournalKind
 
 /**
  * The two DIAGRAM-COLLECTION families — id-keyed maps on each
@@ -76,7 +82,7 @@ export type SmallCollectionIntentKind = 'group' | 'domain' | 'tagSnapshot' | 'de
  * attached — intents for other diagrams stay journaled (badge-counted) until
  * their diagram is activated.
  */
-export type DiagramCollectionIntentKind = 'comment' | 'flow'
+export type DiagramCollectionIntentKind = DiagramJournalKind
 
 /**
  * The diagram STUB family — the registry-facing identity of a diagram
@@ -94,11 +100,12 @@ export type EntityIntentKind =
   | DiagramCollectionIntentKind
   | 'diagram'
 
-export const SMALL_COLLECTION_INTENT_KINDS: readonly SmallCollectionIntentKind[] =
-  ['group', 'domain', 'tagSnapshot', 'decisionRecord']
+/** Derived from the entity-family registry (`journal: 'small'`), in its
+ * declaration order: group, domain, tagSnapshot, decisionRecord. */
+export const SMALL_COLLECTION_INTENT_KINDS: readonly SmallCollectionIntentKind[] = SMALL_JOURNAL_KINDS
 
-export const DIAGRAM_COLLECTION_INTENT_KINDS: readonly DiagramCollectionIntentKind[] =
-  ['comment', 'flow']
+/** Derived from the registry (`journal: 'diagram'`): comment, flow. */
+export const DIAGRAM_COLLECTION_INTENT_KINDS: readonly DiagramCollectionIntentKind[] = DIAGRAM_JOURNAL_KINDS
 
 /** CLOSED-world on purpose (the poison pill): with an open-world
  * `kind !== 'object' && kind !== 'connection'` test, an UNKNOWN kind — a

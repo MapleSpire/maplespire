@@ -13,6 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useDepsChanged } from '../../hooks/useDepsChanged'
 import { motion, AnimatePresence } from 'framer-motion'
 import { X, Coins, Sparkles, RotateCcw, Star, Users } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
@@ -60,15 +61,22 @@ export function ShopModal({ open, onClose }: ShopModalProps) {
   // gallery section below. Fetched when the Community tab is open.
   const [galleryThemes, setGalleryThemes] = useState<GalleryTheme[]>([])
   const [galleryStatus, setGalleryStatus] = useState<'loading' | 'ready' | 'unavailable'>('loading')
-  const loadGallery = useCallback(() => {
-    setGalleryStatus('loading')
+  const fetchGallery = useCallback(() => {
     fetchGalleryThemes()
       .then((themes) => { setGalleryThemes(themes); setGalleryStatus('ready') })
       .catch(() => setGalleryStatus('unavailable'))
   }, [])
+  const loadGallery = useCallback(() => {
+    setGalleryStatus('loading')
+    fetchGallery()
+  }, [fetchGallery])
+  // Opening the Community tab shows the loader again — reset during render,
+  // on the same deps and guard as the fetch effect.
+  const galleryInputsChanged = useDepsChanged([open, tab])
+  if (galleryInputsChanged && open && tab === 'community') setGalleryStatus('loading')
   useEffect(() => {
-    if (open && tab === 'community') loadGallery()
-  }, [open, tab, loadGallery])
+    if (open && tab === 'community') fetchGallery()
+  }, [open, tab, fetchGallery])
   const latestById = useMemo(() => {
     const m = new Map<string, GalleryTheme>()
     for (const theme of galleryThemes) m.set(theme.id, theme)

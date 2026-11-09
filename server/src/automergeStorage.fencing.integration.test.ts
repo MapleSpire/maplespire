@@ -192,6 +192,10 @@ describe.skipIf(!TEST_DATABASE_URL)('PostgresStorageAdapter transactional fencin
       db: db.pool,
       ownership: { fencingToken: () => '12' },
       fencedTransactionIdleTimeoutMs: 250,
+      // 25P03 is a ceiling: the adapter retries the save. Short, so the retry
+      // runs inside THIS test (and meets the new fence) rather than 1 s later
+      // in another one.
+      ceilingRetryDelaysMs: [50],
       afterFenceLocked: async () => {
         signalLocked()
         await new Promise((resolve) => setTimeout(resolve, 500))
@@ -207,6 +211,14 @@ describe.skipIf(!TEST_DATABASE_URL)('PostgresStorageAdapter transactional fencin
     expect(handoffElapsedMs).toBeLessThan(1_000)
     await expect(abandonedWrite).rejects.toMatchObject({ code: '25P03' })
     expect(await oldCell.load(key)).toBeUndefined()
+    // Its retry meets the new fence: refused, and the document is no longer
+    // held as this cell's unsaved write.
+    for (let i = 0; i < 100 && oldCell.hasUnsavedWrite(DOCUMENT_ID); i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    }
+    expect(oldCell.hasUnsavedWrite(DOCUMENT_ID)).toBe(false)
+    expect(await oldCell.load(key)).toBeUndefined()
+    oldCell.close()
   })
 
   it('fences a document-wide removeRange prefix', async () => {

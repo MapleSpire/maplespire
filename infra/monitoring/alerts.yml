@@ -732,6 +732,51 @@ groups:
             has no live projector.
           runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/read-model-projector-health.md
 
+      # A retired head owed the handover re-check (G4-16d) was given up after
+      # repeated failures: a previous owner's late write in it may never be
+      # carried. Per cell: a process-local counter.
+      - alert: ReadModelHandoverRecheckAbandoned
+        expr: >-
+          sum by (job, instance) (
+            increase(maplespire_read_model_handover_recheck_abandoned_total{job="maplespire-api"}[30m])
+          ) > 0
+        for: 1m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "A handover re-check gave up on a retired head"
+          description: >-
+            {{ $labels.instance }} stopped re-checking a retired head after its
+            re-check failed repeatedly. Read
+            read_model.ordinary_handover_recheck_abandoned for the document and
+            read_model.ordinary_fold_arrival_failed / ..._handover_recheck_failed
+            for why; a late write of the previous owner in it is not carried
+            until the head is written again.
+          runbook: docs/read-model-projector-health.md
+
+      # A handover re-check (G4-16d) ran after the barrier's maximum wait:
+      # an old owner's storage write was still open after five minutes,
+      # which the write pool's own ceilings should make impossible. Per cell,
+      # not max(): a process-local counter.
+      - alert: ReadModelHandoverBarrierTimeouts
+        expr: >-
+          sum by (job, instance) (
+            increase(maplespire_read_model_handover_recheck_barrier_timeouts_total{job="maplespire-api"}[30m])
+          ) > 0
+        for: 1m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "A handover re-check ran without its barrier clearing"
+          description: >-
+            {{ $labels.instance }} re-checked a workspace's retired heads while a
+            previous owner's storage write was still open past the maximum
+            wait; one follow-up re-check is scheduled. Look in pg_stat_activity
+            for ms-storage:* backends with an old xact_start (a commit stuck on
+            synchronous replication, a cell of an older version, a ceiling set
+            to 0), and at read_model.ordinary_handover_recheck_barrier_timeout.
+          runbook: docs/read-model-projector-health.md
+
       # `catching_up` is healthy in small doses — it is what a projector doing
       # its job looks like. Sustained, it means it cannot keep pace.
       - alert: ReadModelCatchingUpSustained
@@ -746,8 +791,79 @@ groups:
             continuously. Expected briefly after a large import; not otherwise.
           runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/read-model-projector-health.md
 
+      # G4-16e. With ordinary head rotation on and the chain fold off, every
+      # rotation appends a segment that nothing removes, and an attach costs
+      # ~24 ms per listed segment (mesures/G4-16e-rotation-rate.json). The
+      # gauge counts, per CELL, the rotating workspace/collection pairs whose
+      # overlay chain passed AM_ORDINARY_CHAIN_ALERT_LENGTH — not a fleet fact
+      # like the rules above, but `max()` for a reason of its own: a cell that
+      # lost a workspace keeps its last known chain, so after a takeover two
+      # cells report the same workspace and `sum()` would count it twice. The
+      # chain only grows with the fold off, so the window is short.
+      - alert: ReadModelOrdinaryChainUnbounded
+        expr: max(maplespire_read_model_ordinary_chain_alerts) > 0
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "A cell reports {{ $value }} ordinary overlay chain(s) past AM_ORDINARY_CHAIN_ALERT_LENGTH with the fold off (the largest per-cell count, not a fleet total)"
+          description: >-
+            A workspace rotates its ordinary write heads with the chain fold
+            off, and its overlay chain is past the alert threshold; every
+            later rotation makes its next attach and cold build slower. Read
+            the read_model.ordinary_chain_length_alert log line or the
+            ordinaryHeadRotation block of /api/automerge/stats for which, then
+            follow "Runbook: ReadModelOrdinaryChainUnbounded".
+          runbook: docs/read-model-projector-health.md
+
   - name: maplespire-automerge
     rules:
+      # Evictions refused because a document's last content save failed and
+      # its delta is still only in memory (G4-16d). A few are a save that is
+      # being retried or flushed; a sustained stream is a cell that cannot make
+      # its documents durable, and keeps them resident meanwhile.
+      - alert: AutomergeUnsavedEvictionsSustained
+        expr: >-
+          sum by (job, instance) (
+            increase(maplespire_automerge_evictions_total{job="maplespire-api", outcome="skipped_unsaved_write"}[30m])
+          ) > 10
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Evictions keep being refused for documents with unsaved writes"
+          description: >-
+            {{ $labels.instance }} refused more than 10 evictions in 30 minutes
+            for documents whose last content save failed. Each refusal asks for
+            a flush; look at automerge.storage_write_ceiling,
+            automerge.unsaved_document_flush_failed and the storage pool.
+          runbook: docs/read-model-projector-health.md
+
+      # A storage write stopped by a ceiling of the storage write pool
+      # (statement_timeout 57014, lock_timeout 55P03, idle in transaction
+      # 25P03 — storageWritePoolConfig, server/src/dbConfig.ts). The adapter
+      # retries a failed content save a bounded number of times and refuses to
+      # evict the document meanwhile, so one hit is not data loss; a cell that
+      # keeps hitting them is saving slowly or not at all.
+      - alert: AutomergeStorageWriteCeiling
+        expr: >-
+          sum by (job, instance) (
+            increase(maplespire_automerge_storage_write_ceiling_total{job="maplespire-api"}[15m])
+          ) > 0
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Automerge storage writes are hitting the storage write pool's ceilings"
+          description: >-
+            Saves on {{ $labels.instance }} were cancelled by statement_timeout,
+            lock_timeout or idle_in_transaction_session_timeout in the last 15
+            minutes. Read the automerge.storage_write_ceiling log lines for the
+            documents and codes, and automerge.storage_write_ceiling_retry_exhausted
+            for any that never became durable. See the storage write pool in
+            docs/read-model-projector-health.md.
+          runbook: docs/read-model-projector-health.md
+
       # Should be flat at zero forever. Any increase means a document was
       # evicted while something was still listening to it.
       - alert: AutomergeOrphanedListenerEviction

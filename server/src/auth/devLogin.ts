@@ -14,7 +14,7 @@
 
 import type { Express, Request, Response } from 'express'
 import { pool } from '../db.js'
-import { findOrCreateUser, bootstrapPlatformAdmin } from './users.js'
+import { findOrCreateUser, bootstrapPlatformAdmin, redeemPlatformAdminBootstrapToken } from './users.js'
 import {
   verifySession,
   setSessionCookie,
@@ -80,9 +80,15 @@ export function registerAuthRoutes(app: Express): void {
         res.status(403).json({ error: 'org_suspended' })
         return
       }
+      // Unreachable for a `dev` identity (the Entra allowlist does not apply
+      // to it) — answered anyway, so the kind is never silently org-less.
+      if (resolution.kind === 'tenant_not_allowed') {
+        res.status(403).json({ error: 'tenant_not_allowed' })
+        return
+      }
       const orgId = resolution.kind === 'org' ? resolution.orgId : null
 
-      await bootstrapPlatformAdmin(pool, user.id, user.email)
+      await bootstrapPlatformAdmin(pool, { id: user.id, issuer: 'dev', subject })
 
       // Re-read: bootstrap or the membership insert above may have changed
       // is_platform_admin / role since `user` was fetched.
@@ -113,6 +119,45 @@ export function registerAuthRoutes(app: Express): void {
     res.json({ success: true })
   })
 
+  // Out-of-band platform-admin bootstrap (users.ts
+  // redeemPlatformAdminBootstrapToken): a signed-in user presents the
+  // operator's PLATFORM_ADMIN_BOOTSTRAP_TOKEN. Grants once, and only while no
+  // platform admin exists; the session is re-minted so the flag is live.
+  app.post('/api/auth/bootstrap-platform-admin', async (req: Request, res: Response) => {
+    const auth = req.auth
+    if (!auth) {
+      res.status(401).json({ error: 'Authentication required' })
+      return
+    }
+    if (auth.imp) {
+      res.status(403).json({ error: 'forbidden_while_impersonating' })
+      return
+    }
+    // A browser session only — never an AI bearer token acting for the user.
+    if (req.aiIdentity) {
+      res.status(403).json({ error: 'session_required' })
+      return
+    }
+    try {
+      const outcome = await redeemPlatformAdminBootstrapToken(pool, auth.userId, req.body?.token)
+      if (outcome !== 'granted') {
+        const status = outcome === 'not_configured' ? 404 : outcome === 'invalid_token' ? 403 : 409
+        res.status(status).json({ error: outcome })
+        return
+      }
+      setSessionCookie(res, await signCurrentSession(pool, { userId: auth.userId, orgId: auth.orgId, isPlatformAdmin: true }))
+      res.json({ isPlatformAdmin: true })
+    } catch (err) {
+      const refused = mintRefusalBody(err)
+      if (refused) {
+        res.status(403).json(refused)
+        return
+      }
+      console.error('POST /api/auth/bootstrap-platform-admin error:', err)
+      res.status(500).json({ error: 'Failed to bootstrap platform admin' })
+    }
+  })
+
   app.get('/api/auth/me', async (req: Request, res: Response) => {
     const token = readSessionCookie(req)
     if (!token) {
@@ -139,8 +184,8 @@ export function registerAuthRoutes(app: Express): void {
         res.status(401).json({ error: 'Session permissions changed; sign in again', code: 'session_stale' })
         return
       }
-      const { rows }= await pool.query(
-        'SELECT id, email, name, given_name, family_name, locale, is_platform_admin, status FROM users WHERE id = $1',
+      const { rows } = await pool.query(
+        'SELECT id, email, name, given_name, family_name, locale, is_platform_admin, status, issuer, subject FROM users WHERE id = $1',
         [claims.userId]
       )
       if (rows.length === 0) {
@@ -159,6 +204,9 @@ export function registerAuthRoutes(app: Express): void {
           locale: row.locale,
           isPlatformAdmin: row.is_platform_admin,
           status: row.status,
+          // The user's own identity key — what an operator copies into
+          // PLATFORM_ADMIN_BOOTSTRAP_ISSUER/SUBJECT (docs/auth-setup.md).
+          identity: { issuer: row.issuer, subject: row.subject },
         },
       })
     } catch (err) {

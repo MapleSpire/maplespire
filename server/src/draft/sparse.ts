@@ -24,6 +24,7 @@ import { purgeServerCreationPlacement } from '../rbac/serverCreationPlacement.js
 import { openBootstrapScope, type BootstrapScope } from '../bootstrapScope.js'
 import { pool } from '../db.js'
 import { buildModelMeta } from '../modelMeta.js'
+import { emptyMonolithModel } from '../modelCollections.js'
 import { copyRootShape } from '../rootShape.js'
 import type { WorkspaceKey } from '../readModel/projector.js'
 import { registerStaticReadModelDocuments } from '../readModel/staticWorkspace.js'
@@ -142,9 +143,7 @@ export async function createSparseDraftRoot(
   if (!parentMeta?.staticBaseline) throw new Error('sparse draft requires a static baseline')
 
   const create = <T extends object>(value: T) => scope.create(repo, value)
-  const monolith = create({
-    objects: {}, connections: {}, groups: {}, domains: {}, tagSnapshots: {}, decisionRecords: {},
-  })
+  const monolith = create(emptyMonolithModel())
   const objectOverlay = create({ objects: {}, writeHeadVersion: 1, writeBatchIds: [] })
   const connectionOverlay = create({ connections: {}, writeHeadVersion: 1, writeBatchIds: [] })
   await Promise.all([monolith, objectOverlay, connectionOverlay].map((handle) => handle.whenReady()))
@@ -445,10 +444,7 @@ export async function ensureSparseDraftDiagram(
 }
 
 function emptyModel(): FullModel {
-  return {
-    objects: {}, connections: {}, groups: {}, domains: {}, tagSnapshots: {}, decisionRecords: {},
-    diagrams: {}, missing: [],
-  }
+  return { ...emptyMonolithModel(), diagrams: {}, missing: [] }
 }
 
 function splitDiagram(doc: Json): DiagramDetail {

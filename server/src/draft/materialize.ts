@@ -16,6 +16,7 @@ import { getHistory, view } from '@automerge/automerge'
 import { isValidAutomergeUrl } from '@automerge/automerge-repo'
 import type { SealedRepo } from '../rbac/sealedRepo.js'
 import { findReadyDocument } from '../automergeRepoCompat.js'
+import { emptyMonolithModel } from '../modelCollections.js'
 
 /**
  * Materialize a whole workspace root into a normalized, id-keyed snapshot for the
@@ -203,10 +204,7 @@ export async function materializeFullModel(
   atHeads?: HeadsMap
 ): Promise<FullModel> {
   const missing: MissingDoc[] = []
-  const empty = (): FullModel => ({
-    objects: {}, connections: {}, groups: {}, domains: {}, tagSnapshots: {}, decisionRecords: {},
-    diagrams: {}, missing,
-  })
+  const empty = (): FullModel => ({ ...emptyMonolithModel(), diagrams: {}, missing })
 
   const root = await materializeDoc<RootLike & object>(repo, rootUrl, atHeads, missing, 'root', true)
   if (!root) throw new Error(`materializeFullModel: root unavailable (${rootUrl})`)

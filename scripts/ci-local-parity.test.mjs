@@ -109,4 +109,26 @@ describe('ci:local reproduces the runner environment', () => {
     assert.deepEqual(missing, [],
       'these npm scripts run in ci-local and in NO workflow step, so ci-local can go red for something CI never runs')
   })
+
+  it('runs the LOCAL-ONLY compat harness only behind --compat', () => {
+    // The one deliberate exception to the rule above: `ci.yml` runs no
+    // browser suite, so the N-1 <-> N harness (V0-09) is not in any workflow.
+    // That is only honest while it never runs by default. Every invocation of
+    // it must sit inside the `if (args.compat)` block, and nowhere else.
+    const calls = [...ciLocal.matchAll(/scripts\/compat-n-1\.mjs/g)]
+    assert.ok(calls.length >= 1, 'ci-local.mjs no longer invokes scripts/compat-n-1.mjs — --compat runs nothing')
+    // The block runs from its `if` to the first line that closes it at the
+    // same two-space indentation.
+    const guarded = /\n  if \(args\.compat\) \{\n[\s\S]*?\n  \}\n/.exec(ciLocal)?.[0]
+    assert.ok(guarded, 'no `if (args.compat) { … }` block in ci-local.mjs')
+    assert.match(guarded, /runStreamed\('node', \['scripts\/compat-n-1\.mjs'\]/,
+      'the compat leg is not inside `if (args.compat) { … }`')
+    const outside = ciLocal.replace(guarded, '').split(/\r?\n/)
+      .filter((line) => /compat-n-1\.mjs/.test(line) && !/^\s*(\/\/|\*)/.test(line))
+    assert.deepEqual(outside, [], 'scripts/compat-n-1.mjs is invoked outside the --compat guard')
+    // And the workflow really does not run it — if it ever does, this
+    // exception (and the "not in ci.yml" wording) must go.
+    assert.ok(!runLines(workflow).some((line) => /compat-n-1|e2e:compat/.test(line)),
+      'ci.yml now runs the compat harness: drop the local-only exception')
+  })
 })

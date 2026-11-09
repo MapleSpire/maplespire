@@ -178,6 +178,9 @@ describe('workspace fsck — the document-graph invariants', () => {
       .toEqual(Object.keys(FSCK_CHECKS).sort())
     expect(result.checksSkipped).toEqual([
       { check: 'overlay-head-bounded', reason: 'ordinary workspace: overlay rotation is a static-plane mechanism' },
+      // ORDINARY head rotation is off unless `AM_ORDINARY_HEAD_ROTATION=on`
+      // names the workspace; the fixture next door turns it on.
+      { check: 'ordinary-head-actors-bounded', reason: 'ordinary workspace: AM_ORDINARY_HEAD_ROTATION is not on for it' },
     ])
     // …and a does-not-apply skip must leave the run CLEAN. Without the
     // `ordinary workspace` prefix in `fsckStatusOf`, every ordinary workspace
@@ -195,10 +198,67 @@ describe('workspace fsck — the document-graph invariants', () => {
     // The ONE check that does not apply here, and the mirror of the ordinary
     // fixture's `overlay-head-bounded`: `model-containers-present` reads what
     // the ORDINARY projector refuses, and this plane reads those maps `?? {}`.
-    expect(result.checksSkipped.map((entry) => entry.check)).toEqual(['model-containers-present'])
-    expect(result.checksSkipped[0]!.reason).toMatch(/^static workspace/)
-    expect([...result.checksRun, 'model-containers-present'].sort()).toEqual(Object.keys(FSCK_CHECKS).sort())
+    // `ordinary-head-actors-bounded` too: the static plane's heads are bounded
+    // by `overlay-head-bounded`, which RUNS here.
+    expect(result.checksSkipped.map((entry) => entry.check)).toEqual(['model-containers-present', 'ordinary-head-actors-bounded'])
+    for (const skipped of result.checksSkipped) expect(skipped.reason).toMatch(/^static workspace/)
+    expect([...result.checksRun, 'model-containers-present', 'ordinary-head-actors-bounded'].sort())
+      .toEqual(Object.keys(FSCK_CHECKS).sort())
     expect(fsckStatusOf(result.findings, result.checksSkipped)).toBe('clean')
+  })
+
+  describe('ordinary-head-actors-bounded — what ordinary head rotation promises', () => {
+    const ON = { rotates: true, maxActors: 128, maxChanges: 512 }
+    const withStats = (object: { numActors: number | null; numChanges: number | null }) => [
+      { field: 'editsObjectShardUrl', url: OBJ_HEAD, entities: 3, batches: 1, quietForMs: 10, bytes: 900, ...object },
+      { field: 'editsConnectionShardUrl', url: CONN_HEAD, entities: 2, batches: 1, quietForMs: 10, bytes: 700, numActors: 2, numChanges: 3 },
+    ] as OverlayWriteHeadSize[]
+
+    it('RUNS on an ordinary workspace with rotation on, every other check still accounted for, and the run is clean', () => {
+      const result = checkWorkspaceStructure(healthyInput({
+        ordinaryHeadRotation: ON, overlayWriteHeads: withStats({ numActors: 40, numChanges: 100 }),
+      }))
+      expect(result.findings).toEqual([])
+      expect(result.checksRun).toContain('ordinary-head-actors-bounded')
+      // `overlay-head-bounded` still does not apply, and says why in terms of
+      // what this rotator bounds.
+      expect(result.checksSkipped).toEqual([{
+        check: 'overlay-head-bounded',
+        reason: 'ordinary workspace: its rotation bounds actors and changes, not entities (ordinary-head-actors-bounded)',
+      }])
+      expect([...result.checksRun, ...result.checksSkipped.map((entry) => entry.check)].sort())
+        .toEqual(Object.keys(FSCK_CHECKS).sort())
+      expect(fsckStatusOf(result.findings, result.checksSkipped)).toBe('clean')
+    })
+
+    it('reports a head at twice a threshold, not one below it — actors and changes alike', () => {
+      const findingsFor = (numActors: number, numChanges: number) => checkWorkspaceStructure(healthyInput({
+        ordinaryHeadRotation: ON, overlayWriteHeads: withStats({ numActors, numChanges }),
+      })).findings.filter((finding) => finding.check === 'ordinary-head-actors-bounded')
+      expect(findingsFor(255, 1023)).toEqual([])
+      const actors = findingsFor(256, 10)
+      expect(actors.map((finding) => [finding.severity, finding.documentUrl])).toEqual([['degraded', OBJ_HEAD]])
+      expect(actors[0]!.detail).toContain('256 actors (rotation at 128)')
+      const changes = findingsFor(3, 1024)
+      expect(changes).toHaveLength(1)
+      expect(changes[0]!.detail).toContain('1024 changes (rotation at 512)')
+    })
+
+    it('an unmeasurable head is a finding, never a pass', () => {
+      const result = checkWorkspaceStructure(healthyInput({
+        ordinaryHeadRotation: ON, overlayWriteHeads: withStats({ numActors: null, numChanges: null }),
+      }))
+      expect(result.findings.map((finding) => finding.check)).toEqual(['ordinary-head-actors-bounded'])
+      expect(result.findings[0]!.detail).toContain('UNVERIFIED')
+    })
+
+    it('with rotation off the same over-full head is not this check\'s business', () => {
+      const result = checkWorkspaceStructure(healthyInput({
+        ordinaryHeadRotation: { ...ON, rotates: false }, overlayWriteHeads: withStats({ numActors: 5_000, numChanges: 9_000 }),
+      }))
+      expect(result.findings).toEqual([])
+      expect(fsckStatusOf(result.findings, result.checksSkipped)).toBe('clean')
+    })
   })
 
   describe('diagram-doc-url — a registry meta that names no document', () => {
@@ -289,7 +349,7 @@ describe('workspace fsck — the document-graph invariants', () => {
       // reads the chain's length, `overlay-head-bounded` the two current heads,
       // and this one the size of every listed segment. All three carry the
       // "monolith workspace" prefix, so the run stays COMPLETE.
-      'overlay-head-bounded', 'overlay-segment-bounded', 'claim-coverage',
+      'overlay-head-bounded', 'ordinary-head-actors-bounded', 'overlay-segment-bounded', 'claim-coverage',
       'diagram-tombstone-honoured', 'registry-head-projected',
     ])
     // Every skip is a does-not-apply prefix ("monolith workspace" /

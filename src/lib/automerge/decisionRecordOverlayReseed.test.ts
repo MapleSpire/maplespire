@@ -17,6 +17,7 @@ import { describe, expect, it } from 'vitest'
 import { changedDecisionRecords, usesDecisionRecordDelta } from './decisionRecordDelta'
 import { overlayRecordsToReseed, type ReseedMeta } from './decisionRecordOverlayReseed'
 import { reconcile } from './reconcile'
+import { COLLECTION_SCHEMAS, DECISION_RECORD_SCHEMA } from './knownKeys'
 import type { DecisionRecord } from '../../types'
 
 /**
@@ -67,7 +68,7 @@ function flushSmallCollections(
   baseline: Map<string, DecisionRecord>,
 ): void {
   if (!usesDecisionRecordDelta(meta)) {
-    reconcile(meta.decisionRecords, Object.fromEntries(storeRecords.map((r) => [r.id, r])))
+    reconcile(meta.decisionRecords, Object.fromEntries(storeRecords.map((r) => [r.id, r])), COLLECTION_SCHEMAS.decisionRecords)
     return
   }
   const overlayIds = new Set(Object.keys(meta.decisionRecords ?? {}))
@@ -78,7 +79,7 @@ function flushSmallCollections(
   }
   for (const r of changedDecisionRecords(storeRecords, baseline, overlayIds)) {
     deletedIds.delete(r.id)
-    if (meta.decisionRecords[r.id]) reconcile(meta.decisionRecords[r.id], r)
+    if (meta.decisionRecords[r.id]) reconcile(meta.decisionRecords[r.id], r, DECISION_RECORD_SCHEMA)
     else meta.decisionRecords[r.id] = r
   }
   meta.deletedDecisionRecordIds = [...deletedIds]

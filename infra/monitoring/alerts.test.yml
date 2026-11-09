@@ -643,6 +643,45 @@ tests:
         alertname: RedisMemoryNearLimit
         exp_alerts: []
 
+  # G4-16e. One cell with a chain past the threshold is enough (`max()`), a
+  # second cell at 0 does not dilute it, and it waits its 10 minutes.
+  - interval: 1m
+    name: an ordinary overlay chain past its alert length tickets after ten minutes
+    input_series:
+      - series: 'maplespire_read_model_ordinary_chain_alerts{job="maplespire-api", instance="api-a:3001"}'
+        values: '0+0x40'
+      - series: 'maplespire_read_model_ordinary_chain_alerts{job="maplespire-api", instance="api-b:3001"}'
+        values: '0 0 0 0 0 1+0x35'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: ReadModelOrdinaryChainUnbounded
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: ReadModelOrdinaryChainUnbounded
+        exp_alerts: []
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="ReadModelOrdinaryChainUnbounded", alertstate="firing"}'
+        eval_time: 16m
+        exp_samples:
+          - labels: 'ALERTS{alertname="ReadModelOrdinaryChainUnbounded", alertstate="firing", severity="ticket"}'
+            value: 1
+
+  # ...and every cell at 0, or a chain over for less than the window, stays silent.
+  - interval: 1m
+    name: no ordinary chain past its alert length, or one for five minutes only, is silent
+    input_series:
+      - series: 'maplespire_read_model_ordinary_chain_alerts{job="maplespire-api", instance="api-a:3001"}'
+        values: '0+0x40'
+      - series: 'maplespire_read_model_ordinary_chain_alerts{job="maplespire-api", instance="api-b:3001"}'
+        values: '0 0 1 1 1 1 1 0+0x33'
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: ReadModelOrdinaryChainUnbounded
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: ReadModelOrdinaryChainUnbounded
+        exp_alerts: []
+
   - interval: 1m
     name: a failed router scrape pages after two minutes
     input_series:
@@ -1537,3 +1576,95 @@ tests:
       - eval_time: 60m
         alertname: SyncCellSupersededGeneration
         exp_alerts: []
+
+  # G4-16d: a storage write stopped by a ceiling of the storage write pool
+  # fires per instance once it persists five minutes; a flat counter (an
+  # old hit, long retried) never does.
+  - interval: 1m
+    name: storage write ceilings fire per instance on a new hit and stay silent on a flat counter
+    input_series:
+      - series: 'maplespire_automerge_storage_write_ceiling_total{job="maplespire-api", instance="api-a:3001", code="57014"}'
+        values: '0+0x5 1+0x40'
+      - series: 'maplespire_automerge_storage_write_ceiling_total{job="maplespire-api", instance="api-a:3001", code="55P03"}'
+        values: '0+0x45'
+      - series: 'maplespire_automerge_storage_write_ceiling_total{job="maplespire-api", instance="api-b:3001", code="57014"}'
+        values: '3+0x45'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: AutomergeStorageWriteCeiling
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: AutomergeStorageWriteCeiling
+        exp_alerts: []
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="AutomergeStorageWriteCeiling", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples:
+          - labels: 'ALERTS{alertname="AutomergeStorageWriteCeiling", alertstate="firing", job="maplespire-api", instance="api-a:3001", severity="ticket"}'
+            value: 1
+
+  # G4-16d: a handover re-check that ran without its barrier clearing.
+  - interval: 1m
+    name: a handover barrier timeout fires for its instance only, and a flat counter stays silent
+    input_series:
+      - series: 'maplespire_read_model_handover_recheck_barrier_timeouts_total{job="maplespire-api", instance="api-a:3001"}'
+        values: '0+0x5 1+0x60'
+      - series: 'maplespire_read_model_handover_recheck_barrier_timeouts_total{job="maplespire-api", instance="api-b:3001"}'
+        values: '2+0x65'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: ReadModelHandoverBarrierTimeouts
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: ReadModelHandoverBarrierTimeouts
+        exp_alerts: []
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="ReadModelHandoverBarrierTimeouts", alertstate="firing"}'
+        eval_time: 8m
+        exp_samples:
+          - labels: 'ALERTS{alertname="ReadModelHandoverBarrierTimeouts", alertstate="firing", job="maplespire-api", instance="api-a:3001", severity="ticket"}'
+            value: 1
+
+  # G4-16d: a re-check given up fires for its instance; a flat counter does not.
+  - interval: 1m
+    name: an abandoned handover re-check fires for its instance only, and a flat counter stays silent
+    input_series:
+      - series: 'maplespire_read_model_handover_recheck_abandoned_total{job="maplespire-api", instance="api-a:3001"}'
+        values: '0+0x5 1+0x60'
+      - series: 'maplespire_read_model_handover_recheck_abandoned_total{job="maplespire-api", instance="api-b:3001"}'
+        values: '4+0x65'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: ReadModelHandoverRecheckAbandoned
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: ReadModelHandoverRecheckAbandoned
+        exp_alerts: []
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="ReadModelHandoverRecheckAbandoned", alertstate="firing"}'
+        eval_time: 8m
+        exp_samples:
+          - labels: 'ALERTS{alertname="ReadModelHandoverRecheckAbandoned", alertstate="firing", job="maplespire-api", instance="api-a:3001", severity="ticket"}'
+            value: 1
+
+  # G4-16d: a sustained stream of refused evictions (one a minute) fires; a
+  # handful does not, nor do the other outcomes.
+  - interval: 1m
+    name: unsaved-write eviction refusals fire only when sustained above ten per half hour
+    input_series:
+      - series: 'maplespire_automerge_evictions_total{job="maplespire-api", instance="api-a:3001", outcome="skipped_unsaved_write"}'
+        values: '0+1x60'
+      - series: 'maplespire_automerge_evictions_total{job="maplespire-api", instance="api-b:3001", outcome="skipped_unsaved_write"}'
+        values: '0+0x10 5+0x50'
+      - series: 'maplespire_automerge_evictions_total{job="maplespire-api", instance="api-c:3001", outcome="evicted"}'
+        values: '0+5x60'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: AutomergeUnsavedEvictionsSustained
+        exp_alerts: []
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="AutomergeUnsavedEvictionsSustained", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples:
+          - labels: 'ALERTS{alertname="AutomergeUnsavedEvictionsSustained", alertstate="firing", job="maplespire-api", instance="api-a:3001", severity="ticket"}'
+            value: 1

@@ -68,7 +68,9 @@ only governs HTTP-layer rejection.
 | `ORG_SEED` | `off` | `on` enables `POST /api/orgs/:orgId/seed` (org admin) — seeds a complete demo environment (demo landscape + versions + diagrams, teams with grants, 5 fake members) into the org. DEV/TEST ONLY. |
 | `DEMO_SEED` | `on` | On the very first boot of an empty database, the server writes the MapleSpire demo into the `default` workspace before publishing its root (it used to be the first browser that opened it). `off` creates that root empty. Read once at boot; a database whose root already exists is never seeded. The backup drill's cold server sets it `off`. |
 | `PERFORMANCE_SEED` | `off` | `on` permits the distinct offline `seed:performance` CLI. It can create hundreds of thousands of test records and must never be enabled in production. |
-| `PLATFORM_ADMIN_BOOTSTRAP_EMAIL` | — | First login with this email is auto-granted `is_platform_admin` (once, idempotent, audited as `system`). |
+| `PLATFORM_ADMIN_BOOTSTRAP_ISSUER` + `PLATFORM_ADMIN_BOOTSTRAP_SUBJECT` | — | The first sign-in of exactly this identity `(issuer, subject)` — as stored in `users`, and shown to a signed-in user by `GET /api/auth/me` → `user.identity` — is granted `is_platform_admin` while no platform admin exists (idempotent, audited as `system`). See "Platform-admin bootstrap" below. |
+| `PLATFORM_ADMIN_BOOTSTRAP_TOKEN` | — | One-time out-of-band bootstrap (≥ 32 chars, e.g. `openssl rand -base64 32`): a signed-in user `POST`s it to `/api/auth/bootstrap-platform-admin`. Grants while no platform admin exists, once per token value. |
+| `PLATFORM_ADMIN_BOOTSTRAP_EMAIL` | — | **Deprecated (V0-02).** Still honoured, but only as the SUBJECT of a `dev` (dev-login) or `local` (password, email confirmed) identity — never against any OIDC provider's email. |
 | `APP_URL` | `http://localhost:5173` | Public base URL of the SPA — used in emails (invite links) and OIDC redirects. |
 | `AUTH_COOKIE_SECURE` | `auto` | `on` forces the `Secure` cookie attribute; `auto` sets it when `APP_URL` is https. |
 | `SHARE_RATE_LIMIT_PER_MIN` | `120` | Per-token rate limit on the public `GET /api/shares/:token` resolution path. Over limit → `429` + `Retry-After`; the first crossing per window is audited (`share.rate_limited`). See "Share links" below. |
@@ -130,6 +132,66 @@ enabled provider id (e.g. `http://localhost:3002/api/auth/callback/google`,
 `openid-client` v6 auto-handles Entra ID's multi-tenant discovery quirk (the `/common`
 discovery document's `issuer` is a `{tenantid}`-templated string; the library substitutes
 the token's own `tid` claim before validating `iss`) — no workaround needed in this codebase.
+
+### Microsoft: allowed Entra tenants per org, and unverified emails (V0-02)
+
+The Azure registration stays multi-tenant, so the `microsoft` provider admits **any**
+Entra tenant and personal accounts at sign-in. What an account may then *reach* is per
+org (`server/src/auth/tenantPolicy.ts`):
+
+- Every Microsoft sign-in records the token's `tid` as `users.idp_tenant_id` (a Microsoft
+  token without a `tid` is refused).
+- An org admin lists allowed tenant IDs in **Org admin → Settings → Allowed Entra
+  tenants** (`GET/POST /api/orgs/:orgId/idp-tenants`, `DELETE
+  /api/orgs/:orgId/idp-tenants/:tenantId`, `PATCH /api/orgs/:orgId/idp-tenant-policy
+  {microsoftPersonalAccountsAllowed}`; org admin or platform admin, Zod-validated). Once
+  the list is non-empty, a Microsoft identity whose tenant is not listed cannot sign in
+  to that org, accept an invitation to it, switch to it, or be impersonated into it
+  (`tenant_not_allowed`); from a session pinned to another org its membership counts
+  as none (workspace access through `rbac_effective_access`, the org admin console,
+  invites, `org` share links), and an org-bound AI token (PAT/MCP) is refused on its
+  next call. An identity whose tenant is unknown (signed in before
+  V0-02) is refused until it signs in again. The personal-accounts tenant
+  `9188040d-6c67-4c5b-b112-36a304b66dad` is never a list entry: under a non-empty list it
+  is admitted only when the org's `microsoft_personal_accounts_allowed` is on (default
+  off).
+- An **empty list keeps the pre-V0-02 behaviour** (every tenant and personal accounts)
+  and the admin page shows a warning.
+- A change revokes the sessions of the members it newly excludes (their per-user epoch
+  is bumped in the same transaction), and a change that would exclude the acting org
+  admin is refused (`409 would_lock_out_self`; platform admins are exempt).
+- Google, password and dev-login identities are not affected by the list.
+
+**Email.** The Microsoft email is recorded as verified (`users.email_verified`) only when
+the id_token carries `email_verified: true` or `xms_edov: true`; `preferred_username` is
+never verified. An unverified Microsoft email never drives an authorization decision: an
+invitation is refused (`email_unverified`) and a `domain` share audience is not satisfied.
+To get `xms_edov`, add the `xms_edov` (and `email`) optional claims to the ID token in the
+app registration's **Token configuration**. The identity itself is always `(issuer,
+subject)`.
+
+### Platform-admin bootstrap
+
+The first platform admin is chosen by **identity, never by email**:
+
+1. **By `(issuer, subject)`** — set `PLATFORM_ADMIN_BOOTSTRAP_ISSUER` and
+   `PLATFORM_ADMIN_BOOTSTRAP_SUBJECT`. Sign in once, read `user.identity` from
+   `GET /api/auth/me`, copy both values, restart. Issuers as stored: `https://accounts.google.com/`,
+   `https://login.microsoftonline.com/common/v2.0` (public Microsoft),
+   `https://login.microsoftonline.com/<MS_TENANT>/v2.0` (SSO), `local`, `dev`.
+2. **By one-time token** — set `PLATFORM_ADMIN_BOOTSTRAP_TOKEN` (≥ 32 chars), sign in with
+   any account, then from the app's origin:
+   `fetch('/api/auth/bootstrap-platform-admin', {method: 'POST', credentials: 'include',
+   headers: {'Content-Type': 'application/json'}, body: JSON.stringify({token: '…'})})`.
+   The digest is recorded in `platform_admin_bootstrap_token_uses`, so the same value can
+   never be redeemed twice; remove the variable afterwards.
+
+Both are inert once any platform admin exists. **Backward compatibility:**
+`PLATFORM_ADMIN_BOOTSTRAP_EMAIL` keeps working for dev-login and password accounts, whose
+subject *is* the (lower-cased) address — so existing dev scripts and the password-auth
+demo stack are unchanged. It no longer bootstraps a Google or Microsoft account: on such
+a deployment, switch to one of the two mechanisms above before the first sign-in.
+Deployments that already have a platform admin are unaffected.
 
 ### Share links
 

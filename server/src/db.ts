@@ -17,9 +17,13 @@ import {
   databasePoolConfig,
   lifecycleApplyDatabasePoolConfig,
   readModelDatabasePoolConfig,
+  storageWriteApplicationName,
+  storageWritePoolConfig,
   syncCellDatabasePoolConfig,
 } from './dbConfig.js'
 import { guardIdleClientErrors } from './db/poolErrorGuard.js'
+import { currentProcessBootId } from './processIdentity.js'
+import { checkStorageWriteConnection } from './db/storageWriteTag.js'
 
 export const pool = guardIdleClientErrors(new Pool(databasePoolConfig()), 'primary')
 export const readModelPool = guardIdleClientErrors(new Pool(readModelDatabasePoolConfig()), 'read-model')
@@ -55,6 +59,26 @@ export const lifecycleApplyPool = guardIdleClientErrors(
   new Pool(lifecycleApplyDatabasePoolConfig()),
   'lifecycle-apply',
 )
+
+/** This process's storage-write `application_name` (`storageWriteApplicationName`). */
+export const storageWriteApplication = storageWriteApplicationName(currentProcessBootId())
+/**
+ * The sync server's storage WRITE pool: tagged with `storageWriteApplication`
+ * and bounded by its own statement, lock and idle-in-transaction ceilings, so
+ * a new workspace owner can wait for an old owner's in-flight saves, and only
+ * for them (G4-16d). The why and the sizing are on `storageWritePoolConfig`.
+ */
+const storageWriteConfig = storageWritePoolConfig(storageWriteApplication)
+export const storageWritePool = guardIdleClientErrors(
+  new Pool(storageWriteConfig),
+  'storage-write',
+)
+// Each new connection is checked once for the tag, the ceiling and
+// `track_activities` the barrier needs (`db/storageWriteTag.ts` says what can
+// lose them); a mismatch is logged loudly, never refused.
+storageWritePool.on('connect', (client) => {
+  void checkStorageWriteConnection(client, storageWriteApplication, Number(storageWriteConfig.statement_timeout ?? 0))
+})
 
 // An error on an *idle* pooled client (DB restart, dropped socket, network
 // blip) is emitted on the POOL. Without a listener, node-postgres lets it
@@ -284,12 +308,26 @@ export async function initSchema(): Promise<void> {
     // Existing installations predate GC age admission. Backfill with NOW so
     // every pre-migration chunk receives a full grace period before it can be
     // considered by the global worker.
-    await client.query(
-      'ALTER TABLE automerge_storage ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()'
-    )
-    await client.query(
-      'ALTER TABLE automerge_storage ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()'
-    )
+    //
+    // GUARDED, as SET DEFAULT is below: `ADD COLUMN IF NOT EXISTS` takes its
+    // ACCESS EXCLUSIVE lock on the storage table BEFORE it finds the column
+    // there, so replaying it on every boot (and every GC worker start) queues
+    // behind any open transaction on the table — and every save queues behind
+    // it. Asked once, in the catalogue, which takes no table lock.
+    const storageColumns = new Set((await client.query<{ column_name: string }>(`
+      SELECT column_name FROM information_schema.columns
+      WHERE table_schema = current_schema() AND table_name = 'automerge_storage'
+    `)).rows.map((row) => row.column_name))
+    if (!storageColumns.has('created_at')) {
+      await client.query(
+        'ALTER TABLE automerge_storage ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()'
+      )
+    }
+    if (!storageColumns.has('updated_at')) {
+      await client.query(
+        'ALTER TABLE automerge_storage ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()'
+      )
+    }
     const { rows: nullableStorageAgeColumns } = await client.query<{ column_name: string }>(`
       SELECT column_name
       FROM information_schema.columns
@@ -328,9 +366,11 @@ export async function initSchema(): Promise<void> {
     // EXISTING row — destroying the "NULL = predates the clock" semantics the
     // fallback depends on, and rewriting a table that can hold millions of
     // chunks on a routine boot. SET DEFAULT applies to future inserts only.
-    await client.query(`
-      ALTER TABLE automerge_storage ADD COLUMN IF NOT EXISTS arrival_seq BIGINT
-    `)
+    if (!storageColumns.has('arrival_seq')) {
+      await client.query(`
+        ALTER TABLE automerge_storage ADD COLUMN IF NOT EXISTS arrival_seq BIGINT
+      `)
+    }
     // Guarded: SET DEFAULT takes an ACCESS EXCLUSIVE lock on the storage
     // table, and replaying it unconditionally would take that lock on EVERY
     // boot.

@@ -26,22 +26,24 @@ import { describe, expect, it } from 'vitest'
 import * as A from '@automerge/automerge'
 import {
   applyCollectionReconcile,
+  EXACT,
   planCollectionReconcile,
   reconcile,
   reconcileIsNoop,
   reconcileKey,
 } from './reconcile'
+import { DIAGRAM_META_SCHEMA } from './knownKeys'
 
 /** Oracle: does reconcileKey(doc, 'v', target) write anything? */
 function writes(current: unknown, target: unknown): boolean {
   const base = A.from<any>(current === undefined ? {} : { v: current })
-  const after = A.change(base, (d: any) => reconcileKey(d, 'v', target))
+  const after = A.change(base, (d: any) => reconcileKey(d, 'v', target, EXACT))
   return A.getHeads(after).join() !== A.getHeads(base).join()
 }
 
 function judged(current: unknown, target: unknown): boolean {
   const doc = A.from<any>(current === undefined ? {} : { v: current })
-  return reconcileIsNoop(doc.v, target)
+  return reconcileIsNoop(doc.v, target, EXACT)
 }
 
 const CASES: Array<[string, unknown, unknown]> = [
@@ -89,19 +91,19 @@ describe('reconcileIsNoop agrees with a real Automerge reconcile', () => {
   it('the by-id `related` array: index-equal means no write either way', () => {
     const current = { related: [{ id: 'r1', kind: 'x' }, { id: 'r2', kind: 'y' }] }
     const doc = A.from<any>({ v: current })
-    const after = A.change(doc, (d: any) => reconcile(d.v, current))
+    const after = A.change(doc, (d: any) => reconcile(d.v, current, EXACT))
     expect(A.getHeads(after)).toEqual(A.getHeads(doc))
-    expect(reconcileIsNoop(doc.v, current)).toBe(true)
-    expect(reconcileIsNoop(doc.v, { related: [{ id: 'r2', kind: 'y' }] })).toBe(false)
+    expect(reconcileIsNoop(doc.v, current, EXACT)).toBe(true)
+    expect(reconcileIsNoop(doc.v, { related: [{ id: 'r2', kind: 'y' }] }, EXACT)).toBe(false)
   })
 
   it('a registry meta read from a MATERIALIZED shard doc is judged current, and any drift is not', () => {
     const meta = { id: 'd1', name: 'D', type: 'container', docUrl: 'automerge:x', objectIds: ['o1'], connectionIds: ['c1'], groupIds: [] }
     const shard = A.from<any>({ diagrams: { d1: meta } })
-    expect(reconcileIsNoop(shard.diagrams.d1, { ...meta })).toBe(true)
-    expect(reconcileIsNoop(shard.diagrams.d1, { ...meta, connectionIds: ['c1', 'c2'] })).toBe(false)
-    expect(reconcileIsNoop(shard.diagrams.d1, { ...meta, parentObjectId: 'p' })).toBe(false)
-    expect(reconcileIsNoop(shard.diagrams.d1, { ...meta, name: 'E' })).toBe(false)
+    expect(reconcileIsNoop(shard.diagrams.d1, { ...meta }, DIAGRAM_META_SCHEMA)).toBe(true)
+    expect(reconcileIsNoop(shard.diagrams.d1, { ...meta, connectionIds: ['c1', 'c2'] }, DIAGRAM_META_SCHEMA)).toBe(false)
+    expect(reconcileIsNoop(shard.diagrams.d1, { ...meta, parentObjectId: 'p' }, DIAGRAM_META_SCHEMA)).toBe(false)
+    expect(reconcileIsNoop(shard.diagrams.d1, { ...meta, name: 'E' }, DIAGRAM_META_SCHEMA)).toBe(false)
   })
 })
 
@@ -123,11 +125,11 @@ describe('planCollectionReconcile + applyCollectionReconcile ≡ reconcile(colle
   for (const [name, target] of TARGETS) {
     it(name, () => {
       const doc = A.from<any>({ coll: base })
-      const full = A.change(A.clone(doc), (d: any) => reconcile(d.coll, target))
-      const plan = planCollectionReconcile(doc.coll, target)
+      const full = A.change(A.clone(doc), (d: any) => reconcile(d.coll, target, EXACT))
+      const plan = planCollectionReconcile(doc.coll, target, EXACT)
       const targeted = plan === null
         ? doc
-        : A.change(A.clone(doc), (d: any) => applyCollectionReconcile(d.coll, target, plan))
+        : A.change(A.clone(doc), (d: any) => applyCollectionReconcile(d.coll, target, plan, EXACT))
       expect(JSON.parse(JSON.stringify(targeted.coll))).toEqual(JSON.parse(JSON.stringify(full.coll)))
       // null plan ⇔ the full reconcile wrote nothing
       expect(plan === null).toBe(A.getHeads(full).join() === A.getHeads(doc).join())
@@ -136,9 +138,9 @@ describe('planCollectionReconcile + applyCollectionReconcile ≡ reconcile(colle
 
   it('plans only the keys that differ', () => {
     const doc = A.from<any>({ coll: base })
-    const plan = planCollectionReconcile(doc.coll, { ...base, b: { id: 'b', name: 'B2', tags: [] }, d: { id: 'd', name: 'D', tags: [] } })
+    const plan = planCollectionReconcile(doc.coll, { ...base, b: { id: 'b', name: 'B2', tags: [] }, d: { id: 'd', name: 'D', tags: [] } }, EXACT)
     expect(plan).toEqual({ update: ['b', 'd'], remove: [] })
-    expect(planCollectionReconcile(doc.coll, { a: base.a, b: base.b })).toEqual({ update: [], remove: ['c'] })
+    expect(planCollectionReconcile(doc.coll, { a: base.a, b: base.b }, EXACT)).toEqual({ update: [], remove: ['c'] })
   })
 
   // QA lens 2026-10-11: the JSON-equality arms above cannot see HOW the plan
@@ -149,9 +151,9 @@ describe('planCollectionReconcile + applyCollectionReconcile ≡ reconcile(colle
     const doc = A.from<any>({ coll: base })
     const peer = A.change(A.clone(doc), (d: any) => { d.coll.b.tags.push('peer-tag') })
     const target = { ...base, b: { id: 'b', name: 'B2', tags: [] } }
-    const plan = planCollectionReconcile(doc.coll, target)!
+    const plan = planCollectionReconcile(doc.coll, target, EXACT)!
     expect(plan).toEqual({ update: ['b'], remove: [] })
-    const mine = A.change(A.clone(doc), (d: any) => applyCollectionReconcile(d.coll, target, plan))
+    const mine = A.change(A.clone(doc), (d: any) => applyCollectionReconcile(d.coll, target, plan, EXACT))
     const merged = A.merge(A.clone(mine), peer)
     expect(merged.coll.b.name).toBe('B2')
     expect([...merged.coll.b.tags]).toEqual(['peer-tag'])
@@ -243,8 +245,8 @@ describe('property: reconcileIsNoop === true ⇒ the reconcile writes nothing', 
       const current = value(r, 0)
       const target = perturb(r, current)
       const doc = A.from<any>({ v: current })
-      const judgedNoop = reconcileIsNoop(doc.v, target)
-      const after = A.change(doc, (d: any) => reconcileKey(d, 'v', target))
+      const judgedNoop = reconcileIsNoop(doc.v, target, EXACT)
+      const after = A.change(doc, (d: any) => reconcileKey(d, 'v', target, EXACT))
       const moved = A.getHeads(after).join() !== A.getHeads(doc).join()
       if (judgedNoop) {
         noop++
@@ -269,14 +271,14 @@ describe('property: reconcileIsNoop === true ⇒ the reconcile writes nothing', 
       const target = perturb(r, coll) as Record<string, unknown>
       if (target === null || typeof target !== 'object' || Array.isArray(target)) continue
       const doc = A.from<any>({ coll })
-      const full = A.change(A.clone(doc), (d: any) => reconcile(d.coll, target))
-      const plan = planCollectionReconcile(doc.coll, target)
+      const full = A.change(A.clone(doc), (d: any) => reconcile(d.coll, target, EXACT))
+      const plan = planCollectionReconcile(doc.coll, target, EXACT)
       if (plan === null) {
         nullPlans++
         expect(A.getHeads(full).join(), `seed ${seed}`).toBe(A.getHeads(doc).join())
         continue
       }
-      const targeted = A.change(A.clone(doc), (d: any) => applyCollectionReconcile(d.coll, target, plan))
+      const targeted = A.change(A.clone(doc), (d: any) => applyCollectionReconcile(d.coll, target, plan, EXACT))
       expect(JSON.parse(JSON.stringify(targeted.coll)), `seed ${seed}`).toEqual(JSON.parse(JSON.stringify(full.coll)))
     }
     expect(nullPlans).toBeGreaterThan(50)

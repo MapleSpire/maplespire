@@ -257,13 +257,14 @@ function thinkingOptions(cfg: ResolvedAiConfig, thinking: ThinkingLevel | undefi
 
 /**
  * Registry → AI SDK ToolSet. Write tools are OMITTED for read-only callers
- * (the model never sees them); execution still goes through `executeAiTool`,
+ * and tools outside a bearer token's scopes (the model never sees them);
+ * execution still goes through `executeAiTool`,
  * which re-enforces the gate. Tool errors come back as `{error}` results —
  * models recover from a structured error far better than a thrown one.
  */
 export function buildAiSdkTools(ctx: AiToolCtx): ToolSet {
   const out: ToolSet = {}
-  for (const def of listAiTools({ includeWrite: ctx.canWrite })) {
+  for (const def of listAiTools({ includeWrite: ctx.canWrite, scopes: ctx.identity?.scopes })) {
     out[def.name] = tool({
       description: def.description,
       inputSchema: def.schema as z.ZodType,

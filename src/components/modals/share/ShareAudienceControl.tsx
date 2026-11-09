@@ -12,8 +12,9 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU Affero General Public License for more details.
 
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
+import { useDepsChanged } from '../../../hooks/useDepsChanged'
 import { cn } from '../../../lib/utils'
 import type { ShareAudience } from '../../../lib/share/types'
 
@@ -43,9 +44,9 @@ export function ShareAudienceControl({
   const [domainInput, setDomainInput] = useState(allowedEmailDomain ?? '')
 
   // Reseed the field whenever the underlying link (or its saved domain) changes.
-  useEffect(() => {
-    setDomainInput(allowedEmailDomain ?? '')
-  }, [allowedEmailDomain])
+  // Done during render rather than in an effect, so no frame shows the old value.
+  const domainChanged = useDepsChanged([allowedEmailDomain])
+  if (domainChanged) setDomainInput(allowedEmailDomain ?? '')
 
   return (
     <div className="space-y-1.5">

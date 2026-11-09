@@ -20,6 +20,10 @@
     {"variable":"AM_WORKSPACE_ROUTE_BURST_CACHE_MS","benchDefault":1000,"shippedDefault":500,"reason":"Established harness route-cache budget; target ownership/fencing checks remain authoritative."}
   ],
   "equalTimingVariables": ["AM_CONCRETE_WORKSPACE_ROUTE_CACHE_MS", "AM_STORAGE_FENCE_IDLE_TIMEOUT_MS", "AM_SYNC_DEBOUNCE_MS", "SYNC_CELL_LEASE_TTL_MS", "SYNC_CELL_PARTITION_PROBE_INTERVAL_MS", "SYNC_CELL_RENEW_INTERVAL_MS", "SYNC_WS_OWNER_RECHECK_MS"],
+  "experimentArms": [
+    {"variable":"AM_ORDINARY_HEAD_ROTATION","benchDefault":"off","shippedDefault":"off","arms":["off","shadow","on"],"companions":["AM_ORDINARY_HEAD_ROTATION_WORKSPACE_ALLOWLIST","AM_ORDINARY_HEAD_ROTATION_MAX_ACTORS","AM_ORDINARY_HEAD_ROTATION_MAX_CHANGES"],"selectedBy":"sync-cell-bench.mjs --ordinary-head-rotation","reason":"G4-16b A/B arm, not a posture delta: unset it is the shipped off; selected, each arm carries the runner-written allow-list (the two preselected hot workspaces) and the nine qualified settings do not move. Thresholds are per invocation and the harness cannot enforce them equal across the two arms: each report records the values its cells parsed."},
+    {"variable":"AM_ORDINARY_CHAIN_FOLD","benchDefault":"off","shippedDefault":"off","arms":["off","on"],"companions":["AM_ORDINARY_CHAIN_FOLD_RETAIN_HOURS"],"selectedBy":"sync-cell-bench.mjs --ordinary-chain-fold","reason":"G4-16b phase 4 run, not a posture delta: unset it is the shipped off; selected, it rides on an ordinary-head rotation arm set on (the server refuses it otherwise) and the nine qualified settings do not move."}
+  ],
   "instrumentDelta": "Cell/router readiness healthchecks use at least twice the larger Redis command budget: default bench2s, current shipped3s. This bounds the probe process, not the lease. The load harness keeps two hot partitions and three cells; production topology is not transplanted.",
   "decisionD50": "The pre-engaged response names Redis command275 explicitly in T-POST exit5. That is not the current benchmark general command750. If triggered, record that distinction and apply the decision, not a silent reinterpretation of this inventory."
 }

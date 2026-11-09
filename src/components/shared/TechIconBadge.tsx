@@ -13,6 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import { useEffect, useState } from 'react'
+import { useDepsChanged } from '../../hooks/useDepsChanged'
 import type { IconDefinition } from '../../lib/techIcons'
 import { resolveTechnologyIconPath } from '../../lib/technologies/iconPath'
 import { useThemeStore } from '../../stores/themeStore'
@@ -41,11 +42,13 @@ export function TechIconBadge({
   const [failedPath, setFailedPath] = useState<string | null>(null)
   const [icon, setIcon] = useState<IconDefinition | null>(null)
 
+  // No catalog fallback wanted: drop any earlier one during render (on the
+  // same deps the lookup effect re-runs on); the effect only does the lookup.
+  const usesCatalogFallback = allowCatalogFallback && !iconLightPath && !iconDarkPath
+  const fallbackInputsChanged = useDepsChanged([allowCatalogFallback, iconDarkPath, iconLightPath, name])
+  if (fallbackInputsChanged && !usesCatalogFallback) setIcon(null)
   useEffect(() => {
-    if (!allowCatalogFallback || iconLightPath || iconDarkPath) {
-      setIcon(null)
-      return
-    }
+    if (!allowCatalogFallback || iconLightPath || iconDarkPath) return
     let active = true
     void import('../../lib/techIcons').then(({ getIconByName }) => {
       if (active) setIcon(getIconByName(name) ?? null)

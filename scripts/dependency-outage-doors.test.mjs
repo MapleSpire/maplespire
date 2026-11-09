@@ -152,6 +152,11 @@ const DOORS = {
       why: 'Raises it (`staleWrite`, `coalesceStaleImmutableMutation`) and re-exports the leaf class.',
     },
     {
+      path: 'server/src/automergeStorage.ts',
+      kind: 'bookkeeping',
+      why: 'G4-16d. The adapter branches on its OWN refusal to keep its unsaved-write bookkeeping honest: a document the fence refuses is no longer this cell’s to make durable, so its unsaved mark and pending ceiling retries are dropped (otherwise eviction would refuse it for the life of the process). The error is rethrown unchanged to the caller; no answer to any client depends on this branch.',
+    },
+    {
       path: 'server/src/automergeBackgroundSave.ts',
       kind: 'swallow',
       why: 'A background save that loses the fence is not a user-visible failure; it is back-pressure and the write is re-attempted by the owner.',
@@ -177,6 +182,11 @@ const DOORS = {
       path: 'server/src/automergeStorage.ts',
       kind: 'throw-site',
       why: 'Raises it at the two acquisition sites (`withClient` for the borrow, `acquireStoragePermit` for the queue deadline). Deliberately NOT re-exported: unlike `StaleSyncCellWriteError` nothing outside catches it by name.',
+    },
+    {
+      path: 'server/src/automergeStorage.ts',
+      kind: 'bookkeeping',
+      why: 'G4-16d. The adapter’s own ceiling retry (`scheduleCeilingRetry`) branches on it: a retry the pool refused backs off without spending an attempt (and without logging `retry_exhausted`). It runs on a timer, outside any request; the original save’s error already reached its caller unchanged.',
     },
   ],
   WorkspaceRegistryUnavailableError: [
@@ -218,7 +228,10 @@ for (const [className, allowed] of Object.entries(DOORS)) {
    * banning it keeps every rule below able to match on the real name.
    */
   const aliasedImport = new RegExp(`\\b${className}\\s+as\\s+\\w+`)
-  const handlers = allowed.filter((entry) => entry.kind === 'http' || entry.kind === 'swallow')
+  // `bookkeeping`: a file that branches on the error only to keep its OWN
+  // state right and rethrows it unchanged (or runs outside any request) — no
+  // client's answer depends on it. Counted with the handlers: it is a branch.
+  const handlers = allowed.filter((entry) => entry.kind === 'http' || entry.kind === 'swallow' || entry.kind === 'bookkeeping')
   const throwSites = allowed.filter((entry) => entry.kind === 'throw-site')
 
   test(`${className}: no file branches on it outside the allowlist`, () => {
@@ -280,8 +293,8 @@ for (const [className, allowed] of Object.entries(DOORS)) {
     for (const entry of allowed) {
       assert.ok(entry.why && entry.why.trim().length > 20, `${entry.path} has no usable reason`)
       assert.ok(
-        ['http', 'swallow', 'throw-site'].includes(entry.kind),
-        `${entry.path} has kind='${entry.kind}', which is not one of http|swallow|throw-site`,
+        ['http', 'swallow', 'bookkeeping', 'throw-site'].includes(entry.kind),
+        `${entry.path} has kind='${entry.kind}', which is not one of http|swallow|bookkeeping|throw-site`,
       )
     }
   })
@@ -353,8 +366,8 @@ test('every self-terminating handler that can be fenced consults the shared mapp
   assert.equal(
     SELF_TERMINATING_HANDLERS.length,
     5,
-    'the five fenceable self-terminating handlers are a MEASURED population (a survey of all 30 '
-    + '`res.status(500)` sites in index.ts). Changing this number means re-running that survey, not editing a literal.',
+    'the five fenceable self-terminating handlers are a MEASURED population (a survey of the '
+    + '`res.status(500)` sites in index.ts, pinned below). Changing this number means re-running that survey, not editing a literal.',
   )
 
   // AND THE POPULATION IT WAS DRAWN FROM. A new self-terminating site is a site
@@ -378,11 +391,19 @@ test('every self-terminating handler that can be fenced consults the shared mapp
   // Automerge sites. `StaleSyncCellWriteError` is raised only inside the
   // storage adapter's `withFencedMutation` (save / remove / removeRange), which
   // no read in that handler awaits. No guard, no entry above.
+  //
+  // 30 -> 26 (2026-11-08): four surveyed sites LEFT index.ts, none added. The
+  // three theme handlers (list, get, publish) moved to themeRoutes.ts and the
+  // share PATCH handler to shareManageRoutes.ts, so each could be tested over
+  // HTTP. They were among the pure app-Postgres CRUD sites: themeRoutes.ts
+  // imports only `pool`, `themes.js` and the workspace gate, and
+  // shareManageRoutes.ts only `shares.js` and the workspace gate. Neither
+  // file touches the repo, a flush, the fenced adapter or a Redis client.
   const terminations = (index.body.match(/res\.status\(500\)/g) ?? []).length
   assert.equal(
     terminations,
-    30,
-    `index.ts now has ${terminations} \`res.status(500)\` sites, not the 30 the five-handler survey covered. `
+    26,
+    `index.ts now has ${terminations} \`res.status(500)\` sites, not the 26 the five-handler survey covered. `
     + 'Re-run the survey: can the new one reach StaleSyncCellWriteError or RedisUnavailableError? '
     + 'If it can, it needs a guard and an entry above; if it cannot, update this number with the reason.',
   )
@@ -446,7 +467,8 @@ const CANONICALISING = /\b(?:canonicalWorkspaceKey|readableWorkspace|resolveWork
 const REGISTRY_READING_SELF_TERMINATING = [
   'POST /api/shares',
   'GET /api/shares',
-  'PATCH /api/shares/:token',
+  // PATCH /api/shares/:token is registered in index.ts but its handler lives in
+  // shareManageRoutes.ts (sharePatchHandler); its guard is pinned by the next test.
   'DELETE /api/shares/:token',
   'GET /api/automerge/doc-heads',
   'GET /api/automerge/registry-diagram',
@@ -460,8 +482,13 @@ function routeHandlers(source) {
     const opening = /^(\s*)app\.(get|post|put|patch|delete)\(\s*'([^']+)'/.exec(lines[i])
     if (!opening) continue
     const closing = new RegExp(`^${opening[1]}\\}\\)+`)
+    // A registration that closes on its own line (`app.patch('/x', handler(deps))`,
+    // whose handler lives in another module) has no body here: without this
+    // it would run on into the NEXT handler and report that one's code as its own.
+    const depth = (lines[i].match(/\(/g) ?? []).length - (lines[i].match(/\)/g) ?? []).length
     let end = i + 1
-    while (end < lines.length && !closing.test(lines[end])) end++
+    if (depth === 0) end = i
+    else while (end < lines.length && !closing.test(lines[end])) end++
     handlers.push({ route: `${opening[2].toUpperCase()} ${opening[3]}`, body: lines.slice(i, end + 1).join('\n') })
   }
   return handlers
@@ -474,7 +501,9 @@ test('every self-terminating handler that canonicalises a workspace consults the
   // Vacuity: the walker found the routes at all, and found the ones it must.
   // 95 measured 2026-10-29, equal to `grep -cE "app\.(get|post|put|patch|delete)\("`
   // on the file; a floor rather than an equality, so adding a route is not red.
-  assert.ok(handlers.length >= 95, `only ${handlers.length} route registrations found in index.ts; the walker is broken`)
+  // 95 -> 90 (merge of 2026-11-08): the five theme registrations moved to
+  // themeRoutes.ts; the count is again equal to that grep on the file.
+  assert.ok(handlers.length >= 90,`only ${handlers.length} route registrations found in index.ts; the walker is broken`)
   assert.ok(handlers.some((h) => h.route === 'GET /api/automerge/root' && CANONICALISING.test(h.body)))
 
   const population = []
@@ -507,6 +536,22 @@ test('every self-terminating handler that canonicalises a workspace consults the
     `${problems.join('; ')}: a failed registry read here answers 500 — it used to be a 404 "unknown workspace" — `
     + 'instead of the shared 503. Add "if (sendDependencyOutage(res, err)) return" at the top of the catch.',
   )
+})
+
+test('the share PATCH handler, lifted out of index.ts, consults the shared mapping before its own 500', () => {
+  // It canonicalises through `deps.workspaceKey` (index.ts's shareWorkspaceKey),
+  // so a failed registry read lands in its catch, not in the walk above.
+  const index = SOURCES.find((file) => file.path === 'server/src/index.ts')
+  assert.ok(index, 'server/src/index.ts not found')
+  assert.match(index.body, /app\.patch\('\/api\/shares\/:token', sharePatchHandler\(\{ pool, workspaceKey: shareWorkspaceKey \}\)\)/)
+  const manage = SOURCES.find((file) => file.path === 'server/src/shareManageRoutes.ts')
+  assert.ok(manage, 'server/src/shareManageRoutes.ts not found')
+  const handler = manage.body.slice(manage.body.indexOf('export function sharePatchHandler('))
+  const catchAt = handler.indexOf('} catch (err) {')
+  assert.notEqual(catchAt, -1, 'sharePatchHandler has no catch')
+  const terminal = handler.indexOf('res.status(500)', catchAt)
+  assert.notEqual(terminal, -1, 'the slice is not the share PATCH handler\'s catch')
+  assert.match(handler.slice(catchAt, terminal), /if \(sendDependencyOutage\(res, err\)\) return/)
 })
 
 test('the tag capability check consults the shared mapping before its own 500', () => {

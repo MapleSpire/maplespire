@@ -13,6 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import type { FullModel, FullDiagram, DiagramDetail } from './materialize.js'
+import { DRAFT_MODEL_COLLECTION_NAMES, DRAFT_MODEL_COLLECTIONS, type DraftModelCollection } from '../modelCollections.js'
 
 /**
  * 3-way content diff of a draft against its parent.
@@ -32,7 +33,9 @@ import type { FullModel, FullDiagram, DiagramDetail } from './materialize.js'
  */
 
 export type ChangeKind = 'created' | 'updated' | 'deleted'
-export type ModelCollection = 'object' | 'connection' | 'group' | 'domain' | 'tag' | 'decisionRecord'
+/** 'object' | 'connection' | 'group' | 'domain' | 'tag' | 'decisionRecord' —
+ * from `modelCollections.ts`, compared against the entity-family registry. */
+export type ModelCollection = DraftModelCollection
 export type ChangeCollection = ModelCollection | 'diagram' | 'layout' | 'flow'
 export type ConflictKind = 'update/update' | 'update/delete' | 'delete/update' | 'unresolved'
 
@@ -341,17 +344,8 @@ function sameCreatedDiagram(a: FullDiagram, b: FullDiagram): boolean {
 export function diffModels(base: FullModel, ours: FullModel, theirs: FullModel): DiffResult {
   const out: DiffResult = { changes: [], conflicts: [], counts: { model: 0, diagrams: 0, conflicts: 0 } }
 
-  const collections: ModelCollection[] = ['object', 'connection', 'group', 'domain', 'tag', 'decisionRecord']
-  const mapOf = (m: FullModel, c: ModelCollection): Dict => {
-    switch (c) {
-      case 'object': return m.objects
-      case 'connection': return m.connections
-      case 'group': return m.groups
-      case 'domain': return m.domains
-      case 'tag': return m.tagSnapshots
-      case 'decisionRecord': return m.decisionRecords
-    }
-  }
+  const collections: readonly ModelCollection[] = DRAFT_MODEL_COLLECTION_NAMES
+  const mapOf = (m: FullModel, c: ModelCollection): Dict => m[DRAFT_MODEL_COLLECTIONS[c]]
   for (const c of collections) diffCollection(c, mapOf(base, c), mapOf(ours, c), mapOf(theirs, c), out)
 
   diffDiagrams(base, ours, theirs, out)

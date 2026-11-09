@@ -12,7 +12,8 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU Affero General Public License for more details.
 
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
+import { useDepsChanged } from '../../hooks/useDepsChanged'
 import { useTranslation } from 'react-i18next'
 import type { IconDefinition } from '../../lib/techIcons'
 import type { ShapeType, TechnologyUsage } from '../../types'
@@ -50,9 +51,9 @@ export function ShapeIconPickerModal({
   const { t } = useTranslation()
   const [source, setSource] = useState<'technology' | 'generic'>('technology')
 
-  useEffect(() => {
-    if (!isOpen) setSource('technology')
-  }, [isOpen])
+  // Closing returns the picker to the technology catalog — adjusted during render.
+  const openChanged = useDepsChanged([isOpen])
+  if (openChanged && !isOpen) setSource('technology')
 
   return (
     <>

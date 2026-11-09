@@ -20,8 +20,11 @@
  * (parentId/icon/links/technologyUsages/…), so writing it straight into a doc/shard would
  * throw and the entity would never persist — surfacing to the user as an add/edit that
  * silently "reverts". `stripUndefined` returns a deep copy with every undefined-valued
- * key dropped (recursing through arrays + nested objects). Dropping a key also lets a
- * subsequent `reconcile` delete a field the user cleared (e.g. removed an icon).
+ * key dropped (recursing through arrays + nested objects). A dropped key is then
+ * ABSENT from the reconcile target, and `reconcile` deletes an absent field only
+ * when its schema declares it (`knownKeys.ts`, V0-08) — so clearing a field the
+ * user removed (e.g. an icon) works for every field the registry lists, and a
+ * field written by a newer client is kept.
  */
 export function stripUndefined<T>(v: T): T {
   if (Array.isArray(v)) return v.map((x) => stripUndefined(x)) as unknown as T

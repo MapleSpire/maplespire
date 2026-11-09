@@ -1,0 +1,168 @@
+# MapleSpire SAST rules (V0-12). Run together with the registry packs:
+#   semgrep --config .semgrep.yml --config p/typescript --config p/nodejs
+# (scripts/security-scan.mjs does exactly that.)
+#
+# Scope: the three trust boundaries the ticket names. Tests are excluded.
+# Severity ERROR blocks the gate; WARNING is reported and does not. A finding
+# is waived only through security-exceptions.yml (tool: semgrep, id = rule id).
+rules:
+  # --- authz -----------------------------------------------------------------
+  # Express routes registered with a bare handler. Auth in this tree is mostly
+  # called INSIDE the handler (`requireX(req, res)`), which Semgrep cannot see
+  # across, so this is a WARNING: it lists the routes a human should confirm,
+  # it does not claim they are open.
+  - id: sr-authz-route-without-middleware
+    message: >-
+      Route registered with a bare handler and no auth/authorization middleware
+      argument. Confirm the handler authenticates and authorizes first, or pass
+      the middleware (`requireAuth`, `requireRole`, ...).
+    severity: WARNING
+    languages: [typescript]
+    paths:
+      include: [server/src/auth, server/src/rbac, server/src/ai]
+      exclude: ['*.test.ts', '*.integration.test.ts']
+    patterns:
+      - pattern-either:
+          - pattern: $APP.get($PATH, async ($REQ, $RES) => { ... })
+          - pattern: $APP.post($PATH, async ($REQ, $RES) => { ... })
+          - pattern: $APP.put($PATH, async ($REQ, $RES) => { ... })
+          - pattern: $APP.patch($PATH, async ($REQ, $RES) => { ... })
+          - pattern: $APP.delete($PATH, async ($REQ, $RES) => { ... })
+      - pattern-not-inside: |
+          $APP.$M($PATH, async ($REQ, $RES) => {
+            ...
+            $AUTH($REQ, $RES, ...)
+            ...
+          })
+      - pattern-not-inside: |
+          $APP.$M($PATH, async ($REQ, $RES) => {
+            ...
+            await $AUTH($REQ, $RES, ...)
+            ...
+          })
+    metadata:
+      category: security
+      cwe: 'CWE-862: Missing Authorization'
+
+  - id: sr-authz-role-from-request
+    message: >-
+      Authorization decision reads the role/permission from client-controlled
+      request data. Derive it from the verified session instead.
+    severity: ERROR
+    languages: [typescript]
+    paths:
+      include: [server/src/auth, server/src/rbac, server/src/ai]
+      exclude: ['*.test.ts', '*.integration.test.ts']
+    pattern-either:
+      - pattern: if ($REQ.body.role === ...) { ... }
+      - pattern: if ($REQ.query.role === ...) { ... }
+      - pattern: if ($REQ.headers['x-role'] ...) { ... }
+      - pattern: $X = $REQ.body.isAdmin
+    metadata:
+      category: security
+      cwe: 'CWE-639: Authorization Bypass Through User-Controlled Key'
+
+  # --- SSRF ------------------------------------------------------------------
+  - id: sr-ssrf-fetch-request-derived-url
+    message: >-
+      fetch() with a URL derived from the request. Validate the host against an
+      allowlist and resolve it before connecting (SSRF).
+    severity: ERROR
+    languages: [typescript]
+    paths:
+      include: [server/src/auth, server/src/rbac, server/src/ai]
+      exclude: ['*.test.ts', '*.integration.test.ts']
+    mode: taint
+    pattern-sources:
+      - pattern: $REQ.body
+      - pattern: $REQ.query
+      - pattern: $REQ.params
+      - pattern: $REQ.headers
+    pattern-sinks:
+      - pattern: fetch($URL, ...)
+        focus-metavariable: $URL
+      - pattern: globalThis.fetch($URL, ...)
+        focus-metavariable: $URL
+      - pattern: http.request($URL, ...)
+        focus-metavariable: $URL
+      - pattern: https.request($URL, ...)
+        focus-metavariable: $URL
+      - pattern: http.get($URL, ...)
+        focus-metavariable: $URL
+      - pattern: https.get($URL, ...)
+        focus-metavariable: $URL
+    pattern-sanitizers:
+      - pattern: encodeURIComponent(...)
+      - pattern: assertAllowedUrl(...)
+    metadata:
+      category: security
+      cwe: 'CWE-918: Server-Side Request Forgery'
+
+  - id: sr-ssrf-fetch-template-with-host-variable
+    message: >-
+      fetch() whose URL starts with an interpolated value, so the variable
+      controls the host. Build the URL from a fixed base.
+    severity: WARNING
+    languages: [typescript]
+    paths:
+      include: [server/src/auth, server/src/rbac, server/src/ai]
+      exclude: ['*.test.ts', '*.integration.test.ts']
+    pattern-either:
+      - pattern: fetch(`${$HOST}...`, ...)
+      - pattern: fetch($REQ.body.$F, ...)
+      - pattern: fetch($REQ.query.$F, ...)
+    metadata:
+      category: security
+      cwe: 'CWE-918: Server-Side Request Forgery'
+
+  # --- crypto ----------------------------------------------------------------
+  - id: sr-crypto-weak-hash
+    message: MD5 and SHA-1 are broken; use SHA-256 or better (and a KDF for passwords).
+    severity: ERROR
+    languages: [typescript]
+    paths:
+      include: [server/src/auth, server/src/rbac, server/src/ai]
+      exclude: ['*.test.ts', '*.integration.test.ts']
+    pattern-either:
+      - pattern: createHash('md5')
+      - pattern: createHash('sha1')
+      - pattern: createHash("md5")
+      - pattern: createHash("sha1")
+      - pattern: crypto.createHash('md5')
+      - pattern: crypto.createHash('sha1')
+      - pattern: createHmac('md5', ...)
+      - pattern: createHmac('sha1', ...)
+    metadata:
+      category: security
+      cwe: 'CWE-327: Use of a Broken or Risky Cryptographic Algorithm'
+
+  - id: sr-crypto-math-random-token
+    message: >-
+      Math.random() is not a CSPRNG. Tokens, session ids, nonces and invite
+      codes must come from crypto.randomBytes / crypto.randomUUID.
+    severity: ERROR
+    languages: [typescript]
+    paths:
+      include: [server/src/auth, server/src/rbac, server/src/ai]
+      exclude: ['*.test.ts', '*.integration.test.ts']
+    pattern: Math.random()
+    metadata:
+      category: security
+      cwe: 'CWE-338: Use of Cryptographically Weak PRNG'
+
+  - id: sr-crypto-non-constant-time-secret-compare
+    message: >-
+      Secret/token/signature compared with ===, which leaks timing. Use
+      crypto.timingSafeEqual on equal-length buffers.
+    severity: WARNING
+    languages: [typescript]
+    paths:
+      include: [server/src/auth, server/src/rbac, server/src/ai]
+      exclude: ['*.test.ts', '*.integration.test.ts']
+    pattern-either:
+      - pattern: $A.signature === $B
+      - pattern: $A.token === $B
+      - pattern: $A.secret === $B
+    metadata:
+      category: security
+      cwe: 'CWE-208: Observable Timing Discrepancy'

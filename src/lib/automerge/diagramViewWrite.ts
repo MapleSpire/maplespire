@@ -14,6 +14,7 @@
 
 import type { Diagram } from '../../types'
 import { clonePlain, reconcileKey } from './reconcile'
+import { DIAGRAM_DOC_SCHEMA } from './knownKeys'
 import { persistentSlicesChanged } from './persistentSlices'
 
 /**
@@ -109,7 +110,7 @@ export function classifyDiagramViewEdit(state: ViewEditSlices, previous: ViewEdi
 export function applyDiagramViewFields(doc: object, diagram: Diagram): void {
   const draft = doc as Record<string, unknown>
   const source = diagram as unknown as Record<string, unknown>
-  for (const key of DIAGRAM_VIEW_FIELDS) reconcileKey(draft, key, source[key])
+  for (const key of DIAGRAM_VIEW_FIELDS) reconcileKey(draft, key, source[key], DIAGRAM_DOC_SCHEMA.fields[key])
 }
 
 /**

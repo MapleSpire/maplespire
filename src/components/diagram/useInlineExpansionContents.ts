@@ -474,6 +474,7 @@ export function useInlineExpansionContents(
     for (const id of [...inflightRef.current.keys()]) {
       if (!compositions.has(id)) inflightRef.current.delete(id)
     }
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- the cache this publishes lives in refs shared with the async loaders and was just pruned above, together with the source sessions this effect closes; the version bump is the notification of that external mutation and cannot be derived during render, while deferring it would leave contentsRef describing collapsed targets for an extra commit
     if (changed) publish()
 
     for (const [diagramId, composition] of compositions) {

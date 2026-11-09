@@ -3,7 +3,7 @@ FROM node:22-alpine AS build
 
 WORKDIR /app
 
-COPY package.json package-lock.json* patch-automerge-peer-sync-state.mjs patch-automerge-change-observers.mjs patch-automerge-document-saves.mjs patch-automerge-cooperative-events.mjs patch-automerge-inflight-fanout.mjs patch-automerge-sync-state-lifetime.mjs ./
+COPY package.json package-lock.json* patch-automerge-peer-sync-state.mjs patch-automerge-change-observers.mjs patch-automerge-document-saves.mjs patch-automerge-cooperative-events.mjs patch-automerge-inflight-fanout.mjs patch-automerge-sync-state-lifetime.mjs patch-automerge-compaction-latch.mjs ./
 RUN npm ci
 
 COPY tsconfig.json ./
@@ -19,7 +19,7 @@ ENV NODE_ENV=production
 
 RUN apk add --no-cache su-exec
 
-COPY package.json package-lock.json* patch-automerge-peer-sync-state.mjs patch-automerge-change-observers.mjs patch-automerge-document-saves.mjs patch-automerge-cooperative-events.mjs patch-automerge-inflight-fanout.mjs patch-automerge-sync-state-lifetime.mjs ./
+COPY package.json package-lock.json* patch-automerge-peer-sync-state.mjs patch-automerge-change-observers.mjs patch-automerge-document-saves.mjs patch-automerge-cooperative-events.mjs patch-automerge-inflight-fanout.mjs patch-automerge-sync-state-lifetime.mjs patch-automerge-compaction-latch.mjs ./
 RUN npm ci --omit=dev
 
 COPY --from=build /app/dist ./dist

@@ -1,0 +1,148 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="883" height="1019" viewBox="0 0 883 1019" role="img" aria-label="Containers">
+</g>
+</g>
+</g>
+</g>
+</g>
+</g>
+</g>
+</g>
+<circle cx="128" cy="589" r="3.5" fill="#C9C3BA"/>
+<circle cx="128" cy="607" r="5" fill="#B7B1A8"/>
+<circle cx="192.45" cy="589" r="3.5" fill="#C9C3BA"/>
+<circle cx="208" cy="597.73" r="3.5" fill="#C9C3BA"/>
+<circle cx="208" cy="678.92" r="3.5" fill="#DAD5CC"/>
+<circle cx="401" cy="903.1" r="3.5" fill="#DAD5CC"/>
+<circle cx="498" cy="163" r="10" fill="#C06A2C"/>
+<circle cx="507.64" cy="241" r="3.5" fill="#C9C3BA"/>
+<circle cx="507.8" cy="521" r="3.5" fill="#C9C3BA"/>
+<circle cx="511" cy="863" r="10" fill="#B7B1A8"/>
+<circle cx="525" cy="303" r="10" fill="#C06A2C"/>
+<circle cx="534.29" cy="381" r="3.5" fill="#C9C3BA"/>
+<circle cx="551" cy="443" r="10" fill="#C06A2C"/>
+<circle cx="551" cy="521" r="3.5" fill="#C9C3BA"/>
+<circle cx="583.5" cy="521" r="3.5" fill="#C9C3BA"/>
+<circle cx="631" cy="856.42" r="3.5" fill="#C9C3BA"/>
+<circle cx="662.86" cy="381" r="3.5" fill="#C9C3BA"/>
+<circle cx="711" cy="863" r="10" fill="#B7B1A8"/>
+<circle cx="725" cy="303" r="10" fill="#C06A2C"/>
+<circle cx="821" cy="903.1" r="3.5" fill="#DAD5CC"/>
+<ellipse cx="642" cy="567" rx="80" ry="6" fill="#ffffff"/>
+<g opacity="0.55">
+<g opacity="0.55">
+<g opacity="0.55">
+<g>
+<g>
+<g>
+<g>
+<g>
+<path d="M 120 617 A 8 8 0 0 1 136 617 Z" fill="#B7B1A8"/>
+<path d="M 128 585 C 128 439 451.52 391 451.52 255" fill="none" stroke="#C9C3BA" stroke-width="1.6" stroke-dasharray="6 4"/>
+<path d="M 192.45 585 C 192.45 453.27 460.55 516.73 460.55 395" fill="none" stroke="#C9C3BA" stroke-width="1.6" stroke-dasharray="6 4"/>
+<path d="M 208 673.58 L 214.67 680.56 L 217.64 674.22 Z" fill="#C9C3BA"/>
+<path d="M 211.21 595.34 C 241.33 572.94 335.17 486.58 408 449 C 480.83 411.42 605.5 385.06 631.68 376.59" fill="none" stroke="#C9C3BA" stroke-width="1.6" stroke-dasharray="6 4"/>
+<path d="M 212 678.92 C 306.62 678.92 428.62 690.38 428.62 775" fill="none" stroke="#DAD5CC" stroke-width="1.6" stroke-dasharray="6 4"/>
+<path d="M 397 903.1 C 324.54 903.1 667.46 882.2 605 882.2" fill="none" stroke="#DAD5CC" stroke-width="1.6" stroke-dasharray="6 4"/>
+<path d="M 428.62 789 L 431.81 779.89 L 424.82 780.13 Z" fill="#DAD5CC"/>
+<path d="M 451.52 241 L 447.4 249.74 L 454.39 250.22 Z" fill="#C9C3BA"/>
+<path d="M 460.55 381 L 456.49 389.76 L 463.48 390.2 Z" fill="#C9C3BA"/>
+<path d="M 507.64 245 C 507.64 271 515.36 251 515.36 267" fill="none" stroke="#C9C3BA" stroke-width="1.6" stroke-dasharray="6 4"/>
+<path d="M 507.8 525 C 507.8 649 510.57 713 510.57 827" fill="none" stroke="#C9C3BA" stroke-width="1.6" stroke-dasharray="6 4"/>
+<path d="M 510.57 841 L 514.06 832 L 507.06 832 Z" fill="#C9C3BA"/>
+<path d="M 515.36 281 L 518.83 271.99 L 511.83 272.01 Z" fill="#C9C3BA"/>
+<path d="M 534.29 385 C 534.29 411 541.71 391 541.71 407" fill="none" stroke="#C9C3BA" stroke-width="1.6" stroke-dasharray="6 4"/>
+<path d="M 541.71 421 L 545.18 411.99 L 538.18 412.01 Z" fill="#C9C3BA"/>
+<path d="M 551.11 525 C 551.83 552.33 532.94 655.67 556 709 C 579.06 762.33 667.15 819 679.43 831.15" fill="none" stroke="#C9C3BA" stroke-width="1.6" stroke-dasharray="6 4"/>
+<path d="M 562 567 A 80 6 0 0 0 722 567" fill="none" stroke="rgba(111, 106, 98, 0.28)" stroke-width="1"/>
+<path d="M 562 567 L 562 655 A 80 6 0 0 0 722 655 L 722 567 A 80 6 0 0 0 562 567 Z" fill="#FFFFFF" stroke="#E7E4DF" stroke-width="1"/>
+<path d="M 583.5 525 C 583.5 551 609.5 531 609.5 547" fill="none" stroke="#C9C3BA" stroke-width="1.6" stroke-dasharray="6 4"/>
+<path d="M 591 882.2 L 599.97 885.77 L 600.03 878.77 Z" fill="#DAD5CC"/>
+<path d="M 609.5 561 L 612.89 551.96 L 605.9 552.04 Z" fill="#C9C3BA"/>
+<path d="M 613.14 421 L 616.84 412.08 L 609.84 411.92 Z" fill="#C9C3BA"/>
+<path d="M 627.29 854.92 C 593.33 841.18 475.5 795.47 405 765 C 334.5 734.53 240.83 688.82 220.7 679.47" fill="none" stroke="#C9C3BA" stroke-width="1.6" stroke-dasharray="6 4"/>
+<path d="M 631 882.2 L 621.97 878.77 L 622.03 885.77 Z" fill="#DAD5CC"/>
+<path d="M 645 372.27 L 635.37 371.58 L 637.43 378.27 Z" fill="#C9C3BA"/>
+<path d="M 662.86 385 C 662.86 411 613.14 391 613.14 407" fill="none" stroke="#C9C3BA" stroke-width="1.6" stroke-dasharray="6 4"/>
+<path d="M 689.38 841 L 685.21 832.29 L 680.42 837.4 Z" fill="#C9C3BA"/>
+<path d="M 825 903.1 C 897.46 903.1 554.54 882.2 617 882.2" fill="none" stroke="#DAD5CC" stroke-width="1.6" stroke-dasharray="6 4"/>
+<rect width="100%" height="100%" fill="#E7E6E2"/>
+<rect x="106.91" y="669" width="42.18" height="16" rx="4" fill="#F1EFEB"/>
+<rect x="196.64" y="487.93" width="265.23" height="20" rx="4" fill="#E7E6E2" stroke="#E7E6E2"/>
+<rect x="222.73" y="416.61" width="146.16" height="20" rx="4" fill="#E7E6E2" stroke="#E7E6E2"/>
+<rect x="245.7" y="470.38" width="265.23" height="20" rx="4" fill="#E7E6E2" stroke="#E7E6E2"/>
+<rect x="362.12" y="743.98" width="95.28" height="20" rx="4" fill="#E7E6E2" stroke="#E7E6E2"/>
+<rect x="388" y="48" width="447" height="641" rx="12" fill="rgba(231, 230, 226, 0.35)" fill-opacity="1" stroke="#1168bd" stroke-opacity="0.5" stroke-width="1.5"/>
+<rect x="401" y="789" width="420" height="182" rx="12" fill="#DBEAFE" fill-opacity="0.3" stroke="#DBEAFE" stroke-opacity="0.5" stroke-width="1.5" stroke-dasharray="6 4"/>
+<rect x="408.11" y="261.65" width="203.69" height="20" rx="4" fill="#E7E6E2" stroke="#E7E6E2"/>
+<rect x="418" y="141" width="160" height="100" rx="12" fill="#FFFFFF" stroke="#E7E4DF" stroke-width="1"/>
+<rect x="431" y="841" width="160" height="100" rx="12" fill="#FAF9F7" stroke="#E7E4DF" stroke-width="1"/>
+<rect x="445" y="281" width="160" height="100" rx="12" fill="#FFFFFF" stroke="#E7E4DF" stroke-width="1"/>
+<rect x="446.11" y="669.93" width="102.15" height="20" rx="4" fill="#E7E6E2" stroke="#E7E6E2"/>
+<rect x="471" y="421" width="160" height="100" rx="12" fill="#FFFFFF" stroke="#E7E4DF" stroke-width="1"/>
+<rect x="48" y="589" width="160" height="100" rx="12" fill="#FAF9F7" stroke="#E7E4DF" stroke-width="1"/>
+<rect x="483.25" y="221" width="29.51" height="16" rx="4" fill="#F1EFEB"/>
+<rect x="485.33" y="401.64" width="102.15" height="20" rx="4" fill="#E7E6E2" stroke="#E7E6E2"/>
+<rect x="488.95" y="921" width="44.09" height="16" rx="4" fill="#F1EFEB"/>
+<rect x="491.74" y="703.76" width="106.48" height="20" rx="4" fill="#E7E6E2" stroke="#E7E6E2"/>
+<rect x="510.25" y="361" width="29.51" height="16" rx="4" fill="#F1EFEB"/>
+<rect x="528.99" y="541.74" width="134.11" height="20" rx="4" fill="#E7E6E2" stroke="#E7E6E2"/>
+<rect x="536.25" y="501" width="29.51" height="16" rx="4" fill="#F1EFEB"/>
+<rect x="586.68" y="377.75" width="102.15" height="20" rx="4" fill="#E7E6E2" stroke="#E7E6E2"/>
+<rect x="613.96" y="641" width="56.08" height="16" rx="4" fill="#F1EFEB"/>
+<rect x="631" y="841" width="160" height="100" rx="12" fill="#FAF9F7" stroke="#E7E4DF" stroke-width="1"/>
+<rect x="645" y="281" width="160" height="100" rx="12" fill="#FFFFFF" stroke="#E7E4DF" stroke-width="1"/>
+<rect x="688.95" y="921" width="44.09" height="16" rx="4" fill="#F1EFEB"/>
+<rect x="710.25" y="361" width="29.51" height="16" rx="4" fill="#F1EFEB"/>
+<text x="128" y="635.4" font-family="Inter" font-size="10.5" font-weight="600" fill="#8C877F" text-anchor="middle">Personal Banking Customer</text>
+<text x="128" y="650.2" font-family="Inter" font-size="9" font-weight="400" fill="#C0BBB2" text-anchor="middle">A customer of the bank, with</text>
+<text x="128" y="660.55" font-family="Inter" font-size="9" font-weight="400" fill="#C0BBB2" text-anchor="middle">personal bank accounts.</text>
+<text x="128" y="680" font-family="Inter" font-size="9" font-weight="500" fill="#56524C" text-anchor="middle">Person</text>
+<text x="295.81" y="430.11" font-family="Inter" font-size="10" font-weight="400" fill="#8C877F" text-anchor="middle">Visits bigbank.com/ib using</text>
+<text x="329.26" y="501.43" font-family="Inter" font-size="10" font-weight="400" fill="#8C877F" text-anchor="middle">Views account balances, and makes payments using</text>
+<text x="378.31" y="483.88" font-family="Inter" font-size="10" font-weight="400" fill="#8C877F" text-anchor="middle">Views account balances, and makes payments using</text>
+<text x="409.76" y="757.48" font-family="Inter" font-size="10" font-weight="400" fill="#8C877F" text-anchor="middle">Sends e-mails to</text>
+<text x="413" y="815" font-family="Inter" font-size="11" font-weight="600" fill="#8C877F" text-anchor="start" fill-opacity="0.8">Big Bank plc</text>
+<text x="497.19" y="683.43" font-family="Inter" font-size="10" font-weight="400" fill="#8C877F" text-anchor="middle">Makes API calls to</text>
+<text x="498" y="166.5" font-family="Inter" font-size="10" font-weight="700" fill="#E7E6E2" text-anchor="middle">A</text>
+<text x="498" y="189.4" font-family="Inter" font-size="13" font-weight="600" fill="#1E1D1B" text-anchor="middle">Web Application</text>
+<text x="498" y="202.2" font-family="Inter" font-size="9" font-weight="400" fill="#9A958C" text-anchor="middle">Delivers the static content and</text>
+<text x="498" y="212.55" font-family="Inter" font-size="9" font-weight="400" fill="#9A958C" text-anchor="middle">the Internet banking single pag…</text>
+<text x="498" y="232" font-family="Inter" font-size="9" font-weight="500" fill="#56524C" text-anchor="middle">App</text>
+<text x="509.96" y="275.15" font-family="Inter" font-size="10" font-weight="400" fill="#8C877F" text-anchor="middle">Delivers to the customer's web browser</text>
+<text x="511" y="866.5" font-family="Inter" font-size="10" font-weight="700" fill="#E7E6E2" text-anchor="middle">S</text>
+<text x="511" y="887.4" font-family="Inter" font-size="10.5" font-weight="600" fill="#8C877F" text-anchor="middle">Mainframe Banking System</text>
+<text x="511" y="902.2" font-family="Inter" font-size="9" font-weight="400" fill="#C0BBB2" text-anchor="middle">Stores all of the core banking</text>
+<text x="511" y="912.55" font-family="Inter" font-size="9" font-weight="400" fill="#C0BBB2" text-anchor="middle">information about customers,…</text>
+<text x="511" y="932" font-family="Inter" font-size="9" font-weight="500" fill="#56524C" text-anchor="middle">System</text>
+<text x="525" y="306.5" font-family="Inter" font-size="10" font-weight="700" fill="#E7E6E2" text-anchor="middle">A</text>
+<text x="525" y="328.6" font-family="Inter" font-size="12" font-weight="600" fill="#1E1D1B" text-anchor="middle">Single-Page Application</text>
+<text x="525" y="342.2" font-family="Inter" font-size="9" font-weight="400" fill="#9A958C" text-anchor="middle">Provides all of the Internet</text>
+<text x="525" y="352.55" font-family="Inter" font-size="9" font-weight="400" fill="#9A958C" text-anchor="middle">banking functionality to…</text>
+<text x="525" y="372" font-family="Inter" font-size="9" font-weight="500" fill="#56524C" text-anchor="middle">App</text>
+<text x="536.4" y="415.14" font-family="Inter" font-size="10" font-weight="400" fill="#8C877F" text-anchor="middle">Makes API calls to</text>
+<text x="544.99" y="717.26" font-family="Inter" font-size="10" font-weight="400" fill="#8C877F" text-anchor="middle">Sends e-mail using</text>
+<text x="551" y="446.5" font-family="Inter" font-size="10" font-weight="700" fill="#E7E6E2" text-anchor="middle">A</text>
+<text x="551" y="469.4" font-family="Inter" font-size="13" font-weight="600" fill="#1E1D1B" text-anchor="middle">API Application</text>
+<text x="551" y="482.2" font-family="Inter" font-size="9" font-weight="400" fill="#9A958C" text-anchor="middle">Provides Internet banking</text>
+<text x="551" y="492.55" font-family="Inter" font-size="9" font-weight="400" fill="#9A958C" text-anchor="middle">functionality via a JSON/HTTPS…</text>
+<text x="551" y="512" font-family="Inter" font-size="9" font-weight="500" fill="#56524C" text-anchor="middle">App</text>
+<text x="596.04" y="555.24" font-family="Inter" font-size="10" font-weight="400" fill="#8C877F" text-anchor="middle">Reads from and writes to</text>
+<text x="611.5" y="102.5" font-family="Inter" font-size="10" font-weight="400" fill="#9A958C" text-anchor="middle">System</text>
+<text x="611.5" y="123" font-family="Inter" font-size="12" font-weight="400" fill="#8C877F" text-anchor="middle">Allows customers to view information about their bank accounts, and make payments.</text>
+<text x="611.5" y="84" font-family="Inter" font-size="14" font-weight="600" fill="#8C877F" text-anchor="middle">Internet Banking System</text>
+<text x="637.76" y="391.25" font-family="Inter" font-size="10" font-weight="400" fill="#8C877F" text-anchor="middle">Makes API calls to</text>
+<text x="642" y="609.4" font-family="Inter" font-size="13" font-weight="600" fill="#1E1D1B" text-anchor="middle">Database</text>
+<text x="642" y="622.2" font-family="Inter" font-size="9" font-weight="400" fill="#9A958C" text-anchor="middle">Stores user registration</text>
+<text x="642" y="632.55" font-family="Inter" font-size="9" font-weight="400" fill="#9A958C" text-anchor="middle">information, hashed…</text>
+<text x="642" y="652" font-family="Inter" font-size="9" font-weight="500" fill="#56524C" text-anchor="middle">Data store</text>
+<text x="711" y="866.5" font-family="Inter" font-size="10" font-weight="700" fill="#E7E6E2" text-anchor="middle">S</text>
+<text x="711" y="889.4" font-family="Inter" font-size="13" font-weight="600" fill="#8C877F" text-anchor="middle">E-mail System</text>
+<text x="711" y="902.2" font-family="Inter" font-size="9" font-weight="400" fill="#C0BBB2" text-anchor="middle">The internal Microsoft Exchange</text>
+<text x="711" y="912.55" font-family="Inter" font-size="9" font-weight="400" fill="#C0BBB2" text-anchor="middle">e-mail system.</text>
+<text x="711" y="932" font-family="Inter" font-size="9" font-weight="500" fill="#56524C" text-anchor="middle">System</text>
+<text x="725" y="306.5" font-family="Inter" font-size="10" font-weight="700" fill="#E7E6E2" text-anchor="middle">A</text>
+<text x="725" y="329.4" font-family="Inter" font-size="13" font-weight="600" fill="#1E1D1B" text-anchor="middle">Mobile App</text>
+<text x="725" y="342.2" font-family="Inter" font-size="9" font-weight="400" fill="#9A958C" text-anchor="middle">Provides a limited subset of the</text>
+<text x="725" y="352.55" font-family="Inter" font-size="9" font-weight="400" fill="#9A958C" text-anchor="middle">Internet banking functionality to…</text>
+<text x="725" y="372" font-family="Inter" font-size="9" font-weight="500" fill="#56524C" text-anchor="middle">App</text>
+</svg>

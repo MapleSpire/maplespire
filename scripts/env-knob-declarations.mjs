@@ -23,6 +23,51 @@ export const DECLARED_OFF_BY_DEFAULT_FLAGS = [{
   exportName: 'PROPOSER_FLAG',
   test: 'server/src/syncCells/placementProposer.test.ts',
   why: 'T-14d requires explicit on plus a dedicated audited PG LOGIN; missing, blank and off open no connection.',
+}, {
+  knob: 'AM_ORDINARY_HEAD_ROTATION',
+  file: 'server/src/readModel/ordinaryHeadRotation.ts',
+  exportName: 'ORDINARY_HEAD_ROTATION_FLAG',
+  test: 'server/src/readModel/ordinaryHeadRotation.test.ts',
+  why: 'Missing, blank and off compute no stats and rotate nothing; shadow only logs; on rotates allow-listed heads and refuses the * allow-list at boot.',
+  // The one manifest allowed to name it: the bench harness, as pass-throughs
+  // whose unset value is off (the flag) or blank (the list and thresholds).
+  // deploy-parity.test.mjs checks both halves; no shipped manifest may be here.
+  benchManifests: ['infra/compose/sync-cell-failover.yml'],
+  benchWhy: 'G4-16b A/B arm: sync-cell-bench.mjs --ordinary-head-rotation sets it with an allow-list of the two preselected hot workspaces.',
+}, {
+  knob: 'AM_ORDINARY_CHAIN_FOLD',
+  file: 'server/src/readModel/ordinaryHeadRotation.ts',
+  exportName: 'ORDINARY_CHAIN_FOLD_FLAG',
+  test: 'server/src/readModel/ordinaryHeadRotation.test.ts',
+  why: 'G4-16b phase 4: missing, blank and off fold nothing; on folds retired ordinary heads of the rotation allow-list and is refused at boot unless AM_ORDINARY_HEAD_ROTATION=on. Turn on only once every replica runs phase 4 step 2.',
+  benchManifests: ['infra/compose/sync-cell-failover.yml'],
+  benchWhy: 'G4-16b phase 4 run: sync-cell-bench.mjs --ordinary-chain-fold sets it on the armed cells, with --ordinary-head-rotation=on.',
+}, {
+  knob: 'SYNC_DIAG_CPU_PROFILE',
+  file: 'server/src/diagnostics/cpuProfileCapture.ts',
+  exportName: 'CPU_PROFILE_FLAG',
+  test: 'server/src/diagnostics/cpuProfileCapture.test.ts',
+  why: 'G4 stall diagnosis: missing, blank, off and anything but on open no inspector session, start no worker, observer or timer; on needs an absolute SYNC_DIAG_CPU_PROFILE_DIR and writes rolling CPU-profile chunks and a GC log from boot.',
+  benchManifests: ['infra/compose/sync-cell-failover.yml'],
+  benchWhy: 'sync-cell-bench.mjs --cpu-profile=on sets it on the three load cells and bind-mounts a host directory at SYNC_DIAG_CPU_PROFILE_DIR.',
+}, {
+  knob: 'SYNC_LOAD_ORDINARY_HEAD_ROTATION',
+  file: 'server/scripts/verify-sync-cell-load-soak.mjs',
+  exportName: 'ORDINARY_HEAD_ROTATION_ARM_FLAG',
+  test: 'server/scripts/verify-sync-cell-load-soak.test.mjs',
+  why: 'Load-harness knob, not a server one: missing and blank name no A/B arm and change nothing; off, shadow and on make the gate read the cells\' parsed rotation config and log events and VOID an arm whose observed rotation contradicts it; anything else throws.',
+}, {
+  knob: 'SYNC_LOAD_ORDINARY_CHAIN_FOLD',
+  file: 'server/scripts/verify-sync-cell-load-soak.mjs',
+  exportName: 'ORDINARY_CHAIN_FOLD_ARM_FLAG',
+  test: 'server/scripts/verify-sync-cell-load-soak.test.mjs',
+  why: 'Load-harness knob, not a server one: missing and blank check nothing; off and on are the fold the bench asked for, and the gate VOIDs an arm whose cells parsed another; it needs SYNC_LOAD_ORDINARY_HEAD_ROTATION (on for on); anything else throws.',
+}, {
+  knob: 'SYNC_LOAD_FOLLOW_WRITE_HEAD',
+  file: 'server/scripts/verify-sync-cell-load-soak.mjs',
+  exportName: 'FOLLOW_WRITE_HEAD_FLAG',
+  test: 'server/scripts/verify-sync-cell-load-soak.test.mjs',
+  why: 'Load-harness knob, not a server one: missing, blank and off keep the fixed pre-baseline write target; on re-resolves the bridge write head every soak cycle and records distinct heads per partition; anything else throws.',
 }]
 //
 // The list the `local/no-bare-env-number` rule (scripts/env-knobs.mjs) checks

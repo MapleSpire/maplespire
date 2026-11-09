@@ -30,6 +30,7 @@ import {
 } from './rbac/docScope.js'
 import { coverWorkspace } from './rbac/claimCoverage.js'
 import { announceDefaultVersionRepoint } from './syncCells/defaultVersionRepoint.js'
+import { ensureShareSchema } from './shares.js'
 
 /**
  * Multi-landscape registry.
@@ -804,17 +805,40 @@ export async function deleteLandscape(id: string): Promise<DeleteResult> {
     : await pool.query<{ n: number }>('SELECT count(*)::int AS n FROM landscapes')
   if ((rows[0]?.n ?? 0) <= 1) return { ok: false, reason: 'Cannot delete the only landscape.' }
 
-  const { rowCount } = await pool.query('DELETE FROM landscapes WHERE id = $1', [id])
-  if ((rowCount ?? 0) === 0) return { ok: false, reason: 'Landscape not found.' }
-
-  if (orgId) {
-    await pool.query(
-      `UPDATE orgs SET default_landscape_id = (
-         SELECT id FROM landscapes WHERE org_id = $1 ORDER BY created_at LIMIT 1
-       )
-       WHERE id = $1 AND default_landscape_id = $2`,
-      [orgId, id]
-    )
+  // `shared_links.landscape_id` is added lazily by ensureShareSchema (memoized);
+  // run it first so the DELETE below never meets a DB that has not grown the
+  // column yet.
+  await ensureShareSchema(pool)
+  // One transaction: the landscape row, its share links (V0-03 — a share must
+  // not outlive its landscape and keep serving its snapshot publicly) and the
+  // org's default repoint commit or roll back together.
+  const client = await pool.connect()
+  let releaseErr: Error | undefined
+  try {
+    await client.query('BEGIN')
+    const { rowCount } = await client.query('DELETE FROM landscapes WHERE id = $1', [id])
+    if ((rowCount ?? 0) === 0) {
+      await client.query('ROLLBACK')
+      return { ok: false, reason: 'Landscape not found.' }
+    }
+    await client.query('DELETE FROM shared_links WHERE landscape_id = $1', [id])
+    if (orgId) {
+      await client.query(
+        `UPDATE orgs SET default_landscape_id = (
+           SELECT id FROM landscapes WHERE org_id = $1 ORDER BY created_at LIMIT 1
+         )
+         WHERE id = $1 AND default_landscape_id = $2`,
+        [orgId, id]
+      )
+    }
+    await client.query('COMMIT')
+  } catch (err) {
+    // A failed ROLLBACK leaves the session in an unknown state: destroy the
+    // client instead of returning it to the pool.
+    await client.query('ROLLBACK').catch((rbErr: Error) => { releaseErr = rbErr })
+    throw err
+  } finally {
+    client.release(releaseErr)
   }
 
   await softDeleteScopesFor('landscape', id)

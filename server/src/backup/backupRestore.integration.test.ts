@@ -326,6 +326,27 @@ describe.skipIf(!TEST_DATABASE_URL)('real PostgreSQL backup and restore drill', 
     expect(await readdir(bundleDirectory)).not.toContain(BUNDLE_OWNER_FILE)
   })
 
+  it('writes the bundle owner-only: directories 0700, dump and manifest 0600', async () => {
+    // A fresh intermediate directory too, so the parent `mkdir` is covered.
+    const parent = join(temporaryDirectory, 'perm-parent')
+    const bundleDirectory = join(parent, 'bundle')
+    await createDatabaseBackup({
+      databaseUrl: source.url,
+      bundleDirectory,
+      pgTools: tools,
+      assetDirectory: assetVolume,
+    })
+    const modeOf = async (path: string) => (await stat(path)).mode & 0o777
+    expect(await modeOf(parent)).toBe(0o700)
+    expect(await modeOf(bundleDirectory)).toBe(0o700)
+    expect(await modeOf(join(bundleDirectory, 'database.dump'))).toBe(0o600)
+    expect(await modeOf(join(bundleDirectory, 'manifest.json'))).toBe(0o600)
+    expect(await modeOf(join(bundleDirectory, 'assets'))).toBe(0o700)
+    for (const name of await readdir(join(bundleDirectory, 'assets'))) {
+      expect(await modeOf(join(bundleDirectory, 'assets', name))).toBe(0o600)
+    }
+  }, 180_000)
+
   it('restores exact chunks, documents and a non-empty asset volume', async () => {
     const bundleDirectory = join(temporaryDirectory, 'bundle')
     const manifest = await createDatabaseBackup({

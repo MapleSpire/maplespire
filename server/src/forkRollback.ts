@@ -47,6 +47,13 @@ import { StaleSyncCellWriteError } from './automergeStorageErrors.js'
  * already in flight lands after the flush resolves, and a `change()` in the
  * window re-arms it.)
  *
+ * The storage adapter's OWN retry is not such a save: a content save stopped
+ * by a ceiling of the storage write pool is retried by
+ * `PostgresStorageAdapter` (`scheduleCeilingRetry`) for about a minute, and a
+ * fork fails exactly when the pool is struggling — but a `removeRange` of the
+ * document's content that SUCCEEDS cancels every retry pending for it, so the
+ * removal below is not undone by it (`automergeStorage.ts`, `removeRange`).
+ *
  * So the outcome below has NO field about resurrection, on purpose: a boolean
  * this function cannot compute would be read as a guarantee. What reclaims a
  * written-back document depends on its NAME, and the log line below says

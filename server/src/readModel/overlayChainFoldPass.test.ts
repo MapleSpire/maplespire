@@ -15,6 +15,7 @@
 import { Repo, type AutomergeUrl } from '@automerge/automerge-repo'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { StaticDeltaProjector, substituteOverlayPrefix } from './staticDeltaProjector.js'
+import { projectionLockOrderViolations } from './lockEdgeScan.js'
 
 /**
  * The chain-fold PASS, driven through the REAL rotation path.
@@ -588,60 +589,11 @@ describe('D3 — le pliage dont la revendication ÉCHOUE (A7)', () => {
   }, 60_000)
 })
 
-/**
- * The ONE global lock order in this subsystem, made executable.
- *
- * `read-model-projection:` before `overlay-rotation:`, always. It holds only
- * because nothing that takes an `overlay-rotation` lock ever asks for the
- * projection mutex: rotation, fold and admitted-rotation recovery hold
- * `overlay-rotation` at SESSION scope on their own client and run their
- * transactions with a bare `BEGIN`, deliberately NOT through
- * `withReadModelProjectionTransaction`. Route any of them through it "for
- * uniformity" and the order inverts against `publish()`, which holds the mutex
- * and then takes `overlay-rotation` as an XACT lock inside
- * `synchronizeOverlaySegments` — a real 40P01, on one workspace, needing no
- * fan-out.
- *
- * A comment cannot notice that edit, which is the whole reason this scanner
- * exists rather than a paragraph. It lives in THIS file because this is where
- * real rotations and real folds are driven end to end: the hazard shape is
- * produced for free by `publishAdmittedRotation`, which COMMITS its transaction
- * and then calls `metaHandle.change` while the session lock is still held —
- * firing the ModelMeta listener, whose publish is the transaction that wants
- * the mutex.
- *
- * Process-wide on purpose, not per-connection. The dangerous cycle here is
- * partly in JavaScript — one path holds a session lock and then waits for a
- * pool slot held by a path waiting on that lock — and Postgres cannot see that
- * one at all: only one side is waiting in the lock manager, so there is no
- * cycle to detect and no 40P01 to catch it.
- */
-function projectionLockOrderViolations(
-  calls: readonly (readonly [string, (readonly unknown[])?])[],
-): string[] {
-  const held: string[] = []
-  const violations: string[] = []
-  for (const [sql, params] of calls) {
-    const text = String(sql)
-    const key = String((params ?? [])[0] ?? '')
-    // `pg_advisory_lock(` cannot match `pg_advisory_xact_lock(` — the xact form
-    // spells `advisory_xact_lock` — so these three branches are disjoint. The
-    // TRY form is spelled `pg_try_advisory_lock(` and does not match the bare
-    // one either, which is why it is named explicitly: the projector's three
-    // session-lock sites all use it, and matching only the blocking form
-    // would leave this detector tracking an empty `held` stack for ever —
-    // reporting zero violations because it stopped looking, not because there
-    // are none.
-    if (text.includes('pg_advisory_lock(') || text.includes('pg_try_advisory_lock(')) held.push(key)
-    else if (text.includes('pg_advisory_unlock(')) {
-      const at = held.lastIndexOf(key)
-      if (at >= 0) held.splice(at, 1)
-    } else if (text.includes('pg_advisory_xact_lock(') && key.startsWith('read-model-projection:')) {
-      if (held.length > 0) violations.push(`${key} taken while holding ${held.join(', ')}`)
-    }
-  }
-  return violations
-}
+// Gate A8, `projectionLockOrderViolations`, lives in `lockEdgeScan.ts` since
+// phase 3 of ordinary writer-head rotation: the ordinary rotator
+// (`ordinaryHeadRotator.ts`) is a second overlay-rotation session-lock holder,
+// and its integration test feeds its own statement stream through the SAME
+// detector. Its documentation moved with it.
 
 /**
  * The ROW-lock order, which the advisory detector above cannot see.

@@ -26,6 +26,7 @@ import {
 } from './diagramViewWrite'
 import { diagramToDiagramDoc } from './projection'
 import { reconcile } from './reconcile'
+import { DIAGRAM_DOC_SCHEMA } from './knownKeys'
 
 function diagram(id: string, over: Partial<Diagram> = {}): Diagram {
   return {
@@ -166,7 +167,7 @@ describe('applyDiagramViewFields', () => {
   // whole-doc reconcile would — on a REAL Automerge doc, view fields only.
   function fullWrite(doc: Automerge.Doc<Record<string, unknown>>, d: Diagram, checkpoints: unknown[] = []) {
     return Automerge.change(doc, (draft) => {
-      reconcile(draft, diagramToDiagramDoc(d, [], [], checkpoints as never))
+      reconcile(draft, diagramToDiagramDoc(d, [], [], checkpoints as never), DIAGRAM_DOC_SCHEMA)
     })
   }
 
@@ -221,7 +222,7 @@ describe('objectScopes delta write', () => {
   /** Create a document the way the client does (map at birth, or legacy without). */
   function born(store: Diagram): Doc {
     return Automerge.change(Automerge.from({} as Record<string, unknown>), (draft) => {
-      reconcile(draft, diagramToDiagramDoc(store, [], [], []))
+      reconcile(draft, diagramToDiagramDoc(store, [], [], []), DIAGRAM_DOC_SCHEMA)
     })
   }
 
@@ -231,7 +232,7 @@ describe('objectScopes delta write', () => {
     return Automerge.change(Automerge.clone(doc), (draft) => {
       const target = diagramToDiagramDoc(store, [], [], []) as Record<string, unknown>
       setObjectScopesForReconcile(target, store.objectScopes, draft, dirty ? new Set(dirty) : undefined)
-      reconcile(draft, target)
+      reconcile(draft, target, DIAGRAM_DOC_SCHEMA)
     })
   }
 

@@ -55,12 +55,14 @@ export function MarkdownEditor({ value, onChange, placeholder, testId, disabled 
     return DOMPurify.sanitize(raw)
   }, [value])
 
+  // Plain data: the click handler calls `insert` (which reads the textarea ref),
+  // so no ref-reading closure is built during render.
   const tools = [
-    { icon: Bold, label: t('misc.markdownEditor.bold'), action: () => insert('**', '**') },
-    { icon: Italic, label: t('misc.markdownEditor.italic'), action: () => insert('*', '*') },
-    { icon: Heading, label: t('misc.markdownEditor.heading'), action: () => insert('## ', '') },
-    { icon: List, label: t('misc.markdownEditor.list'), action: () => insert('- ', '') },
-    { icon: Code, label: t('misc.markdownEditor.code'), action: () => insert('`', '`') },
+    { icon: Bold, label: t('misc.markdownEditor.bold'), before: '**', after: '**' },
+    { icon: Italic, label: t('misc.markdownEditor.italic'), before: '*', after: '*' },
+    { icon: Heading, label: t('misc.markdownEditor.heading'), before: '## ', after: '' },
+    { icon: List, label: t('misc.markdownEditor.list'), before: '- ', after: '' },
+    { icon: Code, label: t('misc.markdownEditor.code'), before: '`', after: '`' },
   ]
 
   return (
@@ -72,7 +74,7 @@ export function MarkdownEditor({ value, onChange, placeholder, testId, disabled 
             <button
               key={tool.label}
               type="button"
-              onClick={tool.action}
+              onClick={() => insert(tool.before, tool.after)}
               disabled={disabled}
               title={tool.label}
               className="p-1 rounded hover:bg-surface-300 text-fg-muted transition-colors"
