@@ -31,6 +31,13 @@ RUN mkdir -p /var/lib/maplespire/assets/technologies \
 
 ENV TECHNOLOGY_ASSET_DIR=/var/lib/maplespire/assets/technologies
 
+# Non-root by default (uid 1000, `node`), as Kubernetes (run_as_user 1000) and
+# ECS (EFS access point posixUser 1000) already run it. A fresh named volume is
+# seeded from the node-owned directory above. Starting the container as root
+# (`user: root`) is still supported: the entrypoint repairs the volume's
+# ownership, then drops to `node` with su-exec.
+USER node
+
 ENTRYPOINT ["technology-assets-entrypoint"]
 
 EXPOSE 3001
@@ -50,6 +57,9 @@ CMD ["node", "dist/index.js"]
 # upgraded Postgres and nothing else broke. Bump it with the postgres image.
 FROM runtime AS drill
 
+# Root only for the build steps below; the stage ends as `node` again.
+USER root
+
 ARG PG_MAJOR=16
 RUN apk add --no-cache "postgresql${PG_MAJOR}-client"
 
@@ -62,6 +72,7 @@ RUN mkdir -p "${BACKUP_DIRECTORY}" && chown -R node:node "${BACKUP_DIRECTORY}"
 # drill mounts read-only on purpose. See docker-entrypoint-drill.sh.
 COPY docker-entrypoint-drill.sh /usr/local/bin/backup-drill-entrypoint
 RUN chmod 0755 /usr/local/bin/backup-drill-entrypoint
+USER node
 ENTRYPOINT ["backup-drill-entrypoint"]
 
 CMD ["node", "dist/backup/drillScheduler.js"]

@@ -56,7 +56,7 @@ rules:
     pattern-either:
       - pattern: if ($REQ.body.role === ...) { ... }
       - pattern: if ($REQ.query.role === ...) { ... }
-      - pattern: if ($REQ.headers['x-role'] ...) { ... }
+      - pattern: if (<... $REQ.headers['x-role'] ...>) { ... }
       - pattern: $X = $REQ.body.isAdmin
     metadata:
       category: security

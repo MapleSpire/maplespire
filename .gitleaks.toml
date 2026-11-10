@@ -26,3 +26,35 @@ regexes = ['''^AKIAIOSFODNN7EXAMPLE$''']
 description = "Local-only docker-compose Postgres/Redis dev password"
 regexTarget = "match"
 regexes = ['''maplespire:maplespire@''']
+
+# The fixed AUTH_SECRET the server auth tests sign their sessions with.
+[[allowlists]]
+description = "Server auth test signing secret"
+regexes = ['''test-secret-1234567890''']
+
+# The alerting fixtures' fake SNS key ids (AKIA = long-lived, ASIA = session).
+# ABCDEFGHIJKLMNOP is the alphabet, not key material.
+[[allowlists]]
+description = "Alerting fixture AWS key ids"
+regexes = ['''A[KS]IAABCDEFGHIJKLMNOP''']
+
+# Fixture tunnel token in the deployment-placement manifest; it says what it is.
+[[allowlists]]
+description = "Deployment-placement fixture tunnel token"
+regexes = ['''g6-fixture-tunnel-token-not-a-credential''']
+
+# A Redis key PREFIX in the performance-validation compose file (`..._KEY_...`).
+[[allowlists]]
+description = "Performance-validation Redis key prefix"
+regexes = ['''^maplespire-dag-7366$''']
+
+# The placeholder token in the admin UI's copy-paste curl example.
+[[allowlists]]
+description = "Admin UI curl example placeholder"
+regexes = ['''bvr_YOUR_TOKEN''']
+
+# The linkedin-client-id rule reads the 14 letters after `"LinkedIn",` in the
+# generated icon catalog: they are the JSON key `compatibleWith`.
+[[allowlists]]
+description = "Icon catalog JSON key read as a LinkedIn client id"
+regexes = ['''^compatibleWith$''']

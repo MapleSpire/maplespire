@@ -56,6 +56,15 @@ describe('ai/crypto', () => {
     expect(decryptSecret(blob)).toBeNull() // key rotation → caller surfaces re-enter-key
   })
 
+  it('refuses a truncated authentication tag', () => {
+    const blob = encryptSecret('value')
+    const [v, iv, tag, ct] = blob.split(':')
+    // The first 4 bytes of the genuine tag: Node accepts that length unless
+    // authTagLength is pinned, and checks only the bytes it was given.
+    const short = Buffer.from(tag, 'base64url').subarray(0, 4).toString('base64url')
+    expect(decryptSecret(`${v}:${iv}:${short}:${ct}`)).toBeNull()
+  })
+
   it('falls back to AUTH_SECRET and reports availability', () => {
     delete process.env.AI_KEY_SECRET
     expect(aiCryptoAvailable()).toBe(false)

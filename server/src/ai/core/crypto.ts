@@ -48,10 +48,13 @@ function deriveKey(): Buffer {
   return createHash('sha256').update(material).digest()
 }
 
+/** AES-GCM authentication tag length, in bytes: the full 128 bits. */
+const GCM_TAG_BYTES = 16
+
 export function encryptSecret(plain: string): string {
   const key = deriveKey()
   const iv = randomBytes(12)
-  const cipher = createCipheriv('aes-256-gcm', key, iv)
+  const cipher = createCipheriv('aes-256-gcm', key, iv, { authTagLength: GCM_TAG_BYTES })
   const ct = Buffer.concat([cipher.update(plain, 'utf8'), cipher.final()])
   const tag = cipher.getAuthTag()
   return `v1:${iv.toString('base64url')}:${tag.toString('base64url')}:${ct.toString('base64url')}`
@@ -65,7 +68,9 @@ export function decryptSecret(blob: string): string | null {
     const [version, ivB64, tagB64, ctB64] = blob.split(':')
     if (version !== 'v1' || !ivB64 || !tagB64 || !ctB64) return null
     const key = deriveKey()
-    const decipher = createDecipheriv('aes-256-gcm', key, Buffer.from(ivB64, 'base64url'))
+    // Pin the tag length: without it, Node accepts a TRUNCATED tag (down to 4
+    // bytes), which makes forging a blob that decrypts far cheaper.
+    const decipher = createDecipheriv('aes-256-gcm', key, Buffer.from(ivB64, 'base64url'), { authTagLength: GCM_TAG_BYTES })
     decipher.setAuthTag(Buffer.from(tagB64, 'base64url'))
     return Buffer.concat([decipher.update(Buffer.from(ctB64, 'base64url')), decipher.final()]).toString('utf8')
   } catch {

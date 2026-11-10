@@ -78,7 +78,10 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   const name = req.params.name
   const args = (req.params.arguments ?? {}) as Record<string, unknown>
   const { landscapeId, versionId, ...input } = args
-  const res = await fetch(`${BASE}/api/ai/tools/${encodeURIComponent(name)}`, {
+  // Encoded into ONE path segment before it meets the URL: the tool name comes
+  // from the MCP client and must never reach the host or add a path segment.
+  const toolSegment = encodeURIComponent(name)
+  const res = await fetch(`${BASE}/api/ai/tools/${toolSegment}`, {
     method: 'POST',
     headers: headers(),
     body: JSON.stringify({
