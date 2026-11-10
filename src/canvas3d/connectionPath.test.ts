@@ -14,7 +14,8 @@
 
 import { describe, expect, it } from 'vitest'
 import type { Connection } from '../types'
-import { connectionPath, samplePath, type Rect } from './connectionPath'
+import { anchorPoint, connectionPath, edgePoint, nearestAnchorIndex, samplePath, type Rect } from './connectionPath'
+import { personAnchorPoint, personContains, personEdgePoint, personGeometry } from '../canvas/personShape'
 import { INK_HEAD_LEN } from './inkLine'
 
 // Two cards of the quality harness board (scripts/view3d-quality/run.mjs).
@@ -44,4 +45,36 @@ describe('connectionPath — the route both 3D profiles draw (2D parity)', () =>
       expect(Math.hypot(pts[0].x - g.fromEdge.x, pts[0].y - g.fromEdge.y)).toBeCloseTo(4, 9)
     })
   }
+})
+
+describe('connectionPath — the C4 person figure (2D parity)', () => {
+  const USER: Rect = { x: 0, y: 0, w: 160, h: 100, shape: 'person' }
+  const CARD: Rect = { x: 0, y: 0, w: 160, h: 100 }
+
+  it('free ends and anchors use the shared person geometry, exactly as the 2D engine does', () => {
+    for (const [tx, ty] of [[-300, -300], [80, -500], [900, 40], [80, 900], [-40, 30]]) {
+      expect(edgePoint(USER, tx, ty)).toEqual(personEdgePoint(USER, tx, ty))
+    }
+    const sides = ['top', 'top', 'top', 'right', 'right', 'right', 'bottom', 'bottom', 'bottom', 'left', 'left', 'left'] as const
+    const ratios = [0.2, 0.5, 0.8]
+    for (let i = 0; i < 12; i++) {
+      expect(anchorPoint(USER, i)).toEqual(personAnchorPoint(USER, sides[i], ratios[i % 3]))
+    }
+  })
+
+  it('a route toward the upper left starts on the figure, not in the empty box corner', () => {
+    const g = connectionPath(conn({}), USER, { x: -400, y: -400, w: 160, h: 100 })
+    const fig = personGeometry(0, 0, 160, 100)
+    const { x, y } = g.fromEdge
+    const len = Math.hypot(x - 80, y - 50)
+    expect(personContains(fig, x - ((x - 80) / len) * 0.5, y - ((y - 50) / len) * 0.5)).toBe(true)
+    expect(personContains(fig, x + ((x - 80) / len) * 0.5, y + ((y - 50) / len) * 0.5)).toBe(false)
+    expect(y).toBeGreaterThan(10)
+  })
+
+  it('a card rect (no shape) keeps the rectangle maths', () => {
+    expect(edgePoint(CARD, 80, -500)).toEqual({ x: 80, y: 0, face: 'top' })
+    expect(anchorPoint(CARD, 0)).toEqual({ x: 8 + 0.2 * 144, y: 0, face: 'top' })
+    expect(nearestAnchorIndex(USER, 80, -2)).toBe(1) // the crown
+  })
 })

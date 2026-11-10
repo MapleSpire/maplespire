@@ -88,6 +88,11 @@ describe('3D theme spec sanitizers (plan §8 — community-safe by construction)
     expect(sanitizeEnvironment3d(undefined)).toBeNull()
   })
 
+  it('node spec: a resting border colour passes the same colour gate as the faces', () => {
+    expect(sanitizeNodeSpec3d({ materials: { border: '#4A525D' } })!.materials).toEqual({ border: '#4A525D' })
+    expect(sanitizeNodeSpec3d({ materials: { border: 'url(evil)' } })).toBeNull()
+  })
+
   it('node spec: clamps dims/motion, gates colors, drops unknown keys', () => {
     const spec = sanitizeNodeSpec3d({
       materials: { top: '#FCEE0A', opacity: 0.01, evil: 'expression(x)' },

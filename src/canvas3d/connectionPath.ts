@@ -22,12 +22,16 @@
  */
 
 import type { Connection, ConnectionShape, Position } from '../types'
+import { personAnchorPoint, personEdgePoint, type ObjectSilhouette } from '../canvas/personShape'
 
 export interface Rect {
   x: number
   y: number
   w: number
   h: number
+  /** Drawn silhouette when it is not the card (the C4 person figure): edge
+   * points and anchors then land on the figure, as in the 2D engine. */
+  shape?: ObjectSilhouette
 }
 
 export type Face = 'top' | 'bottom' | 'left' | 'right'
@@ -78,6 +82,7 @@ export function anchorPoint(rect: Rect, anchorIndex: number): EdgePoint {
   const cx = rect.x + rect.w / 2
   const cy = rect.y + rect.h / 2
   if (!def) return { x: cx, y: cy, face: 'top' }
+  if (rect.shape === 'person') return personAnchorPoint(rect, def.side, def.ratio)
   const r = 8
   switch (def.side) {
     case 'top':
@@ -93,6 +98,7 @@ export function anchorPoint(rect: Rect, anchorIndex: number): EdgePoint {
 
 /** Unanchored endpoint: where the line toward `(tx, ty)` exits the rect. */
 export function edgePoint(rect: Rect, tx: number, ty: number): EdgePoint {
+  if (rect.shape === 'person') return personEdgePoint(rect, tx, ty)
   const cx = rect.x + rect.w / 2
   const cy = rect.y + rect.h / 2
   const dx = tx - cx

@@ -137,6 +137,9 @@ export interface NodeSpec3D {
     top?: string
     wallFront?: string
     wallSide?: string
+    /** Resting border (the slab's top cap, showing as the 1px rim around the
+     * top face). Never applied to a selected card, which keeps the accent. */
+    border?: string
     /** Whole-card opacity (clamped ≥ 0.35 — cards must stay readable). */
     opacity?: number
   }
@@ -367,10 +370,12 @@ export function sanitizeNodeSpec3d(raw: unknown): NodeSpec3D | null {
     const top = safeColor(m.top)
     const wallFront = safeColor(m.wallFront)
     const wallSide = safeColor(m.wallSide)
+    const border = safeColor(m.border)
     const opacity = clampNum(m.opacity, 0.35, 1)
     if (top) materials.top = top
     if (wallFront) materials.wallFront = wallFront
     if (wallSide) materials.wallSide = wallSide
+    if (border) materials.border = border
     if (opacity !== undefined) materials.opacity = opacity
     if (hasAnyKey(materials)) out.materials = materials
   }

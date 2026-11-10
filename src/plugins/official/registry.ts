@@ -18,6 +18,7 @@ import { studioTheme } from './studio.theme'
 import { cyberpunkTheme } from './cyberpunk.theme'
 import { eightbitTheme } from './eightbit.theme'
 import { graffitiTheme } from './graffiti.theme'
+import { c4Theme } from './c4.theme'
 
 /**
  * Maps a skin id → its official ThemePlugin. The engine resolves a plugin here
@@ -41,6 +42,7 @@ const officialThemes = new Map<string, ThemePlugin>([
   [cyberpunkTheme.meta.id, cyberpunkTheme],
   [eightbitTheme.meta.id, eightbitTheme],
   [graffitiTheme.meta.id, graffitiTheme],
+  [c4Theme.meta.id, c4Theme],
 ])
 
 /** Resolve the official theme for a skin id, falling back to the default theme. */
