@@ -42,6 +42,11 @@ ENTRYPOINT ["technology-assets-entrypoint"]
 
 EXPOSE 3001
 
+# The same probe the Compose files use: /api/ready on PORT. The 5 s timeout is
+# above 2 x the 1500 ms Redis command ceiling the readiness check can wait on.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+  CMD ["node", "-e", "fetch('http://127.0.0.1:'+(process.env.PORT||3001)+'/api/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+
 CMD ["node", "dist/index.js"]
 
 # --- Drill stage: the same artifact, plus a matching PostgreSQL client ---
@@ -59,6 +64,9 @@ FROM runtime AS drill
 
 # Root only for the build steps below; the stage ends as `node` again.
 USER root
+
+# The drill serves no /api/ready; it reports through its own metrics port.
+HEALTHCHECK NONE
 
 ARG PG_MAJOR=16
 RUN apk add --no-cache "postgresql${PG_MAJOR}-client"

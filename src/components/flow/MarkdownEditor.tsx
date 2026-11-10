@@ -120,12 +120,17 @@ export function MarkdownEditor({ value, onChange, placeholder, testId, disabled 
           className="w-full text-[12px] text-fg-secondary px-3 py-2 resize-none focus:outline-none bg-surface-100"
         />
       ) : (
-        <div
-          className="px-3 py-2 text-[12px] text-fg-secondary min-h-[80px] max-h-[200px] overflow-y-auto prose prose-sm max-w-none"
-          dangerouslySetInnerHTML={{
-            __html: previewHtml || `<span class="text-fg-subtle">${t('misc.markdownEditor.nothingToPreview')}</span>`,
-          }}
-        />
+        previewHtml ? (
+          <div
+            className="px-3 py-2 text-[12px] text-fg-secondary min-h-[80px] max-h-[200px] overflow-y-auto prose prose-sm max-w-none"
+            // nosemgrep: typescript.react.security.audit.react-dangerouslysetinnerhtml.react-dangerouslysetinnerhtml -- previewHtml is DOMPurify.sanitize output
+            dangerouslySetInnerHTML={{ __html: previewHtml }}
+          />
+        ) : (
+          <div className="px-3 py-2 text-[12px] text-fg-secondary min-h-[80px] max-h-[200px] overflow-y-auto prose prose-sm max-w-none">
+            <span className="text-fg-subtle">{t('misc.markdownEditor.nothingToPreview')}</span>
+          </div>
+        )
       )}
     </div>
   )

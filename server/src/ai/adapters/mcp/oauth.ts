@@ -109,6 +109,7 @@ export function registerMcpOAuthRoutes(app: Express): void {
   app.get('/.well-known/oauth-authorization-server/mcp', metadata)
 
   // ── Dynamic client registration (public clients + PKCE) ─────────────────
+  // nosemgrep: sr-authz-route-without-middleware -- public: OAuth dynamic client registration (RFC 7591) runs before any sign-in
   app.post('/api/auth/mcp/register', (req, res) => {
     void (async () => {
       const body = (req.body ?? {}) as { redirect_uris?: unknown; client_name?: unknown }
@@ -214,18 +215,21 @@ export function registerMcpOAuthRoutes(app: Express): void {
         })
           .map(([k, v]) => `<input type="hidden" name="${esc(k)}" value="${esc(v)}">`)
           .join('\n')
-        res.send(
-          page(
-            'Authorize access',
-            `<p><strong>${esc(client.client_name ?? 'An MCP client')}</strong> wants to access your MapleSpire architecture model as <strong>${esc(email)}</strong>.</p>
-             <p>It will be able to read the model and make changes with your permissions (scope: <code>${esc(scope)}</code>).</p>
-             <form method="post" action="/api/auth/mcp/authorize">
-               ${hidden}
-               <button name="decision" value="approve" class="approve">Authorize</button>
-               <button name="decision" value="deny" class="deny">Deny</button>
-             </form>`
-          )
-        )
+        // Every interpolated value below is escaped with esc(); the scanners
+        // cannot see through it, hence the nosemgrep comments.
+        const consentBody = [
+          // nosemgrep: javascript.express.security.injection.raw-html-format.raw-html-format
+          `<p><strong>${esc(client.client_name ?? 'An MCP client')}</strong> wants to access your MapleSpire architecture model as <strong>${esc(email)}</strong>.</p>`,
+          // nosemgrep: javascript.express.security.injection.raw-html-format.raw-html-format
+          `<p>It will be able to read the model and make changes with your permissions (scope: <code>${esc(scope)}</code>).</p>`,
+          '<form method="post" action="/api/auth/mcp/authorize">',
+          hidden,
+          '<button name="decision" value="approve" class="approve">Authorize</button>',
+          '<button name="decision" value="deny" class="deny">Deny</button>',
+          '</form>',
+        ].join('\n')
+        // nosemgrep: javascript.express.security.audit.xss.direct-response-write.direct-response-write
+        res.send(page('Authorize access', consentBody))
         return
       }
 
