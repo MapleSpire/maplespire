@@ -78,19 +78,27 @@ rules:
       - pattern: $REQ.query
       - pattern: $REQ.params
       - pattern: $REQ.headers
+    # The sink is the URL argument only (`focus-metavariable` inside `patterns:`):
+    # a request value sent in the BODY of a fetch to a fixed host is not SSRF.
     pattern-sinks:
-      - pattern: fetch($URL, ...)
-        focus-metavariable: $URL
-      - pattern: globalThis.fetch($URL, ...)
-        focus-metavariable: $URL
-      - pattern: http.request($URL, ...)
-        focus-metavariable: $URL
-      - pattern: https.request($URL, ...)
-        focus-metavariable: $URL
-      - pattern: http.get($URL, ...)
-        focus-metavariable: $URL
-      - pattern: https.get($URL, ...)
-        focus-metavariable: $URL
+      - patterns:
+          - pattern: fetch($URL, ...)
+          - focus-metavariable: $URL
+      - patterns:
+          - pattern: globalThis.fetch($URL, ...)
+          - focus-metavariable: $URL
+      - patterns:
+          - pattern: http.request($URL, ...)
+          - focus-metavariable: $URL
+      - patterns:
+          - pattern: https.request($URL, ...)
+          - focus-metavariable: $URL
+      - patterns:
+          - pattern: http.get($URL, ...)
+          - focus-metavariable: $URL
+      - patterns:
+          - pattern: https.get($URL, ...)
+          - focus-metavariable: $URL
     pattern-sanitizers:
       - pattern: encodeURIComponent(...)
       - pattern: assertAllowedUrl(...)
