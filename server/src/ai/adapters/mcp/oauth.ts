@@ -16,7 +16,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import express, { type Express, type Request, type Response } from 'express'
 import { pool } from '../../../db.js'
 import { authStage } from '../../../auth/middleware.js'
-import { createAiToken, findByRefreshToken, revokeTokenById } from '../../core/tokens.js'
+import { createAiToken, findByRefreshToken, loadLiveTokenOwner, revokeToken } from '../../core/tokens.js'
 import { hashToken } from '../../core/crypto.js'
 import { requestPublicBaseUrl } from '../publicBaseUrl.js'
 
@@ -309,12 +309,30 @@ export function registerMcpOAuthRoutes(app: Express): void {
           tokenError(res, 400, 'invalid_grant', 'refresh token revoked or unknown')
           return
         }
+        // A refresh must not outlive what a session would: a disabled owner, a
+        // suspended org or a bumped epoch ends the grant instead of re-minting
+        // a fresh token under the current epochs.
+        if (!(await loadLiveTokenOwner(pool, existing))) {
+          tokenError(res, 400, 'invalid_grant', 'refresh token revoked or unknown')
+          return
+        }
         // Rotate: revoke the old access+refresh pair, mint a fresh one.
         const { rows } = await pool.query<{ name: string; client_id: string | null }>(
           'SELECT name, client_id FROM ai_api_tokens WHERE id = $1',
           [existing.tokenId]
         )
-        await revokeTokenById(pool, existing.tokenId)
+        // Audited like every revocation. Only the request whose UPDATE
+        // actually revoked the row mints the successor: a concurrent refresh
+        // with the same token finds it already revoked and gets invalid_grant
+        // instead of a second live pair.
+        const rotated = await revokeToken(pool, existing.tokenId, 'oauth refresh rotation', {
+          role: 'system',
+          userId: existing.userId,
+        })
+        if (!rotated) {
+          tokenError(res, 400, 'invalid_grant', 'refresh token revoked or unknown')
+          return
+        }
         await issueTokens(res, {
           userId: existing.userId,
           orgId: existing.orgId,

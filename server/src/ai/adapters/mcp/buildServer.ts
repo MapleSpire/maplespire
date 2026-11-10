@@ -36,7 +36,7 @@ const DESTRUCTIVE = /^(delete_|merge_draft$|set_default_version$)/
 
 export function buildMcpServer(deps: McpDeps, identity: AiIdentity | null): McpServer {
   const server = new McpServer({ name: 'maplespire', version: '1.0.0' })
-  for (const def of listAiTools()) {
+  for (const def of listAiTools({ scopes: identity?.scopes })) {
     server.registerTool(
       def.name,
       {

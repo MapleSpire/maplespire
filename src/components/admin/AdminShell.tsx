@@ -13,6 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import { useEffect, useState } from 'react'
+import { useDepsChanged } from '../../hooks/useDepsChanged'
 import { Link, Outlet, useNavigate, useParams, useRouterState } from '@tanstack/react-router'
 import { LayoutGrid, Users, UsersRound, ShieldCheck, Sparkles, Lock, Layers3, Settings2, Tags } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
@@ -80,11 +81,17 @@ export function AdminShell() {
 
   // Guard: probe the overview endpoint once we have a session (or stage is
   // 'off', where auth is not enforced yet and the server will just answer).
+  // The reset to 'loading' happens during render, on the same inputs the probe
+  // effect below re-runs on, so the effect itself only fetches.
+  const probeInputsChanged = useDepsChanged([authLoading, config, user, orgId])
+  if (probeInputsChanged && !authLoading && config && (config.stage === 'off' || user)) {
+    setProbe({ status: 'loading' })
+  }
+
   useEffect(() => {
     if (authLoading || !config) return
     if (config.stage !== 'off' && !user) return // redirecting above
     let cancelled = false
-    setProbe({ status: 'loading' })
     getOverview(orgId)
       .then((data) => {
         if (!cancelled) setProbe({ status: 'ok', orgName: data.org.name })

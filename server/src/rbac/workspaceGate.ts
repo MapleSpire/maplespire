@@ -19,6 +19,7 @@ import { authStage } from '../auth/middleware.js'
 import { ensureDefaultOrg } from '../auth/schema.js'
 import { allowedWorkspaceKeys, writableWorkspaceKeys } from './docScope.js'
 import { explainAccess } from './access.js'
+import { orgRoleIfAdmitted } from '../auth/tenantPolicy.js'
 import { WorkspaceRegistryUnavailableError } from './workspaceRegistryErrors.js'
 
 /**
@@ -180,12 +181,24 @@ interface WriteDecisionTarget {
   versionId?: string
 }
 
+export interface WriteGateOptions {
+  /** What a MISSING landscape row means. 'allow' (default) keeps the historical
+   * contract for `/api/landscapes/*` endpoints, whose own lookup 404s. 'deny' is
+   * for callers that act on a row which merely REFERENCES a landscape — share
+   * links (V0-03): a share of a deleted landscape has no owner to check write
+   * against, so it is refused with a 404 instead of falling through. Applies
+   * wherever the gate evaluates (stages 'dual' and 'on' with claims); stage
+   * 'off', claim-less requests and platform admins return before the lookup. */
+  missingLandscape?: 'allow' | 'deny'
+}
+
 /** Shared body of requireLandscapeWrite / requireVersionWrite. */
 async function requireWorkspaceWrite(
   pool: Pool,
   req: Request,
   res: Response,
-  target: WriteDecisionTarget
+  target: WriteDecisionTarget,
+  opts: WriteGateOptions = {}
 ): Promise<boolean> {
   const stage = authStage()
   if (stage === 'off') return true
@@ -197,7 +210,13 @@ async function requireWorkspaceWrite(
       `SELECT l.org_id, o.status FROM landscapes l LEFT JOIN orgs o ON o.id = l.org_id WHERE l.id = $1`,
       [target.landscapeId]
     )
-    if (rows.length === 0) return true // missing landscape: the endpoint's own lookup 404s
+    if (rows.length === 0) {
+      if (opts.missingLandscape === 'deny') {
+        res.status(404).json({ error: 'Landscape not found' })
+        return false
+      }
+      return true // missing landscape: the endpoint's own lookup 404s
+    }
     const ownerOrgId = rows[0].org_id
     const suspended = rows[0].status === 'suspended'
 
@@ -223,11 +242,8 @@ async function requireWorkspaceWrite(
       } else if (ownerOrgId) {
         // No scope row at all (pre-backfill edge): fail closed for members,
         // but an org admin of the owning org still writes.
-        const { rows: admin } = await pool.query(
-          `SELECT 1 FROM org_members WHERE org_id = $1 AND user_id = $2 AND role = 'admin'`,
-          [ownerOrgId, claims.userId]
-        )
-        canWrite = admin.length > 0
+        // …if the org's Entra tenant policy admits them (V0-02).
+        canWrite = (await orgRoleIfAdmitted(pool, ownerOrgId, claims.userId)) === 'admin'
       }
     }
 
@@ -269,9 +285,10 @@ export async function requireVersionWrite(
   req: Request,
   res: Response,
   landscapeId: string,
-  versionId: string
+  versionId: string,
+  opts: WriteGateOptions = {}
 ): Promise<boolean> {
-  return requireWorkspaceWrite(pool, req, res, { landscapeId, versionId })
+  return requireWorkspaceWrite(pool, req, res, { landscapeId, versionId }, opts)
 }
 
 /**

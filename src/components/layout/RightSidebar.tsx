@@ -13,6 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import { useState, useRef, useEffect, useMemo, useCallback } from 'react'
+import { useDepsChanged } from '../../hooks/useDepsChanged'
 import { createPortal } from 'react-dom'
 import {
   Box,
@@ -2782,14 +2783,17 @@ function ConnectionsPanel({ selected, readonly }: { selected: C4Object; readonly
     getName(a[0]).localeCompare(getName(b[0]))
   )
 
-  // Reset expansion when filter or search changes: expand first group only
-  useEffect(() => {
+  // Reset expansion when filter or search changes: expand first group only.
+  // Done during render with this render's groups — keyed on the filters alone,
+  // as before, so a model edit does not collapse what the user expanded.
+  const expansionFiltersChanged = useDepsChanged([filter, kindFilter, search])
+  if (expansionFiltersChanged) {
     if (sortedGroups.length > 0) {
       setExpandedGroups({ [sortedGroups[0][0]]: true })
     } else {
       setExpandedGroups({})
     }
-  }, [filter, kindFilter, search])
+  }
 
   const toggleGroup = (id: string) => {
     setExpandedGroups((prev) => ({ ...prev, [id]: !prev[id] }))

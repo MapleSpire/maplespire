@@ -106,7 +106,14 @@ function logSessionCheckFailure(err: unknown): void {
 
 function isAllowlisted(req: Request): boolean {
   const path = req.path
-  if (ALLOWLISTED_PREFIXES.some((p) => path === p.replace(/\/$/, '') || path.startsWith(p))) return true
+  // Whole path segments only: `/health` admits `/health` and `/health/...`,
+  // never `/healthz` or `/healthy-landscapes`.
+  if (
+    ALLOWLISTED_PREFIXES.some((p) => {
+      const base = p.replace(/\/$/, '')
+      return path === base || path.startsWith(`${base}/`)
+    })
+  ) return true
   // Share-link resolution is GET-only and public; mutating a share must
   // still authenticate.
   if (req.method === 'GET' && path.startsWith('/shares/')) return true

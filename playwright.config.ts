@@ -23,7 +23,13 @@ const SYNC_CELL_FAILOVER_SPECS = ['**/workspace-move-retryable.spec.ts', '**/syn
 // an empty personal workspace; at AUTH=off `/` is the landing page, no login
 // form appears and every test times out waiting for /app/landscape/… (6/6,
 // measured 2026-10-25 on an isolated AUTH-off stack).
-const AUTH_DEV_LOGIN_SPECS = ['**/tag-perspective-new-group.spec.ts', '**/canvas-undo-clipboard.spec.ts']
+// auth-admin-permissions (V0-16) additionally needs AUTH_PASSWORD_LOGIN=on, and skips its
+// optional cases when E2E_AUTH_PLATFORM_EMAIL / E2E_AUTH_DATABASE_URL are absent (header of the spec).
+const AUTH_DEV_LOGIN_SPECS = [
+  '**/tag-perspective-new-group.spec.ts',
+  '**/canvas-undo-clipboard.spec.ts',
+  '**/auth-admin-permissions.spec.ts',
+]
 
 // E2E tests drive the REAL app (two isolated browser contexts) against the
 // running dev stack (`npm run dev:local`). They are NOT run by `npm test`
@@ -68,6 +74,10 @@ export default defineConfig({
       dependencies: ['chromium-seed'],
       testIgnore: [
         '**/boot/**', '**/view3d*.spec.ts', '**/model-read-cache-scale.spec.ts',
+        // Pixel baselines, platform-specific: the `visual` project below (docs/visual-tests.md).
+        '**/visual/**',
+        // Needs its own stack and two client builds: playwright.compat.config.ts.
+        '**/compat-n-1.spec.ts',
         ...SYNC_CELL_FAILOVER_SPECS, ...AUTH_DEV_LOGIN_SPECS,
       ],
       use: { ...devices['Desktop Chrome'], locale: 'en-US' },
@@ -125,6 +135,45 @@ export default defineConfig({
       name: 'boot-load',
       testMatch: '**/boot/load/*.spec.ts',
       use: { ...devices['Desktop Chrome'], baseURL: process.env.E2E_BOOT_URL ?? 'http://localhost:5180' },
+    },
+    // Visual-comparison gallery (V0-15): `toHaveScreenshot` / text snapshots against
+    // an AUTH-off dev:local stack. Read docs/visual-tests.md before touching it.
+    //   E2E_VISUAL_URL=http://localhost:<port> npm run e2e:visual
+    //   E2E_VISUAL_URL=http://localhost:<port> npm run e2e:visual:update
+    // Baselines are PER PLATFORM (`{platform}` in the path: darwin/ and linux/) because glyph
+    // rasterisation differs between CoreText and FreeType. Not part of the required CI job
+    // until linux baselines are committed (docs/visual-tests.md).
+    {
+      name: 'visual',
+      testMatch: '**/visual/**/*.spec.ts',
+      retries: 0, // a retry would hide exactly the nondeterminism this project exists to expose
+      snapshotPathTemplate: '{testDir}/visual/__snapshots__/{platform}/{arg}{ext}',
+      expect: {
+        timeout: 30_000,
+        toHaveScreenshot: {
+          animations: 'disabled',
+          caret: 'hide',
+          scale: 'css',
+          // Per-pixel colour tolerance stays tight (0.1) so a recoloured 1 px connection counts
+          // as a different pixel; the ratio budget absorbs only anti-aliasing noise.
+          threshold: 0.1,
+          maxDiffPixelRatio: 0.0001,
+        },
+      },
+      use: {
+        ...devices['Desktop Chrome'],
+        baseURL: process.env.E2E_VISUAL_URL ?? 'http://localhost:5174',
+        locale: 'en-US',
+        timezoneId: 'UTC',
+        viewport: { width: 1440, height: 900 },
+        deviceScaleFactor: 1,
+        contextOptions: { reducedMotion: 'reduce' },
+        colorScheme: 'light',
+        launchOptions: {
+          // Same glyph raster on every run: no subpixel positioning, no LCD text, sRGB output.
+          args: ['--font-render-hinting=none', '--disable-lcd-text', '--force-color-profile=srgb', '--disable-gpu'],
+        },
+      },
     },
   ],
 })

@@ -1,0 +1,60 @@
+# gitleaks configuration (V0-12).
+#
+# `useDefault` keeps the whole upstream ruleset. Allowlists below are
+# NARROW: each one excuses one specific, documented fake value, so a real
+# secret pasted into the same file still fires.
+#
+# There is deliberately NO `paths` entry in any global allowlist. gitleaks
+# (v8.30.1, sources/common.go `shouldSkipPath`) skips a WHOLE file when any
+# global allowlist's `paths` matches it, whatever that allowlist's `condition`:
+# a `condition = "AND"` path+regex pair still drops every *.test.ts file
+# unscanned. `scripts/security-gitleaks.test.mjs` plants a token in a
+# *.test.ts file to keep it that way.
+title = "MapleSpire gitleaks config"
+
+[extend]
+useDefault = true
+
+# Fixture: the public, documented AWS example access key id used in tests.
+[[allowlists]]
+description = "Documented AWS example key id"
+regexes = ['''^AKIAIOSFODNN7EXAMPLE$''']
+
+# The local-only docker-compose Postgres/Redis dev password. Matched against
+# the whole rule match, which carries the `user:password@` part of the URL.
+[[allowlists]]
+description = "Local-only docker-compose Postgres/Redis dev password"
+regexTarget = "match"
+regexes = ['''maplespire:maplespire@''']
+
+# The fixed AUTH_SECRET the server auth tests sign their sessions with.
+[[allowlists]]
+description = "Server auth test signing secret"
+regexes = ['''test-secret-1234567890''']
+
+# The alerting fixtures' fake SNS key ids (AKIA = long-lived, ASIA = session).
+# ABCDEFGHIJKLMNOP is the alphabet, not key material.
+[[allowlists]]
+description = "Alerting fixture AWS key ids"
+regexes = ['''A[KS]IAABCDEFGHIJKLMNOP''']
+
+# Fixture tunnel token in the deployment-placement manifest; it says what it is.
+[[allowlists]]
+description = "Deployment-placement fixture tunnel token"
+regexes = ['''g6-fixture-tunnel-token-not-a-credential''']
+
+# A Redis key PREFIX in the performance-validation compose file (`..._KEY_...`).
+[[allowlists]]
+description = "Performance-validation Redis key prefix"
+regexes = ['''^maplespire-dag-7366$''']
+
+# The placeholder token in the admin UI's copy-paste curl example.
+[[allowlists]]
+description = "Admin UI curl example placeholder"
+regexes = ['''bvr_YOUR_TOKEN''']
+
+# The linkedin-client-id rule reads the 14 letters after `"LinkedIn",` in the
+# generated icon catalog: they are the JSON key `compatibleWith`.
+[[allowlists]]
+description = "Icon catalog JSON key read as a LinkedIn client id"
+regexes = ['''^compatibleWith$''']

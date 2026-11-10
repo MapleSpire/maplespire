@@ -20,7 +20,8 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { performance } from 'node:perf_hooks'
 import { promisify } from 'node:util'
-import { Repo } from '@automerge/automerge-repo'
+import { stats as automergeStats } from '@automerge/automerge'
+import { Repo, isValidAutomergeUrl } from '@automerge/automerge-repo'
 import { AuthenticatedWebSocketClientAdapter } from '../qa/authenticatedWebSocketAdapter.mjs'
 import { appendOverlayBatchId, loadObjectIds, objectMap, percentile, resolveLoadHandle } from '../qa/loadUsersCore.mjs'
 import { makeObject } from '../qa/lib.mjs'
@@ -29,6 +30,7 @@ import { assertTopologyBuild, assertTopologyTargetReceipt, qualifyRuntimeTopolog
 import { RehearsalObservations, RehearsalSampler, closeRehearsalSeeder, freshnessIdentityValid, isFreshWitness, measureTakeover, publishRehearsalBases, rehearsalDurableAcknowledged } from './sync-cell-rehearsal.mjs'
 import { assertBenchSession, benchRuntime, benchSessionFile, runCompose, runComposeSync } from './sync-bench-runtime.mjs'
 import { readCalibrationReceipt } from './sync-cell-calibration.mjs'
+import { REMOTE_LOAD_ENV, assertLanAddress, readRemoteLoadSecret, startRemoteLoadServer } from './sync-cell-remote-load-core.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const composeFile = resolve(here, '../../infra/compose/sync-cell-failover.yml')
@@ -37,6 +39,12 @@ const activeLoadProcesses = new Set()
 /** The run lock of the run in progress, so an ABANDONED run can still
  *  give it back: `main()`'s `finally` never runs when `run()` never settles. */
 let activeRunLock = null
+/** The remote load session of the run in progress (`SYNC_LOAD_REMOTE=listen`),
+ *  through which `startLoadProcess` starts its cohorts on the load host. Null
+ *  for every run that did not ask: the cohorts are then local children, as
+ *  they always were. */
+let activeRemoteLoad = null
+let activeRemoteLoadServer = null
 /** Where `run()` is, for the failure line of a run that never produced a
  *  verdict. Nothing else reads it. */
 let currentPhase = 'not started'
@@ -235,6 +243,799 @@ export const LOAD_PROFILES = {
   },
 }
 
+/**
+ * Follow the ordinary workspace's CURRENT object write head at every soak cycle
+ * instead of the one resolved before baseline. Off (missing, blank, `off`) is
+ * the historical fixed-target harness. `on` exists for A/B runs against a
+ * server-side ordinary-head rotation (`AM_ORDINARY_HEAD_ROTATION`): without it
+ * the writers keep writing to a head the server has retired.
+ */
+export const FOLLOW_WRITE_HEAD_FLAG = 'SYNC_LOAD_FOLLOW_WRITE_HEAD'
+
+export function parseFollowWriteHead(raw) {
+  const value = raw?.trim()
+  if (value === undefined || value === '' || value === 'off') return false
+  if (value === 'on') return true
+  throw new Error(`${FOLLOW_WRITE_HEAD_FLAG} must be on or off`)
+}
+
+/**
+ * The G4-16b A/B ARM: the `AM_ORDINARY_HEAD_ROTATION` the bench runner put on
+ * the cells (`sync-cell-bench.mjs --ordinary-head-rotation`). A harness knob,
+ * like the one above. Missing or blank is NO ARM: nothing below inspects,
+ * counts or voids anything, and the config and the report are those of a run
+ * before the arm existed. `off`, `shadow` and `on` name the arm; the gate then
+ * reads the mode the cells themselves PARSED, counts their rotation and
+ * forwarding log events, and VOIDs an arm whose observed rotation contradicts
+ * it (`evaluateOrdinaryHeadRotationArm`). Anything else throws.
+ */
+export const ORDINARY_HEAD_ROTATION_ARM_FLAG = 'SYNC_LOAD_ORDINARY_HEAD_ROTATION'
+
+export function parseOrdinaryHeadRotationArm(raw) {
+  const value = raw?.trim()
+  if (value === undefined || value === '') return null
+  if (value === 'off' || value === 'shadow' || value === 'on') return value
+  throw new Error(`${ORDINARY_HEAD_ROTATION_ARM_FLAG} must be off, shadow or on`)
+}
+
+/**
+ * The chain fold the bench ASKED for (G4-16b phase 4), set by
+ * `sync-cell-bench.mjs` on an armed run only. Missing and blank name no
+ * request and check nothing; off and on are compared with the fold the cells
+ * parsed, and a mismatch VOIDs the arm (`ordinaryHeadRotationConfigVoids`);
+ * anything else throws.
+ */
+export const ORDINARY_CHAIN_FOLD_ARM_FLAG = 'SYNC_LOAD_ORDINARY_CHAIN_FOLD'
+
+export function parseOrdinaryChainFoldArm(raw) {
+  const value = raw?.trim()
+  if (value === undefined || value === '') return null
+  if (value === 'off' || value === 'on') return value
+  throw new Error(`${ORDINARY_CHAIN_FOLD_ARM_FLAG} must be off or on`)
+}
+
+/**
+ * The two hot workspaces chosen BEFORE the cells boot with the arm, so the
+ * server allow-list can name them: the allow-list is read once at boot
+ * (`server/src/index.ts`) and a fresh landscape's ids are minted by the server,
+ * so no list can be written before the stack has run once. The runner starts
+ * the stack, runs this gate with `--preselect-workspaces` (which selects
+ * exactly as a run would and prints the choice), recreates the three cells
+ * with the allow-list, and hands the choice back here. Same
+ * `landscapeId:versionId` grammar as SYNC_LOAD_WORKSPACES. Unlike that list it
+ * may be combined with fresh workspaces: the preselection CREATED them for this
+ * run, and this run's cleanup deletes them. Outside fresh mode (smoke) the run
+ * cannot tell a landscape the preselection created from one it reused, so it
+ * deletes neither; the bench's `down -v` removes them (not under `--keep`).
+ */
+export const PRESELECTED_WORKSPACES_ENV = 'SYNC_LOAD_PRESELECTED_WORKSPACES'
+export const PRESELECT_ARG = '--preselect-workspaces'
+
+function parseWorkspaceSelectors(raw, label) {
+  return (raw ?? '')
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .map((entry) => {
+      const separator = entry.indexOf(':')
+      if (separator <= 0 || separator === entry.length - 1) {
+        throw new Error(`${label} entries must use landscapeId:versionId`)
+      }
+      return { landscapeId: entry.slice(0, separator), versionId: entry.slice(separator + 1) }
+    })
+}
+
+/** `landscapeId/versionId`, the server allow-list's own key
+ * (`ordinaryHeadRotationAdmits`). */
+export const ordinaryHeadWorkspaceKey = (workspace) => `${workspace.landscapeId}/${workspace.versionId}`
+
+/** The cells' own parse of the rotation knobs: the compiled config function,
+ * run inside each container against that container's environment, so the
+ * record names what the server READ, not what the runner meant to pass. */
+const ORDINARY_HEAD_ROTATION_PROBE = [
+  "import { ordinaryHeadRotationConfig } from './dist/readModel/ordinaryHeadRotation.js'",
+  'const c = ordinaryHeadRotationConfig(process.env)',
+  "const allowlist = c.allowlist === 'all' ? 'all' : [...c.allowlist].sort()",
+  "process.stdout.write('ORDINARY_HEAD_ROTATION=' + JSON.stringify({ mode: c.mode, allowlist, maxActors: c.maxActors, maxChanges: c.maxChanges, chainFold: c.chainFold ?? null }) + '\\n')",
+].join('\n')
+
+/** One record from the per-cell parses; `agree` is false when any cell
+ * differs, which voids the arm (a mixed fleet is not either arm). */
+export function summarizeOrdinaryHeadRotationConfigs(rows) {
+  const comparable = (row) => JSON.stringify([row.mode, row.allowlist, row.maxActors, row.maxChanges, row.chainFold ?? null])
+  const first = rows[0] ?? null
+  return {
+    mode: first?.mode ?? null,
+    allowlist: first?.allowlist ?? null,
+    maxActors: first?.maxActors ?? null,
+    maxChanges: first?.maxChanges ?? null,
+    // The phase-4 chain fold (`AM_ORDINARY_CHAIN_FOLD`): its parsed
+    // minChain/budget/retainMs, or null when off.
+    chainFold: first?.chainFold ?? null,
+    agree: rows.length === 3 && rows.every((row) => comparable(row) === comparable(first)),
+    cells: rows,
+  }
+}
+
+export async function inspectOrdinaryHeadRotation(config, exec = composeAsync) {
+  const rows = []
+  for (const cell of cells(config)) {
+    const { stdout } = await exec(config, 'exec', '-T', '-e', 'NODE_OPTIONS=', '-w', '/app', cell.service,
+      'node', '--input-type=module', '-e', ORDINARY_HEAD_ROTATION_PROBE)
+    const line = String(stdout).split(/\r?\n/).find((entry) => entry.startsWith('ORDINARY_HEAD_ROTATION='))
+    if (!line) throw new Error(`${cell.service} printed no ordinary-head rotation configuration`)
+    rows.push({ service: cell.service, ...JSON.parse(line.slice('ORDINARY_HEAD_ROTATION='.length)) })
+  }
+  return summarizeOrdinaryHeadRotationConfigs(rows)
+}
+
+/** The server's own account of rotation, as the cells log it
+ * (`ordinaryHeadRotation.ts`, `ordinaryHeadRotator.ts`,
+ * `ordinaryHeadForwarding.ts`, `projectorService.ts`). */
+export const ORDINARY_HEAD_EVENTS = Object.freeze([
+  'read_model.ordinary_head_rotation_due',
+  'read_model.ordinary_head_rotated',
+  'read_model.ordinary_head_rotation_refused',
+  'read_model.ordinary_head_rotation_failed',
+  'read_model.ordinary_head_forwarded',
+  'read_model.ordinary_head_forward_refused',
+])
+const ORDINARY_HEAD_EVENT_LIST_CAP = 64
+
+/**
+ * Count those events in the cells' logs: per event for the hot workspaces,
+ * and separately for any other workspace (a rotation anywhere contradicts an
+ * `off` arm). Pure, so the counting is pinned without Docker. The boot line
+ * `[read-model] ordinary head rotation: …` is kept per cell — `index.ts`
+ * prints it only when the mode is not `off`.
+ */
+export function summarizeOrdinaryHeadEvents(logsByService, workspaces) {
+  const hot = new Set(workspaces.map(ordinaryHeadWorkspaceKey))
+  const counts = Object.fromEntries(ORDINARY_HEAD_EVENTS.map((event) => [event, 0]))
+  const otherWorkspaceCounts = Object.fromEntries(ORDINARY_HEAD_EVENTS.map((event) => [event, 0]))
+  const rotations = []
+  const due = []
+  const problems = []
+  const conflictSamples = []
+  const bootLines = {}
+  let forwardedEntities = 0
+  let forwardConflicts = 0
+  let forwardsCommitted = 0
+  let unparseableLines = 0
+  for (const [service, text] of Object.entries(logsByService)) {
+    bootLines[service] = null
+    for (const line of String(text ?? '').split(/\r?\n/)) {
+      if (line.includes('[read-model] ordinary head rotation:')) {
+        bootLines[service] = line.slice(line.indexOf('[read-model]'))
+        continue
+      }
+      if (!line.includes('"read_model.ordinary_head_')) continue
+      let entry
+      try { entry = JSON.parse(line.slice(line.indexOf('{'))) } catch {
+        unparseableLines += 1
+        continue
+      }
+      if (!Object.hasOwn(counts, entry?.event)) continue
+      const isHot = hot.has(entry.workspace)
+      ;(isHot ? counts : otherWorkspaceCounts)[entry.event] += 1
+      if (!isHot) continue
+      const brief = { service, workspace: entry.workspace }
+      if (entry.event === 'read_model.ordinary_head_rotated' && rotations.length < ORDINARY_HEAD_EVENT_LIST_CAP) {
+        rotations.push({ ...brief, collection: entry.collection, retired: entry.retired, child: entry.child,
+          retirementHeads: entry.retirementHeads })
+      } else if (entry.event === 'read_model.ordinary_head_rotation_due' && due.length < ORDINARY_HEAD_EVENT_LIST_CAP) {
+        due.push({ ...brief, kind: entry.kind, url: entry.url, numActors: entry.numActors,
+          numChanges: entry.numChanges, newlyCrossed: entry.newlyCrossed, thresholds: entry.thresholds })
+      } else if (entry.event === 'read_model.ordinary_head_forwarded') {
+        forwardedEntities += Number(entry.written?.length ?? entry.written ?? 0) + Number(entry.created?.length ?? entry.created ?? 0)
+        forwardConflicts += Array.isArray(entry.conflicts) ? entry.conflicts.length : Number(entry.conflicts ?? 0)
+        for (const conflict of Array.isArray(entry.conflicts) ? entry.conflicts : []) {
+          if (conflictSamples.length < ORDINARY_HEAD_EVENT_LIST_CAP) conflictSamples.push({ ...brief, retired: entry.retired, current: entry.current, conflict })
+        }
+        if (entry.committed === true) forwardsCommitted += 1
+      } else if (entry.event !== 'read_model.ordinary_head_rotated'
+        && entry.event !== 'read_model.ordinary_head_rotation_due' && problems.length < ORDINARY_HEAD_EVENT_LIST_CAP) {
+        problems.push({ ...brief, event: entry.event, reason: entry.reason ?? entry.error ?? null })
+      }
+    }
+  }
+  return {
+    counts,
+    otherWorkspaceCounts,
+    rotatedHot: counts['read_model.ordinary_head_rotated'],
+    rotatedTotal: counts['read_model.ordinary_head_rotated'] + otherWorkspaceCounts['read_model.ordinary_head_rotated'],
+    forwardedHot: counts['read_model.ordinary_head_forwarded'],
+    forwardsCommitted,
+    forwardedEntities,
+    forwardConflicts,
+    conflictSamples,
+    rotations,
+    due,
+    problems,
+    bootLines,
+    unparseableLines,
+  }
+}
+
+/** The chain fold's account (G4-16b phase 4), as the cells log it
+ * (`ordinaryChainFoldWriter.ts`, `projectorService.ts`, and the shared
+ * overlay-rotation lock's refusals in `overlayRotationLock.ts`). */
+export const ORDINARY_CHAIN_FOLD_EVENTS = Object.freeze([
+  'read_model.ordinary_chain_fold_pass',
+  'read_model.ordinary_chain_fold_lock_held',
+  'read_model.ordinary_chain_folded',
+  'read_model.ordinary_chain_fold_unpublished',
+  'read_model.ordinary_chain_fold_abandoned',
+  'read_model.ordinary_chain_fold_abandon_not_pending',
+  'read_model.ordinary_chain_fold_rows_swept',
+  'read_model.ordinary_chain_fold_rows_sweep_failed',
+  'read_model.ordinary_chain_fold_conflict',
+  'read_model.ordinary_chain_fold_failed',
+  'read_model.ordinary_fold_arrival_poll_summary',
+  'read_model.ordinary_fold_arrival_failed',
+  'read_model.ordinary_fold_arrival_poll_failed',
+  'read_model.overlay_rotation_lock_contended',
+])
+
+/** count, p50, p99 and max of a list of milliseconds (nulls when empty). */
+function msSpread(values) {
+  const sorted = values.filter(Number.isFinite).sort((a, b) => a - b)
+  return {
+    count: sorted.length,
+    p50: sorted.length ? percentile(sorted, 0.5) : null,
+    p99: sorted.length ? percentile(sorted, 0.99) : null,
+    max: sorted.at(-1) ?? null,
+  }
+}
+
+/**
+ * Count the chain fold's events for the hot workspaces, and what the bench
+ * reads from them. Lines carry `at` (epoch ms, the server's clock), so the
+ * run is cut in four equal quarters between the first and last timestamped
+ * fold line, across every cell (a handover moves a workspace between logs):
+ *  - per workspace and kind, the chain the fold works on after each pass:
+ *    ModelMeta's overlay list (`edits*ShardUrls`), its max, the max per
+ *    quarter, and the first and last sample by time — a chain still growing
+ *    shows in the quarters, where one max cannot. Not the read order
+ *    (`objectShardUrls`): it also lists base shards, which no fold touches
+ *    (measured on the PC, 2026-11-03: one bench workspace read 33 with 9
+ *    overlay heads, then 26 with 2 after a fold — 24 base shards both times),
+ *    so its length named a chain the fold could never shorten. Its max is
+ *    kept beside, as `readOrderMax`. The overlay list is still an upper
+ *    bound on what the planner counts: it also holds the current head and
+ *    every sealed head (`planOrdinaryChainFold` counts neither), so a long
+ *    soak whose sealed run grows reads longer here than the fold's chain;
+ *  - pass duration by outcome (a loose bound: the whole pass), and the time
+ *    the fold actually HELD the lock (`ordinary_chain_fold_lock_held`), with
+ *    its max per quarter;
+ *  - the lock's refusals by path, so what a rotation paid is visible;
+ *  - rows swept, recoveries, and the folded-arrival poll's cost.
+ * Other workspaces are counted apart. Pure.
+ */
+export function summarizeOrdinaryChainFoldEvents(logsByService, workspaces) {
+  const hot = new Set(workspaces.map(ordinaryHeadWorkspaceKey))
+  const counts = Object.fromEntries(ORDINARY_CHAIN_FOLD_EVENTS.map((event) => [event, 0]))
+  const otherWorkspaceCounts = Object.fromEntries(ORDINARY_CHAIN_FOLD_EVENTS.map((event) => [event, 0]))
+  const passes = []
+  const held = []
+  const contended = {}
+  const problems = []
+  let recovered = 0
+  let sweptRows = 0
+  let sweptRecords = 0
+  const poll = { summaries: 0, polls: 0, totalMs: 0, maxMs: 0, rows: 0, loaded: 0 }
+  let unparseableLines = 0
+  for (const [service, text] of Object.entries(logsByService)) {
+    for (const line of String(text ?? '').split(/\r?\n/)) {
+      if (!line.includes('"read_model.ordinary_chain_') && !line.includes('"read_model.ordinary_fold_arrival_')
+        && !line.includes('"read_model.overlay_rotation_lock_contended"')) continue
+      let entry
+      try { entry = JSON.parse(line.slice(line.indexOf('{'))) } catch {
+        unparseableLines += 1
+        continue
+      }
+      if (!Object.hasOwn(counts, entry?.event)) continue
+      // The lock's line names the workspace by its two ids.
+      const workspace = entry.event === 'read_model.overlay_rotation_lock_contended'
+        ? `${entry.landscapeId}/${entry.versionId}` : entry.workspace
+      const isHot = hot.has(workspace)
+      ;(isHot ? counts : otherWorkspaceCounts)[entry.event] += 1
+      if (!isHot) continue
+      const at = Number.isFinite(entry.at) ? entry.at : null
+      switch (entry.event) {
+        case 'read_model.ordinary_chain_fold_pass':
+          passes.push({
+            service, workspace, kind: entry.kind, at, outcome: entry.outcome, passMs: entry.passMs,
+            chain: entry.chain, overlay: entry.overlay,
+          })
+          break
+        case 'read_model.ordinary_chain_fold_lock_held':
+          held.push({ at, heldMs: entry.heldMs })
+          break
+        case 'read_model.overlay_rotation_lock_contended':
+          contended[entry.path] = (contended[entry.path] ?? 0) + 1
+          break
+        case 'read_model.ordinary_chain_folded':
+          if (entry.recovered === true) recovered += 1
+          break
+        case 'read_model.ordinary_chain_fold_rows_swept':
+          sweptRows += Number(entry.rows ?? 0)
+          sweptRecords += Number(entry.records ?? 0)
+          break
+        case 'read_model.ordinary_fold_arrival_poll_summary':
+          poll.summaries += 1
+          poll.polls += Number(entry.polls ?? 0)
+          poll.totalMs += Number(entry.totalMs ?? 0)
+          poll.maxMs = Math.max(poll.maxMs, Number(entry.maxMs ?? 0))
+          poll.rows += Number(entry.rows ?? 0)
+          poll.loaded += Number(entry.loaded ?? 0)
+          break
+        case 'read_model.ordinary_chain_fold_unpublished':
+          break
+        default:
+          if (problems.length < ORDINARY_HEAD_EVENT_LIST_CAP) {
+            problems.push({ service, workspace, event: entry.event, reason: entry.reason ?? entry.error ?? null })
+          }
+      }
+    }
+  }
+  const stamped = [...passes, ...held].map((row) => row.at).filter((at) => at !== null)
+  const startAt = stamped.length ? Math.min(...stamped) : null
+  const endAt = stamped.length ? Math.max(...stamped) : null
+  const quarterOf = (at) => (at === null || startAt === null ? null
+    : endAt === startAt ? 0 : Math.min(3, Math.floor(((at - startAt) / (endAt - startAt)) * 4)))
+  const quarterMax = (rows, field) => {
+    const out = [null, null, null, null]
+    for (const row of rows) {
+      const quarter = quarterOf(row.at)
+      if (quarter === null || !Number.isFinite(row[field])) continue
+      out[quarter] = Math.max(out[quarter] ?? 0, row[field])
+    }
+    return out
+  }
+  const chains = {}
+  for (const pass of passes) {
+    if (!Number.isFinite(pass.overlay)) continue
+    const key = `${pass.workspace}/${pass.kind}`
+    if (!chains[key]) chains[key] = []
+    chains[key].push(pass)
+  }
+  const byTime = (a, b) => (a.at ?? 0) - (b.at ?? 0)
+  const passOutcomes = {}
+  const passMsByOutcome = {}
+  for (const pass of passes) {
+    passOutcomes[pass.outcome] = (passOutcomes[pass.outcome] ?? 0) + 1
+    if (!passMsByOutcome[pass.outcome]) passMsByOutcome[pass.outcome] = []
+    passMsByOutcome[pass.outcome].push(pass.passMs)
+  }
+  return {
+    counts,
+    otherWorkspaceCounts,
+    foldedHot: counts['read_model.ordinary_chain_folded'],
+    foldedTotal: counts['read_model.ordinary_chain_folded'] + otherWorkspaceCounts['read_model.ordinary_chain_folded'],
+    recovered,
+    window: { startAt, endAt },
+    passOutcomes,
+    passMs: Object.fromEntries(Object.entries(passMsByOutcome).map(([outcome, values]) => [outcome, msSpread(values)])),
+    lockHeldMs: { ...msSpread(held.map((row) => row.heldMs)), quarterMax: quarterMax(held, 'heldMs') },
+    lockContendedByPath: contended,
+    chains: Object.fromEntries(Object.entries(chains).map(([key, rows]) => {
+      const sorted = [...rows].sort(byTime)
+      const readOrder = rows.map((row) => row.chain).filter(Number.isFinite)
+      return [key, {
+        passes: rows.length,
+        max: Math.max(...rows.map((row) => row.overlay)),
+        quarterMax: quarterMax(rows, 'overlay'),
+        first: { at: sorted[0].at, overlay: sorted[0].overlay },
+        last: { at: sorted.at(-1).at, overlay: sorted.at(-1).overlay },
+        readOrderMax: readOrder.length ? Math.max(...readOrder) : null,
+      }]
+    })),
+    sweptRows,
+    sweptRecords,
+    poll: { ...poll, meanMs: poll.polls ? Math.round((poll.totalMs / poll.polls) * 100) / 100 : null },
+    problems,
+    unparseableLines,
+  }
+}
+
+const RSS_SAMPLES_PER_SERVICE_CAP = 20_000
+
+/**
+ * Each service's resident memory over the run, from the gate's own samples:
+ * first, last and max, and the max per quarter of that service's sampled
+ * span — the trend one max over every service cannot show. Pure.
+ */
+export function summarizeRssTrend(samplesByService) {
+  return Object.fromEntries(Object.entries(samplesByService ?? {}).map(([service, samples]) => {
+    if (!samples.length) return [service, null]
+    const startAt = samples[0].at
+    const span = samples.at(-1).at - startAt
+    const quarterMax = [null, null, null, null]
+    for (const sample of samples) {
+      const quarter = span > 0 ? Math.min(3, Math.floor(((sample.at - startAt) / span) * 4)) : 0
+      quarterMax[quarter] = Math.max(quarterMax[quarter] ?? 0, sample.rss)
+    }
+    return [service, {
+      samples: samples.length,
+      first: samples[0].rss,
+      last: samples.at(-1).rss,
+      max: Math.max(...samples.map((sample) => sample.rss)),
+      quarterMax,
+    }]
+  }))
+}
+
+/** One sampled point of a cell's memory and of what may hold it, taken from
+ * the `/api/automerge/stats` body the accumulator already reads every 500 ms
+ * (no extra request). A field the body lacks is null, never 0: an absent
+ * counter and a measured zero are different facts. */
+export function residencySample(at, rss, stats) {
+  const number = (value) => (Number.isFinite(Number(value)) && value !== null && value !== undefined ? Number(value) : null)
+  return {
+    at,
+    rss,
+    heapUsed: number(stats?.transport?.processMemoryBytes?.heapUsed),
+    external: number(stats?.transport?.processMemoryBytes?.external),
+    handles: number(stats?.totalHandles),
+    documentsWithPeers: number(stats?.synchronizer?.documentsWithPeers),
+    peerBindings: number(stats?.synchronizer?.totalPeerBindings),
+    // Added with the wasm gauge: a cell image older than it reports none of
+    // these, and the column is null, not 0. `wasm` is inside `external`.
+    heapTotal: number(stats?.transport?.processMemoryBytes?.heapTotal),
+    arrayBuffers: number(stats?.transport?.processMemoryBytes?.arrayBuffers),
+    wasm: number(stats?.transport?.processMemoryBytes?.wasm),
+  }
+}
+
+export const RESIDENCY_TREND_COLUMNS = Object.freeze([
+  'minute', 'rssMiB', 'heapUsedMiB', 'externalMiB', 'handles', 'documentsWithPeers', 'peerBindings',
+  'heapTotalMiB', 'arrayBuffersMiB', 'wasmMiB',
+])
+
+/**
+ * A cell's memory over the WHOLE run, one point per `bucketMs` (the last
+ * sample of each bucket), beside the documents resident and the peers bound
+ * to them. `rssByService` keeps four maxima; this keeps the series, because
+ * the question G4-16b-defer2h left open is what grows WITH the RSS, and the
+ * compose-log tail the bench keeps covers only the last 20–60 minutes.
+ * Minutes are counted from the service's first sample.
+ */
+export function summarizeResidencyTrend(samplesByService, bucketMs = 60_000) {
+  const mib = (bytes) => (bytes === null ? null : Math.round((bytes / 1_048_576) * 10) / 10)
+  return Object.fromEntries(Object.entries(samplesByService ?? {}).map(([service, samples]) => {
+    if (!samples.length) return [service, null]
+    const startAt = samples[0].at
+    const byBucket = new Map()
+    for (const sample of samples) byBucket.set(Math.floor((sample.at - startAt) / bucketMs), sample)
+    const points = [...byBucket].sort(([left], [right]) => left - right).map(([bucket, sample]) => [
+      bucket * (bucketMs / 60_000),
+      mib(sample.rss ?? null),
+      mib(sample.heapUsed ?? null),
+      mib(sample.external ?? null),
+      sample.handles ?? null,
+      sample.documentsWithPeers ?? null,
+      sample.peerBindings ?? null,
+      mib(sample.heapTotal ?? null),
+      mib(sample.arrayBuffers ?? null),
+      mib(sample.wasm ?? null),
+    ])
+    return [service, { bucketMs, columns: RESIDENCY_TREND_COLUMNS, points }]
+  }))
+}
+
+/**
+ * G4-16e: one sampled point of the rotation counters a cell publishes for the
+ * workspaces it ROTATES (`ordinaryHeadRotation.entries` in the same
+ * `/api/automerge/stats` body, `server/src/readModel/ordinaryRotationTelemetry.ts`),
+ * keyed `landscapeId/versionId/collection` — so the evidence file carries
+ * those workspace ids. Null when the body carries no such block (a cell image
+ * older than G4-16e), so a missing series is not read as "no rotation". A
+ * field the entry lacks is null, never 0 or false. `bootId` is the body's
+ * `processBootId`: `rotations` and the trigger counts are the process's own
+ * since boot, and a restart must read as a reset, not a fall. Pure.
+ */
+export function rotationSample(at, stats) {
+  const entries = stats?.ordinaryHeadRotation?.entries
+  if (!Array.isArray(entries)) return null
+  const number = (value) => (Number.isFinite(Number(value)) && value !== null && value !== undefined ? Number(value) : null)
+  const flag = (value) => (typeof value === 'boolean' ? value : null)
+  const series = {}
+  for (const entry of entries) {
+    if (typeof entry?.workspace !== 'string' || typeof entry?.collection !== 'string') continue
+    series[`${entry.workspace}/${entry.collection}`] = {
+      rotations: number(entry.rotations),
+      rotationsLast24h: number(entry.rotationsLast24h),
+      listedShards: number(entry.listedShards),
+      overlayChain: number(entry.overlayChain),
+      parkedHeads: number(entry.parkedHeads),
+      retiredRows: number(entry.retiredRows),
+      foldedRows: number(entry.foldedRows),
+      actors: number(entry.currentHead?.actors),
+      changes: number(entry.currentHead?.changes),
+      chainAlert: flag(entry.chainAlert),
+      byActors: number(entry.rotationsByTrigger?.actors),
+      byChanges: number(entry.rotationsByTrigger?.changes),
+      byBoth: number(entry.rotationsByTrigger?.both),
+      resident: flag(entry.resident),
+    }
+  }
+  return { at, bootId: typeof stats?.processBootId === 'string' ? stats.processBootId : null, series }
+}
+
+export const ROTATION_TREND_COLUMNS = Object.freeze([
+  'minute', 'rotations', 'rotationsLast24h', 'listedShards', 'overlayChain', 'parkedHeads',
+  'retiredRows', 'foldedRows', 'actors', 'changes', 'chainAlert', 'byActors', 'byChanges', 'byBoth',
+  'resident', 'processRestarted',
+])
+
+/**
+ * Per service and per rotating workspace/collection, the LAST rotation
+ * sample of each `bucketMs` (a minute by default), minutes counted from the
+ * service's first rotation sample — the same bucketing as the residency
+ * trend, so the two series line up. `rotations` and `by*` are the cell's own
+ * counts since it booted: `processRestarted` is true on the first point of a
+ * key after the cell's `processBootId` changed (null when either boot id is
+ * unknown), so a drop there is a restart. `rotationsLast24h` is durable (from
+ * the retirement rows) and does not reset. `bootIds` lists the boot ids seen,
+ * in order. A takeover moves the workspace to another cell's series. Pure.
+ */
+export function summarizeRotationTrend(samplesByService, bucketMs = 60_000) {
+  return Object.fromEntries(Object.entries(samplesByService ?? {}).map(([service, samples]) => {
+    if (!samples?.length) return [service, null]
+    const startAt = samples[0].at
+    const byKey = {}
+    const bootIds = []
+    for (const sample of samples) {
+      const bootId = sample.bootId ?? null
+      if (bootId !== null && bootIds.at(-1) !== bootId) bootIds.push(bootId)
+      const bucket = Math.floor((sample.at - startAt) / bucketMs)
+      for (const [key, value] of Object.entries(sample.series)) {
+        if (!byKey[key]) byKey[key] = new Map()
+        byKey[key].set(bucket, { ...value, bootId })
+      }
+    }
+    const series = Object.fromEntries(Object.entries(byKey).sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, buckets]) => {
+        let previous
+        return [key, [...buckets].sort(([left], [right]) => left - right).map(([bucket, value]) => {
+          const restarted = previous === undefined ? false
+            : (previous === null || value.bootId === null ? null : previous !== value.bootId)
+          previous = value.bootId
+          return [
+            bucket * (bucketMs / 60_000),
+            ...ROTATION_TREND_COLUMNS.slice(1, -1).map((column) => value[column] ?? null),
+            restarted,
+          ]
+        })]
+      }))
+    return [service, { bucketMs, columns: ROTATION_TREND_COLUMNS, bootIds, series }]
+  }))
+}
+
+/**
+ * What the measurement says, beside the arm's VOID rules: concerns about
+ * the fold itself, never a contradiction of the arm. With the fold the cells
+ * parsed (`minChain`, `budget`): an overlay chain whose LAST quarter still
+ * goes past `minChain + budget` (one fold's worth above the trigger) is
+ * either not bounded or holds sealed heads, which no fold takes — the
+ * concern says which to look at, not which it is;
+ * more than one pass in ten failing is a fold that runs but does not work.
+ */
+export function ordinaryChainFoldConcerns(foldConfig, foldEvents) {
+  if (!foldConfig || !foldEvents) return []
+  const concerns = []
+  const bound = foldConfig.minChain + foldConfig.budget
+  for (const [key, chain] of Object.entries(foldEvents.chains ?? {})) {
+    const last = chain.quarterMax?.[3]
+    if (Number.isFinite(last) && last > bound) {
+      concerns.push(`${key}: the overlay chain reached ${last} in the last quarter, past minChain + budget = ${bound}`)
+    }
+  }
+  const total = Object.values(foldEvents.passOutcomes ?? {}).reduce((sum, count) => sum + count, 0)
+  const failed = (foldEvents.passOutcomes?.failed ?? 0) + (foldEvents.passOutcomes?.['authority-lost'] ?? 0)
+  if (total > 0 && failed / total > 0.1) concerns.push(`${failed} of ${total} fold passes failed`)
+  return concerns
+}
+
+/** The whole log of each cell, both streams (`console.warn` carries the
+ * `rotation_due` line). Bounded at 120 s and 512 MB per cell; past either the
+ * read rejects, the events are unread, and the arm is VOID. A two-hour log's
+ * size has not been measured. */
+async function composeLogs(config, service) {
+  const { stdout, stderr } = await promisify(execFile)('docker',
+    ['compose', '-p', config.project, '-f', composeFile, 'logs', '--no-color', '--no-log-prefix', service], {
+      encoding: 'utf8', timeout: 120_000, maxBuffer: 512 * 1024 * 1024, windowsHide: true,
+    })
+  return `${stdout}\n${stderr}`
+}
+
+export async function collectOrdinaryHeadEvents(config, workspaces, read = composeLogs) {
+  const logs = {}
+  for (const cell of cells(config)) logs[cell.service] = await read(config, cell.service)
+  return { ...summarizeOrdinaryHeadEvents(logs, workspaces), chainFold: summarizeOrdinaryChainFoldEvents(logs, workspaces) }
+}
+
+/** What can void an arm before any load: the cells did not parse the arm the
+ * runner asked for, or (shadow/on) their allow-list does not name both hot
+ * workspaces — the "on with an empty list" mistake. */
+export function ordinaryHeadRotationConfigVoids(requested, server, workspaces, requestedChainFold = null) {
+  if (!server) return ['the cells\' ordinary-head rotation configuration was not observed']
+  const reasons = []
+  if (server.agree !== true) reasons.push('the three cells parsed different ordinary-head rotation configurations')
+  // The chain fold the bench asked for (SYNC_LOAD_ORDINARY_CHAIN_FOLD) against
+  // what the cells parsed: an image without phase 4 parses no fold at all.
+  if (requestedChainFold === 'on' && !server.chainFold) reasons.push('requested chain fold on, but the cells parsed no chain fold')
+  if (requestedChainFold === 'off' && server.chainFold) reasons.push('requested chain fold off, but the cells parsed one')
+  if (server.mode !== requested) reasons.push(`requested ordinary-head rotation ${requested}, but the cells run ${server.mode}`)
+  if (requested !== 'off') {
+    const listed = server.allowlist === 'all' ? null : new Set(server.allowlist ?? [])
+    if (!listed || !workspaces.every((workspace) => listed.has(ordinaryHeadWorkspaceKey(workspace)))) {
+      reasons.push(`ordinary-head rotation ${requested} needs an allow-list naming exactly the two hot workspaces`)
+    }
+  }
+  return reasons
+}
+
+/**
+ * The A/B VOID rules. An arm is VOID — not RED, not PASS — when what was
+ * observed contradicts what was requested, because then it is not a sample of
+ * the arm it is labelled with:
+ *
+ *  - the cells' parsed config contradicts the request (above);
+ *  - `on`: no partition's writers were handed a new write head
+ *    (`writeHeads.partitions[].rotated`), or no cell logged
+ *    `read_model.ordinary_head_rotated` for a hot workspace, or the writers did
+ *    not follow (nothing could be observed);
+ *  - `off` / `shadow`: any partition's writers were handed a new head, or any
+ *    cell logged a rotation for any workspace, or an ordinary-head event line
+ *    could not be parsed (it may be that rotation);
+ *  - the logs could not be read (the second witness is missing).
+ */
+export function evaluateOrdinaryHeadRotationArm({ requested, requestedChainFold = null, server, serverEvents, workspaces = [], writeHeads, followWriteHead }) {
+  const voidReasons = ordinaryHeadRotationConfigVoids(requested, server, workspaces, requestedChainFold)
+  const partitionsRotated = writeHeads?.partitions?.map((row) => ({
+    partition: row.partition, rotated: row.rotated === true, distinctWriteHeads: row.distinctWriteHeads,
+  })) ?? null
+  const anyPartitionRotated = partitionsRotated?.some((row) => row.rotated) ?? false
+  if (!serverEvents) voidReasons.push('the cells\' ordinary-head rotation log events were not read')
+  if (requested === 'on') {
+    if (!partitionsRotated) voidReasons.push('rotation on, but the writers did not follow the write head, so no rotation could be observed')
+    else if (!anyPartitionRotated) voidReasons.push('rotation on, but no partition\'s writers were handed a new write head')
+    if (serverEvents && serverEvents.rotatedHot === 0) {
+      voidReasons.push('rotation on, but no cell logged read_model.ordinary_head_rotated for a hot workspace')
+    }
+  } else {
+    if (anyPartitionRotated) voidReasons.push(`rotation ${requested}, but a partition's writers were handed a new write head`)
+    if (serverEvents && serverEvents.rotatedTotal > 0) {
+      voidReasons.push(`rotation ${requested}, but a cell logged read_model.ordinary_head_rotated`)
+    }
+    // A line naming an ordinary-head event that does not parse could be the
+    // rotation this arm must not have: unread is not absent.
+    if (serverEvents && serverEvents.unparseableLines !== 0) {
+      voidReasons.push(`rotation ${requested}, but ${serverEvents.unparseableLines} ordinary-head log line(s) could not be parsed`)
+    }
+  }
+  // The chain fold (phase 4) as the cells parsed it (the request is compared
+  // with it in ordinaryHeadRotationConfigVoids): on, it must have folded a
+  // hot workspace; off, nothing may have folded anywhere, and a fold line
+  // that does not parse could be that fold.
+  const foldEvents = serverEvents?.chainFold ?? null
+  if (!foldEvents && serverEvents && (server?.chainFold || requestedChainFold)) {
+    voidReasons.push('the cells\' chain-fold log events were not read')
+  }
+  if (server?.chainFold && foldEvents && foldEvents.foldedHot === 0) {
+    voidReasons.push('chain fold on, but no cell logged read_model.ordinary_chain_folded for a hot workspace')
+  }
+  if (server && !server.chainFold && foldEvents) {
+    if (foldEvents.foldedTotal > 0) voidReasons.push('chain fold off, but a cell logged read_model.ordinary_chain_folded')
+    if (foldEvents.unparseableLines !== 0) {
+      voidReasons.push(`chain fold off, but ${foldEvents.unparseableLines} chain-fold log line(s) could not be parsed`)
+    }
+  }
+  const chainFoldConcerns = ordinaryChainFoldConcerns(server?.chainFold ?? null, foldEvents)
+  return {
+    requestedMode: requested,
+    serverMode: server?.mode ?? null,
+    allowlist: server?.allowlist ?? null,
+    thresholds: server ? { maxActors: server.maxActors, maxChanges: server.maxChanges } : null,
+    chainFold: server?.chainFold ?? null,
+    requestedChainFold: requestedChainFold ?? null,
+    chainFoldConcerns,
+    followWriteHead: Boolean(followWriteHead),
+    workspaces: workspaces.map(ordinaryHeadWorkspaceKey),
+    partitionsRotated,
+    serverEvents: serverEvents ?? null,
+    status: voidReasons.length ? 'VOID' : 'CONSISTENT',
+    voidReasons,
+  }
+}
+
+/** `A.stats` of a write head as synced to the gate when it resolved it — the
+ * per-cycle actor/change trend of the head the writers are about to write.
+ * It can lag the server by whatever has not synced yet; null if the document
+ * is not one this Automerge can read. */
+export function writeHeadStats(doc) {
+  try {
+    const { numActors, numChanges, numOps } = automergeStats(doc)
+    return { numActors, numChanges, numOps }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * The object write head a browser writes into, read the way the bridge reads
+ * it (`planOverlayWriteHeads` in src/lib/automerge/overlayWriteHead.ts, used by
+ * `writeEditsShards`): `editsObjectShardUrl`, only when it is a valid URL and
+ * the head protocol version is current. No fallback to the segment or base
+ * lists — the bridge never writes there. A legacy-version head THROWS: an
+ * online bridge would migrate it, which this harness does not imitate.
+ * The load writers write objects only, so the connection head is not followed.
+ * The version is a copy of the ruling one in overlayWriteHead.ts; the test
+ * suite reads that file and asserts the two are equal.
+ */
+export const OVERLAY_WRITE_HEAD_VERSION = 1
+export function currentObjectWriteHead(meta, isValidUrl = isValidAutomergeUrl) {
+  const url = meta?.editsObjectShardUrl
+  if (typeof url !== 'string' || !isValidUrl(url)) return null
+  if (meta.editsOverlayWriteHeadVersion !== OVERLAY_WRITE_HEAD_VERSION) {
+    throw new Error(`object write head ${url} has legacy write-head version ${JSON.stringify(meta.editsOverlayWriteHeadVersion)}`)
+  }
+  return url
+}
+
+/** Re-resolve each partition's current head. Unlike
+ * `refreshRotatedLoadTargets`, an unchanged head is the expected answer. */
+export async function followLoadTargets(selections, previousTargets, resolveTarget) {
+  const followed = new Map()
+  for (const partition of [0, 1]) {
+    const target = await resolveTarget(selections.get(partition), previousTargets.get(partition), partition)
+    if (!target) throw new Error(`partition ${partition} has no current overlay write head`)
+    followed.set(partition, target)
+  }
+  return followed
+}
+
+/**
+ * Which write head each partition's writers were handed, per load episode.
+ * Every writer of a partition is spawned with the same `--root`, so the
+ * per-partition count IS the per-writer count. `rotated` is what voids an A/B
+ * arm: it must be true where the server rotation was on, false where it was off.
+ */
+export class WriteHeadLedger {
+  constructor() { this.entries = [] }
+  /** `headStats` (optional, per partition): `writeHeadStats` of the head as
+   * the gate resolved it for this episode. */
+  record(phase, cycle, targets, headStats = null) {
+    for (const partition of [0, 1]) {
+      const url = targets.get(partition)
+      if (!url) throw new Error(`write-head ledger: partition ${partition} has no target in ${phase} ${cycle}`)
+      const stats = headStats?.get(partition) ?? null
+      this.entries.push({ phase, cycle, partition, url, ...(stats ? { headStats: stats } : {}) })
+    }
+  }
+  summary() {
+    return {
+      followWriteHead: true,
+      writersShareTarget: true,
+      partitions: [0, 1].map((partition) => {
+        const episodes = this.entries.filter((entry) => entry.partition === partition)
+        const writeHeads = [...new Set(episodes.map((entry) => entry.url))]
+        return {
+          partition,
+          distinctWriteHeads: writeHeads.length,
+          rotated: writeHeads.length > 1,
+          writeHeads,
+          episodes: episodes.map(({ phase, cycle, url, headStats }) => ({
+            phase, cycle, writeHeadIndex: writeHeads.indexOf(url), ...(headStats ? { headStats } : {}),
+          })),
+        }
+      }),
+    }
+  }
+}
+
 export function parseLoadSoakConfig(env = process.env, argv = process.argv.slice(2)) {
   const mode = argv.find((arg) => arg.startsWith('--mode='))?.slice(7)
     || env.SYNC_LOAD_MODE?.trim()
@@ -290,19 +1091,15 @@ export function parseLoadSoakConfig(env = process.env, argv = process.argv.slice
     ? Boolean(env.SYNC_BENCH_POSTURE && mode === 'soak')
     : env.SYNC_LOAD_FRESH_WORKSPACES === 'on'
   const segmentedWorkspaces = env.SYNC_LOAD_SEGMENTED_WORKSPACES === 'on'
-  const workspaceSelectors = (env.SYNC_LOAD_WORKSPACES ?? '')
-    .split(',')
-    .map((entry) => entry.trim())
-    .filter(Boolean)
-    .map((entry) => {
-      const separator = entry.indexOf(':')
-      if (separator <= 0 || separator === entry.length - 1) {
-        throw new Error('SYNC_LOAD_WORKSPACES entries must use landscapeId:versionId')
-      }
-      return { landscapeId: entry.slice(0, separator), versionId: entry.slice(separator + 1) }
-    })
+  const workspaceSelectors = parseWorkspaceSelectors(env.SYNC_LOAD_WORKSPACES, 'SYNC_LOAD_WORKSPACES')
   if (freshWorkspaces && segmentedWorkspaces) {
     throw new Error('segmented load requires pre-seeded performance workspaces, not fresh monolithic workspaces')
+  }
+  const followWriteHead = parseFollowWriteHead(env[FOLLOW_WRITE_HEAD_FLAG])
+  if (followWriteHead && segmentedWorkspaces) {
+    // Segmented mode already re-resolves every cycle and REQUIRES a new head;
+    // following one that may not move would weaken that requirement silently.
+    throw new Error(`${FOLLOW_WRITE_HEAD_FLAG}=on cannot be combined with SYNC_LOAD_SEGMENTED_WORKSPACES=on`)
   }
   if (workspaceSelectors.length > 0 && workspaceSelectors.length !== 2) {
     throw new Error('SYNC_LOAD_WORKSPACES must contain exactly two workspaces')
@@ -310,6 +1107,34 @@ export function parseLoadSoakConfig(env = process.env, argv = process.argv.slice
   if (freshWorkspaces && workspaceSelectors.length > 0) {
     throw new Error('explicit load workspaces cannot be combined with fresh workspaces')
   }
+  const ordinaryHeadRotation = parseOrdinaryHeadRotationArm(env[ORDINARY_HEAD_ROTATION_ARM_FLAG])
+  const ordinaryChainFold = parseOrdinaryChainFoldArm(env[ORDINARY_CHAIN_FOLD_ARM_FLAG])
+  if (ordinaryChainFold && !ordinaryHeadRotation) {
+    throw new Error(`${ORDINARY_CHAIN_FOLD_ARM_FLAG} needs ${ORDINARY_HEAD_ROTATION_ARM_FLAG}`)
+  }
+  if (ordinaryChainFold === 'on' && ordinaryHeadRotation !== 'on') {
+    throw new Error(`${ORDINARY_CHAIN_FOLD_ARM_FLAG}=on requires ${ORDINARY_HEAD_ROTATION_ARM_FLAG}=on`)
+  }
+  const preselectedWorkspaces = parseWorkspaceSelectors(env[PRESELECTED_WORKSPACES_ENV], PRESELECTED_WORKSPACES_ENV)
+  const preselectOnly = argv.includes(PRESELECT_ARG)
+  if (ordinaryHeadRotation === 'on' && !followWriteHead) {
+    // The writers would keep writing the head the server retired: arm B would
+    // measure forwarding, not rotation, and `rotated` could never be observed.
+    throw new Error(`${ORDINARY_HEAD_ROTATION_ARM_FLAG}=on requires ${FOLLOW_WRITE_HEAD_FLAG}=on`)
+  }
+  if (ordinaryHeadRotation && segmentedWorkspaces) {
+    throw new Error(`${ORDINARY_HEAD_ROTATION_ARM_FLAG} measures ordinary workspaces; it cannot be combined with SYNC_LOAD_SEGMENTED_WORKSPACES=on`)
+  }
+  if (preselectedWorkspaces.length > 0 && preselectedWorkspaces.length !== 2) {
+    throw new Error(`${PRESELECTED_WORKSPACES_ENV} must contain exactly two workspaces`)
+  }
+  if (preselectedWorkspaces.length > 0 && workspaceSelectors.length > 0) {
+    throw new Error(`${PRESELECTED_WORKSPACES_ENV} cannot be combined with SYNC_LOAD_WORKSPACES`)
+  }
+  if (preselectOnly && preselectedWorkspaces.length > 0) {
+    throw new Error(`${PRESELECT_ARG} chooses the workspaces; it cannot be given ${PRESELECTED_WORKSPACES_ENV}`)
+  }
+  const remoteLoad = parseRemoteLoadConfig(env)
   const config = {
     mode,
     profile,
@@ -336,6 +1161,16 @@ export function parseLoadSoakConfig(env = process.env, argv = process.argv.slice
     loginEmail: env.SYNC_FAILOVER_LOGIN_EMAIL?.trim() || 'failover-admin@maplespire.local',
     freshWorkspaces,
     segmentedWorkspaces,
+    followWriteHead,
+    // Present only when set, so a run without an arm parses to the same
+    // object it did before the arm existed.
+    ...(ordinaryHeadRotation ? { ordinaryHeadRotation } : {}),
+    ...(ordinaryChainFold ? { ordinaryChainFold } : {}),
+    ...(preselectedWorkspaces.length > 0 ? { preselectedWorkspaces } : {}),
+    ...(preselectOnly ? { preselectOnly } : {}),
+    // Present only when asked for, like the arm: a local run parses to the
+    // object it parsed before remote load existed.
+    ...(remoteLoad ? { remoteLoad } : {}),
     workspaceSelectors,
     usersPerWorkspace,
     clientsPerProcess: boundedInteger(
@@ -410,6 +1245,30 @@ export function parseLoadSoakConfig(env = process.env, argv = process.argv.slice
   )
   if (config.benchPosture !== null) assertPostureQualificationConfig(config)
   return config
+}
+
+/**
+ * `SYNC_LOAD_REMOTE=listen` (set by `sync-cell-bench.mjs --load-remote=listen`):
+ * the gate listens on one LAN address for the load agent and runs every load
+ * cohort there; nothing else about the run changes. Null when unset or blank.
+ * The secret is checked here, before any I/O, and read again where the
+ * listener starts — it is never part of the config, which runs print.
+ */
+export function parseRemoteLoadConfig(env = process.env) {
+  const mode = env[REMOTE_LOAD_ENV.mode]?.trim() || null
+  if (mode === null) return null
+  if (mode !== 'listen') throw new Error(`${REMOTE_LOAD_ENV.mode} must be listen or unset`)
+  for (const name of [REMOTE_LOAD_ENV.bind, REMOTE_LOAD_ENV.controlPort, REMOTE_LOAD_ENV.routerPort]) {
+    if (!env[name]?.trim()) throw new Error(`${REMOTE_LOAD_ENV.mode}=listen needs ${name}`)
+  }
+  readRemoteLoadSecret(env)
+  return {
+    mode,
+    bind: assertLanAddress(env[REMOTE_LOAD_ENV.bind], REMOTE_LOAD_ENV.bind),
+    controlPort: boundedInteger(env[REMOTE_LOAD_ENV.controlPort], null, 1, 65_535, REMOTE_LOAD_ENV.controlPort),
+    routerPort: boundedInteger(env[REMOTE_LOAD_ENV.routerPort], null, 1, 65_535, REMOTE_LOAD_ENV.routerPort),
+    connectTimeoutMs: boundedInteger(env[REMOTE_LOAD_ENV.connectTimeoutMs], 15 * 60_000, 10_000, 60 * 60_000, REMOTE_LOAD_ENV.connectTimeoutMs),
+  }
 }
 
 /** The posture qualification is the declared fleet experiment. Refuse an
@@ -491,10 +1350,17 @@ export function defaultRunDeadlineMs(config) {
   // Segmented mode rotates the write heads once after baseline and once per
   // soak cycle; both rotations resolve two targets again.
   const rotation = config.segmentedWorkspaces ? targets : 0
+  // Following the current head re-resolves both targets once per soak cycle
+  // (and re-seeds a head the server rotated), never after baseline.
+  const followed = config.followWriteHead ? targets : 0
   const failover = loadPhase(config.failureArmMs) + 30_000 + 30_000 // takeover, former owner back as standby
-  const soak = config.soakDurationMs + loadPhase(1_000) + rotation
+  const soak = config.soakDurationMs + loadPhase(1_000) + rotation + followed
   const cleanup = 2 * (30_000 + 3 * settle) + 2 * 30_000
-  return setup + selection + targets + baseline + rotation + failover + soak + cleanup
+  // An A/B arm reads each cell's parsed config once and its whole log once.
+  const arm = config.ordinaryHeadRotation ? 3 * (30_000 + 120_000) : 0
+  // Remote load waits for the agent once, then probes the router and the clock.
+  const remote = config.remoteLoad ? config.remoteLoad.connectTimeoutMs + 60_000 : 0
+  return setup + selection + targets + baseline + rotation + failover + soak + cleanup + arm + remote
 }
 
 /** A bare host name or address — no scheme, port, path or credentials, which
@@ -1038,27 +1904,37 @@ async function workspaceHasSegmentedOverlay(config, selection, cookie) {
   }
 }
 
-async function selectPartitionWorkspaces(config, allCells, states, cookie, createdLandscapeIds = []) {
+export async function selectPartitionWorkspaces(config, allCells, states, cookie, createdLandscapeIds = []) {
   const response = await json(`${allCells[0].baseUrl}/api/landscapes`, { cookie })
   const available = (response.landscapes || []).map(workspaceOf).filter(Boolean)
   // Performance baselines are normally seeded after ordinary workspaces. Scan
   // newest-first in segmented mode so a gate does not cold-open every legacy
   // monolithic root before reaching the intended bounded overlays.
-  const explicit = config.workspaceSelectors?.length > 0
-    ? config.workspaceSelectors.map((wanted) => available.find((candidate) => (
-        candidate.landscapeId === wanted.landscapeId && candidate.versionId === wanted.versionId
+  const preselected = config.preselectedWorkspaces?.length > 0
+  const wanted = preselected ? config.preselectedWorkspaces : config.workspaceSelectors
+  const explicit = wanted?.length > 0
+    ? wanted.map((entry) => available.find((candidate) => (
+        candidate.landscapeId === entry.landscapeId && candidate.versionId === entry.versionId
       )))
     : null
   if (explicit?.some((workspace) => !workspace)) {
-    throw new Error('an explicit SYNC_LOAD_WORKSPACES entry is not an accessible active workspace')
+    throw new Error(preselected
+      ? `a ${PRESELECTED_WORKSPACES_ENV} entry is not an accessible active workspace`
+      : 'an explicit SYNC_LOAD_WORKSPACES entry is not an accessible active workspace')
   }
-  const candidates = config.freshWorkspaces
-    ? []
-    : explicit ?? (config.segmentedWorkspaces ? available.reverse() : available)
+  // The preselection created fresh workspaces for THIS run: owned here, so
+  // deleted here, and recorded before anything can fail.
+  if (preselected && config.freshWorkspaces) createdLandscapeIds.push(...explicit.map((workspace) => workspace.landscapeId))
+  const candidates = preselected
+    ? explicit
+    : config.freshWorkspaces
+      ? []
+      : explicit ?? (config.segmentedWorkspaces ? available.reverse() : available)
   const selected = new Map()
   for (let attempt = 0; attempt < 30 && selected.size < 2; attempt += 1) {
     if (attempt >= candidates.length) {
-      if (config.segmentedWorkspaces) break
+      // A preselected pair is the pair the allow-list names; never add a third.
+      if (config.segmentedWorkspaces || preselected) break
       const created = await json(`${allCells[0].baseUrl}/api/landscapes`, {
         cookie,
         method: 'POST',
@@ -1081,7 +1957,7 @@ async function selectPartitionWorkspaces(config, allCells, states, cookie, creat
   return selected
 }
 
-async function resolveLoadTarget(config, selection, cookie, previousTargetUrl = null) {
+async function resolveLoadTarget(config, selection, cookie, previousTargetUrl = null, { follow = false, onStats = null } = {}) {
   const wsUrl = routerWs(config, selection.workspace)
   const repo = new Repo({ network: [new AuthenticatedWebSocketClientAdapter(wsUrl, cookie, 500)] })
   try {
@@ -1090,7 +1966,14 @@ async function resolveLoadTarget(config, selection, cookie, previousTargetUrl = 
     const root = rootHandle.doc()
     if (!root) throw new Error('workspace root is unavailable')
     let targetUrl = root.modelUrl
-    if (root.modelMetaUrl) {
+    if (follow) {
+      // Same head may come back: following is not rotating. The seed below
+      // still runs, so a head the server DID rotate gets this run's objects.
+      if (!root.modelMetaUrl) throw new Error(`${FOLLOW_WRITE_HEAD_FLAG}=on requires a ModelMeta overlay write head`)
+      const metaHandle = (await resolveLoadHandle(repo, root.modelMetaUrl)).handle
+      await metaHandle.whenReady()
+      targetUrl = await waitFor('current overlay write head', () => currentObjectWriteHead(metaHandle.doc()), config.settleMs)
+    } else if (root.modelMetaUrl) {
       const metaHandle = (await resolveLoadHandle(repo, root.modelMetaUrl)).handle
       await metaHandle.whenReady()
       targetUrl = await waitFor('rotated overlay write head', () => {
@@ -1102,7 +1985,7 @@ async function resolveLoadTarget(config, selection, cookie, previousTargetUrl = 
       }, config.settleMs)
     }
     if (!targetUrl) throw new Error('workspace has no object write target')
-    if (previousTargetUrl && targetUrl === previousTargetUrl) {
+    if (!follow && previousTargetUrl && targetUrl === previousTargetUrl) {
       throw new Error('load phase would reuse a retired overlay write head')
     }
     const target = (await resolveLoadHandle(repo, targetUrl)).handle
@@ -1150,13 +2033,34 @@ async function resolveLoadTarget(config, selection, cookie, previousTargetUrl = 
         await shutdownRepo(verifier)
       }
     }
+    if (onStats) onStats(writeHeadStats(target.doc()))
     return targetUrl
   } finally {
     await shutdownRepo(repo)
   }
 }
 
-function startLoadProcess(config, selection, targetUrl, cookie, phase, startDelay, partition, cohort, barrierId = null, onResult = () => {}) {
+/** Resolves to `{ targets, headStats }`: the per-partition head and its
+ * `writeHeadStats` at this cycle's start. */
+async function followCurrentWriteHeads(config, selections, targets, cookie, cycle) {
+  setPhase(`soak cycle ${cycle}: following the current write heads`)
+  const headStats = new Map()
+  const followed = await followLoadTargets(selections, targets,
+    (selection, _previous, partition) => resolveLoadTarget(config, selection, cookie, null, {
+      follow: true, onStats: (stats) => { if (stats) headStats.set(partition, stats) },
+    }))
+  return { targets: followed, headStats }
+}
+
+/** Route `startLoadProcess` through a remote load session (or back to local
+ *  children with null); returns the previous one. `main()` and the tests. */
+export function bindRemoteLoadSession(session) {
+  const previous = activeRemoteLoad
+  activeRemoteLoad = session
+  return previous
+}
+
+export function startLoadProcess(config, selection, targetUrl, cookie, phase, startDelay, partition, cohort, barrierId = null, onResult = () => {}) {
   const args = [
     loadUsersScript,
     '--root', targetUrl,
@@ -1174,23 +2078,30 @@ function startLoadProcess(config, selection, targetUrl, cookie, phase, startDela
     '--objectAssignment', config.objectAssignment,
     '--writerActors', config.writerActors,
   ]
-  const child = spawn(process.execPath, args, {
-    cwd: resolve(here, '..'),
-    env: {
-      ...process.env,
-      QA_API: routerHttp(config),
-      QA_WS: `ws://${config.host}:${config.routerPort}/automerge`,
-      QA_LANDSCAPE_ID: selection.workspace.landscapeId,
-      QA_VERSION_ID: selection.workspace.versionId,
-      QA_SESSION_COOKIE: cookie,
-      QA_LOAD_OBJECT_PREFIX: qualificationObjectPrefix(config.runId, targetUrl),
-      QA_LOAD_BASELINE_BARRIER_ID: barrierId || '',
-      QA_LOAD_EPISODE_ID: barrierId || '',
-    },
-    shell: false,
-    windowsHide: true,
-    stdio: barrierId ? ['ignore', 'pipe', 'pipe', 'ipc'] : ['ignore', 'pipe', 'pipe'],
-  })
+  const childEnv = {
+    ...process.env,
+    QA_API: routerHttp(config),
+    QA_WS: `ws://${config.host}:${config.routerPort}/automerge`,
+    QA_LANDSCAPE_ID: selection.workspace.landscapeId,
+    QA_VERSION_ID: selection.workspace.versionId,
+    QA_SESSION_COOKIE: cookie,
+    QA_LOAD_OBJECT_PREFIX: qualificationObjectPrefix(config.runId, targetUrl),
+    QA_LOAD_BASELINE_BARRIER_ID: barrierId || '',
+    QA_LOAD_EPISODE_ID: barrierId || '',
+  }
+  // REMOTE LOAD changes WHERE the cohort runs and nothing after this line: the
+  // same argv (the agent supplies the script path from its own checkout), the
+  // same QA_* values with the router's LAN publication as API/WS, and a child
+  // object with the same events, so parsing, evidence and barrier stay as is.
+  const child = activeRemoteLoad
+    ? activeRemoteLoad.spawn(args.slice(1), childEnv, { ipc: Boolean(barrierId) })
+    : spawn(process.execPath, args, {
+      cwd: resolve(here, '..'),
+      env: childEnv,
+      shell: false,
+      windowsHide: true,
+      stdio: barrierId ? ['ignore', 'pipe', 'pipe', 'ipc'] : ['ignore', 'pipe', 'pipe'],
+    })
   const barrier = { ready: null, error: null, released: false }
   const onBarrierMessage = (message) => {
     if (message?.type !== 'load-baseline-ready') return
@@ -1244,7 +2155,10 @@ function startLoadProcess(config, selection, targetUrl, cookie, phase, startDela
       }
       const loadResult = {
         ...result, partition, cohort: cohort.index,
-        childProcess: { pid: child.pid, exitCode: code, signal: signal ?? null },
+        childProcess: { pid: child.pid, exitCode: code, signal: signal ?? null,
+          // Which host and clock produced this cohort's timestamps; absent for
+          // a local child, whose clock is the gate's.
+          ...(typeof child.remoteLoad === 'function' ? { remote: child.remoteLoad() } : {}) },
       }
       try {
         assertLoadUserEvidence(loadResult, { pid: child.pid, episodeId: barrierId || null,
@@ -1490,6 +2404,8 @@ export class MetricsAccumulator {
     )
     this.eventLoopOutliers = []
     this.maxRssBytes = 0
+    this.rssSamplesByService = {}
+    this.rotationSamplesByService = {}
     this.peakActiveConnections = 0
     this.maxSynchronizerPeerBindings = 0
     this.maxPeersPerDocument = 0
@@ -1598,7 +2514,23 @@ export class MetricsAccumulator {
           this.eventLoopOutliers.length = Math.min(this.eventLoopOutliers.length, 12)
         }
       }
-      this.maxRssBytes = Math.max(this.maxRssBytes, Number(snapshot.stats.transport?.processMemoryBytes?.rss ?? 0))
+      const rss = Number(snapshot.stats.transport?.processMemoryBytes?.rss ?? 0)
+      this.maxRssBytes = Math.max(this.maxRssBytes, rss)
+      // Per service, with time, so a trend (not one max over every service)
+      // can be read; bounded, a 2 h soak samples each service well under this.
+      if (rss > 0) {
+        if (!this.rssSamplesByService[snapshot.service]) this.rssSamplesByService[snapshot.service] = []
+        const samples = this.rssSamplesByService[snapshot.service]
+        if (samples.length < RSS_SAMPLES_PER_SERVICE_CAP) samples.push(residencySample(Date.now(), rss, snapshot.stats))
+      }
+      // G4-16e: the rotation counters, from the same body; only a cell that
+      // publishes them gets a series.
+      const rotation = rotationSample(Date.now(), snapshot.stats)
+      if (rotation) {
+        if (!this.rotationSamplesByService[snapshot.service]) this.rotationSamplesByService[snapshot.service] = []
+        const samples = this.rotationSamplesByService[snapshot.service]
+        if (samples.length < RSS_SAMPLES_PER_SERVICE_CAP) samples.push(rotation)
+      }
       this.maxForeignResidentProjectors = Math.max(
         this.maxForeignResidentProjectors,
         Number(snapshot.fleet.foreignResidentProjectors ?? 0),
@@ -1747,6 +2679,9 @@ export class MetricsAccumulator {
       maxEventLoopP99MsByService: this.maxEventLoopP99MsByService,
       eventLoopOutliers: this.eventLoopOutliers,
       maxRssBytes: this.maxRssBytes,
+      rssByService: summarizeRssTrend(this.rssSamplesByService),
+      residencyByService: summarizeResidencyTrend(this.rssSamplesByService),
+      rotationByService: summarizeRotationTrend(this.rotationSamplesByService),
       maxForeignResidentProjectors: this.maxForeignResidentProjectors,
       maxStaleFenceCoalescingCacheSize: this.maxStaleFenceCoalescingCacheSize,
       maxRetiredDocuments: this.maxRetiredDocuments,
@@ -2244,6 +3179,26 @@ export function evaluatePostureBaseline(evidence, config) {
 
 /** Same admission and raw facts in every qualified episode. Only the named
  * voluntary loss is expected; prior loss counters remain cumulative facts. */
+/**
+ * THE ONE CROSS-CLOCK COMPARISON of the gate: a cohort's write timestamps
+ * (the client's clock) against the takeover interval (the gate's clock). For a
+ * local cohort the two clocks are one and this is the comparison it always
+ * was. For a remote cohort the write is moved onto the gate's clock by the
+ * measured offset, and the interval is shrunk by the offset's uncertainty on
+ * both sides, so a write the clock error could place outside the pause is
+ * never counted as inside it. Every other comparison (convergence, barrier,
+ * write timeline) is between timestamps of one host.
+ */
+export function writeOverlapsTakeover(row, takeover) {
+  const remote = row?.childProcess?.remote
+  // A remote cohort whose clock was never measured cannot be placed at all.
+  if (remote && !(Number.isFinite(remote.clockOffsetMs) && Number.isFinite(remote.clockUncertaintyMs))) return false
+  const offset = remote?.clockOffsetMs ?? 0
+  const margin = remote?.clockUncertaintyMs ?? 0
+  return Boolean(row?.writesCompleted?.some(write => write.completedAt - offset >= takeover?.startedAt + margin
+    && write.completedAt - offset <= takeover?.completedAt - margin))
+}
+
 export function evaluatePostureEpisode(evidence, config, phase, takeover = null) {
   const invalid = []
   const failures = []
@@ -2479,7 +3434,7 @@ export function evaluatePostureEpisode(evidence, config, phase, takeover = null)
   }
   if (seen.size !== 8) invalid.push('baseline fleet cohort coverage is incomplete')
   if (phase === 'failover' && !(Array.isArray(raw) && raw.some(row => row?.partition === 0
-    && row.writesCompleted?.some(write => write.completedAt >= takeover?.startedAt && write.completedAt <= takeover?.completedAt)))) {
+    && writeOverlapsTakeover(row, takeover)))) {
     invalid.push('no actual partition-zero write overlaps the acknowledged pause and takeover interval')
   }
   if (evidence.baselineError && Array.isArray(raw) && raw.every((entry) => entry?.childProcess?.exitCode === 0)) {
@@ -2548,6 +3503,16 @@ export function evaluateLoadSoakEvidence(evidence, config) {
   if (baseline && baseline.status !== 'PASS') {
     throw new Error(`T-POST baseline ${baseline.status}: ${baseline.reasons.join('; ')}`)
   }
+  // Only when an arm was requested: without one the report is unchanged.
+  const rotationArm = config.ordinaryHeadRotation
+    ? evaluateOrdinaryHeadRotationArm({
+      ...evidence.ordinaryHeadRotation,
+      requested: config.ordinaryHeadRotation,
+      requestedChainFold: config.ordinaryChainFold,
+      writeHeads: evidence.writeHeads,
+      followWriteHead: config.followWriteHead,
+    })
+    : null
   const failures = []
   const normal = [...evidence.baselineResults, ...evidence.soakResults]
   const failover = evidence.failoverResults
@@ -2658,6 +3623,28 @@ export function evaluateLoadSoakEvidence(evidence, config) {
     staleFields: sumOverResults([...normal, ...failover], 'staleFields'),
     hotDiverged: sumOverResults([...normal, ...failover], 'hotDiverged'),
   }
+  // A VOID arm is not a sample of the arm it is labelled with, so its
+  // failures are not evidence against the product either — but they are
+  // carried, with the lost-edit totals, so a VOID cannot hide a lost edit.
+  if (rotationArm?.status === 'VOID') {
+    return {
+      outcome: 'void',
+      status: 'VOID',
+      reasons: rotationArm.voidReasons,
+      mode: config.mode,
+      profile: config.profile,
+      ordinaryHeadRotation: rotationArm,
+      failures: [...new Set(failures)],
+      convergence,
+      normalCycleConvergence,
+      failoverCycleConvergence,
+      ...lostEdits,
+      takeover: evidence.takeover,
+      maxEventLoopP99Ms: evidence.metrics.maxEventLoopP99Ms,
+      maxEventLoopP99MsByService: evidence.metrics.maxEventLoopP99MsByService,
+      ...(evidence.writeHeads ? { writeHeads: evidence.writeHeads } : {}),
+    }
+  }
   if (failures.length > 0) {
     throw new Error(
       `multi-cell load/soak gate failed: ${[...new Set(failures)].join('; ')}; evidence=${JSON.stringify({
@@ -2669,6 +3656,8 @@ export function evaluateLoadSoakEvidence(evidence, config) {
         failoverResults: failover,
         takeover: evidence.takeover,
         metrics: evidence.metrics,
+        ...(evidence.writeHeads ? { writeHeads: evidence.writeHeads } : {}),
+        ...(rotationArm ? { ordinaryHeadRotation: rotationArm } : {}),
       })}`,
     )
   }
@@ -2704,6 +3693,9 @@ export function evaluateLoadSoakEvidence(evidence, config) {
     maxSynchronizerPeerBindings: evidence.metrics.maxSynchronizerPeerBindings,
     maxPeersPerDocument: evidence.metrics.maxPeersPerDocument,
     maxRssBytes: evidence.metrics.maxRssBytes,
+    rssByService: evidence.metrics.rssByService ?? null,
+    residencyByService: evidence.metrics.residencyByService ?? null,
+    rotationByService: evidence.metrics.rotationByService ?? null,
     maxStaleFenceCoalescingCacheSize:
       evidence.metrics.maxStaleFenceCoalescingCacheSize,
     backpressureDisconnectsDelta: 0,
@@ -2730,11 +3722,51 @@ export function evaluateLoadSoakEvidence(evidence, config) {
     maxForeignResidentProjectors: 0,
     maxRetiredDocuments: Number(evidence.metrics.maxRetiredDocuments ?? 0),
     retiredDocumentLimitExceeded: false,
+    ...(evidence.writeHeads ? { writeHeads: evidence.writeHeads } : {}),
+    ...(rotationArm ? { ordinaryHeadRotation: rotationArm } : {}),
     note: 'Capacity remains uncertified until the same tier passes on production-shaped infrastructure with provider CPU and memory evidence.',
   }
 }
 
-async function runLocalRehearsal(config, allCells, selections, targets, cookie) {
+/** The older evaluator's supplementary transport/fencing guards, for the
+ * G4-7 rehearsal. The arm is judged by `judgeRehearsalRotationArm`, not here:
+ * the rehearsal's evidence carries no `ordinaryHeadRotation`, so an armed
+ * config reaching this evaluator would return a VOID verdict instead of
+ * throwing, and every failure it exists to report would be dropped.
+ * D60: the rehearsal is the one caller gated on population p99s (loop and
+ * steady convergence are judged in RehearsalObservations.finish), so this is
+ * the one place `populationGated` is set. */
+export function rehearsalSupplementaryFailures(evidence, config) {
+  try {
+    evaluateLoadSoakEvidence(evidence, { ...config, benchPosture: null, ordinaryHeadRotation: undefined, populationGated: true })
+    return []
+  } catch (error) {
+    return [error.message]
+  }
+}
+
+/** The G4-16b arm in the G4-7 rehearsal: judged by the same rules as `run()`
+ * and VOIDed through `observations.refuse`. Null when no arm was requested.
+ * An arm requested without inspection evidence is refused, not skipped. The
+ * one call in `runLocalRehearsal` is the remaining wire: no test boots that
+ * function. */
+export async function judgeRehearsalRotationArm({ config, rotationEvidence, writeHeads, observations, collect = collectOrdinaryHeadEvents }) {
+  if (!config.ordinaryHeadRotation) return null
+  const evidence = rotationEvidence ?? { workspaces: [], server: null }
+  const serverEvents = await collect(config, evidence.workspaces).catch((error) => {
+    console.error(`ordinary-head rotation log events could not be read: ${error.message}`)
+    return null
+  })
+  const arm = evaluateOrdinaryHeadRotationArm({
+    ...evidence, serverEvents, requested: config.ordinaryHeadRotation, requestedChainFold: config.ordinaryChainFold,
+    writeHeads, followWriteHead: config.followWriteHead,
+  })
+  observations.emit('ordinary-head-rotation', arm)
+  for (const reason of arm.voidReasons) observations.refuse(reason, { phase: 'final', cycle: null })
+  return arm
+}
+
+async function runLocalRehearsal(config, allCells, selections, targets, cookie, rotationEvidence = null) {
   const seed = await seedRehearsalWorkspace(config, selections.get(0), targets.get(0), cookie, config.seedObjectCount)
   const initial = await Promise.all(allCells.map(cell => cellSnapshot(cell, cookie)))
   const accumulator = new MetricsAccumulator(initial)
@@ -2830,9 +3862,12 @@ async function runLocalRehearsal(config, allCells, selections, targets, cookie) 
     }, 30_000)
     return measured
   }
+  const writeHeads = config.followWriteHead ? new WriteHeadLedger() : null
   try {
     observations.emit('seed', seed)
+    writeHeads?.record('baseline', 0, targets)
     await runEpisode('baseline', 0)
+    writeHeads?.record('failover', 0, targets)
     await runEpisode('failover', 0, async () => {
       const measured = await takePartition(seed, true)
       takeover = measured.takeover
@@ -2842,6 +3877,11 @@ async function runLocalRehearsal(config, allCells, selections, targets, cookie) 
     if (!takeover) throw new Error('failover never ran after fleet admission')
     const soakStartedMono = performance.now()
     do {
+      if (writeHeads) {
+        const followed = await followCurrentWriteHeads(config, selections, targets, cookie, cycle + 1)
+        targets = followed.targets
+        writeHeads.record('soak', cycle + 1, targets, followed.headStats)
+      }
       await runEpisode('soak', cycle + 1)
       actualSoakMs = performance.now() - soakStartedMono
       observations.emit('soak-progress', { actualSoakMs, cycles: cycle })
@@ -2859,16 +3899,20 @@ async function runLocalRehearsal(config, allCells, selections, targets, cookie) 
     }
     // The older evaluator retains its supplementary transport/fencing guards.
     // Cohort, posture, clocks and strict limits are qualified above.
-    const extraFailures = []
-    try { evaluateLoadSoakEvidence(evidence, { ...config, benchPosture: null, populationGated: true }) } catch (error) { extraFailures.push(error.message) }
+    const extraFailures = rehearsalSupplementaryFailures(evidence, config)
+    const rotationArm = await judgeRehearsalRotationArm({ config, rotationEvidence, writeHeads: writeHeads?.summary(), observations })
     observations.emit('calibration', calibration)
     const report = observations.finish({ actualSoakMs, freshness, calibration, extraFailures })
     return { ...report, posture: config.benchPosture, topologyBuild: config.topologyBuild, takeover, takeoverPreflights, metrics,
+      ...(writeHeads ? { writeHeads: writeHeads.summary() } : {}),
+      ...(rotationArm ? { ordinaryHeadRotation: rotationArm } : {}),
       note: 'A FAIL may stop after one complete soak cycle; durationCompleted alone confirms two hours. Local Docker Desktop, not provider capacity.' }
   } catch (error) {
     console.log(`G47_PARTIAL ${JSON.stringify({ status: 'VOID', reason: error.message, actualSoakMs,
       firstFailure: observations.firstFailure, invalid: observations.invalid, episodes: observations.episodes,
-      maxEventLoopP99MsByService: observations.maxEventLoopP99MsByService, takeover, takeoverPreflights, freshness, calibration })}`)
+      maxEventLoopP99MsByService: observations.maxEventLoopP99MsByService, takeover, takeoverPreflights, freshness, calibration,
+      ...(writeHeads ? { writeHeads: writeHeads.summary() } : {}),
+      ...(rotationEvidence ? { ordinaryHeadRotationRequested: config.ordinaryHeadRotation, ordinaryHeadRotationServer: rotationEvidence.server } : {}) })}`)
     throw error
   }
 }
@@ -2914,8 +3958,24 @@ async function run(config) {
     targets.set(partition, await resolveLoadTarget(config, selections.get(partition), session.cookie))
   }
 
+  // The A/B arm: read what the cells PARSED, and refuse before any load an
+  // arm that is already not the arm it is labelled with.
+  let rotationEvidence = null
+  if (config.ordinaryHeadRotation) {
+    setPhase('reading the cells\' ordinary-head rotation configuration')
+    const workspaces = [0, 1].map((partition) => selections.get(partition).workspace)
+    let server = null
+    let inspectionError = null
+    try { server = await inspectOrdinaryHeadRotation(config) } catch (error) { inspectionError = error.message }
+    rotationEvidence = { workspaces, server, ...(inspectionError ? { inspectionError } : {}) }
+    console.log(`ORDINARY_HEAD_ROTATION_ARM ${JSON.stringify({ requested: config.ordinaryHeadRotation,
+      requestedChainFold: config.ordinaryChainFold, ...rotationEvidence })}`)
+    const reasons = ordinaryHeadRotationConfigVoids(config.ordinaryHeadRotation, server, workspaces, config.ordinaryChainFold)
+    if (reasons.length) throw new Error(`ordinary-head rotation arm is VOID before load: ${reasons.join('; ')}${inspectionError ? ` (${inspectionError})` : ''}`)
+  }
+
   if (config.benchPosture && config.mode === 'soak') {
-    return await runLocalRehearsal(config, allCells, selections, targets, session.cookie)
+    return await runLocalRehearsal(config, allCells, selections, targets, session.cookie, rotationEvidence)
   }
 
   setPhase('baseline diagnostics snapshot')
@@ -2930,6 +3990,8 @@ async function run(config) {
     : null
   let baselineRecord = null
   let baselineAdmission = null
+  const writeHeads = config.followWriteHead ? new WriteHeadLedger() : null
+  writeHeads?.record('baseline', 0, targets)
   setPhase('baseline load')
   const loadBaseline = () => runLoadPair(config, selections, targets, session.cookie, accumulator, {
     phase: 'baseline',
@@ -2963,6 +4025,7 @@ async function run(config) {
   const originalOwner = allCells[originalOwnerIndex]
   let expectedUnavailableService = null
   let takeover = null
+  writeHeads?.record('failover', 0, targets)
   setPhase('failover load, before the owner is paused')
   const failoverRaw = await runLoadPair(config, selections, targets, session.cookie, accumulator, {
     phase: 'failover',
@@ -3028,6 +4091,11 @@ async function run(config) {
         (selection, previous) => resolveLoadTarget(config, selection, session.cookie, previous),
       )
     }
+    if (writeHeads) {
+      const followed = await followCurrentWriteHeads(config, selections, targets, session.cookie, soakCycle)
+      targets = followed.targets
+      writeHeads.record('soak', soakCycle, targets, followed.headStats)
+    }
     setPhase(`soak cycle ${soakCycle}`)
     soakRaw.push(...await runLoadPair(config, selections, targets, session.cookie, accumulator, {
       phase: 'soak',
@@ -3040,6 +4108,13 @@ async function run(config) {
   const finalSnapshots = await Promise.all(allCells.map((cell) => cellSnapshot(cell, session.cookie)))
   accumulator.record(finalSnapshots)
   const metrics = accumulator.summarize(finalSnapshots, takeover.originalService)
+  if (rotationEvidence) {
+    setPhase('counting the cells\' ordinary-head rotation log events')
+    rotationEvidence.serverEvents = await collectOrdinaryHeadEvents(config, rotationEvidence.workspaces).catch((error) => {
+      console.error(`ordinary-head rotation log events could not be read: ${error.message}`)
+      return null
+    })
+  }
   const evidence = {
     baselineResults: baselineRaw.map(convergedResult),
     ...(baselineRecord ? {
@@ -3053,6 +4128,8 @@ async function run(config) {
     soakMs,
     metrics,
     finalOwnership: finalSnapshots.map((snapshot) => snapshot.ownership),
+    ...(writeHeads ? { writeHeads: writeHeads.summary() } : {}),
+    ...(rotationEvidence ? { ordinaryHeadRotation: rotationEvidence } : {}),
   }
   setPhase('evaluating the evidence')
   return evaluateLoadSoakEvidence(evidence, config)
@@ -3068,6 +4145,58 @@ async function run(config) {
       },
       primaryError,
     )
+  }
+}
+
+/**
+ * `--preselect-workspaces`: choose the two hot workspaces exactly as `run()`
+ * would — same readiness waits, same `selectPartitionWorkspaces`, so fresh
+ * mode creates them and smoke mode reuses or creates them — then print the
+ * choice and stop: no load, no pause. Landscapes it created and did NOT choose
+ * are deleted here; the chosen two belong to the run that follows, which
+ * deletes them in its own cleanup in fresh mode only (see
+ * PRESELECTED_WORKSPACES_ENV; `createdLandscapeIds` is not handed over). The verdict carries both
+ * spellings the runner needs: the gate's `landscapeId:versionId` list and the
+ * server allow-list's `landscapeId/versionId` list.
+ */
+export async function preselectWorkspaces(config) {
+  const allCells = cells(config)
+  setPhase('preselect: waiting for three sync-cell HTTP processes')
+  await waitFor('three sync-cell HTTP processes', async () => {
+    const health = await Promise.all(allCells.map((cell) => request(`${cell.baseUrl}/api/health`).catch(() => null)))
+    return health.every((entry) => entry?.status === 200)
+  }, 120_000)
+  const session = await login(config, allCells[0])
+  setPhase('preselect: waiting for two owners and one spare cell')
+  const states = await waitFor('two owners and one spare cell', async () => {
+    const rows = await Promise.all(allCells.map((cell) => json(`${cell.baseUrl}/api/platform/sync-cell`, { cookie: session.cookie })))
+    const owners = rows.filter((state) => state.ready && (state.partitionIndex === 0 || state.partitionIndex === 1))
+    const standby = rows.filter((state) => !state.ready && state.partitionIndex === null)
+    return owners.length === 2 && standby.length === 1 && new Set(owners.map((state) => state.partitionIndex)).size === 2
+      ? rows
+      : null
+  }, 120_000)
+  const created = []
+  let selections
+  try {
+    setPhase('preselect: selecting one hot workspace per partition')
+    selections = await selectPartitionWorkspaces(config, allCells, states, session.cookie, created)
+  } catch (error) {
+    await completeQualificationCleanup(() => cleanupFreshLandscapes(config, allCells, session.cookie, created), error)
+    throw error
+  }
+  const workspaces = [0, 1].map((partition) => ({ partition, ...selections.get(partition).workspace }))
+  const chosen = new Set(workspaces.map((workspace) => workspace.landscapeId))
+  await cleanupFreshLandscapes(config, allCells, session.cookie, created.filter((id) => !chosen.has(id)))
+  return {
+    outcome: 'passed',
+    preselection: {
+      workspaces,
+      freshWorkspaces: config.freshWorkspaces,
+      createdLandscapeIds: created.filter((id) => chosen.has(id)),
+      [PRESELECTED_WORKSPACES_ENV]: workspaces.map((workspace) => `${workspace.landscapeId}:${workspace.versionId}`).join(','),
+      allowlist: workspaces.map(ordinaryHeadWorkspaceKey).join(','),
+    },
   }
 }
 
@@ -3093,6 +4222,10 @@ function unpauseAnyPausedCell(config) {
  */
 export function abandonRun(config) {
   terminateActiveLoadProcesses()
+  // Dropping the control connection makes the agent stop every cohort itself.
+  try { activeRemoteLoadServer?.destroy() } catch { /* best effort */ }
+  activeRemoteLoadServer = null
+  activeRemoteLoad = null
   unpauseAnyPausedCell(config)
   activeRunLock?.release()
   activeRunLock = null
@@ -3102,6 +4235,18 @@ export function abandonRun(config) {
  *  so that there is exactly one place a process exit is decided. Returns the
  *  verdict object; rejects with the run's error. */
 export async function main(config) {
+  if (config.preselectOnly) {
+    // Before the posture/topology checks: these cells are about to be
+    // recreated with the allow-list, and the real run qualifies those.
+    const runLock = acquireQualificationRunLock(config.project)
+    activeRunLock = runLock
+    try {
+      return await preselectWorkspaces(config)
+    } finally {
+      runLock.release()
+      if (activeRunLock === runLock) activeRunLock = null
+    }
+  }
   if (config.benchPosture && config.mode === 'soak'
     && !(config.calibrationBinding?.path && config.calibrationBinding.sha256 && config.calibrationBinding.nonce)) {
     throw new Error('G4 soak requires this invocation\'s dedicated calibration receipt')
@@ -3117,16 +4262,52 @@ export async function main(config) {
   }
   const runLock = acquireQualificationRunLock(config.project)
   activeRunLock = runLock
+  let remote = null
   try {
-    return await run(config)
+    if (config.remoteLoad) remote = await openRemoteLoad(config)
+    const verdict = await run(config)
+    return remote ? { ...verdict, remoteLoad: remote.session.evidence() } : verdict
   } catch (error) {
     unpauseAnyPausedCell(config)
     throw error
   } finally {
     terminateActiveLoadProcesses()
+    if (remote || activeRemoteLoadServer) await closeRemoteLoad()
     runLock.release()
     if (activeRunLock === runLock) activeRunLock = null
   }
+}
+
+/**
+ * Listen on the LAN address for the load agent and wait for it: authenticated,
+ * same client code, router reachable from its side, clock offset measured.
+ * Before any login or write, so a missing agent costs nothing but the wait.
+ */
+async function openRemoteLoad(config) {
+  const { bind, controlPort, routerPort, connectTimeoutMs } = config.remoteLoad
+  setPhase(`waiting for the remote load agent on ${bind}:${controlPort}`)
+  const server = await startRemoteLoadServer({ bind, port: controlPort, secret: readRemoteLoadSecret(process.env),
+    router: { host: bind, port: routerPort } })
+  activeRemoteLoadServer = server
+  console.error(`[remote load] start the agent on the load host: cd server && node scripts/sync-cell-remote-load.mjs --connect=${bind}:${controlPort} --once`)
+  const session = await server.waitForAgent(connectTimeoutMs)
+  bindRemoteLoadSession(session)
+  console.error(`[remote load] agent ready: ${session.agent?.host?.hostname ?? '?'} (${session.agent?.address}), clock offset ${session.currentClock()?.offsetMs} ms +/- ${session.currentClock()?.uncertaintyMs} ms`)
+  return { server, session }
+}
+
+async function closeRemoteLoad() {
+  const server = activeRemoteLoadServer
+  activeRemoteLoadServer = null
+  bindRemoteLoadSession(null)
+  if (!server) return
+  let evidence = null
+  try { evidence = await server.close('run finished') } catch (error) {
+    console.error(`[remote load] closing the session failed: ${error.message}`)
+  }
+  // On every path, pass or fail: which host ran the clients and how its clock
+  // compared. The verdict of a passing run carries the same object.
+  console.log(`REMOTE_LOAD_SESSION ${JSON.stringify(evidence)}`)
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1]).href) {

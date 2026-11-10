@@ -21,11 +21,12 @@ import { NodeWSServerAdapter } from '@automerge/automerge-repo-network-websocket
 import * as Automerge from '@automerge/automerge'
 import { PostgresStorageAdapter, type StorageFenceSnapshot } from './automergeStorage.js'
 import { cachedHandles, drainEntries, syncedHandle } from './automergeRepoCompat.js'
-import { pool } from './db.js'
+import { pool, storageWritePool } from './db.js'
 import { envNumber } from './envNumber.js'
 import { migrateEntitiesIntoRoot } from './automergeMigrate.js'
 import { seedDemoIntoUnpublishedRoot } from './demoSeed.js'
 import { buildModelMeta } from './modelMeta.js'
+import { emptyMonolithModel } from './modelCollections.js'
 import { buildEmptyRootShape } from './rootShape.js'
 import type { BootstrapScope } from './bootstrapScope.js'
 import { createSelectiveSync, stageAwareAccessCheck } from './selectiveSync.js'
@@ -68,6 +69,7 @@ import { AutomergeResidencyLeases, classifyAutomergeDocument } from './automerge
 import { serializeAutomergeDocumentMessages } from './serializeAutomergeMessages.js'
 import { observeAutomergeBackgroundSaveErrors } from './automergeBackgroundSave.js'
 import { drainAutomergeResources, runShutdownSteps } from './automergeDrain.js'
+import { automergeShutdownSteps, residencyStorageProbe, syncServerStorageAdapterOptions } from './automergeStorageWiring.js'
 import { FairInboundQueue, inboundFrameBatchSize } from './fairInboundQueue.js'
 import {
   createDiagramPresenceGate,
@@ -315,7 +317,7 @@ function emptyRoot(): Record<string, unknown> {
 }
 
 function emptyModelDoc(): Record<string, unknown> {
-  return { objects: {}, connections: {}, groups: {}, domains: {}, tagSnapshots: {}, decisionRecords: {} }
+  return emptyMonolithModel()
 }
 
 async function getMeta(key: string): Promise<string | null> {
@@ -974,13 +976,14 @@ export async function startAutomergeSync(
   // seam test (like `installDenyLedgerReleaseGuard`) is used instead of another
   // ref, because no test boots this function and a ref's wiring lines would be
   // pinned by nothing.
-  const storageAdapter = new PostgresStorageAdapter({
-    ownership: options.ownership?.enabled ? options.ownership : undefined,
-    fencedTransactionIdleTimeoutMs: Number.isFinite(configuredFenceIdleTimeoutMs)
-      ? configuredFenceIdleTimeoutMs
-      : 1_000,
+  // Saves and removals on their own tagged, bounded pool (G4-16d,
+  // `storageWritePoolConfig`); reads stay on the primary pool.
+  const storageAdapter = new PostgresStorageAdapter(syncServerStorageAdapterOptions({
+    writeDb: storageWritePool,
+    ownership: options.ownership,
+    fencedTransactionIdleTimeoutMs: configuredFenceIdleTimeoutMs,
     trackStaticReadModel: process.env.READ_MODEL === 'on',
-  })
+  }))
   const repo = new Repo({
     network: [adapter],
     storage: storageAdapter,
@@ -1547,10 +1550,7 @@ export async function startAutomergeSync(
   })
 
   const rootUrl = await ensureRootDoc(repo)
-  const residency = new AutomergeResidencyLeases(repo, {
-    snapshot: (documentIds) => storageAdapter.residencySnapshot(documentIds),
-    forget: (documentId) => storageAdapter.forgetResidency(documentId),
-  })
+  const residency = new AutomergeResidencyLeases(repo, residencyStorageProbe(storageAdapter))
   const inboundMessageQueue = serializeAutomergeDocumentMessages(repo.synchronizer)
   const protectedRoot = await findBootDocument(repo, rootUrl, 'workspace root')
   residency.protect(protectedRoot)
@@ -1682,11 +1682,14 @@ export async function startAutomergeSync(
   let shuttingDown: Promise<void> | null = null
   const shutdown = (): Promise<void> => {
     if (shuttingDown) return shuttingDown
-    shuttingDown = runShutdownSteps('Automerge shutdown', [
-      { name: 'drain', run: drain },
-      { name: 'repo shutdown', run: () => repo.shutdown() },
-      { name: 'background save observer', run: stopBackgroundSaveErrors },
-    ])
+    // After the Repo's last flush, before index.ts ends the pools: no
+    // ceiling retry may fire against an ended pool (`automergeShutdownSteps`).
+    shuttingDown = runShutdownSteps('Automerge shutdown', automergeShutdownSteps({
+      drain,
+      repoShutdown: () => repo.shutdown(),
+      storageAdapter,
+      stopBackgroundSaveErrors,
+    }))
     return shuttingDown
   }
   return {

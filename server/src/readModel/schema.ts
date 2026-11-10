@@ -580,6 +580,112 @@ export async function ensureReadModelSchema(db: Queryable): Promise<void> {
     ON read_model_overlay_entity_bases (
       landscape_id, version_id, collection, document_id
     )`)
+  // ORDINARY-plane overlay head retirements (`ordinaryHeadForwarding.ts`).
+  // A row with status `retired` names a write head that is no longer current
+  // and the heads (H_r) up to which its content is already published; every
+  // later change is forwarded into the current head instead of being projected
+  // from the retired one. `forwarded_heads` is how far forwarding has got.
+  // No row (a head retired by compaction) keeps the direct projection.
+  // `admitted` is a rotation that has not recorded H_r yet and is treated like
+  // no row. Its production writer is the phase-3 rotator
+  // (`ordinaryHeadRotator.ts`), which only ever writes `retired` WITH H_r.
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS read_model_ordinary_head_retirements (
+      landscape_id      TEXT NOT NULL,
+      version_id        TEXT NOT NULL,
+      collection        TEXT NOT NULL CHECK (collection IN ('object', 'connection')),
+      document_id       TEXT NOT NULL,
+      retirement_heads  TEXT[],
+      forwarded_heads   TEXT[],
+      status            TEXT NOT NULL DEFAULT 'admitted'
+                        CHECK (status IN ('admitted', 'retired')),
+      created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (landscape_id, version_id, collection, document_id),
+      CHECK (status <> 'retired' OR retirement_heads IS NOT NULL)
+    )
+  `)
+  // G4-16b phase 4: a retired head merged into a fold product
+  // (`ordinaryChainFold.ts`) is `folded`. It keeps H_r and `forwarded_heads`
+  // and keeps forwarding late writes; `folded_into` names the product and
+  // `retain_until` how long its document must outlive its last listing.
+  // `arrival_watermark` (phase 4 step 4): the highest `automerge_storage`
+  // arrival of a folded head the projector has already forwarded past; an
+  // arrival beyond it is a late write to carry (`ordinaryFoldedArrivals.ts`).
+  await db.query(`
+    ALTER TABLE read_model_ordinary_head_retirements
+      ADD COLUMN IF NOT EXISTS folded_into TEXT,
+      ADD COLUMN IF NOT EXISTS retain_until TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS arrival_watermark BIGINT
+  `)
+  // GUARDED, not dropped and re-added: this runs on every boot, and an ALTER
+  // takes ACCESS EXCLUSIVE on a table a rotator or forwarder may hold. The
+  // status CHECK is replaced only while its definition lacks `folded`; the
+  // folded CHECK is added once, by name. `pg_get_constraintdef` runs in the
+  // SELECT list, never in the WHERE: there the planner may call it on another
+  // table's constraint, and one being dropped concurrently (another schema's
+  // DROP ... CASCADE) fails the whole statement with "could not open relation".
+  await db.query(`
+    DO $$
+    DECLARE
+      status_check TEXT;
+    BEGIN
+      SELECT pg_get_constraintdef(oid) INTO status_check FROM pg_constraint
+      WHERE conrelid = to_regclass(current_schema() || '.read_model_ordinary_head_retirements')
+        AND conname = 'read_model_ordinary_head_retirements_status_check';
+      IF status_check IS NULL OR status_check NOT LIKE '%folded%' THEN
+        ALTER TABLE read_model_ordinary_head_retirements
+          DROP CONSTRAINT IF EXISTS read_model_ordinary_head_retirements_status_check;
+        ALTER TABLE read_model_ordinary_head_retirements
+          ADD CONSTRAINT read_model_ordinary_head_retirements_status_check
+          CHECK (status IN ('admitted', 'retired', 'folded'));
+      END IF;
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = to_regclass(current_schema() || '.read_model_ordinary_head_retirements')
+          AND conname = 'read_model_ordinary_head_retirements_folded_check'
+      ) THEN
+        ALTER TABLE read_model_ordinary_head_retirements
+          ADD CONSTRAINT read_model_ordinary_head_retirements_folded_check
+          CHECK ((status = 'folded') = (folded_into IS NOT NULL)
+            AND (status = 'folded') = (retain_until IS NOT NULL)
+            AND (status <> 'folded' OR retirement_heads IS NOT NULL));
+      END IF;
+    END $$;
+  `)
+  // One row per fold product: the authority a projector checks before it
+  // accepts a segment marked `foldedFromUrls` (`ordinaryChainFold.ts`).
+  // Written with the sources' `folded` rows in ONE transaction, before the
+  // ModelMeta change that lists the product.
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS read_model_ordinary_chain_folds (
+      landscape_id         TEXT NOT NULL,
+      version_id           TEXT NOT NULL,
+      collection           TEXT NOT NULL CHECK (collection IN ('object', 'connection')),
+      product_document_id  TEXT NOT NULL,
+      source_document_ids  TEXT[] NOT NULL CHECK (cardinality(source_document_ids) > 0),
+      created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (landscape_id, version_id, collection, product_document_id)
+    )
+  `)
+  // The writer reads the LATEST fold of a kind on every pass.
+  await db.query(`CREATE INDEX IF NOT EXISTS idx_read_model_ordinary_chain_folds_latest
+    ON read_model_ordinary_chain_folds (landscape_id, version_id, collection, created_at DESC)`)
+  // G4-16e: what WROTE a retirement row — `rotation` (the rotator,
+  // `ordinaryHeadRotator.ts`) or `fold-product` (the fold record gives every
+  // product a `retired` row so it can be folded again, `ordinaryChainFold.ts`).
+  // The durable rotation rate counts the first only. GUARDED like the CHECKs
+  // above: the ALTER and its one-time backfill run once, not on every boot.
+  // The backfill names the products still recorded; a product whose record a
+  // sweep already removed stays NULL and is counted as a rotation.
+  if (!(await currentSchemaHasColumn(db, 'read_model_ordinary_head_retirements', 'origin'))) {
+    await db.query(`ALTER TABLE read_model_ordinary_head_retirements
+      ADD COLUMN IF NOT EXISTS origin TEXT CHECK (origin IN ('rotation', 'fold-product'))`)
+    await db.query(`UPDATE read_model_ordinary_head_retirements row SET origin = 'fold-product'
+      FROM read_model_ordinary_chain_folds fold
+      WHERE row.origin IS NULL AND row.landscape_id = fold.landscape_id AND row.version_id = fold.version_id
+        AND row.collection = fold.collection AND row.document_id = fold.product_document_id`)
+  }
   await db.query(`
     DELETE FROM read_model_static_document_queue queue
     USING read_model_static_documents document

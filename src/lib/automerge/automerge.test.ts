@@ -14,7 +14,8 @@
 
 import { describe, it, expect } from 'vitest'
 import * as Automerge from '@automerge/automerge'
-import { reconcile } from './reconcile'
+import { EXACT, reconcile } from './reconcile'
+import { COLLECTION_SCHEMAS, CONNECTION_SCHEMA, C4_OBJECT_SCHEMA } from './knownKeys'
 import {
   rootModelToSlice,
   sliceToRootModel,
@@ -67,37 +68,37 @@ function makeObject(id: string, over: Partial<C4Object> = {}): C4Object {
 describe('reconcile (pure)', () => {
   it('adds, updates, and deletes object keys to match target', () => {
     const draft: Record<string, unknown> = { a: 1, b: 2, keep: 'x' }
-    reconcile(draft, { a: 1, b: 99, c: 3, keep: 'x' })
+    reconcile(draft, { a: 1, b: 99, c: 3, keep: 'x' }, EXACT)
     expect(draft).toEqual({ a: 1, b: 99, c: 3, keep: 'x' })
   })
 
   it('treats undefined in target as deletion', () => {
     const draft: Record<string, unknown> = { a: 1, b: 2 }
-    reconcile(draft, { a: 1, b: undefined })
+    reconcile(draft, { a: 1, b: undefined }, EXACT)
     expect(draft).toEqual({ a: 1 })
   })
 
   it('recurses into nested objects without replacing the parent reference', () => {
     const nested = { x: 1, y: 2 }
     const draft: Record<string, unknown> = { pos: nested }
-    reconcile(draft, { pos: { x: 1, y: 5 } })
+    reconcile(draft, { pos: { x: 1, y: 5 } }, EXACT)
     expect(draft.pos).toBe(nested) // same reference — minimal, drilled-in edit
     expect(draft.pos).toEqual({ x: 1, y: 5 })
   })
 
   it('grows, shrinks, and edits arrays in place', () => {
     const grow: unknown[] = [1, 2]
-    reconcile(grow, [1, 2, 3, 4])
+    reconcile(grow, [1, 2, 3, 4], EXACT)
     expect(grow).toEqual([1, 2, 3, 4])
 
     const shrink: unknown[] = [1, 2, 3, 4]
-    reconcile(shrink, [1, 9])
+    reconcile(shrink, [1, 9], EXACT)
     expect(shrink).toEqual([1, 9])
   })
 
   it('reconciles arrays of objects element-wise', () => {
     const draft: unknown[] = [{ id: 'a', v: 1 }, { id: 'b', v: 2 }]
-    reconcile(draft, [{ id: 'a', v: 1 }, { id: 'b', v: 22 }, { id: 'c', v: 3 }])
+    reconcile(draft, [{ id: 'a', v: 1 }, { id: 'b', v: 22 }, { id: 'c', v: 3 }], EXACT)
     expect(draft).toEqual([{ id: 'a', v: 1 }, { id: 'b', v: 22 }, { id: 'c', v: 3 }])
   })
 })
@@ -456,10 +457,10 @@ describe('Automerge field-level merge via reconcile', () => {
     // A edits description; B (concurrently) moves the shape. Each uses reconcile,
     // mirroring how the bridge writes a changed entity into the doc.
     a = Automerge.change(a, (d) => {
-      reconcile(d.objects.x, makeObject('x', { name: 'X', description: 'A-edited' }))
+      reconcile(d.objects.x, makeObject('x', { name: 'X', description: 'A-edited' }), C4_OBJECT_SCHEMA)
     })
     b = Automerge.change(b, (d) => {
-      reconcile(d.objects.x, makeObject('x', { name: 'X', description: 'orig', position: { x: 500, y: 300 } }))
+      reconcile(d.objects.x, makeObject('x', { name: 'X', description: 'orig', position: { x: 500, y: 300 } }), C4_OBJECT_SCHEMA)
     })
 
     const merged = Automerge.merge(a, b)
@@ -473,8 +474,8 @@ describe('Automerge field-level merge via reconcile', () => {
     let a = Automerge.clone(base)
     let b = Automerge.clone(base)
 
-    a = Automerge.change(a, (d) => reconcile(d.objects, sliceMap([makeObject('x'), makeObject('y')])))
-    b = Automerge.change(b, (d) => reconcile(d.objects, sliceMap([makeObject('x'), makeObject('z')])))
+    a = Automerge.change(a, (d) => reconcile(d.objects, sliceMap([makeObject('x'), makeObject('y')]), COLLECTION_SCHEMAS.objects))
+    b = Automerge.change(b, (d) => reconcile(d.objects, sliceMap([makeObject('x'), makeObject('z')]), COLLECTION_SCHEMAS.objects))
 
     const merged = Automerge.merge(a, b)
     expect(Object.keys(merged.objects).sort()).toEqual(['x', 'y', 'z'])
@@ -486,7 +487,7 @@ describe('Automerge field-level merge via reconcile', () => {
     const b = Automerge.clone(base)
 
     // A removes y by reconciling the map to one without it.
-    a = Automerge.change(a, (d) => reconcile(d.objects, sliceMap([makeObject('x')])))
+    a = Automerge.change(a, (d) => reconcile(d.objects, sliceMap([makeObject('x')]), COLLECTION_SCHEMAS.objects))
 
     const merged = Automerge.merge(a, b)
     expect(Object.keys(merged.objects)).toEqual(['x'])
@@ -495,7 +496,7 @@ describe('Automerge field-level merge via reconcile', () => {
   it('reconciling to an identical value records no change (minimal ops)', () => {
     const doc = fromDoc(modelWith([makeObject('x', { description: 'same' })]))
     const next = Automerge.change(doc, (d) => {
-      reconcile(d.objects.x, makeObject('x', { description: 'same' }))
+      reconcile(d.objects.x, makeObject('x', { description: 'same' }), C4_OBJECT_SCHEMA)
     })
     // No-op change: content identical, heads unchanged.
     expect(Automerge.getHeads(next)).toEqual(Automerge.getHeads(doc))
@@ -532,15 +533,15 @@ describe('reconcile on real Automerge drafts', () => {
       id: 'c1', fromId: 'a', toId: 'b', type: 'solid', waypoints,
     })
     let doc = fromDoc<ModelDoc>({ objects: {}, connections: {}, groups: {}, domains: {}, tagSnapshots: {}, decisionRecords: {} })
-    doc = Automerge.change(doc, (d) => reconcile(d.connections, { c1: conn([{ x: 1, y: 1 }, { x: 2, y: 2 }]) }))
+    doc = Automerge.change(doc, (d) => reconcile(d.connections, { c1: conn([{ x: 1, y: 1 }, { x: 2, y: 2 }]) }, COLLECTION_SCHEMAS.connections))
     expect(doc.connections.c1.waypoints).toEqual([{ x: 1, y: 1 }, { x: 2, y: 2 }])
 
     // edit one point + append another (array-of-objects through the proxy)
-    doc = Automerge.change(doc, (d) => reconcile(d.connections.c1, conn([{ x: 1, y: 9 }, { x: 2, y: 2 }, { x: 3, y: 3 }])))
+    doc = Automerge.change(doc, (d) => reconcile(d.connections.c1, conn([{ x: 1, y: 9 }, { x: 2, y: 2 }, { x: 3, y: 3 }]), CONNECTION_SCHEMA))
     expect(doc.connections.c1.waypoints).toEqual([{ x: 1, y: 9 }, { x: 2, y: 2 }, { x: 3, y: 3 }])
 
     // shrink
-    doc = Automerge.change(doc, (d) => reconcile(d.connections.c1, conn([{ x: 1, y: 9 }])))
+    doc = Automerge.change(doc, (d) => reconcile(d.connections.c1, conn([{ x: 1, y: 9 }]), CONNECTION_SCHEMA))
     expect(doc.connections.c1.waypoints).toEqual([{ x: 1, y: 9 }])
   })
 
@@ -550,7 +551,7 @@ describe('reconcile on real Automerge drafts', () => {
       delete d.objects.x
     })
     const b = Automerge.change(Automerge.clone(base), (d) => {
-      reconcile(d.objects.x, makeObject('x', { description: 'b-edit' }))
+      reconcile(d.objects.x, makeObject('x', { description: 'b-edit' }), C4_OBJECT_SCHEMA)
     })
     // Automerge merges commutatively — both orders must converge to the same keys.
     const ab = Automerge.merge(Automerge.clone(a), b)
@@ -588,7 +589,7 @@ describe('ADRLink related[] merges by link id', () => {
     Automerge.from<RecordDoc>({ rec: { id: 'A1', related: links.map((l) => ({ ...l })) } })
   /** How the app saves: the whole array, through reconcile, inside one change. */
   const save = (doc: Automerge.Doc<RecordDoc>, related: Link[], actor: string) =>
-    Automerge.change(Automerge.clone(doc, { actor }), (d) => reconcile(d.rec, { id: 'A1', related }))
+    Automerge.change(Automerge.clone(doc, { actor }), (d) => reconcile(d.rec, { id: 'A1', related }, EXACT))
   const idsOf = (d: Automerge.Doc<RecordDoc>) => d.rec.related.map((l) => l.id)
 
   it('two users removing a DIFFERENT link no longer resurrect one of them', () => {
@@ -664,7 +665,7 @@ describe('by-id array merge is scoped by key name, not by element shape', () => 
   it('keys related by id: removing the middle does not rewrite the tail in place', () => {
     const draft = [item('a', 'A'), item('b', 'B'), item('c', 'C')]
     const kept = draft[2]
-    reconcile({ related: draft }, { related: [item('a', 'A'), item('c', 'C')] })
+    reconcile({ related: draft }, { related: [item('a', 'A'), item('c', 'C')] }, EXACT)
     expect(draft.map((x) => x.id)).toEqual(['a', 'c'])
     expect(draft[1]).toBe(kept) // the survivor was moved, not overwritten
   })
@@ -674,7 +675,7 @@ describe('by-id array merge is scoped by key name, not by element shape', () => 
     // the special case has leaked by shape.
     const draft = [item('a', 'A'), item('b', 'B'), item('c', 'C')]
     const wasSecond = draft[1]
-    reconcile({ steps: draft }, { steps: [item('a', 'A'), item('c', 'C')] })
+    reconcile({ steps: draft }, { steps: [item('a', 'A'), item('c', 'C')] }, EXACT)
     expect(draft.map((x) => x.id)).toEqual(['a', 'c'])
     expect(draft[1]).toBe(wasSecond) // slot 1 was OVERWRITTEN in place — index semantics
   })
@@ -685,7 +686,7 @@ describe('by-id array merge is scoped by key name, not by element shape', () => 
     // silently drop all but one — strictly worse than the bug being fixed. Two of
     // them is what makes that observable: keyed, nothing here would be removed.
     const draft: Array<{ id?: string; label: string }> = [{ label: 'x' }, { label: 'y' }]
-    reconcile({ related: draft }, { related: [{ label: 'y' }] })
+    reconcile({ related: draft }, { related: [{ label: 'y' }] }, EXACT)
     expect(draft).toEqual([{ label: 'y' }])
   })
 
@@ -694,7 +695,7 @@ describe('by-id array merge is scoped by key name, not by element shape', () => 
     // only the uniqueness check stands between this and a lookup that resolves
     // both 'a' entries to the LAST one, leaving the first holding stale fields.
     const draft = [item('a', 'A'), item('b', 'B'), item('a', 'A2')]
-    reconcile({ related: draft }, { related: [item('a', 'X'), item('b', 'B'), item('a', 'Y')] })
+    reconcile({ related: draft }, { related: [item('a', 'X'), item('b', 'B'), item('a', 'Y')] }, EXACT)
     expect(draft).toEqual([item('a', 'X'), item('b', 'B'), item('a', 'Y')])
   })
 
@@ -704,20 +705,20 @@ describe('by-id array merge is scoped by key name, not by element shape', () => 
     // is already stale by the second append — on a plain array that writes a
     // hole, and on an Automerge list it throws ("index N is out of bounds").
     const draft = [item('a', 'A'), item('b', 'B')]
-    reconcile({ related: draft }, { related: [item('b', 'B'), item('c', 'C'), item('d', 'D')] })
+    reconcile({ related: draft }, { related: [item('b', 'B'), item('c', 'C'), item('d', 'D')] }, EXACT)
     expect(draft).toEqual([item('b', 'B'), item('c', 'C'), item('d', 'D')])
   })
 
   it('falls back to the index walk on a genuine reorder, which by-id cannot express', () => {
     const draft = [item('a', 'A'), item('b', 'B')]
-    reconcile({ related: draft }, { related: [item('b', 'B'), item('a', 'A')] })
+    reconcile({ related: draft }, { related: [item('b', 'B'), item('a', 'A')] }, EXACT)
     expect(draft.map((x) => x.id)).toEqual(['b', 'a'])
   })
 
   it('does not key a nested array just because its parent was keyed', () => {
     // Inside reconcileArray the key is a numeric index, never a name.
     const draft = [{ id: 'a', related: [item('x', 'X'), item('y', 'Y')] }]
-    reconcile({ related: draft }, { related: [{ id: 'a', related: [item('x', 'X'), item('y', 'Y2')] }] })
+    reconcile({ related: draft }, { related: [{ id: 'a', related: [item('x', 'X'), item('y', 'Y2')] }] }, EXACT)
     expect(draft[0].related[1].label).toBe('Y2')
   })
 })

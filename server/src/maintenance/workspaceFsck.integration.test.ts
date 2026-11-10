@@ -369,6 +369,63 @@ describe.skipIf(!TEST_DATABASE_URL)('workspace fsck (live Postgres + real storag
       .toMatch(/^monolith workspace/)
   })
 
+  it('ordinary-head-actors-bounded: RUNS through fsckWorkspace when rotation is on for the workspace, and fires on a head twice past a threshold', async () => {
+    // The WIRE: `fsckWorkspace` hands the rotation config to the check and
+    // `measureOverlayWriteHeads` measures `A.stats` on the real head. Off (the
+    // environment here) it does not apply.
+    const key = { landscapeId: 'L-actors', versionId: 'V1' }
+    const rootUrl = await provision(key.landscapeId, key.versionId)
+    const off = await fsckWorkspace(db.pool, repo, key, rootUrl)
+    expect(off.checksSkipped.find((entry) => entry.check === 'ordinary-head-actors-bounded')?.reason)
+      .toMatch(/^ordinary workspace/)
+    const on = (maxChanges: number) => ({
+      mode: 'on' as const, allowlist: new Set([`${key.landscapeId}/${key.versionId}`]), maxActors: 1_000, maxChanges,
+    })
+    const quiet = await fsckWorkspace(db.pool, repo, key, rootUrl, { ordinaryHeadRotation: on(1_000) })
+    expect(quiet.checksRun).toContain('ordinary-head-actors-bounded')
+    expect(quiet.findings).toEqual([])
+    const root = await findReadyDocument<Record<string, unknown>>(repo, rootUrl)
+    const meta = await findReadyDocument<Record<string, unknown>>(repo, root.doc()!.modelMetaUrl as string)
+    const headUrl = meta.doc()!.editsObjectShardUrl as string
+    const head = await findReadyDocument<Record<string, unknown>>(repo, headUrl)
+    for (let index = 0; index < 4; index += 1) {
+      head.change((doc) => {
+        if (!doc.objects) doc.objects = {}
+        ;(doc.objects as Record<string, unknown>)[`c${index}`] = { id: `c${index}` }
+      })
+    }
+    await repo.flush([head.documentId])
+    const changes = Automerge.stats(head.doc() as Automerge.Doc<unknown>).numChanges
+    expect(changes).toBeGreaterThanOrEqual(4)
+    const fired = await fsckWorkspace(db.pool, repo, key, rootUrl, { ordinaryHeadRotation: on(2) })
+    const finding = fired.findings.find((f) => f.check === 'ordinary-head-actors-bounded')
+    expect(finding?.documentUrl).toBe(headUrl)
+    expect(finding?.detail).toContain(`${changes} changes (rotation at 2)`)
+  })
+
+  it('ordinary-head-actors-bounded does NOT apply under shadow, nor for a workspace off the allow-list (QA lens: K03, K04)', async () => {
+    const key = { landscapeId: 'L-actors-scope', versionId: 'V1' }
+    const rootUrl = await provision(key.landscapeId, key.versionId)
+    const listed = new Set([`${key.landscapeId}/${key.versionId}`])
+    const reason = (report: Awaited<ReturnType<typeof fsckWorkspace>>) =>
+      report.checksSkipped.find((entry) => entry.check === 'ordinary-head-actors-bounded')?.reason
+    const shadow = await fsckWorkspace(db.pool, repo, key, rootUrl, {
+      ordinaryHeadRotation: { mode: 'shadow', allowlist: listed, maxActors: 1, maxChanges: 1 },
+    })
+    expect(shadow.checksRun).not.toContain('ordinary-head-actors-bounded')
+    expect(reason(shadow)).toMatch(/not on for it/)
+    const unlisted = await fsckWorkspace(db.pool, repo, key, rootUrl, {
+      ordinaryHeadRotation: { mode: 'on', allowlist: new Set(['other/V1']), maxActors: 1, maxChanges: 1 },
+    })
+    expect(unlisted.checksRun).not.toContain('ordinary-head-actors-bounded')
+    expect(reason(unlisted)).toMatch(/not on for it/)
+    // Control: the same config, on and listed, runs the check.
+    const on = await fsckWorkspace(db.pool, repo, key, rootUrl, {
+      ordinaryHeadRotation: { mode: 'on', allowlist: listed, maxActors: 1, maxChanges: 1 },
+    })
+    expect(on.checksRun).toContain('ordinary-head-actors-bounded')
+  })
+
   it('finds the born-broken head-less meta as data-loss (the shape that lost a real object)', async () => {
     const rootUrl = await provision('L-headless', 'V1')
     const root = await findReadyDocument<{ modelMetaUrl?: string }>(repo, rootUrl)

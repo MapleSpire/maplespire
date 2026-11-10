@@ -13,7 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import { createHash } from 'node:crypto'
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
@@ -90,6 +90,17 @@ describe('technology asset archive', () => {
     const result = await restoreAssets({ bundleDirectory: bundle, targetDirectory: restored })
     expect(result).toEqual({ written: 3, alreadyPresent: 0, bytes: summary.bytes })
     expect(await readFile(join(restored, light.name))).toEqual(light.body)
+  })
+
+  it('writes the archived blobs 0600 inside a 0700 assets directory', async () => {
+    const icon = blob('<svg xmlns="http://www.w3.org/2000/svg" id="perm"/>')
+    await writeFile(join(volume, icon.name), icon.body)
+    const inventory = await collectAssetInventory(fakeDb([
+      { path: `/assets/technologies/${icon.name}`, referenced: true },
+    ]))
+    await archiveAssets({ inventory, sourceDirectory: volume, bundleDirectory: bundle })
+    expect((await stat(join(bundle, 'assets', icon.name))).mode & 0o777).toBe(0o600)
+    expect((await stat(join(bundle, 'assets'))).mode & 0o777).toBe(0o700)
   })
 
   it('fails the backup when a blob a revision renders is missing from the volume', async () => {

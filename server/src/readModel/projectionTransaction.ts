@@ -53,9 +53,11 @@ import type { Queryable } from './types.js'
  * hold `overlay-rotation` at SESSION scope across `repo.flush`, and run their
  * transactions on their own client with a bare `BEGIN` — deliberately NOT
  * through this function. Routing any of them through it would invert the
- * order and deadlock (40P01) on a single workspace. The order is asserted by
- * `projectionLockOrderViolations` in `overlayChainFoldPass.test.ts`, where
- * those paths are driven end to end.
+ * order and deadlock (40P01) on a single workspace. The ordinary rotator
+ * (`ordinaryHeadRotator.ts`) is the same kind of holder. The order is asserted
+ * by `projectionLockOrderViolations` (`lockEdgeScan.ts`), run where those
+ * paths are driven end to end: `overlayChainFoldPass.test.ts` and
+ * `ordinaryHeadRotator.integration.test.ts`.
  *
  * A caller that is ALREADY inside a transaction hands in its own client (see
  * {@link isPool}) and this function issues the statements on it without

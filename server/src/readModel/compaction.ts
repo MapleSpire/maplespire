@@ -14,6 +14,7 @@
 
 import type { Repo, DocHandle } from '@automerge/automerge-repo'
 import { isValidAutomergeUrl } from '@automerge/automerge-repo'
+import { getHeads } from '@automerge/automerge'
 import type { WorkspaceKey } from './projector.js'
 import type { Queryable } from './types.js'
 import { findReadyDocument } from '../automergeRepoCompat.js'
@@ -90,7 +91,7 @@ export interface CompactionResult {
   /** `projection_not_acknowledged` is deliberately ABSENT: `compactOverlay`
    *  never sets it; it lives on `WorkspaceCompactionSkip`, where the caller
    *  that decides it does. */
-  skippedReason?: 'static_baseline' | 'ownership_lost_mid_fold'
+  skippedReason?: 'static_baseline' | 'ownership_lost_mid_fold' | 'retired_head_forward_pending'
 }
 
 /**
@@ -143,6 +144,32 @@ export interface CompactionOptions {
    * client can be made to materialise a large history.
    */
   stillSafeToWrite?: () => Promise<boolean>
+  /**
+   * Which overlay segments hold late writes the ordinary forwarder has not
+   * carried into the current head yet (`ordinaryHeadLateWritesPending`,
+   * `ordinaryHeadForwarding.ts`), given each segment's heads AS THIS PASS
+   * SNAPSHOT THEM. Asked in `apply` mode only, for BOTH collections, after
+   * each one's snapshot and before the first write of EITHER; any answer
+   * aborts the whole pass with `retired_head_forward_pending`, and then
+   * nothing was written (`compaction.test.ts`, "a CONNECTION late write
+   * pending refuses the pass BEFORE the objects pass writes anything").
+   *
+   * Why the fold cannot simply run: it `Object.assign`s every segment oldest →
+   * newest, so a retired head's un-forwarded FIELD edit is folded under the
+   * current head's whole entity, and the conditional clear then deletes it
+   * from the retired head (it still equals the snapshot) — the edit is gone
+   * from every document. Once forwarded, the current head carries it and the
+   * fold is the cold build's own order. A late write that lands AFTER the
+   * snapshot differs from it and is kept by the conditional clear, and the
+   * forwarder carries it after the re-attach.
+   *
+   * The production caller (`workspaceCompaction.ts`) always passes it; the
+   * DB-free unit suites do not, and have no rows to consult.
+   */
+  lateWritesPending?: (
+    collection: 'object' | 'connection',
+    segments: ReadonlyArray<{ documentId: string; heads: readonly string[]; current: boolean }>,
+  ) => Promise<readonly string[]>
 }
 
 export async function compactOverlay(repo: Repo, rootUrl: string, opts: CompactionOptions): Promise<CompactionResult> {
@@ -164,21 +191,38 @@ export async function compactOverlay(repo: Repo, rootUrl: string, opts: Compacti
   if (!metaHandle.doc()) return empty
 
   const claim = opts.workspace ? { workspace: opts.workspace, rootUrl } : undefined
-  const obj = await foldCollection(repo, resolve, metaHandle, 'objects', 'objectShardUrls', 'editsObjectShardUrl', 'editsObjectShardUrls', 'deletedObjectIds', shardSize, opts.mode, claim, opts.stillSafeToWrite)
+  // BOTH collections are READ — snapshot, heads, and the `lateWritesPending`
+  // answer — before EITHER writes. Asked per collection inside its own pass,
+  // an objects pass that folded and flushed was followed by a connections
+  // pass that refused, and the caller reported "nothing was written" over a
+  // written base shard (phase-3 review). The connections snapshot is then
+  // older than the objects writes; that is the conditional clear's ordinary
+  // case (an entry that changed after its snapshot is kept).
+  const objPrepared = await prepareFold(repo, resolve, metaHandle, 'objects', 'objectShardUrls', 'editsObjectShardUrl', 'editsObjectShardUrls', 'deletedObjectIds', shardSize, opts.mode, claim, opts.stillSafeToWrite, opts.lateWritesPending)
   // The connections pass is SKIPPED once the objects pass has refused: the
   // predicate said this process may no longer write, and starting a second
   // collection would be writing anyway. Its own guard would catch it, but
   // relying on that would mean resolving every connection shard first, for a
   // pass already known to be refused.
-  const conn = obj.aborted
+  const refusedEarly = !('apply' in objPrepared) && objPrepared.aborted
+  const connPrepared = refusedEarly
     ? { folded: 0, kept: 0, deleted: 0, aborted: true as const }
-    : await foldCollection(repo, resolve, metaHandle, 'connections', 'connectionShardUrls', 'editsConnectionShardUrl', 'editsConnectionShardUrls', 'deletedConnectionIds', shardSize, opts.mode, claim, opts.stillSafeToWrite)
+    : await prepareFold(repo, resolve, metaHandle, 'connections', 'connectionShardUrls', 'editsConnectionShardUrl', 'editsConnectionShardUrls', 'deletedConnectionIds', shardSize, opts.mode, claim, opts.stillSafeToWrite, opts.lateWritesPending)
+  // A connections refusal found while reading: the objects pass never writes.
+  const connRefused = !('apply' in connPrepared) && connPrepared.aborted
+  const none = { folded: 0, kept: 0, deleted: 0 }
+  const obj: FoldOutcome = 'apply' in objPrepared
+    ? (connRefused ? none : await objPrepared.apply())
+    : objPrepared
+  const conn: FoldOutcome = 'apply' in connPrepared
+    ? (obj.aborted ? { folded: 0, kept: 0, deleted: 0, aborted: true } : await connPrepared.apply())
+    : connPrepared
   if (obj.aborted || conn.aborted) {
     return {
       objectsFolded: obj.folded, connectionsFolded: conn.folded,
       objectsKept: obj.kept, connectionsKept: conn.kept,
       objectsDeleted: obj.deleted, connectionsDeleted: conn.deleted,
-      skippedReason: 'ownership_lost_mid_fold',
+      skippedReason: obj.abortReason ?? conn.abortReason ?? 'ownership_lost_mid_fold',
     }
   }
   return {
@@ -194,8 +238,17 @@ export async function compactOverlay(repo: Repo, rootUrl: string, opts: Compacti
 /** Fold one overlay collection (objects OR connections) into its base shards, apply delete
  * tombstones (remove from base shards + overlay, then clear the tombstone list), and clear
  * the folded overlay entries. `collKey` is the in-doc map key; `urlsField`/`overlayField`/
- * `tombstoneField` are the ModelMeta fields. */
-async function foldCollection(
+ * `tombstoneField` are the ModelMeta fields.
+ *
+ * In two halves: this function READS (and answers preview, and asks
+ * `lateWritesPending`), and returns either a terminal outcome or the `apply`
+ * that writes. `compactOverlay` prepares both collections before applying
+ * either. */
+type FoldOutcome = {
+  folded: number; kept: number; deleted: number; aborted?: true
+  abortReason?: 'ownership_lost_mid_fold' | 'retired_head_forward_pending'
+}
+async function prepareFold(
   repo: Repo,
   resolve: <T>(url: string) => Promise<DocHandle<T>>,
   metaHandle: DocHandle<MetaLike>,
@@ -208,7 +261,8 @@ async function foldCollection(
   mode: CompactionMode,
   claim?: { workspace: WorkspaceKey; rootUrl: string },
   stillSafeToWrite?: () => Promise<boolean>,
-): Promise<{ folded: number; kept: number; deleted: number; aborted?: true }> {
+  lateWritesPending?: CompactionOptions['lateWritesPending'],
+): Promise<FoldOutcome | { apply: () => Promise<FoldOutcome> }> {
   const none = { folded: 0, kept: 0, deleted: 0 }
   const meta = metaHandle.doc()
 
@@ -232,6 +286,11 @@ async function foldCollection(
   }
   const overlayHandles = await Promise.all(overlayUrls.map((url) => resolve<ShardDoc>(url)))
   const segmentSnapshots = overlayHandles.map((handle) => ({ ...(handle.doc()?.[collKey] ?? {}) }))
+  // Same synchronous turn as the snapshot: the heads `lateWritesPending` is
+  // asked about must be the revision that was folded.
+  const segmentHeads = overlayHandles.map((handle) => {
+    try { return getHeads(handle.doc() as never) } catch { return [] as string[] }
+  })
   const snapshot: Record<string, unknown> = {}
   for (const segment of segmentSnapshots) Object.assign(snapshot, segment)
   for (const id of tombSet) delete snapshot[id]
@@ -280,6 +339,67 @@ async function foldCollection(
     return { folded: ids.length, kept: 0, deleted: tombstones.length }
   }
 
+  // Still a READ, and in this half so that `compactOverlay` has both
+  // collections' answers before either writes.
+  if (lateWritesPending) {
+    const pending = await lateWritesPending(collKey === 'objects' ? 'object' : 'connection', overlayHandles.map(
+      (handle, index) => ({
+        documentId: String(handle.documentId),
+        heads: segmentHeads[index],
+        current: overlayUrls[index] === overlayUrl,
+      }),
+    ))
+    if (pending.length) {
+      console.warn(JSON.stringify({
+        event: 'compaction.refused',
+        reason: 'retired_head_forward_pending',
+        collection: collKey,
+        segments: pending,
+      }))
+      return { folded: 0, kept: 0, deleted: 0, aborted: true, abortReason: 'retired_head_forward_pending' }
+    }
+  }
+
+  return {
+    apply: () => applyFold({
+      repo, metaHandle, collKey, urlsField, overlayField, overlayUrlsField, tombstoneField, shardSize, claim,
+      stillSafeToWrite, tombstones, tombSet, overlayHandles, segmentSnapshots, snapshot, ids, overlaySet,
+      baseHandles, idToShard, existingByShard, created,
+    }),
+  }
+}
+
+/** The WRITE half of {@link prepareFold}: everything from the first ownership
+ * consultation on. Reached only once `compactOverlay` has prepared both
+ * collections. */
+async function applyFold(prepared: {
+  repo: Repo
+  metaHandle: DocHandle<MetaLike>
+  collKey: 'objects' | 'connections'
+  urlsField: 'objectShardUrls' | 'connectionShardUrls'
+  overlayField: 'editsObjectShardUrl' | 'editsConnectionShardUrl'
+  overlayUrlsField: 'editsObjectShardUrls' | 'editsConnectionShardUrls'
+  tombstoneField: 'deletedObjectIds' | 'deletedConnectionIds'
+  shardSize: number
+  claim?: { workspace: WorkspaceKey; rootUrl: string }
+  stillSafeToWrite?: () => Promise<boolean>
+  tombstones: string[]
+  tombSet: Set<string>
+  overlayHandles: DocHandle<ShardDoc>[]
+  segmentSnapshots: Record<string, unknown>[]
+  snapshot: Record<string, unknown>
+  ids: string[]
+  overlaySet: Set<string>
+  baseHandles: DocHandle<ShardDoc>[]
+  idToShard: Map<string, number>
+  existingByShard: Map<number, string[]>
+  created: string[]
+}): Promise<FoldOutcome> {
+  const {
+    repo, metaHandle, collKey, urlsField, overlayField, overlayUrlsField, tombstoneField, shardSize, claim,
+    stillSafeToWrite, tombstones, tombSet, overlayHandles, segmentSnapshots, snapshot, ids, overlaySet,
+    baseHandles, idToShard, existingByShard, created,
+  } = prepared
   // OWNERSHIP GUARD, first consultation — the last instant before this function writes
   // anything. Everything above was reads, and resolving the base shards is an
   // unbounded await during which the lease can move and the workspace can be

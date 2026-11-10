@@ -13,6 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import { useState, useMemo, useEffect } from 'react'
+import { useDepsChanged } from '../../hooks/useDepsChanged'
 import {
   GitBranch,
   MoreHorizontal,
@@ -96,15 +97,16 @@ export function DraftsTable() {
   const selected = drafts.find((d) => d.id === selectedId) ?? null
 
   // Fetch the selected draft's 3-way diff for the panel (latest request wins).
-  useEffect(() => {
-    if (!selected) {
-      setSelChanges(null)
-      setSelChangesFor(null)
-      return
-    }
-    let cancelled = false
+  // The previous diff is dropped during render whenever the selection changes
+  // (both branches of the old effect did that first); the effect only fetches.
+  const selectedChanged = useDepsChanged([selected])
+  if (selectedChanged) {
     setSelChanges(null)
     setSelChangesFor(null)
+  }
+  useEffect(() => {
+    if (!selected) return
+    let cancelled = false
     api
       .getDraftChanges(selected.landscapeId, selected.id)
       .then((c) => {

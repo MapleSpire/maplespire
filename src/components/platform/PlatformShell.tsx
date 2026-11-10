@@ -13,6 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import { useEffect, useState } from 'react'
+import { useDepsChanged } from '../../hooks/useDepsChanged'
 import { Link, Outlet, useNavigate, useRouterState } from '@tanstack/react-router'
 import { LayoutGrid, Building2, Users, ShieldCheck, SearchCode, KeyRound, Lock, ShieldAlert, Layers3, Settings2, Link2Off } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
@@ -86,10 +87,16 @@ export function PlatformShell() {
       })
   }
 
+  // The reset to 'loading' happens during render, on the same inputs the probe
+  // effect below re-runs on, so the effect itself only fetches.
+  const probeInputsChanged = useDepsChanged([authLoading, config, user])
+  if (probeInputsChanged && !authLoading && config && (config.stage === 'off' || user)) {
+    setProbe({ status: 'loading' })
+  }
+
   useEffect(() => {
     if (authLoading || !config) return
     if (config.stage !== 'off' && !user) return // redirecting above
-    setProbe({ status: 'loading' })
     let cancelled = false
     getOverview()
       .then(() => {

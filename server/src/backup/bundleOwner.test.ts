@@ -13,7 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import { describe, it, expect } from 'vitest'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, rm, stat, writeFile } from 'node:fs/promises'
 import { hostname, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -127,6 +127,16 @@ describe('readBundleOwner / writeBundleOwner', () => {
       // the whole point of writing it. Without this the round trip proves only
       // that JSON survives a filesystem.
       expect(bundleOwnerLiveness(read)).toBe('live')
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('writes the claim file 0600', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'maplespire-owner-'))
+    try {
+      await writeBundleOwner(dir, 'cli')
+      expect((await stat(join(dir, BUNDLE_OWNER_FILE))).mode & 0o777).toBe(0o600)
     } finally {
       await rm(dir, { recursive: true, force: true })
     }

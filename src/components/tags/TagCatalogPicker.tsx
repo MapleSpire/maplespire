@@ -13,6 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import { useCallback, useEffect, useMemo, useState, type RefObject } from 'react'
+import { useDepsChanged } from '../../hooks/useDepsChanged'
 import { FolderTree, Loader2, Plus, SlidersHorizontal, X } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { useAuthStore } from '../../stores/authStore'
@@ -107,11 +108,12 @@ export function TagCatalogPicker({
     if (staged.length > 0) setStaged([])
   }
 
-  useEffect(() => {
-    if (!isOpen) return
+  // Same reasoning for the search fields: reset during render on (re)open.
+  const openInputsChanged = useDepsChanged([initialGroupId, isOpen])
+  if (openInputsChanged && isOpen) {
     setQuery('')
     setGroupId(initialGroupId ?? '')
-  }, [initialGroupId, isOpen])
+  }
 
   useEffect(() => {
     if (!isOpen || !orgId) return

@@ -36,6 +36,7 @@ const ERROR_KEYS: Record<string, string> = {
   legal_acceptance_required: 'auth.login.error.legalRequired',
   account_inactive: 'auth.login.error.accountInactive',
   org_suspended: 'auth.login.error.orgSuspended',
+  tenant_not_allowed: 'auth.login.error.tenantNotAllowed',
 }
 
 function errorCodeFromQuery(): string | null {

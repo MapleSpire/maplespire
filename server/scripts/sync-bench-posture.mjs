@@ -163,6 +163,21 @@ export function assertTopologyBuild(record, targets = record?.targets, project =
   assert.equal(new Set([...record.running, record.edge].map(cell => cell.id)).size, 5, 'topology and entry container IDs are not distinct')
 }
 
+/**
+ * Docker lists the bindings of one container port in no stable order once
+ * there are two (the remote-load arm publishes the router on loopback AND on
+ * the LAN address): two inspections of the same container then differ only in
+ * that order, and the admission revalidation read it as a changed binding.
+ * Sorted in place; a port with one binding — every other run — is untouched.
+ */
+export function canonicalPortBindings(ports) {
+  const key = (binding) => `${binding?.HostIp ?? ''}|${String(binding?.HostPort ?? '').padStart(5, '0')}`
+  for (const bindings of Object.values(ports ?? {})) {
+    if (Array.isArray(bindings) && bindings.length > 1) bindings.sort((left, right) => key(left).localeCompare(key(right)))
+  }
+  return ports
+}
+
 function topologyInspector(project, targets, exec) {
   assert.match(project, /^[a-z0-9][a-z0-9_-]{0,62}$/, 'invalid topology project')
   assertTargets(targets)
@@ -177,6 +192,7 @@ function topologyInspector(project, targets, exec) {
   const format = '{"id":{{json .Id}},"image":{{json .Image}},"startedAt":{{json .State.StartedAt}},"restartCount":{{json .RestartCount}},"running":{{json .State.Running}},"project":{{json (index .Config.Labels "com.docker.compose.project")}},"service":{{json (index .Config.Labels "com.docker.compose.service")}},"ports":{{json .NetworkSettings.Ports}}}'
   const inspect = (id, service) => {
     const cell = JSON.parse(invoke(['inspect', id, '--format', format]))
+    canonicalPortBindings(cell.ports)
     assert.equal(cell.id, id, 'inspected topology container changed')
     assert.equal(cell.service, service, 'inspected topology service changed')
     cell.target = targetFor(service, targets)

@@ -13,6 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import { useEffect, useMemo, useState } from 'react'
+import { useDepsChanged } from '../../hooks/useDepsChanged'
 import { Loader2, Search } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import {
@@ -85,7 +86,9 @@ export function TechnologyFilterSelector({
     && trimmedQuery.length < MIN_AUTOMATIC_SEARCH_LENGTH
     && !forceShortSearch
 
-  useEffect(() => {
+  // A new org starts from a clean picker — reset during render.
+  const orgChanged = useDepsChanged([orgId])
+  if (orgChanged) {
     setQuery('')
     setResults([])
     setKnownTechnologies(new Map())
@@ -93,19 +96,20 @@ export function TechnologyFilterSelector({
     setSource(null)
     setHasMore(false)
     setForceShortSearch(false)
-  }, [orgId])
+  }
+
+  // The search effect's synchronous state change, during render on its deps.
+  const searchInputsChanged = useDepsChanged([forceShortSearch, isShortAutomaticQuery, orgId, query, trimmedQuery])
+  if (searchInputsChanged && orgId) {
+    // Trigram indexes cannot make a 1-2 character contains query selective.
+    // Keep the bounded first page visible and wait for a meaningful query;
+    // Enter still lets users find intentionally short names such as Go/C#.
+    setCatalogState(isShortAutomaticQuery ? 'ready' : 'loading')
+  }
 
   useEffect(() => {
-    if (!orgId) return
-    if (isShortAutomaticQuery) {
-      // Trigram indexes cannot make a 1-2 character contains query selective.
-      // Keep the bounded first page visible and wait for a meaningful query;
-      // Enter still lets users find intentionally short names such as Go/C#.
-      setCatalogState('ready')
-      return
-    }
+    if (!orgId || isShortAutomaticQuery) return
     const controller = new AbortController()
-    setCatalogState('loading')
     const timer = window.setTimeout(() => {
       void listSelectableTechnologies(orgId, query, controller.signal)
         .then((result) => {

@@ -15,6 +15,7 @@
 import type { Repo } from '@automerge/automerge-repo'
 import { compactOverlay, readProjectionAcknowledgement, type CompactionResult } from './compaction.js'
 import { isStaticReadModelWorkspace } from './staticWorkspace.js'
+import { ordinaryHeadLateWritesPending } from './ordinaryHeadForwarding.js'
 import type { Queryable } from './types.js'
 import type { WorkspaceKey } from './projector.js'
 
@@ -71,6 +72,11 @@ export type WorkspaceCompactionSkip =
   | 'projection_not_acknowledged'
   | 'foreign_projector_instance'
   | 'ownership_lost_mid_fold'
+  /** A retired ordinary write head holds a late write the forwarder has not
+   * carried yet (`compaction.ts`, `lateWritesPending`). Nothing was written,
+   * in EITHER collection: both are asked before either writes. The re-attach
+   * forwards it and the next window folds. */
+  | 'retired_head_forward_pending'
 
 /** How the pass left the workspace's listeners. `skipped_*` is not a failure —
  *  it is the fact that the read plane is now DETACHED and this pass did not put
@@ -233,6 +239,9 @@ export async function runWorkspaceCompaction(
     // rewrites base shards.
     result = await compactOverlay(deps.repo, deps.rootUrl, {
       workspace: key, mode: 'apply', stillSafeToWrite: stillOwnedAndOrdinary,
+      // Rows are read AFTER the fold's snapshot, from the database: the
+      // projector that would forward is detached for the whole pass.
+      lateWritesPending: (collection, segments) => ordinaryHeadLateWritesPending(deps.db, key, collection, segments),
     })
   } finally {
     // GUARD (c). Every way of NOT re-attaching is named in the returned outcome
@@ -270,6 +279,10 @@ export async function runWorkspaceCompaction(
     }
   }
 
+  if (result.skippedReason === 'retired_head_forward_pending') {
+    warn('[compaction] refused: a retired write head holds late writes not yet forwarded; nothing was written')
+    return { result, reattach }
+  }
   if (result.skippedReason === 'ownership_lost_mid_fold') {
     warn('[compaction] aborted mid-fold: ownership or ordinariness was lost after the shards were resolved')
     return { result, reattach }

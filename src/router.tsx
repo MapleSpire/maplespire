@@ -167,6 +167,7 @@ function WorkspaceRoute() {
   useEffect(() => {
     if (authLoading) return
     if (authStage !== 'on' || !authUser) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- kept in the effect on purpose: moved into render, `checking` lands before the switchTo effect and a URL-led switch then waits for the server check (a behaviour change, not a lint fix)
       setAccess('granted')
       return
     }

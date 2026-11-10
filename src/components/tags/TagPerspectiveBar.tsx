@@ -35,6 +35,7 @@ import {
 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent, type ReactNode } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
+import { useDepsChanged } from '../../hooks/useDepsChanged'
 import { useTranslation } from 'react-i18next'
 import { effectiveSyncStatus, useAutomergeStatus } from '../../stores/automergeStatusStore'
 import { useRoutedRetriesInFlight } from '../../lib/api/useRoutedRetries'
@@ -107,6 +108,7 @@ function HorizontalVirtualStrip<T extends { id: string }>({
     scrollLeft: 0,
     scrollWidth: 0,
   })
+  // eslint-disable-next-line react-hooks/incompatible-library -- TanStack Virtual's useVirtualizer returns a mutable instance whose methods the React Compiler cannot memoize; there is no compatible API to switch to, and this app does not run the compiler, so the skip costs nothing
   const virtualizer = useVirtualizer({
     horizontal: true,
     count: items.length,
@@ -630,13 +632,34 @@ export function TagPerspectiveBar() {
       && (canManageAsAdmin || settings?.allowEditorTagGroupCreation),
   )
 
-  useEffect(() => {
+  // The synchronous halves of the three fetch effects below (permission gate,
+  // group list, tag list) run here, during render, on each effect's own deps
+  // and guard; the effects themselves only fetch.
+  const permissionInputsChanged = useDepsChanged([orgId])
+  if (permissionInputsChanged) setPermissionReady(!orgId)
+  const groupInputsChanged = useDepsChanged([orgId, t])
+  if (groupInputsChanged) {
     if (!orgId) {
-      setPermissionReady(true)
-      return
+      setGroups([])
+    } else {
+      setLoading(true)
+      setError(null)
     }
+  }
+  const tagInputsChanged = useDepsChanged([activeTagGroupId, bottomTab, orgId, t])
+  if (tagInputsChanged) {
+    if (!orgId || bottomTab !== 'tags' || !activeTagGroupId) {
+      setTags([])
+      setTagCursor(null)
+    } else {
+      setLoading(true)
+      setError(null)
+    }
+  }
+
+  useEffect(() => {
+    if (!orgId) return
     const controller = new AbortController()
-    setPermissionReady(false)
     Promise.all([
       getTagSettings(orgId, controller.signal).catch(() => null),
       myOrgs().catch(() => []),
@@ -650,13 +673,8 @@ export function TagPerspectiveBar() {
   }, [orgId])
 
   useEffect(() => {
-    if (!orgId) {
-      setGroups([])
-      return
-    }
+    if (!orgId) return
     const controller = new AbortController()
-    setLoading(true)
-    setError(null)
     void listTagGroupPage(orgId, { status: 'active', limit: 50 }, controller.signal)
       .then((page) => {
         setGroups(page.items)
@@ -679,14 +697,8 @@ export function TagPerspectiveBar() {
   }, [activeTagGroupId, bottomTab, perspectiveGroups, setActiveTagGroup])
 
   useEffect(() => {
-    if (!orgId || bottomTab !== 'tags' || !activeTagGroupId) {
-      setTags([])
-      setTagCursor(null)
-      return
-    }
+    if (!orgId || bottomTab !== 'tags' || !activeTagGroupId) return
     const controller = new AbortController()
-    setLoading(true)
-    setError(null)
     void listTagPage(orgId, {
       groupIds: [activeTagGroupId],
       status: 'active',

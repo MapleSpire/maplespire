@@ -19,6 +19,7 @@ import { useTranslation } from 'react-i18next'
 import { getTagSettings, updateTagSettings, type TagSettings } from '../../lib/tags/api'
 import { InlineError, SectionCard } from './shared'
 import { Switch } from '../ui/switch'
+import { AdminEntraTenants } from './AdminEntraTenants'
 
 type State =
   | { status: 'loading' }
@@ -123,6 +124,8 @@ export function AdminSettings() {
           </div>
         </SectionCard>
       )}
+
+      <AdminEntraTenants orgId={orgId} />
     </div>
   )
 }

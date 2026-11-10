@@ -18,8 +18,10 @@ import { materializeFullModel, type HeadsMap, type FullModel } from './materiali
 import { diffModels, type DiffResult, type DraftChange } from './merge.js'
 import { isSparseDraftManifest, type DraftBaseManifest, type RootManifest } from './manifest.js'
 import { materializeSparseDraftModels } from './sparse.js'
+import { DRAFT_MODEL_COLLECTION_NAMES } from '../modelCollections.js'
 
-const MODEL_COLLECTIONS = new Set(['object', 'connection', 'group', 'domain', 'tag', 'decisionRecord'])
+/** The draft collections counted as MODEL changes (`modelCollections.ts`). */
+export const MODEL_COLLECTIONS: ReadonlySet<string> = new Set(DRAFT_MODEL_COLLECTION_NAMES)
 
 /**
  * Simplify the diff FOR DISPLAY (the merge still applies the full changeset — applyMerge

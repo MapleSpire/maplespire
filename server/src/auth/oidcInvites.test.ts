@@ -395,6 +395,163 @@ describe('GET /api/auth/callback/:provider', () => {
 })
 
 // ---------------------------------------------------------------------------
+// oidc.ts — the Microsoft callback against an org's Entra tenant allowlist
+// (V0-02). The IdP exchange is stubbed (openid-client doMock'd) and the
+// database answers through queryMock: the tenant decision is played by
+// `policyAllows`, a mirror of tenantAllowedSql over the `tid` the callback
+// itself recorded (`UPDATE users SET idp_tenant_id`), so a callback that never
+// records the tid, or never asks, is admitted and goes red. The SQL predicate
+// itself runs against Postgres in orgTenantPolicy.integration.test.ts.
+// ---------------------------------------------------------------------------
+
+const PERSONAL_TID = '9188040d-6c67-4c5b-b112-36a304b66dad'
+const CORP_TID = '11111111-2222-4333-8444-555555555555'
+const OTHER_TID = '99999999-8888-4777-8666-555555555555'
+
+describe('GET /api/auth/callback/microsoft — org Entra tenant allowlist', () => {
+  let idTokenClaims: Record<string, unknown> = {}
+  let recordedTid: string | null | undefined
+
+  /** The org `org1`'s policy, as Postgres would evaluate it. */
+  function policyAllows(org: { tenants: string[]; personalAllowed: boolean }): boolean {
+    if (org.tenants.length === 0) return true
+    if (recordedTid == null) return false
+    if (recordedTid === PERSONAL_TID) return org.personalAllowed
+    return org.tenants.includes(recordedTid)
+  }
+
+  function database(org: { tenants: string[]; personalAllowed: boolean }): void {
+    queryMock.mockImplementation(async (sql: unknown, params?: unknown[]) => {
+      const s = String(sql)
+      if (s.includes('FROM users WHERE issuer = $1 AND subject = $2')) {
+        return {
+          rows: [{
+            id: 'u-ms', email: 'person@corp.example', name: null, given_name: null, family_name: null,
+            is_platform_admin: false, status: 'active',
+          }],
+        }
+      }
+      if (s.includes('SET idp_tenant_id')) {
+        recordedTid = (params as unknown[])[1] as string | null
+        return { rows: [], rowCount: 1 }
+      }
+      const tenantOk = s.includes('org_allowed_idp_tenants') ? policyAllows(org) : undefined
+      if (s.includes('FROM org_members om')) {
+        return { rows: [{ org_id: 'org1', status: 'active', last_org_id: null, tenant_ok: tenantOk }] }
+      }
+      if (s.includes('SELECT is_platform_admin FROM users')) return { rows: [{ is_platform_admin: false }] }
+      if (s.includes('LEFT JOIN auth_global_epochs')) {
+        return { rows: [{ id: 'u-ms', is_platform_admin: false, status: 'active', gepoch: '1' }] }
+      }
+      if (s.includes('FROM orgs o')) {
+        return { rows: [{ status: 'active', epoch: '1', uepoch: '1', member: true, tenant_ok: tenantOk }] }
+      }
+      return { rows: [] }
+    })
+  }
+
+  beforeEach(() => {
+    recordedTid = undefined
+    process.env.MS_CLIENT_ID = 'ms-id'
+    process.env.MS_CLIENT_SECRET = 'ms-secret'
+    process.env.APP_URL = 'https://app.example.com'
+    process.env.AUTH_SECRET = 'test-secret-for-tenant-callback'
+    vi.doMock('openid-client', () => ({
+      discovery: async () => ({}),
+      authorizationCodeGrant: async () => ({ claims: () => idTokenClaims }),
+    }))
+  })
+  afterEach(() => {
+    vi.doUnmock('openid-client')
+  })
+
+  async function signIn(): Promise<Response> {
+    vi.resetModules()
+    const { registerOidcRoutes } = await import('./oidc.js')
+    const { url, close } = await startServer(registerOidcRoutes)
+    try {
+      const attempt = Buffer.from(JSON.stringify({
+        provider: 'microsoft', state: 's', nonce: 'n', codeVerifier: 'v', createdAt: Date.now(),
+      }), 'utf8').toString('base64url')
+      return await fetch(`${url}/api/auth/callback/microsoft?code=abc&state=s`, {
+        redirect: 'manual',
+        headers: { Cookie: `maplespire_oidc=${attempt}` },
+      })
+    } finally {
+      await close()
+    }
+  }
+
+  const sessionSet = (res: Response) => (res.headers.get('set-cookie') ?? '').includes('maplespire_session=')
+
+  it('control: a tenant on the org list signs in, and its tid is recorded', async () => {
+    idTokenClaims = { sub: 'ms-sub', email: 'person@corp.example', tid: CORP_TID.toUpperCase() }
+    database({ tenants: [CORP_TID], personalAllowed: false })
+    const res = await signIn()
+    expect(res.headers.get('location')).toBe('https://app.example.com/auth/complete')
+    expect(sessionSet(res)).toBe(true)
+    expect(recordedTid).toBe(CORP_TID)
+  })
+
+  it('refuses a tenant the org does not list: ?error=tenant_not_allowed, no session', async () => {
+    idTokenClaims = { sub: 'ms-sub', email: 'person@corp.example', tid: OTHER_TID }
+    database({ tenants: [CORP_TID], personalAllowed: false })
+    const res = await signIn()
+    expect(res.headers.get('location')).toBe('https://app.example.com/login?error=tenant_not_allowed')
+    expect(sessionSet(res)).toBe(false)
+  })
+
+  it('refuses a personal Microsoft account unless the org policy allows it', async () => {
+    idTokenClaims = { sub: 'ms-sub', email: 'person@outlook.com', tid: PERSONAL_TID }
+    database({ tenants: [CORP_TID], personalAllowed: false })
+    const refused = await signIn()
+    expect(refused.headers.get('location')).toBe('https://app.example.com/login?error=tenant_not_allowed')
+    expect(sessionSet(refused)).toBe(false)
+
+    database({ tenants: [CORP_TID], personalAllowed: true })
+    const admitted = await signIn()
+    expect(admitted.headers.get('location')).toBe('https://app.example.com/auth/complete')
+  })
+
+  it('an empty list keeps the pre-V0-02 behaviour: any tenant signs in', async () => {
+    idTokenClaims = { sub: 'ms-sub', email: 'person@outlook.com', tid: PERSONAL_TID }
+    database({ tenants: [], personalAllowed: false })
+    const res = await signIn()
+    expect(res.headers.get('location')).toBe('https://app.example.com/auth/complete')
+  })
+
+  it('refuses a Microsoft token without a usable tid (never recorded as "no tenant")', async () => {
+    idTokenClaims = { sub: 'ms-sub', email: 'person@corp.example' }
+    database({ tenants: [], personalAllowed: false })
+    const res = await signIn()
+    expect(res.headers.get('location')).toBe('https://app.example.com/login?error=exchange_failed')
+    expect(recordedTid).toBeUndefined()
+  })
+
+  it('records the email as unverified unless email_verified or xms_edov is true', async () => {
+    const verifiedFlag = () => {
+      const call = queryMock.mock.calls.find((c) => String(c[0]).includes('SET idp_tenant_id'))
+      return (call?.[1] as unknown[] | undefined)?.[2]
+    }
+    database({ tenants: [], personalAllowed: false })
+    idTokenClaims = { sub: 'ms-sub', email: 'ceo@victim.example', tid: OTHER_TID }
+    await signIn()
+    expect(verifiedFlag()).toBe(false)
+
+    queryMock.mockClear()
+    idTokenClaims = { sub: 'ms-sub', email: 'ceo@victim.example', tid: OTHER_TID, xms_edov: true }
+    await signIn()
+    expect(verifiedFlag()).toBe(true)
+
+    queryMock.mockClear()
+    // preferred_username is never a verified email, whatever the flags say.
+    idTokenClaims = { sub: 'ms-sub', preferred_username: 'ceo@victim.example', tid: OTHER_TID, xms_edov: true }
+    await signIn()
+    expect(verifiedFlag()).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // invites.ts
 // ---------------------------------------------------------------------------
 
@@ -638,13 +795,31 @@ describe('POST /api/auth/invite/:token/accept', () => {
    * instead of by position. */
   function routeAcceptQueries(
     invite: Record<string, unknown> | null,
-    opts?: { sessionEmail?: string; memberInsertRowCount?: number; teamIds?: string[] }
+    opts?: {
+      sessionEmail?: string
+      memberInsertRowCount?: number
+      teamIds?: string[]
+      /** The session user's identity facts; default a non-Entra identity. */
+      issuer?: string
+      emailVerified?: boolean | null
+      /** What Postgres answers for tenantAllowedSql on (user, invited org). */
+      tenantOk?: boolean
+    }
   ): void {
     queryMock.mockImplementation(async (sql: unknown) => {
       const s = String(sql)
       if (/^\s*(BEGIN|COMMIT|ROLLBACK)/.test(s)) return { rows: [] }
       if (s.includes('FROM org_invites') && s.includes('FOR UPDATE')) return { rows: invite ? [invite] : [] }
-      if (s.includes('SELECT email FROM users')) return { rows: [{ email: opts?.sessionEmail ?? 'invited@example.com' }] }
+      if (s.includes('SELECT u.email, u.issuer, u.email_verified')) {
+        return {
+          rows: [{
+            email: opts?.sessionEmail ?? 'invited@example.com',
+            issuer: opts?.issuer ?? 'https://accounts.google.com/',
+            email_verified: opts && 'emailVerified' in opts ? opts.emailVerified : true,
+            tenant_ok: opts?.tenantOk ?? true,
+          }],
+        }
+      }
       if (s.includes('INSERT INTO org_members')) return { rows: [], rowCount: opts?.memberInsertRowCount ?? 1 }
       if (s.includes('FROM invite_teams')) return { rows: (opts?.teamIds ?? []).map((t) => ({ team_id: t })) }
       if (s.includes('INSERT INTO team_members')) return { rows: [], rowCount: 1 }
@@ -780,6 +955,88 @@ describe('POST /api/auth/invite/:token/accept', () => {
           }),
         })
       )
+    } finally {
+      await close()
+    }
+  })
+
+  it("403s tenant_not_allowed when the invited org's Entra allowlist refuses the user — before any membership", async () => {
+    routeAcceptQueries(pendingInvite(), {
+      issuer: 'https://login.microsoftonline.com/common/v2.0',
+      emailVerified: true,
+      tenantOk: false,
+    })
+    vi.resetModules()
+    const { registerInviteRoutes } = await import('./invites.js')
+    const { url, close } = await startServer(registerInviteRoutes, {
+      userId: 'session-user-1',
+      orgId: null,
+      isPlatformAdmin: false,
+      epoch: 1,
+    })
+    try {
+      const res = await fetch(`${url}/api/auth/invite/tok/accept`, { method: 'POST' })
+      expect(res.status).toBe(403)
+      expect(await res.json()).toEqual({ error: 'tenant_not_allowed' })
+      const calls = queryMock.mock.calls.map((c) => String(c[0]))
+      // The decision is asked of the invited org's allowlist…
+      const userRead = calls.find((s) => s.includes('SELECT u.email, u.issuer, u.email_verified'))
+      expect(userRead).toContain('org_allowed_idp_tenants')
+      expect(queryMock.mock.calls.find((c) => String(c[0]) === userRead)?.[1]).toEqual(['session-user-1', 'org1'])
+      // …and nothing was granted.
+      expect(calls.some((s) => s.includes('INSERT INTO org_members'))).toBe(false)
+      expect(calls.some((s) => s.includes('UPDATE org_invites SET accepted_at'))).toBe(false)
+    } finally {
+      await close()
+    }
+  })
+
+  it('403s email_unverified for a Microsoft identity whose email the IdP did not vouch for, even when it matches', async () => {
+    for (const emailVerified of [false, null]) {
+      queryMock.mockReset()
+      routeAcceptQueries(pendingInvite(), {
+        issuer: 'https://login.microsoftonline.com/common/v2.0',
+        sessionEmail: 'invited@example.com',
+        emailVerified,
+      })
+      vi.resetModules()
+      const { registerInviteRoutes } = await import('./invites.js')
+      const { url, close } = await startServer(registerInviteRoutes, {
+        userId: 'session-user-1',
+        orgId: null,
+        isPlatformAdmin: false,
+        epoch: 1,
+      })
+      try {
+        const res = await fetch(`${url}/api/auth/invite/tok/accept`, { method: 'POST' })
+        expect(res.status).toBe(403)
+        expect(await res.json()).toEqual({ error: 'email_unverified', invitedEmail: 'i***@example.com' })
+        const calls = queryMock.mock.calls.map((c) => String(c[0]))
+        expect(calls.some((s) => s.includes('INSERT INTO org_members'))).toBe(false)
+      } finally {
+        await close()
+      }
+    }
+  })
+
+  it('accepts for a Microsoft identity with a verified email in an admitted tenant', async () => {
+    process.env.AUTH_SECRET = 'test-secret-for-accept-repin'
+    routeAcceptQueries(pendingInvite(), {
+      issuer: 'https://login.microsoftonline.com/common/v2.0',
+      emailVerified: true,
+      tenantOk: true,
+    })
+    vi.resetModules()
+    const { registerInviteRoutes } = await import('./invites.js')
+    const { url, close } = await startServer(registerInviteRoutes, {
+      userId: 'session-user-1',
+      orgId: null,
+      isPlatformAdmin: false,
+      epoch: 1,
+    })
+    try {
+      const res = await fetch(`${url}/api/auth/invite/tok/accept`, { method: 'POST' })
+      expect(res.status).toBe(200)
     } finally {
       await close()
     }

@@ -309,7 +309,6 @@ describe('tokens: cookie read/write', () => {
 
   it('sessionEndedPending reads the marker WITHOUT clearing it, so every tab is told', () => {
     const res = fakeRes()
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     expect(sessionEndedPending(fakeReq(`${SESSION_COOKIE_NAME}_ended=stale`))).toBe(true)
     expect(res.headers).toEqual([])
     expect(sessionEndedPending(fakeReq('other=1'))).toBe(false)
@@ -415,6 +414,26 @@ describe('middleware: requireAuth', () => {
     handler(req, res, next)
     expect(next).toHaveBeenCalledTimes(1)
     expect(res.statusCode).toBeUndefined()
+  })
+
+  it('on stage: the allowlist matches whole path segments, not string prefixes', async () => {
+    process.env.AUTH = 'on'
+    for (const path of ['/healthz', '/healthzfoo', '/readyz', '/ready-x', '/authx/login', '/dev/outboxes']) {
+      const handler = requireAuth()
+      const { req, res } = fakeReqRes({ path })
+      const next = vi.fn()
+      handler(req, res, next)
+      expect(next, path).not.toHaveBeenCalled()
+      expect(res.statusCode, path).toBe(401)
+    }
+    // Control: the intended public shapes still pass, bare and with a sub-path.
+    for (const path of ['/health', '/health/pools', '/ready', '/auth/me', '/dev/outbox', '/dev/outbox/x']) {
+      const handler = requireAuth()
+      const { req, res } = fakeReqRes({ path })
+      const next = vi.fn()
+      handler(req, res, next)
+      expect(next, path).toHaveBeenCalledTimes(1)
+    }
   })
 
   it('on stage: allows /health through with no cookie', async () => {
@@ -687,8 +706,7 @@ describe('middleware: requireAuth isSessionCurrent (a revoked session on cookie 
       expect(req.auth).toEqual(claims)
     }
     // Control: a path merely STARTING with "health" is not a probe, so the
-    // check runs (it is allowlisted by prefix, so a stale session proceeds
-    // unauthenticated rather than 401).
+    // check runs (and, not being allowlisted either, a stale session is a 401).
     const isSessionCurrent = vi.fn(async () => false)
     const { req } = await run({ stage: 'on', path: '/healthy-landscapes', isSessionCurrent })
     expect(isSessionCurrent).toHaveBeenCalledTimes(1)

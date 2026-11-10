@@ -31,8 +31,13 @@ export function PlatformAccess() {
   const [error, setError] = useState<string | null>(null)
   const [selected, setSelected] = useState<string>('')
 
+  // "Retry" clears the error first; the mount fetch below has none to clear.
   const load = () => {
     setError(null)
+    fetchOrgs()
+  }
+
+  const fetchOrgs = () => {
     api
       .getOrgs({ limit: 100 })
       .then((page) => {
@@ -47,7 +52,7 @@ export function PlatformAccess() {
   // t is only read for the rare non-Error fallback message; refetching from the server on
   // every language switch would be wasteful.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  useEffect(load, [])
+  useEffect(fetchOrgs, [])
 
   return (
     <div data-testid="platform-access" className="flex h-full flex-col">

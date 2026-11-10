@@ -12,16 +12,22 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU Affero General Public License for more details.
 
-import { describe, expect, it } from 'vitest'
-import { Repo, type AutomergeUrl } from '@automerge/automerge-repo'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { Repo, type AutomergeUrl, type DocHandle } from '@automerge/automerge-repo'
+import * as A from '@automerge/automerge'
 import {
+  createClaimedOverlaySegment,
   deleteOverlayEntities,
+  OVERLAY_CONTENT_CHUNK_BYTES,
+  OverlaySegmentAbortedError,
+  overlayContentChunks,
   overlaySegmentUrls,
   writeOverlayEntities,
   type OverlayMetaLike,
 } from './overlaySegments.js'
 import { OVERLAY_WRITE_HEAD_VERSION } from './modelMeta.js'
-import { WorkspaceDocIndex } from './rbac/docScope.js'
+import { WorkspaceDocIndex, setWorkspaceDocumentsRegistrationForTest } from './rbac/docScope.js'
+import { serverCreationPlacementFor } from './rbac/serverCreationPlacement.js'
 
 describe('bounded overlay segments', () => {
   it('splits a large batch, preserves last-wins order and deletes across segments', async () => {
@@ -156,5 +162,196 @@ describe('bounded overlay segments', () => {
 
     expect(overlaySegmentUrls(meta.doc(), 'objects')).toEqual([segment.url])
     expect(segment.doc()?.objects).toEqual({ a: { id: 'a', name: 'A' } })
+  })
+})
+
+// Ported from the phase-3 QA lens (mutants S04, S05, S06): the ordinary
+// rotator's child is the one caller that asks for an owner placement note.
+describe('owner placement note on createClaimedOverlaySegment', () => {
+  const WS = { landscapeId: 'L-place', versionId: 'V1' }
+  let restore: () => void = () => {}
+  afterEach(() => { restore(); restore = () => {}; vi.restoreAllMocks() })
+
+  it('ownerPlacement: noted SYNCHRONOUSLY at the mint and present at the claim', async () => {
+    const repo = new Repo({})
+    const atClaim: Array<{ id: string; placement: unknown }> = []
+    restore = setWorkspaceDocumentsRegistrationForTest(async ({ documentIds }) => {
+      for (const id of documentIds) atClaim.push({ id, placement: serverCreationPlacementFor(id) })
+      return { claimed: documentIds, alreadyOurs: [], foreign: [], missingVersion: false }
+    })
+    let minted: DocHandle<unknown> | null = null
+    const create = repo.create.bind(repo)
+    vi.spyOn(repo, 'create').mockImplementation(((initial: unknown) => {
+      const handle = create(initial as never)
+      minted = handle as DocHandle<unknown>
+      return handle
+    }) as never)
+    const pending = createClaimedOverlaySegment(repo, 'objects', undefined, {
+      workspace: WS, rootUrl: 'automerge:root', ownerPlacement: true,
+    })
+    // Same synchronous frame as the mint: no await has run yet.
+    expect(minted, 'repo.create was not reached synchronously').not.toBeNull()
+    expect(serverCreationPlacementFor(String(minted!.documentId))).toEqual(WS)
+    const handle = await pending
+    expect(atClaim).toEqual([{ id: String(handle.documentId), placement: WS }])
+  })
+
+  it('the static callers (no ownerPlacement) take NO placement note', async () => {
+    const repo = new Repo({})
+    const atClaim: Array<{ id: string; placement: unknown }> = []
+    restore = setWorkspaceDocumentsRegistrationForTest(async ({ documentIds }) => {
+      for (const id of documentIds) atClaim.push({ id, placement: serverCreationPlacementFor(id) })
+      return { claimed: documentIds, alreadyOurs: [], foreign: [], missingVersion: false }
+    })
+    const meta = repo.create<OverlayMetaLike>({ objectShardUrls: [], connectionShardUrls: [] })
+    await meta.whenReady()
+    await writeOverlayEntities(repo, meta, 'objects', { a: { id: 'a' } }, 2, undefined, {
+      workspace: WS, rootUrl: 'automerge:root',
+    })
+    expect(atClaim).toHaveLength(1) // anti-void: a segment was minted and claimed
+    expect(atClaim[0]!.placement).toBeNull()
+  })
+})
+
+describe('createClaimedOverlaySegment content (G4-16b phase 4, a fold product)', () => {
+  it('the fields are in the creating change, and extra fields can neither replace the entity map nor pre-fill writeBatchIds', async () => {
+    const repo = new Repo({})
+    const restore = setWorkspaceDocumentsRegistrationForTest(async ({ documentIds }) =>
+      ({ claimed: documentIds, alreadyOurs: [], foreign: [], missingVersion: false }))
+    try {
+      const handle = await createClaimedOverlaySegment(repo, 'objects', undefined,
+        { workspace: { landscapeId: 'L-content', versionId: 'V1' }, rootUrl: 'automerge:root' },
+        {
+          entities: { a: { id: 'a', name: 'A' } },
+          fields: { objects: { evil: { id: 'evil' } }, writeBatchIds: ['forged'], foldedFromUrls: ['automerge:x'] },
+        })
+      const doc = handle.doc() as unknown as Record<string, unknown>
+      expect(doc.foldedFromUrls).toEqual(['automerge:x'])
+      expect(doc.objects).toEqual({ a: { id: 'a', name: 'A' } })
+      expect(doc.writeBatchIds).toEqual([])
+      // The marker is born with the document, the entities after it.
+      const changes = A.getAllChanges(handle.doc() as A.Doc<unknown>)
+      expect(changes).toHaveLength(2)
+      const atBirth = A.view(handle.doc() as A.Doc<unknown>, [A.decodeChange(changes[0]!).hash]) as Record<string, unknown>
+      expect(atBirth.foldedFromUrls).toEqual(['automerge:x'])
+      expect(atBirth.objects).toEqual({})
+    } finally {
+      restore()
+    }
+  })
+
+  it('G4-16 M3: a large content is written in bounded changes, one timer tick apart, all before the claim', async () => {
+    const repo = new Repo({})
+    // ~1 KiB entities: several chunks at the 8 KiB budget.
+    const entities = Object.fromEntries(Array.from({ length: 40 }, (_, i) =>
+      [`e${i}`, { id: `e${i}`, name: `entity ${i}`, notes: 'n'.repeat(1_000) }]))
+    let seenAtClaim: Record<string, unknown> | undefined
+    let handleRef: DocHandle<unknown> | undefined
+    const restore = setWorkspaceDocumentsRegistrationForTest(async ({ documentIds }) => {
+      seenAtClaim = (handleRef?.doc() as Record<string, Record<string, unknown>> | undefined)?.objects
+      return { claimed: documentIds, alreadyOurs: [], foreign: [], missingVersion: false }
+    })
+    let ticks = 0
+    const ticker = setInterval(() => { ticks += 1 }, 0)
+    try {
+      const created = createClaimedOverlaySegment(repo, 'objects', (handle) => { handleRef = handle },
+        { workspace: { landscapeId: 'L-chunks', versionId: 'V1' }, rootUrl: 'automerge:root' },
+        { entities, fields: { foldedFromUrls: ['automerge:x'] } })
+      const handle = await created
+      const chunks = overlayContentChunks(entities)
+      expect(chunks.length).toBeGreaterThanOrEqual(4)
+      // One change per chunk after the creating one.
+      expect(A.getAllChanges(handle.doc() as A.Doc<unknown>)).toHaveLength(1 + chunks.length)
+      // The timers ran between the chunks: the event loop was given back.
+      expect(ticks).toBeGreaterThanOrEqual(chunks.length - 1)
+      expect((handle.doc() as Record<string, unknown>).objects).toEqual(entities)
+      // Whole before anything is told about it.
+      expect(seenAtClaim).toEqual(entities)
+    } finally {
+      clearInterval(ticker)
+      restore()
+    }
+  })
+})
+
+describe('createClaimedOverlaySegment content: the yield between changes (QA)', () => {
+  it('QA: every change after the first is preceded by a setTimeout(0) of its own', async () => {
+    const repo = new Repo({})
+    const entities = Object.fromEntries(Array.from({ length: 40 }, (_, i) =>
+      [`e${i}`, { id: `e${i}`, name: `entity ${i}`, notes: 'n'.repeat(1_000) }]))
+    const restore = setWorkspaceDocumentsRegistrationForTest(async ({ documentIds }) =>
+      ({ claimed: documentIds, alreadyOurs: [], foreign: [], missingVersion: false }))
+    const timeouts = vi.spyOn(globalThis, 'setTimeout')
+    try {
+      const chunks = overlayContentChunks(entities)
+      const before = timeouts.mock.calls.filter((call) => call[1] === 0).length
+      await createClaimedOverlaySegment(repo, 'objects', undefined,
+        { workspace: { landscapeId: 'L-yield', versionId: 'V1' }, rootUrl: 'automerge:root' }, { entities })
+      const zero = timeouts.mock.calls.filter((call) => call[1] === 0).length - before
+      expect(zero).toBeGreaterThanOrEqual(chunks.length)
+    } finally {
+      timeouts.mockRestore()
+      restore()
+    }
+  })
+})
+
+describe('createClaimedOverlaySegment content: `proceed` stops the build (G4-16 M3 review)', () => {
+  const entities = Object.fromEntries(Array.from({ length: 40 }, (_, i) =>
+    [`e${i}`, { id: `e${i}`, name: `entity ${i}`, notes: 'n'.repeat(1_000) }]))
+  const run = async (proceed: () => boolean) => {
+    const claimed: string[] = []
+    const restore = setWorkspaceDocumentsRegistrationForTest(async ({ documentIds }) => {
+      claimed.push(...documentIds)
+      return { claimed: documentIds, alreadyOurs: [], foreign: [], missingVersion: false }
+    })
+    let handle: DocHandle<unknown> | undefined
+    try {
+      const outcome = await createClaimedOverlaySegment(new Repo({}), 'objects', (touched) => { handle = touched },
+        { workspace: { landscapeId: 'L-abort', versionId: 'V1' }, rootUrl: 'automerge:root' },
+        { entities, proceed }).then(() => 'claimed', (error: unknown) => error)
+      return { outcome, claimed, handle }
+    } finally {
+      restore()
+    }
+  }
+
+  it('false between two chunks: no further change, no claim, and the error names the document', async () => {
+    let asked = 0
+    const { outcome, claimed, handle } = await run(() => { asked += 1; return asked <= 2 })
+    expect(outcome).toBeInstanceOf(OverlaySegmentAbortedError)
+    expect((outcome as OverlaySegmentAbortedError).documentId).toBe(String(handle!.documentId))
+    expect(claimed).toEqual([])
+    // The creating change and the two chunks asked for before the refusal.
+    expect(A.getAllChanges(handle!.doc() as A.Doc<unknown>)).toHaveLength(3)
+  })
+
+  it('false only after the last chunk: everything written, but no claim', async () => {
+    const chunks = overlayContentChunks(entities).length
+    let asked = 0
+    const { outcome, claimed, handle } = await run(() => { asked += 1; return asked <= chunks })
+    expect(outcome).toBeInstanceOf(OverlaySegmentAbortedError)
+    expect(claimed).toEqual([])
+    expect((handle!.doc() as Record<string, unknown>).objects).toEqual(entities)
+  })
+
+  it('control: always true claims it', async () => {
+    const { outcome, claimed, handle } = await run(() => true)
+    expect(outcome).toBe('claimed')
+    expect(claimed).toEqual([String(handle!.documentId)])
+  })
+})
+
+describe('overlayContentChunks', () => {
+  it('cuts in insertion order at the byte budget; an entity over the budget is alone; nothing gives no chunk', () => {
+    const small = (id: string) => ({ id, v: 'x'.repeat(30) })
+    const entities = { a: small('a'), b: small('b'), big: { id: 'big', v: 'y'.repeat(200) }, c: small('c') }
+    const chunks = overlayContentChunks(entities, 60)
+    expect(chunks.map((chunk) => chunk.map(([id]) => id))).toEqual([['a'], ['b'], ['big'], ['c']])
+    const pairs = overlayContentChunks(entities, 100)
+    expect(pairs.map((chunk) => chunk.map(([id]) => id))).toEqual([['a', 'b'], ['big'], ['c']])
+    expect(overlayContentChunks({})).toEqual([])
+    expect(overlayContentChunks(entities).flat().map(([id]) => id)).toEqual(['a', 'b', 'big', 'c'])
+    expect(OVERLAY_CONTENT_CHUNK_BYTES).toBe(8_192)
   })
 })

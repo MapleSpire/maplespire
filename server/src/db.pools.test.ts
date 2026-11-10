@@ -32,10 +32,10 @@
  * that skips is indistinguishable from one that passes in the summary line.
  */
 import { describe, expect, it } from 'vitest'
-import { lifecycleApplyPool, pool, readModelPool, syncCellPool } from './db.js'
+import { lifecycleApplyPool, pool, readModelPool, storageWriteApplication, storageWritePool, syncCellPool } from './db.js'
 
-describe('the four module-scope pools are four different pools', () => {
-  const pools = { pool, readModelPool, syncCellPool, lifecycleApplyPool }
+describe('the five module-scope pools are five different pools', () => {
+  const pools = { pool, readModelPool, syncCellPool, lifecycleApplyPool, storageWritePool }
 
   it('is not an alias of any other pool', () => {
     // Pairwise, not just against `pool`: aliasing the lifecycle pool onto the
@@ -83,5 +83,19 @@ describe('the four module-scope pools are four different pools', () => {
     expect(lifecycle.host).toBe(primary.host)
     expect(lifecycle.port).toBe(primary.port)
     expect(lifecycle.database).toBe(primary.database)
+  })
+
+  it('the storage WRITE pool is tagged with this process\'s name and carries its own ceilings (G4-16d)', () => {
+    const options = (storageWritePool as unknown as { options: Record<string, unknown> }).options
+    expect(options.application_name).toBe(storageWriteApplication)
+    expect(String(options.application_name)).toMatch(/^ms-storage:/)
+    expect(options.max).toBe(4)
+    expect(options.statement_timeout).toBe(120_000)
+    expect(options.lock_timeout).toBe(10_000)
+    expect(options.idle_in_transaction_session_timeout).toBe(30_000)
+    // The primary pool carries none of them (it serves migrations).
+    const primary = (pool as unknown as { options: Record<string, unknown> }).options
+    expect(primary.statement_timeout).toBeUndefined()
+    expect(primary.application_name).toBeUndefined()
   })
 })

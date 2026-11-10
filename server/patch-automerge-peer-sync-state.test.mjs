@@ -29,7 +29,13 @@ import {
   patchStorageSubsystemSource,
   patchSyncStateTrackerBackgroundSaveSource,
   patchAsyncThrottleSource,
+  patchAutomergeUrlEncodeHeadsSource,
 } from './patch-automerge-peer-sync-state.mjs'
+import { createRequire } from 'node:module'
+
+// bs58check is automerge-repo's dependency, not ours: resolve the copy that
+// automerge-repo itself loads rather than relying on hoisting.
+const bs58check = createRequire(new URL('./node_modules/@automerge/automerge-repo/package.json', import.meta.url))('bs58check').default
 
 const readyAfter = `            this.#networkReady = true;
             this.scheduleInboundEvaluation();`
@@ -842,4 +848,211 @@ test('preserves the 2.6 per-connection state machine and patches its storage bou
     }
   }`
   assert.equal(patchDocHandleOutdatedChangeSource(handleSource).changed, false)
+})
+
+// The exact upstream line (automerge-repo 2.6.0-alpha.2 dist/AutomergeUrl.js),
+// framed by neighbours so the patch is shown to touch that line only.
+const automergeUrlSource = `export const binaryToDocumentId = (docId) => bs58check.encode(docId);
+export const encodeHeads = (heads) => heads.map(h => bs58check.encode(uint8ArrayFromHexString(h)));
+export const decodeHeads = (heads) => heads.map(h => uint8ArrayToHexString(bs58check.decode(h)));`
+
+const hexFromBytes = (bytes) => [...bytes].map(b => b.toString(16).padStart(2, '0')).join('')
+const uint8ArrayFromHexString = (hexString) => {
+  if (hexString.length % 2 !== 0) throw new Error('Hex string must have an even length')
+  const bytes = new Uint8Array(hexString.length / 2)
+  for (let i = 0; i < hexString.length; i += 2) bytes[i >> 1] = parseInt(hexString.slice(i, i + 2), 16)
+  return bytes
+}
+
+/** Evaluate a (patched) AutomergeUrl fragment with a counting bs58check. */
+function loadEncodeHeads(source) {
+  const calls = { encode: 0 }
+  const counting = { encode: (bytes) => { calls.encode++; return bs58check.encode(bytes) }, decode: bs58check.decode }
+  const body = source.replace(/^export const /gm, 'const ')
+  const encodeHeads = vm.runInNewContext(`${body}\nencodeHeads`, {
+    bs58check: counting, uint8ArrayFromHexString, uint8ArrayToHexString: hexFromBytes, Map, Uint8Array, parseInt, Error,
+  })
+  return { encodeHeads, calls }
+}
+
+const randomHead = (seed) => hexFromBytes(Uint8Array.from({ length: 32 }, (_, i) => (seed * 131 + i * 17 + (seed >> 3)) & 0xff))
+
+test('memoizes encodeHeads once, idempotently, touching only that line', () => {
+  const patched = patchAutomergeUrlEncodeHeadsSource(automergeUrlSource)
+  assert.equal(patched.changed, true)
+  assert.equal(patchAutomergeUrlEncodeHeadsSource(patched.source).changed, false)
+  assert.ok(patched.source.startsWith('export const binaryToDocumentId = (docId) => bs58check.encode(docId);\n'))
+  assert.ok(patched.source.endsWith('export const decodeHeads = (heads) => heads.map(h => uint8ArrayToHexString(bs58check.decode(h)));'))
+  assert.doesNotMatch(patched.source, /heads\.map\(h => bs58check\.encode\(uint8ArrayFromHexString\(h\)\)\)/)
+})
+
+test('refuses an unrecognised, duplicated or half-applied encodeHeads', () => {
+  assert.throws(() => patchAutomergeUrlEncodeHeadsSource(automergeUrlSource.replace('heads.map(h =>', 'heads.map((h) =>')),
+    /Unsupported @automerge\/automerge-repo AutomergeUrl encodeHeads/)
+  const line = automergeUrlSource.split('\n')[1]
+  assert.throws(() => patchAutomergeUrlEncodeHeadsSource(`${automergeUrlSource}\n${line}`), /Unsupported/)
+  const patched = patchAutomergeUrlEncodeHeadsSource(automergeUrlSource).source
+  assert.throws(() => patchAutomergeUrlEncodeHeadsSource(`${patched}\n${line}`), /marker AND the original/)
+})
+
+test('refuses a stale, partial or duplicated memo block instead of reading it as patched', () => {
+  const patched = patchAutomergeUrlEncodeHeadsSource(automergeUrlSource).source
+  const stale = [
+    patched.replace('ENCODED_HEAD_CACHE_LIMIT = 4096', 'ENCODED_HEAD_CACHE_LIMIT = 8192'),
+    patched.replace('            encodedHeadCache.clear();\n', ''),
+    patched.slice(0, patched.indexOf('const encodedHeadCache')),
+    patched.replace('(docs/plan-cellulaire/mesures/G4-16b-encode-heads.json)', '(docs/plan-cellulaire/mesures/G4-16b-encode-heads.md)'),
+    `${patched}\n${patched}`,
+  ]
+  for (const source of stale) {
+    assert.throws(() => patchAutomergeUrlEncodeHeadsSource(source), /stale, partial or duplicated/)
+  }
+})
+
+test('the memoized encodeHeads returns exactly what the original returns', () => {
+  const original = loadEncodeHeads(automergeUrlSource)
+  const memo = loadEncodeHeads(patchAutomergeUrlEncodeHeadsSource(automergeUrlSource).source)
+  const heads = Array.from({ length: 64 }, (_, i) => randomHead(i))
+  for (const batch of [heads, heads.slice(3, 9), [], [heads[0], heads[0]], heads]) {
+    assert.deepEqual(memo.encodeHeads(batch), original.encodeHeads(batch))
+  }
+  // Upper-case hex parses to the same bytes, so its encoding is identical too.
+  assert.deepEqual(memo.encodeHeads([heads[1].toUpperCase()]), original.encodeHeads([heads[1]]))
+})
+
+test('a repeated head is encoded once', () => {
+  const memo = loadEncodeHeads(patchAutomergeUrlEncodeHeadsSource(automergeUrlSource).source)
+  const heads = [randomHead(1), randomHead(2), randomHead(3)]
+  memo.encodeHeads(heads)
+  assert.equal(memo.calls.encode, 3)
+  for (let i = 0; i < 50; i++) memo.encodeHeads(heads)
+  assert.equal(memo.calls.encode, 3)
+})
+
+test('the cache is bounded and stays correct after it is cleared', () => {
+  const memo = loadEncodeHeads(patchAutomergeUrlEncodeHeadsSource(automergeUrlSource).source)
+  const original = loadEncodeHeads(automergeUrlSource)
+  const first = randomHead(0)
+  memo.encodeHeads([first])
+  // 4096 is the limit: these fill it, and the next distinct head clears it.
+  for (let i = 1; i <= 4096; i++) memo.encodeHeads([hexFromBytes(Uint8Array.from({ length: 32 }, (_, j) => (i >> (j % 2 ? 8 : 0)) & 0xff))])
+  const before = memo.calls.encode
+  assert.deepEqual(memo.encodeHeads([first]), original.encodeHeads([first]))
+  assert.equal(memo.calls.encode, before + 1, 'the first head was evicted by the clear, so it is encoded again')
+  memo.encodeHeads([first])
+  assert.equal(memo.calls.encode, before + 1)
+})
+
+test('errors and non-string heads take the original path and are never cached', () => {
+  const memo = loadEncodeHeads(patchAutomergeUrlEncodeHeadsSource(automergeUrlSource).source)
+  const original = loadEncodeHeads(automergeUrlSource)
+  assert.throws(() => memo.encodeHeads(['abc']), /even length/)
+  assert.throws(() => memo.encodeHeads(['abc']), /even length/)
+  assert.throws(() => memo.encodeHeads([null]), err => {
+    assert.throws(() => original.encodeHeads([null]), { name: err.name, message: err.message })
+    return true
+  })
+})
+
+const qaHead = (i) => hexFromBytes(Uint8Array.from({ length: 32 }, (_, j) => (i >> (j % 2 ? 8 : 0)) & 0xff))
+
+test('heads sharing a long prefix are cached under their full value', () => {
+  const memo = loadEncodeHeads(patchAutomergeUrlEncodeHeadsSource(automergeUrlSource).source)
+  const original = loadEncodeHeads(automergeUrlSource)
+  const a = 'ab'.repeat(31) + '00', b = 'ab'.repeat(31) + '01'
+  assert.deepEqual(memo.encodeHeads([a]), original.encodeHeads([a]))
+  assert.deepEqual(memo.encodeHeads([b]), original.encodeHeads([b]))
+  assert.notDeepEqual(memo.encodeHeads([a]), memo.encodeHeads([b]))
+})
+
+test('the cache is per head, so a head is reused across different arrays', () => {
+  const memo = loadEncodeHeads(patchAutomergeUrlEncodeHeadsSource(automergeUrlSource).source)
+  const [a, b] = [randomHead(1), randomHead(2)]
+  memo.encodeHeads([a, b]); memo.encodeHeads([b, a]); memo.encodeHeads([a]); memo.encodeHeads([b])
+  assert.equal(memo.calls.encode, 2)
+})
+
+test('every call returns a fresh array and reads the current input', () => {
+  // DocHandle.heads() hands this array straight to application code.
+  const memo = loadEncodeHeads(patchAutomergeUrlEncodeHeadsSource(automergeUrlSource).source)
+  const original = loadEncodeHeads(automergeUrlSource)
+  const [a, b, c] = [randomHead(1), randomHead(2), randomHead(3)]
+  const heads = [a, b]
+  const first = memo.encodeHeads(heads)
+  const expected = [...first]
+  first.reverse(); first.push('caller junk')
+  const again = memo.encodeHeads(heads)
+  assert.notEqual(again, first)
+  assert.deepEqual([...again], expected)
+  assert.deepEqual([...memo.encodeHeads([a, b])], expected)
+  heads[0] = c
+  assert.deepEqual(memo.encodeHeads(heads), original.encodeHeads([c, b]))
+})
+
+test('a working set of exactly 4096 heads stays cached (lower edge of the bound)', () => {
+  const memo = loadEncodeHeads(patchAutomergeUrlEncodeHeadsSource(automergeUrlSource).source)
+  const heads = Array.from({ length: 4096 }, (_, i) => qaHead(i))
+  assert.equal(new Set(heads).size, 4096)
+  memo.encodeHeads(heads); assert.equal(memo.calls.encode, 4096)
+  memo.encodeHeads(heads); assert.equal(memo.calls.encode, 4096, 'a working set at the limit must not thrash')
+})
+
+test('a failing head is re-evaluated on every call', () => {
+  const memo = loadEncodeHeads(patchAutomergeUrlEncodeHeadsSource(automergeUrlSource).source)
+  let e1, e2
+  try { memo.encodeHeads(['abc']) } catch (error) { e1 = error }
+  try { memo.encodeHeads(['abc']) } catch (error) { e2 = error }
+  assert.match(e1.message, /even length/); assert.match(e2.message, /even length/)
+  assert.notEqual(e1, e2, 'the same Error instance was rethrown: the failure was cached')
+})
+
+test('a non-string head is never cached, even when it changes underneath', () => {
+  const memo = loadEncodeHeads(patchAutomergeUrlEncodeHeadsSource(automergeUrlSource).source)
+  const original = loadEncodeHeads(automergeUrlSource)
+  const [a, b] = [randomHead(4), randomHead(5)]
+  const head = { s: a, get length() { return this.s.length }, slice(i, j) { return this.s.slice(i, j) } }
+  assert.deepEqual(memo.encodeHeads([head]), original.encodeHeads([a]))
+  head.s = b
+  assert.deepEqual(memo.encodeHeads([head]), original.encodeHeads([b]))
+})
+
+test('apply and verify at an install root patch and police AutomergeUrl.js', async (t) => {
+  const { mkdtemp, cp, rm, readFile, writeFile } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const { applyAutomergePatchesAtInstallRoot, verifyAutomergePatchesAtInstallRoot } = await import('./patch-automerge-peer-sync-state.mjs')
+  const root = await mkdtemp(join(tmpdir(), 'maplespire-encodeheads-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  // Every other patch is already applied in this install (postinstall), so
+  // apply's return value here depends on AutomergeUrl.js alone.
+  for (const pkg of ['automerge', 'automerge-repo']) {
+    await cp(new URL(`./node_modules/@automerge/${pkg}`, import.meta.url), join(root, 'node_modules/@automerge', pkg), { recursive: true })
+  }
+  const urlFile = join(root, 'node_modules/@automerge/automerge-repo/dist/AutomergeUrl.js')
+  const patchedFile = await readFile(urlFile, 'utf8')
+  const upstreamLine = automergeUrlSource.split('\n')[1]
+  const block = patchAutomergeUrlEncodeHeadsSource(upstreamLine).source
+  assert.ok(patchedFile.includes(block))
+  await writeFile(urlFile, patchedFile.replace(block, upstreamLine))
+  await assert.rejects(verifyAutomergePatchesAtInstallRoot(root), /stale for AutomergeUrl\.js/)
+  assert.equal(await applyAutomergePatchesAtInstallRoot(root), true)
+  assert.equal(await readFile(urlFile, 'utf8'), patchedFile)
+  assert.equal(await verifyAutomergePatchesAtInstallRoot(root), true)
+  assert.equal(await applyAutomergePatchesAtInstallRoot(root), false)
+})
+
+test('the installed AutomergeUrl.js carries the memoized encodeHeads', () => {
+  const block = patchAutomergeUrlEncodeHeadsSource(automergeUrlSource.split('\n')[1]).source
+  // server/ always has its own install (the image's npm ci); the repository
+  // root's copy is the one the browser bundle uses, when it is installed.
+  let checked = 0
+  for (const root of ['.', '..']) {
+    const path = new URL(`${root}/node_modules/@automerge/automerge-repo/dist/AutomergeUrl.js`, import.meta.url)
+    let source
+    try { source = readFileSync(path, 'utf8') } catch (error) { if (root === '.' || error.code !== 'ENOENT') throw error; continue }
+    assert.equal(patchAutomergeUrlEncodeHeadsSource(source).changed, false, `${path.pathname} is not patched`)
+    assert.ok(source.includes(block), `${path.pathname} differs from what the patch writes`)
+    checked++
+  }
+  assert.ok(checked >= 1)
 })

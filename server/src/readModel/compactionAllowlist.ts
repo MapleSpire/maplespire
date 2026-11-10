@@ -42,7 +42,12 @@ const keyOf = (key: WorkspaceKey): string => `${key.landscapeId}/${key.versionId
 export function parseCompactionAllowlist(
   env: { COMPACTION_WORKSPACE_ALLOWLIST?: string } = process.env,
 ): CompactionAllowlist {
-  const raw = env[COMPACTION_ALLOWLIST_ENV] ?? ''
+  return parseWorkspaceKeyList(env[COMPACTION_ALLOWLIST_ENV] ?? '')
+}
+
+/** The entry rule above, for any `landscapeId/versionId` allow-list knob, so a
+ * second list cannot quietly accept what this one drops. */
+export function parseWorkspaceKeyList(raw: string): ReadonlySet<string> {
   const entries = raw
     .split(/[,\s]+/)
     .map((entry) => entry.trim())

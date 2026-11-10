@@ -39,6 +39,7 @@ import {
   type RootManifest,
 } from './manifest.js'
 import { materializeSparseDraftModels } from './sparse.js'
+import { DRAFT_INLINE_COLLECTIONS, DRAFT_MODEL_COLLECTIONS } from '../modelCollections.js'
 import {
   deleteOverlayEntities,
   writeOverlayEntities,
@@ -96,11 +97,10 @@ interface DiagramDocLike {
   [k: string]: unknown
 }
 
-const MODEL_KEY: Partial<Record<ChangeCollection, keyof FullModel>> = {
-  object: 'objects', connection: 'connections', group: 'groups',
-  domain: 'domains', tag: 'tagSnapshots', decisionRecord: 'decisionRecords',
-}
-const INLINE_COLLECTIONS: ChangeCollection[] = ['group', 'domain', 'tag', 'decisionRecord']
+/** Draft collection -> model collection, and the inline ones (ModelMeta):
+ * both from `modelCollections.ts`, compared against the entity-family registry. */
+export const MODEL_KEY: Partial<Record<ChangeCollection, keyof FullModel>> = DRAFT_MODEL_COLLECTIONS
+export const INLINE_COLLECTIONS: readonly ChangeCollection[] = DRAFT_INLINE_COLLECTIONS
 /** DiagramDoc keys that are NOT scalar settings (handled separately) — used to
  * wholesale-replace settings so a field the draft REMOVED is actually cleared. */
 const DIAGRAM_NON_SETTINGS = new Set(['objectIds', 'connectionIds', 'groupIds', 'layouts', 'flows', 'comments', 'checkpoints', 'objectScopes'])

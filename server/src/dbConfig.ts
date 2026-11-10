@@ -210,3 +210,93 @@ export function lifecycleApplyDatabasePoolConfig(
     connectionTimeoutMillis: positiveInteger(env.LIFECYCLE_APPLY_DB_CONNECTION_TIMEOUT_MS, 2_000),
   }
 }
+
+/** Integer ≥ 0 (0 is PostgreSQL's "no limit"), else the fallback. */
+function nonNegativeInteger(value: string | undefined, fallback: number): number {
+  const parsed = Number(value)
+  return value !== undefined && value.trim() !== '' && Number.isInteger(parsed) && parsed >= 0 ? parsed : fallback
+}
+
+/** Every storage-write backend's `application_name` starts with this. */
+export const STORAGE_WRITE_APPLICATION_PREFIX = 'ms-storage:'
+/** PostgreSQL keeps NAMEDATALEN - 1 bytes of `application_name`. */
+const APPLICATION_NAME_MAX = 63
+
+/**
+ * The `application_name` of THIS process's storage-write connections:
+ * `ms-storage:<cell>:<boot id>`. The boot id (a UUID, `processIdentity.ts`)
+ * is what tells two processes apart, including a restart of one cell; the cell
+ * id (`SYNC_CELL_ID`, else the host name) is there for the operator, cut to
+ * what fits in 63 bytes. What reads it: the handover barrier
+ * (`readModel/ordinaryFoldedArrivals.ts`), which waits for the OTHER
+ * processes' storage writes only.
+ */
+export function storageWriteApplicationName(bootId: string, env: DatabaseEnvironment = process.env): string {
+  const room = APPLICATION_NAME_MAX - STORAGE_WRITE_APPLICATION_PREFIX.length - 1 - bootId.length
+  const cell = (env.SYNC_CELL_ID?.trim() || env.HOSTNAME?.trim() || 'cell')
+    .toLowerCase().replace(/[^a-z0-9_.-]+/g, '-').slice(0, Math.max(0, room)) || 'cell'
+  return `${STORAGE_WRITE_APPLICATION_PREFIX}${cell}:${bootId}`.slice(0, APPLICATION_NAME_MAX)
+}
+
+/**
+ * The Automerge storage adapter's WRITE pool (`PostgresStorageAdapter`'s
+ * `writeDb`, wired in `automergeServer.ts`): every chunk save and removal of
+ * the sync server, and nothing else. Reads stay on the primary pool.
+ *
+ * ── WHY A POOL OF ITS OWN (G4-16d) ──────────────────────────────────────────
+ *
+ * After an ownership handover the new owner's projector must know when the
+ * OLD owner's in-flight saves have ended (`ordinaryFoldedArrivals.ts`, THE
+ * HANDOVER RESIDUAL). Two things make that knowable, and both need these
+ * connections apart from the primary pool's:
+ *   - `application_name` (`storageWriteApplicationName`) marks them, so the
+ *     new owner waits for them and for nothing else — not `pg_dump`, a
+ *     migration's `CREATE INDEX CONCURRENTLY`, a `psql` session or another
+ *     service;
+ *   - the three ceilings BOUND them, in the startup packet (as
+ *     `syncCellDatabasePoolConfig` does, for the reasons written there):
+ *     `statement_timeout` (`AM_STORAGE_WRITE_STATEMENT_TIMEOUT_MS`) a save's
+ *     statement, `lock_timeout` (`AM_STORAGE_WRITE_LOCK_TIMEOUT_MS`) its lock
+ *     waits, and `idle_in_transaction_session_timeout`
+ *     (`AM_STORAGE_WRITE_IDLE_IN_TRANSACTION_TIMEOUT_MS`) a transaction left
+ *     open by a paused or partitioned client (the test seam's legacy path sets
+ *     a shorter one of its own). 0 disables each, as in PostgreSQL. On the
+ *     primary pool they would bound every route and every migration.
+ *     NOT bounded by any of them: the wait for the commit record's WAL flush
+ *     and for synchronous replication — PostgreSQL does not cancel a commit;
+ *     and a backend blocked SENDING to a dead client, which only the server's
+ *     TCP keepalives (`tcp_keepalives_*`, `tcp_user_timeout`) end.
+ *
+ * THE VALUES, and what they must clear. The barrier waits at most
+ * `AM_ORDINARY_FOLD_HANDOVER_BARRIER_MAX_WAIT_MS` (300 s) for these writes,
+ * so a save must end well inside that: 120 s for the statement, 10 s for any
+ * one lock wait inside it, 30 s idle in a transaction (a save is ONE
+ * autocommit statement; only the test seam's legacy path holds a transaction
+ * open). 120 s is far above what a save is expected to take — a chunk upsert
+ * is one row — and is the ceiling for the slowest one, a large FIRST save (an
+ * import's snapshot, a new fold product) written in one statement: one that
+ * outlives it fails, is counted
+ * (`maplespire_automerge_storage_write_ceiling_total`, alert
+ * `AutomergeStorageWriteCeiling`), and is retried by the adapter, a bounded
+ * number of times (`automergeStorage.ts`, `scheduleCeilingRetry`).
+ *
+ * SIZING: `max` is the adapter's mutation bound (`DEFAULT_STORAGE_DB_CONCURRENCY`,
+ * 4, `automergeStorage.ts`), so the number of concurrent writes is what it was
+ * on the primary pool; the process holds up to four more connections in all,
+ * and the primary pool's four no longer go to writes. Raising
+ * `AM_STORAGE_WRITE_DB_POOL_MAX` raises that bound with it (the adapter's
+ * permit gate on a dedicated write pool is the pool's own `max`).
+ */
+export function storageWritePoolConfig(
+  applicationName: string,
+  env: DatabaseEnvironment = process.env,
+): PoolConfig {
+  return {
+    ...databasePoolConfig(env),
+    max: positiveInteger(env.AM_STORAGE_WRITE_DB_POOL_MAX, 4),
+    application_name: applicationName,
+    statement_timeout: nonNegativeInteger(env.AM_STORAGE_WRITE_STATEMENT_TIMEOUT_MS, 120_000),
+    lock_timeout: nonNegativeInteger(env.AM_STORAGE_WRITE_LOCK_TIMEOUT_MS, 10_000),
+    idle_in_transaction_session_timeout: nonNegativeInteger(env.AM_STORAGE_WRITE_IDLE_IN_TRANSACTION_TIMEOUT_MS, 30_000),
+  }
+}

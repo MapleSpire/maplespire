@@ -14,8 +14,10 @@
 
 import { randomBytes } from 'node:crypto'
 import type { Pool } from 'pg'
+import { z } from 'zod'
 import { pool } from './db.js'
 import { appendAudit } from './auth/audit.js'
+import { emailUsableForAuthorization, memberAdmittedSql } from './auth/tenantPolicy.js'
 import { createDistributedRateLimiter } from './runtime/rateLimiter.js'
 
 /**
@@ -233,6 +235,45 @@ export function validateCreateShare(body: unknown): string | null {
   return null
 }
 
+const isPlainObject = (v: unknown): v is Record<string, unknown> =>
+  typeof v === 'object' && v !== null && !Array.isArray(v)
+
+/** PATCH /api/shares/:token body. Every field optional (an empty body is a
+ * no-op read-back); types match `UpdateShareInput`. Unknown keys are STRIPPED,
+ * not rejected — same tolerance as create — so a body can never smuggle a
+ * column-level field such as `sessionOrgId` into `updateShare`. `audience:
+ * 'domain'` with a null domain is accepted: the client sends exactly that while
+ * the domain is still being typed, and the audience gate fails closed on it. */
+const shareUpdateBodySchema = z.object({
+  enabled: z.boolean().optional(),
+  limitToDiagram: z.boolean().optional(),
+  mode: z.enum(['latest', 'pinned']).optional(),
+  scope: z.enum(['diagram', 'landscape']).optional(),
+  checkpointId: z.string().nullable().optional(),
+  checkpointLabel: z.string().nullable().optional(),
+  heads: z.array(z.string()).nullable().optional(),
+  snapshot: z.custom<Record<string, unknown>>(isPlainObject, 'snapshot must be an object').optional(),
+  audience: z.enum(['public', 'org', 'domain']).optional(),
+  allowedEmailDomain: z.string().nullable().optional(),
+  allow3d: z.boolean().optional(),
+})
+
+export type ShareUpdateBody = z.infer<typeof shareUpdateBodySchema>
+
+/** Validate a share PATCH body; the route answers 400 with `error` on failure. */
+export function parseShareUpdate(body: unknown): { ok: true; value: ShareUpdateBody } | { ok: false; error: string } {
+  const parsed = shareUpdateBodySchema.safeParse(body)
+  if (!parsed.success) {
+    const issue = parsed.error.issues[0]
+    const where = issue?.path.length ? `${issue.path.join('.')}: ` : ''
+    return { ok: false, error: `invalid share update — ${where}${issue?.message ?? 'invalid body'}` }
+  }
+  if (parsed.data.snapshot !== undefined && JSON.stringify(parsed.data.snapshot).length > MAX_SNAPSHOT) {
+    return { ok: false, error: 'snapshot too large' }
+  }
+  return { ok: true, value: parsed.data }
+}
+
 function mapRow(r: Record<string, unknown>): ShareRecord {
   return {
     token: r.token as string,
@@ -367,13 +408,21 @@ export async function createShare(input: CreateShareInput): Promise<ShareRecord>
   throw new Error('could not allocate a unique share token')
 }
 
+/** The public read behind GET /api/shares/:token. A share whose landscape row no
+ * longer exists (an orphan left by a landscape delete before V0-03 added the
+ * cleanup) reads as NOT FOUND — decided in the same query, no second round
+ * trip — so its snapshot stops being served; the row itself is left in place.
+ * A NULL landscape_id (legacy row the ensureShareSchema backfill has not
+ * reached) is served exactly as before. */
 export async function getShare(token: string): Promise<ShareRecord | null> {
   await ensureShareSchema(pool)
   const { rows } = await pool.query(
-    `SELECT token, mode, scope, diagram_id, limit_to_diagram, enabled,
-       checkpoint_id, checkpoint_label, heads, snapshot, view_count, created_at, updated_at, expires_at,
-       landscape_id, version_id, org_id, audience, allowed_email_domain, allow_3d
-     FROM shared_links WHERE token = $1`,
+    `SELECT sl.token, sl.mode, sl.scope, sl.diagram_id, sl.limit_to_diagram, sl.enabled,
+       sl.checkpoint_id, sl.checkpoint_label, sl.heads, sl.snapshot, sl.view_count, sl.created_at, sl.updated_at,
+       sl.expires_at, sl.landscape_id, sl.version_id, sl.org_id, sl.audience, sl.allowed_email_domain, sl.allow_3d
+     FROM shared_links sl
+     WHERE sl.token = $1
+       AND (sl.landscape_id IS NULL OR EXISTS (SELECT 1 FROM landscapes l WHERE l.id = sl.landscape_id))`,
     [token],
   )
   return rows[0] ? mapRow(rows[0]) : null
@@ -494,8 +543,9 @@ export async function checkShareAudienceAccess(
 
   if (share.audience === 'org') {
     if (!share.orgId) return 'forbidden'
+    // A membership the org's Entra tenant policy refuses is no membership.
     const { rows } = await db.query(
-      `SELECT 1 FROM org_members WHERE org_id = $1 AND user_id = $2 LIMIT 1`,
+      `SELECT 1 FROM org_members m WHERE m.org_id = $1 AND m.user_id = $2 AND ${memberAdmittedSql('m')} LIMIT 1`,
       [share.orgId, claims.userId]
     )
     return rows.length > 0 ? 'allow' : 'forbidden'
@@ -503,8 +553,14 @@ export async function checkShareAudienceAccess(
 
   if (share.audience === 'domain') {
     if (!share.allowedEmailDomain) return 'forbidden'
-    const { rows } = await db.query<{ email: string }>(`SELECT email FROM users WHERE id = $1`, [claims.userId])
-    const email = (rows[0]?.email ?? '').toLowerCase()
+    const { rows } = await db.query<{ email: string; issuer: string; email_verified: boolean | null }>(
+      `SELECT email, issuer, email_verified FROM users WHERE id = $1`,
+      [claims.userId]
+    )
+    // An unverified Microsoft email proves nothing about its domain (V0-02 /
+    // finding S1): it cannot satisfy a domain audience.
+    if (!rows[0] || !emailUsableForAuthorization(rows[0])) return 'forbidden'
+    const email = rows[0].email.toLowerCase()
     const at = email.lastIndexOf('@')
     const domain = at >= 0 ? email.slice(at + 1) : ''
     return domain !== '' && domain === share.allowedEmailDomain ? 'allow' : 'forbidden'

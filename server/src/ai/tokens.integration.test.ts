@@ -15,7 +15,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { ensureAuthSchema } from '../auth/schema.js'
 import { ensureAiSchema } from './core/schema.js'
-import { createAiToken, listAiTokens, revokeAiToken, verifyAiToken, findByRefreshToken } from './core/tokens.js'
+import { createAiToken, listAiTokens, revokeToken, verifyAiToken, findByRefreshToken } from './core/tokens.js'
 import { verifyBearerIdentity } from './core/identity.js'
 import { hashToken } from './core/crypto.js'
 
@@ -38,6 +38,8 @@ describe.skipIf(!TEST_DATABASE_URL)('ai tokens + bearer identity (live Postgres)
        ('u1', 'test', 'u1', 'u1@example.com', 'User One', 'active'),
        ('u2', 'test', 'u2', 'u2@example.com', NULL, 'deactivated')`
     )
+    // A bearer token is refused when its org does not exist (as a session would be).
+    await db.pool.query(`INSERT INTO orgs (id, name, slug) VALUES ('org1', 'Org One', 'org-one')`)
   }, 60_000)
 
   afterAll(async () => {
@@ -60,10 +62,10 @@ describe.skipIf(!TEST_DATABASE_URL)('ai tokens + bearer identity (live Postgres)
     const listed = await listAiTokens(db.pool, 'u1')
     expect(listed.map((t) => t.id)).toContain(info.id)
 
-    expect(await revokeAiToken(db.pool, 'u1', info.id)).toBe(true)
+    expect(await revokeToken(db.pool, info.id, undefined, { role: 'owner', userId: 'u1' })).not.toBeNull()
     expect(await verifyAiToken(db.pool, token)).toBeNull()
     // revoking someone else's token fails
-    expect(await revokeAiToken(db.pool, 'u2', info.id)).toBe(false)
+    expect(await revokeToken(db.pool, info.id, undefined, { role: 'owner', userId: 'u2' })).toBeNull()
   })
 
   it('rejects malformed, unknown and expired tokens', async () => {

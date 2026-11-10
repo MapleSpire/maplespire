@@ -2,7 +2,7 @@ FROM node:22-alpine AS web-build
 
 WORKDIR /app
 COPY package.json package-lock.json ./
-COPY server/patch-automerge-peer-sync-state.mjs server/patch-automerge-change-observers.mjs server/patch-automerge-document-saves.mjs server/patch-automerge-cooperative-events.mjs server/patch-automerge-inflight-fanout.mjs server/patch-automerge-sync-state-lifetime.mjs ./server/
+COPY server/patch-automerge-peer-sync-state.mjs server/patch-automerge-change-observers.mjs server/patch-automerge-document-saves.mjs server/patch-automerge-cooperative-events.mjs server/patch-automerge-inflight-fanout.mjs server/patch-automerge-sync-state-lifetime.mjs server/patch-automerge-compaction-latch.mjs ./server/
 RUN npm ci
 
 COPY index.html vite.config.ts tsconfig.json tsconfig.app.json tsconfig.node.json tsconfig.image.json ./
@@ -71,6 +71,14 @@ COPY docker/nginx/nginx.conf /etc/nginx/templates/default.conf.template
 COPY --chmod=755 docker/nginx/40-microsoft-identity-association.sh /docker-entrypoint.d/40-microsoft-identity-association.sh
 COPY --from=web-build /app/dist /usr/share/nginx/html
 COPY docker/icons /usr/share/nginx/html/icons
-RUN mkdir -p /var/lib/maplespire/assets/technologies
+# Non-root (uid 101, `nginx`), as Kubernetes already runs it (run_as_user 101,
+# NET_BIND_SERVICE). Port 80 still binds under Docker, which sets
+# net.ipv4.ip_unprivileged_port_start=0 in the container's network namespace.
+# The entrypoint renders templates into conf.d, and the association script
+# writes .well-known, so both are owned by nginx; so are the cache and pid file.
+RUN mkdir -p /var/lib/maplespire/assets/technologies /usr/share/nginx/html/.well-known \
+    && touch /var/run/nginx.pid \
+    && chown -R nginx:nginx /var/cache/nginx /etc/nginx/conf.d /var/run/nginx.pid /usr/share/nginx/html/.well-known
+USER nginx
 
 EXPOSE 80

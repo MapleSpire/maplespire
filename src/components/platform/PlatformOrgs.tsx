@@ -12,7 +12,8 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU Affero General Public License for more details.
 
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useEffectEvent, useRef, useState } from 'react'
+import { useDepsChanged } from '../../hooks/useDepsChanged'
 import { Search, Plus, Ban, PlayCircle } from 'lucide-react'
 import { Trans, useTranslation } from 'react-i18next'
 import * as api from '../../lib/platform/api'
@@ -41,9 +42,20 @@ export function PlatformOrgs() {
     return () => clearTimeout(timer)
   }, [query])
 
+  // A new search resets to loading during render; the effect below only fetches.
+  const queryChanged = useDepsChanged([debouncedQuery])
+  if (queryChanged) {
+    setStatus('loading')
+    setError(null)
+  }
+
   const load = (q: string) => {
     setStatus('loading')
     setError(null)
+    fetchOrgs(q)
+  }
+
+  const fetchOrgs = (q: string) => {
     api
       .getOrgs({ q: q || undefined })
       .then((page) => {
@@ -57,8 +69,11 @@ export function PlatformOrgs() {
       })
   }
 
+  // An effect event: only a new query refetches, not a re-render that rebuilt
+  // fetchOrgs (or a language switch changing `t`).
+  const fetchOrgsForQuery = useEffectEvent(fetchOrgs)
   useEffect(() => {
-    load(debouncedQuery)
+    fetchOrgsForQuery(debouncedQuery)
   }, [debouncedQuery])
 
   const loadMore = () => {

@@ -33,13 +33,16 @@
  * are on `LEGS` below.
  */
 
-import { execFileSync, spawnSync } from 'node:child_process'
+import { execFileSync, spawn, spawnSync } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
-import { existsSync, readFileSync } from 'node:fs'
+import { chmodSync, closeSync, createWriteStream, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
-import { dirname, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { postureChoice, resolveShippedPosture, shippedOverrides, benchDefaultOverrides, resolvedBenchPosture, inspectRunningPosture } from './sync-bench-posture.mjs'
 import { assertCalibrationReceipt, calibrationProjectCensus, runIsolatedCalibrationStage } from './sync-cell-calibration.mjs'
+import { assertRemoteLoadExposure, describeRemoteLoad, firewallRuleCommand, readRemoteLoadSecret, remoteLoadComposeOverlay,
+  remoteLoadEnvironment, remoteLoadOptions, remoteLoadPorts } from './sync-cell-remote-load-core.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const serverDir = resolve(here, '..')
@@ -135,6 +138,7 @@ const LEGS = {
 function usage() {
   return `usage: node scripts/sync-cell-bench.mjs --leg=<${Object.keys(LEGS).join('|')}> [--keep] [--no-build] [--host=<name|ip>]
                                         [--mode=<smoke|soak|endurance>] [--load-profile=<contention|fleet>] [--users=<n>]
+                                        [--load-remote=listen --bind=<this host's LAN IPv4>]
 
 Brings up infra/compose/sync-cell-failover.yml for ONE leg, runs that leg's
 gate, and tears the stack down. Every leg gets its own compose project and its
@@ -156,6 +160,71 @@ The three below reach the load-soak leg only (they are ignored by the others):
                   historical shape) or fleet (many connected, few writing, on
                   distinct objects); see LOAD_PROFILES in the load gate
   --users         users per hot workspace, overriding the profile's default
+  --follow-write-head=on|off
+                  the gate's SYNC_LOAD_FOLLOW_WRITE_HEAD: writers re-resolve the
+                  current object write head every soak cycle
+  --ordinary-head-rotation=off|shadow|on
+                  the G4-16b A/B arm (AM_ORDINARY_HEAD_ROTATION on the cells).
+                  The runner boots the stack, preselects the two hot
+                  workspaces, recreates the three cells with the arm and an
+                  allow-list naming exactly those two, and the gate VOIDs the
+                  arm if the observed rotation contradicts it. on needs
+                  --follow-write-head=on. Both arms get the same allow-list;
+                  thresholds and --follow-write-head are per invocation, so
+                  pass the same ones to both arms or they differ in more than
+                  the mode. An armed run is comparable to the other arm, not
+                  to an unarmed run: its cells are recreated after a
+                  preselection boot (fresh processes, partitions acquired anew).
+  --ordinary-head-max-actors=N, --ordinary-head-max-changes=N
+                  the arm's thresholds (server defaults 128 and 512)
+  --ordinary-chain-fold=on|off
+                  G4-16b phase 4: AM_ORDINARY_CHAIN_FOLD on the armed cells
+                  (default off); on needs --ordinary-head-rotation=on. The gate
+                  is told the request, VOIDs a run whose cells parsed another
+                  fold or that never folds, and reports the fold's events.
+  --ordinary-chain-fold-retain-hours=N
+                  AM_ORDINARY_CHAIN_FOLD_RETAIN_HOURS (server default 168), so a
+                  short run reaches the abandon and the row sweep
+  --load-remote=listen --bind=<this host's LAN IPv4>
+                  REMOTE LOAD (G4-16 M1): run the load clients on ANOTHER
+                  machine. Only the client processes move; the cells, the gate,
+                  its criteria, failover, stats sampling and calibration stay
+                  here. See "Remote load" below.
+  --cpu-profile=on|off
+                  G4 stall diagnosis: SYNC_DIAG_CPU_PROFILE on the three cells,
+                  which write rolling CPU-profile chunks and a GC log from boot
+                  into a bind-mounted host directory (the calibration stage is
+                  never profiled). Before teardown the runner also saves each
+                  cell's full log there, and tees the gate's output into
+                  <dir>/gate.log. Read it all with
+                  scripts/analyze-cell-stalls.mjs --capture-dir=<dir>.
+  --cpu-profile-dir=<host dir>
+                  where the files land (default: a new directory under the OS
+                  temp dir, printed as bench.cpu_profile)
+  --cpu-profile-interval-us=N, --cpu-profile-chunk-seconds=N
+                  sampling interval (server default 1000) and chunk length
+                  (server default 10)
+
+Remote load. On the stack host (PowerShell, from server/):
+  $env:SYNC_REMOTE_LOAD_SECRET = '<64 hex chars, same value on both hosts>'
+  node scripts/sync-cell-bench.mjs --leg=load-soak --load-remote=listen --bind=192.168.1.20 <same flags as arm A>
+The runner publishes ONE extra port: the router on <bind>:<router port + 5>
+(HTTP and /automerge — all a client needs; PostgreSQL, Redis, the cells and the
+frontend stay on loopback), and the gate listens for the agent on
+<bind>:<router port + 6>; for the load-soak leg those are 3445 and 3446. Both
+bind to that one address, never 0.0.0.0, and a public address is refused.
+Before the first run the OPERATOR adds a firewall rule restricted to the LAN
+(the bench never touches the firewall; it prints this line with its ports):
+  New-NetFirewallRule -DisplayName "MapleSpire remote load (LAN only)" -Direction Inbound -Action Allow -Protocol TCP -LocalAddress 192.168.1.20 -LocalPort 3445,3446 -RemoteAddress 192.168.1.0/24 -Profile Private
+On the load host, from server/ on the SAME commit after npm ci:
+  SYNC_REMOTE_LOAD_SECRET=<same value> node scripts/sync-cell-remote-load.mjs --connect=192.168.1.20:3446 --once
+The agent authenticates by HMAC challenge-response (the secret never crosses
+the wire and is never printed), the gate refuses an agent whose load-client
+sources or package versions differ, checks the router is reachable from the
+agent, and measures the clock offset (16 pings, then 4 every minute). Results
+carry childProcess.remote {clockOffsetMs, clockUncertaintyMs}; the gate's one
+cross-host comparison (a write inside the takeover interval) uses it. The gate
+prints REMOTE_LOAD_SESSION with the agent's host, client identity and clock.
 
 SYNC_FAILOVER_AUTH_SECRET is generated per run when unset.`
 }
@@ -181,6 +250,218 @@ export function loadSoakOverrides(argv) {
       ...(users ? { SYNC_LOAD_USERS_PER_WORKSPACE: users } : {}),
     },
   }
+}
+
+/**
+ * The G4-16b A/B ARM, load-soak leg only: `--ordinary-head-rotation=off|shadow|on`,
+ * with optional `--ordinary-head-max-actors=N` / `--ordinary-head-max-changes=N`
+ * (command line only) and `--follow-write-head=on|off` (or the gate's own
+ * `SYNC_LOAD_FOLLOW_WRITE_HEAD`).
+ * Null when no arm is named: the run is then the run it was before the arm
+ * existed. The ALLOW-LIST is not an input: the runner writes it from the two
+ * hot workspaces it preselects (`main()` below), so no arm can run with an
+ * empty or a stale list. `on` refuses unless the writers follow the head.
+ * Thresholds are validated as text and handed to the cells' own bounded parse;
+ * nothing here turns them into numbers.
+ */
+export function ordinaryHeadRotationArm(argv, env = process.env) {
+  // The CLI owns the arm, as it owns the posture label: an inherited value
+  // must not arm a run the operator believes is plain (nor make every other
+  // leg refuse). Only the gate's own follow variable keeps its env fallback.
+  const pick = (flag, name) => {
+    const raw = argv.find((arg) => arg.startsWith(`${flag}=`))?.slice(flag.length + 1) ?? (name ? env[name] : undefined)
+    return raw?.trim() || null
+  }
+  const mode = pick('--ordinary-head-rotation')
+  const maxActors = pick('--ordinary-head-max-actors')
+  const maxChanges = pick('--ordinary-head-max-changes')
+  const chainFold = pick('--ordinary-chain-fold')
+  const chainFoldRetainHours = pick('--ordinary-chain-fold-retain-hours')
+  const follow = pick('--follow-write-head', 'SYNC_LOAD_FOLLOW_WRITE_HEAD')
+  if (follow !== null && follow !== 'on' && follow !== 'off') fail('--follow-write-head must be on or off')
+  if (chainFold !== null && chainFold !== 'on' && chainFold !== 'off') fail('--ordinary-chain-fold must be on or off')
+  if (chainFoldRetainHours !== null) {
+    if (chainFold !== 'on') fail('--ordinary-chain-fold-retain-hours needs --ordinary-chain-fold=on')
+    if (!/^[1-9][0-9]{0,3}$/.test(chainFoldRetainHours) || Number(chainFoldRetainHours) > 8760) {
+      fail('--ordinary-chain-fold-retain-hours must be an integer from 1 to 8760')
+    }
+  }
+  if (mode === null) {
+    if (maxActors !== null || maxChanges !== null) fail('--ordinary-head-max-actors/--ordinary-head-max-changes need --ordinary-head-rotation')
+    if (chainFold !== null) fail('--ordinary-chain-fold needs --ordinary-head-rotation')
+    return null
+  }
+  // The server refuses fold=on without rotation=on at boot; refuse it here first.
+  if (chainFold === 'on' && mode !== 'on') fail('--ordinary-chain-fold=on needs --ordinary-head-rotation=on')
+  if (!['off', 'shadow', 'on'].includes(mode)) fail('--ordinary-head-rotation must be off, shadow or on')
+  for (const [flag, value] of [['--ordinary-head-max-actors', maxActors], ['--ordinary-head-max-changes', maxChanges]]) {
+    if (value !== null && !/^[1-9][0-9]{0,5}$/.test(value)) fail(`${flag} must be an integer from 1 to 999999`)
+  }
+  if (mode === 'on' && follow !== 'on') {
+    fail('--ordinary-head-rotation=on needs --follow-write-head=on: otherwise the writers keep writing the head the server retired')
+  }
+  return {
+    mode, maxActors, maxChanges, chainFold: chainFold === 'on' ? 'on' : 'off', chainFoldRetainHours,
+    followWriteHead: follow === 'on',
+  }
+}
+
+/** `--follow-write-head` as the gate's own variable; absent leaves an
+ * inherited `SYNC_LOAD_FOLLOW_WRITE_HEAD` in force, as before. */
+export function followWriteHeadOverride(argv) {
+  const raw = argv.find((arg) => arg.startsWith('--follow-write-head='))?.slice('--follow-write-head='.length)?.trim()
+  if (raw === undefined) return {}
+  if (raw !== 'on' && raw !== 'off') fail('--follow-write-head must be on or off')
+  return { SYNC_LOAD_FOLLOW_WRITE_HEAD: raw }
+}
+
+/** Where the cells write inside their containers; the compose file mounts
+ * `SYNC_FAILOVER_DIAG_HOST_DIR` there. */
+export const CPU_PROFILE_CONTAINER_DIR = '/var/lib/maplespire/diag'
+
+/**
+ * `--cpu-profile=on` (load-soak only): the G4 stall-diagnosis capture
+ * (`server/src/diagnostics/cpuProfileCapture.ts`). Null when absent or `off`:
+ * the run is then exactly the run it was before the flag existed. The CLI owns
+ * it, like the arm: no environment fallback arms it. Values are validated as
+ * text and handed to the cells' own bounded parse.
+ */
+export function cpuProfileCaptureRequest(argv, { now = Date.now(), temporaryRoot = tmpdir() } = {}) {
+  const pick = (flag) => argv.find((arg) => arg.startsWith(`${flag}=`))?.slice(flag.length + 1)?.trim() || null
+  const mode = pick('--cpu-profile')
+  const directory = pick('--cpu-profile-dir')
+  const intervalUs = pick('--cpu-profile-interval-us')
+  const chunkSeconds = pick('--cpu-profile-chunk-seconds')
+  const companions = directory !== null || intervalUs !== null || chunkSeconds !== null
+  if (mode === null || mode === 'off') {
+    if (companions) fail('--cpu-profile-dir/--cpu-profile-interval-us/--cpu-profile-chunk-seconds need --cpu-profile=on')
+    return null
+  }
+  if (mode !== 'on') fail('--cpu-profile must be on or off')
+  if (intervalUs !== null && !/^[1-9][0-9]{2,4}$/.test(intervalUs)) fail('--cpu-profile-interval-us must be an integer from 100 to 99999')
+  if (chunkSeconds !== null && (!/^[1-9][0-9]{0,2}$/.test(chunkSeconds) || Number(chunkSeconds) < 5)) {
+    fail('--cpu-profile-chunk-seconds must be an integer from 5 to 999')
+  }
+  const stamp = new Date(now).toISOString().replace(/[:.]/g, '-')
+  return {
+    hostDir: resolve(directory ?? join(temporaryRoot, `maplespire-cpu-profile-${stamp}`)),
+    intervalUs: intervalUs ?? '', chunkSeconds: chunkSeconds ?? '',
+  }
+}
+
+/** ALWAYS all five names, blank without a capture, so an inherited value can
+ * neither arm the cells nor mount a host directory (the compose file defaults
+ * a blank flag to `off` and a blank host dir to an unused named volume). */
+export function cpuProfileEnvironment(capture) {
+  return {
+    SYNC_FAILOVER_DIAG_CPU_PROFILE: capture ? 'on' : '',
+    SYNC_FAILOVER_DIAG_CPU_PROFILE_DIR: capture ? CPU_PROFILE_CONTAINER_DIR : '',
+    SYNC_FAILOVER_DIAG_CPU_PROFILE_INTERVAL_US: capture?.intervalUs ?? '',
+    SYNC_FAILOVER_DIAG_CPU_PROFILE_CHUNK_SECONDS: capture?.chunkSeconds ?? '',
+    // Forward slashes: compose reads `C:/…` on Windows as a drive path too.
+    SYNC_FAILOVER_DIAG_HOST_DIR: capture ? capture.hostDir.replace(/\\/g, '/') : '',
+  }
+}
+
+/** Every cell the leg starts carries the flag and BIND-mounts the host dir. */
+export function assertCpuProfileResolves(config, services, capture) {
+  const cellNames = services.filter((name) => name.startsWith('sync-cell-'))
+  for (const name of cellNames) {
+    const service = config.services?.[name] ?? {}
+    const environment = service.environment ?? {}
+    if (environment.SYNC_DIAG_CPU_PROFILE !== 'on' || environment.SYNC_DIAG_CPU_PROFILE_DIR !== CPU_PROFILE_CONTAINER_DIR) {
+      fail(`${name} does not resolve SYNC_DIAG_CPU_PROFILE=on with SYNC_DIAG_CPU_PROFILE_DIR=${CPU_PROFILE_CONTAINER_DIR}`)
+    }
+    const mount = (service.volumes ?? []).find((volume) => volume?.target === CPU_PROFILE_CONTAINER_DIR)
+    if (mount?.type !== 'bind' || !samePath(String(mount.source ?? ''), capture.hostDir)) {
+      fail(`${name} does not bind-mount ${capture.hostDir} at ${CPU_PROFILE_CONTAINER_DIR} (got ${JSON.stringify(mount ?? null)})`)
+    }
+  }
+  return cellNames
+}
+
+/** The capture runs the cells wrote, as the host sees them: one directory per
+ * process (`<cellId>-<processBootId>`), each with its manifest and file sizes. */
+export function cpuProfileRuns(hostDir) {
+  if (!existsSync(hostDir)) return []
+  return readdirSync(hostDir, { withFileTypes: true }).filter((entry) => entry.isDirectory()).flatMap((entry) => {
+    const directory = join(hostDir, entry.name)
+    let manifest
+    try { manifest = JSON.parse(readFileSync(join(directory, 'manifest.json'), 'utf8')) } catch { return [] }
+    const files = readdirSync(directory)
+    const bytes = files.reduce((sum, file) => sum + statSync(join(directory, file)).size, 0)
+    return [{ run: entry.name, cellId: manifest.cellId, bootId: manifest.bootId, startedAtMs: manifest.anchor?.wallMs ?? null,
+      chunks: files.filter((file) => file.endsWith('.cpuprofile.gz')).length, bytes }]
+  })
+}
+
+/**
+ * What the arm puts in the compose and gate environment. ALWAYS all nine names,
+ * blank unless this run armed them, so an inherited value can neither arm the
+ * cells nor make the gate expect an arm (the compose file defaults a blank
+ * mode to `off`). Before the preselection (`preselection === null`) everything
+ * is blank: the first boot is the plain stack. After it, both arms carry the
+ * SAME allow-list and thresholds and differ only in the mode — under `off` the
+ * server reads neither (`ordinaryHeadRotationConfig`).
+ */
+export function rotationArmEnvironment(arm, preselection = null) {
+  const armed = Boolean(arm && preselection)
+  return {
+    SYNC_FAILOVER_ORDINARY_HEAD_ROTATION: armed ? arm.mode : '',
+    SYNC_FAILOVER_ORDINARY_HEAD_ROTATION_ALLOWLIST: armed ? preselection.allowlist : '',
+    SYNC_FAILOVER_ORDINARY_HEAD_ROTATION_MAX_ACTORS: armed ? arm.maxActors ?? '' : '',
+    SYNC_FAILOVER_ORDINARY_HEAD_ROTATION_MAX_CHANGES: armed ? arm.maxChanges ?? '' : '',
+    SYNC_FAILOVER_ORDINARY_CHAIN_FOLD: armed ? arm.chainFold ?? 'off' : '',
+    SYNC_FAILOVER_ORDINARY_CHAIN_FOLD_RETAIN_HOURS: armed ? arm.chainFoldRetainHours ?? '' : '',
+    SYNC_LOAD_ORDINARY_HEAD_ROTATION: armed ? arm.mode : '',
+    SYNC_LOAD_ORDINARY_CHAIN_FOLD: armed ? arm.chainFold ?? 'off' : '',
+    SYNC_LOAD_PRESELECTED_WORKSPACES: armed ? preselection.SYNC_LOAD_PRESELECTED_WORKSPACES : '',
+  }
+}
+
+/** The preselection verdict from the gate's stdout: the last JSON line with a
+ * `preselection` and two workspaces in distinct partitions. */
+export function parsePreselection(stdout) {
+  const verdicts = String(stdout).split(/\r?\n/).flatMap((line) => {
+    if (!line.trim().startsWith('{')) return []
+    try { return [JSON.parse(line)] } catch { return [] }
+  }).filter((entry) => entry?.outcome === 'passed' && entry.preselection)
+  const preselection = verdicts.at(-1)?.preselection
+  const workspaces = preselection?.workspaces ?? []
+  const key = /^[A-Za-z0-9_-]{1,128}$/
+  if (workspaces.length !== 2 || new Set(workspaces.map((entry) => entry.partition)).size !== 2
+    || !workspaces.every((entry) => key.test(entry.landscapeId ?? '') && key.test(entry.versionId ?? ''))) {
+    fail('the workspace preselection printed no usable pair of workspaces')
+  }
+  const allowlist = workspaces.map((entry) => `${entry.landscapeId}/${entry.versionId}`).join(',')
+  const selectors = workspaces.map((entry) => `${entry.landscapeId}:${entry.versionId}`).join(',')
+  if (preselection.allowlist !== allowlist || preselection.SYNC_LOAD_PRESELECTED_WORKSPACES !== selectors) {
+    fail('the workspace preselection lists disagree with its workspaces')
+  }
+  return preselection
+}
+
+/** Every cell the leg starts resolves the arm, exactly. */
+export function assertRotationArmResolves(config, services, arm, preselection) {
+  const expected = {
+    AM_ORDINARY_HEAD_ROTATION: arm.mode,
+    AM_ORDINARY_HEAD_ROTATION_WORKSPACE_ALLOWLIST: preselection.allowlist,
+    AM_ORDINARY_HEAD_ROTATION_MAX_ACTORS: arm.maxActors ?? '',
+    AM_ORDINARY_HEAD_ROTATION_MAX_CHANGES: arm.maxChanges ?? '',
+    AM_ORDINARY_CHAIN_FOLD: arm.chainFold ?? 'off',
+    AM_ORDINARY_CHAIN_FOLD_RETAIN_HOURS: arm.chainFoldRetainHours ?? '',
+  }
+  const cellNames = services.filter((name) => name.startsWith('sync-cell-'))
+  if (cellNames.length < 3) fail('the ordinary-head rotation arm needs the three load cells')
+  for (const name of cellNames) {
+    const environment = config.services?.[name]?.environment ?? {}
+    for (const [key, value] of Object.entries(expected)) {
+      if (String(environment[key] ?? '') !== String(value)) {
+        fail(`${name} resolves ${key}=${JSON.stringify(environment[key] ?? null)}, but this arm needs ${JSON.stringify(value)}`)
+      }
+    }
+  }
+  return expected
 }
 
 /**
@@ -305,11 +586,12 @@ export function imageIdentity(env, exec = runExec) {
  * settings, reached where. Pure, so the test asserts the exact string and a
  * label/value swap cannot survive.
  */
-export function describeRun({ image, commit, router, host, bind }) {
+export function describeRun({ image, commit, router, host, bind, remoteLoad = null }) {
   const show = (value) => value ?? 'unset'
   return `[bench] image ${image ?? '(not inspected)'} · commit ${commit ?? '(git unavailable or not a checkout)'}`
     + ` · router worker_processes=${show(router.workerProcesses)} worker_connections=${show(router.workerConnections)}`
     + ` worker_rlimit_nofile=${show(router.workerRlimitNofile)} · host ${host} bind ${bind}`
+    + (remoteLoad ? describeRemoteLoad(remoteLoad.options, remoteLoad.ports) : '')
 }
 
 /**
@@ -363,11 +645,27 @@ function environmentFor(legName, leg) {
  */
 const TEARDOWN = ['--profile', '*', 'down', '-v', '--remove-orphans']
 
+/**
+ * The remote-load overlay of THIS run: `{ project, file }`, or null. It belongs
+ * to the main project only — the isolated calibration project the bench also
+ * drives through `compose` publishes nothing beyond loopback.
+ */
+let remoteLoadOverlay = null
+
+/** The `-f` arguments for one compose call: the file, plus the run's overlay
+ * when the call is for the project that owns it. Exported so a test can show
+ * that a run without remote load names the one file it always named. */
+export function composeFileArgs(env, overlay = remoteLoadOverlay) {
+  return overlay && env.SYNC_FAILOVER_PROJECT === overlay.project
+    ? ['-f', composeFile, '-f', overlay.file]
+    : ['-f', composeFile]
+}
+
 function compose(env, args, options = {}) {
   try {
     return execFileSync(
       'docker',
-      ['compose', '-p', env.SYNC_FAILOVER_PROJECT, '-f', composeFile, ...args],
+      ['compose', '-p', env.SYNC_FAILOVER_PROJECT, ...composeFileArgs(env), ...args],
       { encoding: 'utf8', env: { ...process.env, ...env }, stdio: ['ignore', 'pipe', 'pipe'], ...options },
     )
   } catch (error) {
@@ -379,6 +677,84 @@ function compose(env, args, options = {}) {
     }
     throw error
   }
+}
+
+/** The capture runs THIS bench invocation produced: a reused directory's
+ * older runs (listed before `up`, `capture.preexisting`) never count. */
+export function thisRunsCaptures(capture) {
+  return cpuProfileRuns(capture.hostDir).filter((run) => !capture.preexisting?.has(run.run))
+}
+
+/**
+ * The gate, with its stdout and stderr BOTH on this console and, byte for
+ * byte (UTF-8, as the gate writes it), in `logPath`: the analysis must not
+ * depend on how an operator redirected a shell (PowerShell's `>` writes
+ * UTF-16). Resolves like `spawnSync`: { status, signal, error }.
+ */
+export function runGateTeed(file, args, options, logPath) {
+  return new Promise((resolvePromise) => {
+    const log = createWriteStream(logPath, { flags: 'w' })
+    let child
+    try { child = spawn(file, args, { ...options, stdio: ['ignore', 'pipe', 'pipe'] }) } catch (error) {
+      log.end(() => resolvePromise({ status: null, signal: null, error }))
+      return
+    }
+    child.stdout.on('data', (chunk) => { process.stdout.write(chunk); log.write(chunk) })
+    child.stderr.on('data', (chunk) => { process.stderr.write(chunk); log.write(chunk) })
+    let settled = false
+    const settle = (result) => { if (settled) return; settled = true; log.end(() => resolvePromise(result)) }
+    child.once('error', (error) => settle({ status: null, signal: null, error }))
+    child.once('close', (status, signal) => settle({ status, signal, error: undefined }))
+  })
+}
+
+/** The latest capture run of each cell: the processes still running. */
+export function currentCpuProfileRuns(runs) {
+  const latest = new Map()
+  for (const run of runs) {
+    const previous = latest.get(run.cellId)
+    if (!previous || (run.startedAtMs ?? 0) > (previous.startedAtMs ?? 0)) latest.set(run.cellId, run)
+  }
+  return [...latest.values()]
+}
+
+/**
+ * Before the logs and the teardown: make every running cell write the chunk
+ * it holds NOW (SIGUSR2 = an immediate roll, `cpuProfileCapture.ts`). The
+ * stall that fails the gate is always in that chunk, and a `down` can exit a
+ * cell before its SIGTERM chunk lands. Bounded: 20 s, then say what is missing.
+ */
+async function flushCpuProfiles(env, services, capture) {
+  const before = currentCpuProfileRuns(thisRunsCaptures(capture))
+  compose(env, ['kill', '-s', 'SIGUSR2', ...services.filter((name) => name.startsWith('sync-cell-'))])
+  const deadline = Date.now() + 20_000
+  let pending = before
+  while (pending.length > 0 && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 500))
+    const now = cpuProfileRuns(capture.hostDir)
+    pending = pending.filter((run) => (now.find((entry) => entry.run === run.run)?.chunks ?? 0) <= run.chunks)
+  }
+  process.stderr.write(`${JSON.stringify({ event: 'bench.cpu_profile_flushed', runs: before.map((run) => run.run),
+    notFlushed: pending.map((run) => run.run) })}\n`)
+}
+
+/** Each cell's whole log, docker-timestamped, into `<hostDir>/compose-logs/`.
+ * Streamed to the file (a two-hour log does not fit a pipe buffer). */
+function saveCpuProfileLogs(env, services, capture) {
+  const directory = join(capture.hostDir, 'compose-logs')
+  mkdirSync(directory, { recursive: true })
+  for (const service of services.filter((name) => name.startsWith('sync-cell-'))) {
+    const fd = openSync(join(directory, `${service}.log`), 'w')
+    try {
+      compose(env, ['logs', '--no-color', '--timestamps', service], { stdio: ['ignore', fd, 'pipe'], timeout: 300_000 })
+    } finally {
+      closeSync(fd)
+    }
+  }
+  writeFileSync(join(capture.hostDir, 'bench-capture.json'), `${JSON.stringify({
+    project: env.SYNC_FAILOVER_PROJECT, savedAt: new Date().toISOString(), hostDir: capture.hostDir,
+    runs: thisRunsCaptures(capture), composeLogs: readdirSync(directory), gateLog: 'gate.log',
+  }, null, 2)}\n`)
 }
 
 /**
@@ -635,6 +1011,26 @@ async function assertCellsAreServing(env, leg) {
   return serving
 }
 
+/**
+ * The router's LAN publication serves, probed from this host: the extra port
+ * exists and reaches nginx. The far side (firewall, LAN) is probed by the
+ * agent itself before the gate admits it.
+ */
+async function assertRouterLanServing(bind, port) {
+  const deadline = Date.now() + 60_000
+  let last = null
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(`http://${bind}:${port}/api/ready`, { signal: AbortSignal.timeout(2_000) })
+      response.body?.cancel().catch(() => undefined)
+      if (response.ok) return
+      last = `HTTP ${response.status}`
+    } catch (error) { last = error.cause?.code ?? error.message }
+    await new Promise((r) => setTimeout(r, 500))
+  }
+  fail(`the router's LAN publication http://${bind}:${port}/api/ready never served (${last}); is ${bind} an address of this host?`)
+}
+
 async function main() {
   const argv = process.argv.slice(2)
   if (argv.includes('--help') || argv.includes('-h')) {
@@ -647,13 +1043,36 @@ async function main() {
   const keep = argv.includes('--keep')
   const build = !argv.includes('--no-build')
   const overrides = legName === 'load-soak' ? loadSoakOverrides(argv) : { args: null, env: {} }
+  const arm = ordinaryHeadRotationArm(argv)
+  if (arm && legName !== 'load-soak') fail('--ordinary-head-rotation is an arm of the load-soak leg only')
+  const capture = cpuProfileCaptureRequest(argv)
+  if (capture && legName !== 'load-soak') fail('--cpu-profile is a diagnostic of the load-soak leg only')
   const posture = postureChoice(argv)
   if (posture && legName !== 'load-soak') fail('--posture currently qualifies the load-soak leg only')
   if (posture && !build) fail('--posture requires a build from the current tree; omit --no-build')
   const shipped = posture ? resolveShippedPosture() : null
-  const env = { ...environmentFor(legName, leg),
+  let remoteOptions = null
+  try {
+    remoteOptions = remoteLoadOptions(argv)
+    if (remoteOptions) readRemoteLoadSecret(process.env)
+  } catch (error) { fail(error.message) }
+  if (remoteOptions && legName !== 'load-soak') fail('--load-remote moves the load-soak gate\'s clients; no other leg has any')
+  if (remoteOptions && argv.some((arg) => arg.startsWith('--host='))) {
+    fail('--load-remote and --host are different two-host layouts (clients away from the stack vs. stack away from the gate); use one')
+  }
+  const legEnv = environmentFor(legName, leg)
+  const remotePorts = remoteOptions ? remoteLoadPorts(legEnv.SYNC_FAILOVER_ROUTER_PORT) : null
+  const env = { ...legEnv,
     SYNC_FAILOVER_HOST: '127.0.0.1', SYNC_FAILOVER_BIND: '127.0.0.1',
     ...benchHostOverride(argv), ...overrides.env,
+    ...(legName === 'load-soak' ? followWriteHeadOverride(argv) : {}),
+    // Empty without the arm (unless the shell carries one of its names, which
+    // are then blanked), so a plain run hands the gate the environment it did.
+    ...remoteLoadEnvironment(remoteOptions, legEnv.SYNC_FAILOVER_ROUTER_PORT),
+    // Blank until the preselection below; blank for ever without an arm.
+    ...rotationArmEnvironment(null),
+    // Blank until the main stack: the calibration stage is never profiled.
+    ...cpuProfileEnvironment(null),
     ...(posture === 'shipped' ? shippedOverrides(shipped) : posture === 'bench' ? benchDefaultOverrides() : {}),
     // The CLI owns this label. An inherited value must not qualify an
     // ordinary bench as shipped without resolving and inspecting its posture.
@@ -663,10 +1082,28 @@ async function main() {
   const dedicatedCalibration = Boolean(posture && legName === 'load-soak' && legArgs.includes('--mode=soak'))
 
   assertGateInventory()
+  if (remoteOptions) {
+    // A temporary second compose file: the router's LAN publication is a
+    // property of this run, not a manifest in the tree.
+    const directory = mkdtempSync(join(tmpdir(), 'maplespire-remote-load-'))
+    const file = join(directory, 'router-lan.yml')
+    writeFileSync(file, remoteLoadComposeOverlay(remoteOptions.bind, remotePorts.routerLanPort))
+    remoteLoadOverlay = { project: env.SYNC_FAILOVER_PROJECT, file, directory }
+    process.once('exit', () => { try { rmSync(directory, { recursive: true, force: true }) } catch { /* best effort */ } })
+  }
   const config = resolvedConfig(env)
+  if (remoteOptions) {
+    try { assertRemoteLoadExposure(config, remoteOptions.bind, remotePorts.routerLanPort) } catch (error) { fail(error.message) }
+  }
   const postureConfig = posture ? resolvedBenchPosture(config, posture === 'shipped' ? shipped : null) : null
   const excluded = classifyServices(config, leg)
   assertTopologyResolves(config, leg)
+  if (remoteOptions) {
+    process.stderr.write(`[bench] remote load: the router is published on ${remoteOptions.bind}:${remotePorts.routerLanPort} (LAN), `
+      + `the gate will wait for the agent on ${remoteOptions.bind}:${remotePorts.controlPort}\n`
+      + `[bench] remote load: firewall rule (operator, once, elevated PowerShell): ${firewallRuleCommand(remoteOptions.bind, remotePorts)}\n`
+      + `[bench] remote load: on the load host, from server/: node scripts/sync-cell-remote-load.mjs --connect=${remoteOptions.bind}:${remotePorts.controlPort} --once\n`)
+  }
 
   const startedAt = Date.now()
   let gateExitCode = null
@@ -684,11 +1121,13 @@ async function main() {
   const describe = () => {
     if (described) return
     described = true
-    process.stderr.write(`${describeRun({ ...identity, router, host, bind })}\n`)
+    process.stderr.write(`${describeRun({ ...identity, router, host, bind,
+      ...(remoteOptions ? { remoteLoad: { options: remoteOptions, ports: remotePorts } } : {}) })}\n`)
   }
   let teardownFailed = false
   let calibrationStage = null
   let mainStackAttempted = false
+  let armPreselection = null
   try {
     // A stale project from an interrupted run keeps volumes, and the load gate
     // refuses to share a project with a concurrent run. Start from nothing.
@@ -698,16 +1137,89 @@ async function main() {
       compose(env, ['build', 'sync-cell-a'], { stdio: ['ignore', 'inherit', 'inherit'] })
       identity.image = imageIdentity(env)
       const image = identity.image?.match(/\bsha256:[a-f0-9]{64}\b/)?.[0]
-      calibrationStage = await runIsolatedCalibrationStage({ env: { ...process.env, ...env }, image, posture,
+      // The calibration runs no load: it gets the arm's names blanked, so both
+      // arms calibrate with the same environment.
+      calibrationStage = await runIsolatedCalibrationStage({ env: { ...process.env, ...env,
+        ...(remoteOptions ? remoteLoadEnvironment(null, legEnv.SYNC_FAILOVER_ROUTER_PORT, env) : {}) }, image, posture,
         services: leg.services, compose,
         inspectPosture: (project, childEnv) => inspectRunningPosture(project, leg.services, postureConfig, childEnv),
       })
     } else {
       try { compose(env, TEARDOWN) } catch { /* nothing to remove */ }
     }
+    if (capture) {
+      // Created by the runner, world-writable: the cells write as uid 1000
+      // (`node`), and on a Linux host a bind mount keeps host ownership.
+      mkdirSync(capture.hostDir, { recursive: true })
+      try { chmodSync(capture.hostDir, 0o777) } catch { /* Windows: ACLs, not modes */ }
+      // A REUSED directory: its runs predate this invocation and never count
+      // as this run's manifests; its gate log is kept under another name.
+      capture.preexisting = new Set(cpuProfileRuns(capture.hostDir).map((run) => run.run))
+      const gateLog = join(capture.hostDir, 'gate.log')
+      if (existsSync(gateLog)) renameSync(gateLog, join(capture.hostDir, `gate.before-${new Date().toISOString().replace(/[:.]/g, '-')}.log`))
+      Object.assign(env, cpuProfileEnvironment(capture))
+      const resolvedCells = assertCpuProfileResolves(resolvedConfig(env), leg.services, capture)
+      process.stderr.write(`${JSON.stringify({ event: 'bench.cpu_profile', hostDir: capture.hostDir,
+        containerDir: CPU_PROFILE_CONTAINER_DIR, cells: resolvedCells,
+        samplingIntervalUs: capture.intervalUs || 'server default', chunkSeconds: capture.chunkSeconds || 'server default' })}\n`)
+    }
     mainStackAttempted = true
     compose(env, ['up', '-d', '--wait', ...(dedicatedCalibration ? ['--no-build'] : build ? ['--build'] : []), ...leg.services], { stdio: ['ignore', 'inherit', 'inherit'] })
     serving = await assertCellsAreServing(env, leg)
+    if (remoteOptions) await assertRouterLanServing(remoteOptions.bind, remotePorts.routerLanPort)
+    const [gateFile, ...gateArgs] = gateCommand(leg.script)
+    if (arm) {
+      // The allow-list is read once at boot and a fresh landscape's ids are
+      // minted by the server, so: choose the two hot workspaces on this first
+      // boot (the gate's own selection, `--preselect-workspaces`), then
+      // recreate the three cells with the arm. Both arms take this path, so
+      // both have the same history: one boot, one preselection, one recreate.
+      // An UNARMED run (e.g. the historic G4-7 runs) has none of the three: its
+      // serving cells are the processes that created the hot workspaces, and
+      // it is not a control for either arm.
+      process.stderr.write('[bench] ordinary-head rotation arm: preselecting the two hot workspaces\n')
+      const probe = spawnSync(process.execPath, [gateFile, ...gateArgs, ...legArgs, '--preselect-workspaces'], {
+        cwd: serverDir, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024,
+        env: { ...process.env, ...env, SYNC_G47_CALIBRATION_PATH: '', SYNC_G47_CALIBRATION_SHA256: '', SYNC_G47_CALIBRATION_NONCE: '' },
+        stdio: ['ignore', 'pipe', 'inherit'],
+      })
+      process.stderr.write(String(probe.stdout ?? ''))
+      if (probe.error) fail(`could not start the workspace preselection: ${probe.error.message}`)
+      if (probe.status !== 0) fail(`the workspace preselection exited ${probe.status ?? probe.signal}`)
+      armPreselection = parsePreselection(probe.stdout)
+      Object.assign(env, rotationArmEnvironment(arm, armPreselection))
+      const armConfig = resolvedConfig(env)
+      const resolvedArm = assertRotationArmResolves(armConfig, leg.services, arm, armPreselection)
+      // The arm is not a posture delta: the qualified settings must not move.
+      if (posture) resolvedBenchPosture(armConfig, posture === 'shipped' ? shipped : null)
+      const cellsToRecreate = leg.services.filter((name) => name.startsWith('sync-cell-'))
+      // Their environment changed, so compose recreates exactly these three;
+      // the databases and the routers keep running untouched.
+      compose(env, ['up', '-d', '--wait', '--no-build', ...cellsToRecreate], { stdio: ['ignore', 'inherit', 'inherit'] })
+      serving = await assertCellsAreServing(env, leg)
+      process.stderr.write(`${JSON.stringify({ event: 'bench.ordinary_head_rotation', mode: arm.mode,
+        chainFold: arm.chainFold, followWriteHead: arm.followWriteHead, preselection: armPreselection, resolved: resolvedArm, recreated: cellsToRecreate })}\n`)
+    }
+    if (capture) {
+      // A capture that is not writing is refused NOW, not discovered after two
+      // hours: every serving cell must have written its manifest (one per boot
+      // — the arm's recreate is a second boot of each cell).
+      const running = resolvedConfig(env)
+      const cellIds = leg.services.filter((name) => name.startsWith('sync-cell-'))
+        .map((name) => String(running.services?.[name]?.environment?.SYNC_CELL_ID ?? name))
+      const boots = arm ? 2 : 1
+      const deadline = Date.now() + 30_000
+      let runs = thisRunsCaptures(capture)
+      const short = () => cellIds.filter((id) => runs.filter((run) => run.cellId === id).length < boots)
+      while (short().length > 0 && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 500))
+        runs = thisRunsCaptures(capture)
+      }
+      if (short().length > 0) {
+        fail(`--cpu-profile: no capture manifest from ${short().join(', ')} in ${capture.hostDir} after 30 s (expected ${boots} boot(s) per cell); see the cells' diagnostics.cpu_profile_* log lines`)
+      }
+      process.stderr.write(`${JSON.stringify({ event: 'bench.cpu_profile_capturing', hostDir: capture.hostDir, runs })}\n`)
+    }
     const broughtUpAt = Date.now()
     identity.image = imageIdentity(env)
     if (posture) {
@@ -736,17 +1248,17 @@ async function main() {
     // Both the file and its own flags come from `package.json`, so
     // `verify:sync-redis-failover`'s `--redis-outage` is carried without this
     // file knowing it exists.
-    const [gateFile, ...gateArgs] = gateCommand(leg.script)
-    const gate = spawnSync(
-      process.execPath,
-      [gateFile, ...gateArgs, ...legArgs],
-      { cwd: serverDir, env: { ...process.env, ...env,
-        // Always override inherited receipts, including on the other legs.
-        SYNC_G47_CALIBRATION_PATH: calibrationStage?.binding.path ?? '',
-        SYNC_G47_CALIBRATION_SHA256: calibrationStage?.binding.sha256 ?? '',
-        SYNC_G47_CALIBRATION_NONCE: calibrationStage?.binding.nonce ?? '',
-      }, stdio: ['ignore', 'inherit', 'inherit'] },
-    )
+    const gateOptions = { cwd: serverDir, env: { ...process.env, ...env,
+      // Always override inherited receipts, including on the other legs.
+      SYNC_G47_CALIBRATION_PATH: calibrationStage?.binding.path ?? '',
+      SYNC_G47_CALIBRATION_SHA256: calibrationStage?.binding.sha256 ?? '',
+      SYNC_G47_CALIBRATION_NONCE: calibrationStage?.binding.nonce ?? '',
+    } }
+    // With a capture, the G47_EVENT stream the analysis reads is teed into
+    // `<hostDir>/gate.log` by the runner itself, whatever the shell does.
+    const gate = capture
+      ? await runGateTeed(process.execPath, [gateFile, ...gateArgs, ...legArgs], gateOptions, join(capture.hostDir, 'gate.log'))
+      : spawnSync(process.execPath, [gateFile, ...gateArgs, ...legArgs], { ...gateOptions, stdio: ['ignore', 'inherit', 'inherit'] })
     if (gate.error) fail(`could not start ${leg.script}: ${gate.error.message}`)
     if (gate.status === null) fail(`${leg.script} was terminated by signal ${gate.signal ?? '(unknown)'} and produced no verdict`)
     gateExitCode = gate.status
@@ -762,6 +1274,9 @@ async function main() {
       commit: identity.commit,
       router,
       ...(posture ? { posture, postureConfig, runningPosture } : {}),
+      ...(arm ? { ordinaryHeadRotation: { ...arm, preselection: armPreselection } } : {}),
+      ...(remoteOptions ? { loadRemote: { mode: remoteOptions.mode, bind: remoteOptions.bind, ...remotePorts } } : {}),
+      ...(capture ? { cpuProfile: capture } : {}),
       services: leg.services,
       excluded,
       cellsServing: serving,
@@ -782,6 +1297,16 @@ async function main() {
         process.stderr.write(`[bench] could not collect service logs: ${error.message}\n`)
       }
     }
+    if (capture && mainStackAttempted) {
+      // The analysis needs the cells' WHOLE logs (rotation events, with docker
+      // timestamps in the cells' clock), pass or fail, before `down` erases them.
+      try { await flushCpuProfiles(env, leg.services, capture) } catch (error) {
+        process.stderr.write(`[bench] could not flush the cells' CPU profiles: ${error.message}\n`)
+      }
+      try { saveCpuProfileLogs(env, leg.services, capture) } catch (error) {
+        process.stderr.write(`[bench] could not save the cells' logs into ${capture.hostDir}: ${error.message}\n`)
+      }
+    }
     if (keep && mainStackAttempted) {
       process.stderr.write(`[bench] --keep: leaving ${env.SYNC_FAILOVER_PROJECT} up\n`)
     } else if (mainStackAttempted) {
@@ -798,11 +1323,21 @@ async function main() {
         process.stderr.write(`${String(error.stderr || '').trim()}\n`)
       }
     }
+    if (capture && mainStackAttempted) {
+      // After `down`: SIGTERM made each cell write its final chunk.
+      const runs = thisRunsCaptures(capture)
+      process.stderr.write(`${JSON.stringify({ event: 'bench.cpu_profile_done', hostDir: capture.hostDir, runs,
+        totalBytes: runs.reduce((sum, run) => sum + run.bytes, 0),
+        analyze: `node scripts/analyze-cell-stalls.mjs --capture-dir=${capture.hostDir}` })}\n`)
+    }
     if (calibrationStage) {
       try { calibrationStage.dispose() } catch (error) {
         teardownFailed = true
         process.stderr.write(`[bench] calibration receipt cleanup failed: ${error.message}\n`)
       }
+    }
+    if (remoteLoadOverlay && !keep) {
+      try { rmSync(remoteLoadOverlay.directory, { recursive: true, force: true }) } catch { /* the exit hook retries */ }
     }
   }
   // `process.exitCode` and a return, never `process.exit()`. The JSON verdict

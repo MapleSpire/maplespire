@@ -170,12 +170,16 @@ describe.skipIf(!TEST_DATABASE_URL)('D3 — racine GC des segments overlay reten
     await db.pool.query(`
       CREATE TABLE landscape_versions (manifest JSONB NOT NULL)
     `)
+    // `arrival_seq` as in production (`db.ts`): the folded-head root asks
+    // storage for an arrival above a row's watermark, and PostgreSQL resolves
+    // that column even when no folded row exists. NULL here: no arrival.
     await db.pool.query(`
       CREATE TABLE automerge_storage (
         key TEXT PRIMARY KEY,
         data BYTEA NOT NULL,
         created_at TIMESTAMPTZ NOT NULL,
-        updated_at TIMESTAMPTZ NOT NULL
+        updated_at TIMESTAMPTZ NOT NULL,
+        arrival_seq BIGINT
       )
     `)
     await db.pool.query(`

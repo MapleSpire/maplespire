@@ -20,6 +20,7 @@ import { setSessionCookie } from './tokens.js'
 import { signCurrentSession } from './sessionEpoch.js'
 import { getEmailProvider } from '../email/index.js'
 import { inviteEmail } from '../email/templates.js'
+import { emailUsableForAuthorization, orgRoleIfAdmitted, tenantAllowedSql } from './tenantPolicy.js'
 
 /**
  * Org invites: an org admin (or platform admin) invites an email to join with
@@ -119,11 +120,8 @@ function acceptUrlFor(token: string): string {
  * on the token, since role changes must take effect immediately. */
 async function canManageOrg(db: Pool, orgId: string, auth: { userId: string; isPlatformAdmin: boolean }): Promise<boolean> {
   if (auth.isPlatformAdmin) return true
-  const { rows } = await db.query<{ role: string }>(
-    'SELECT role FROM org_members WHERE org_id = $1 AND user_id = $2',
-    [orgId, auth.userId]
-  )
-  return rows[0]?.role === 'admin'
+  // Admitted by the org's Entra tenant policy too (V0-02).
+  return (await orgRoleIfAdmitted(db, orgId, auth.userId)) === 'admin'
 }
 
 export function registerInviteRoutes(app: import('express').Express): void {
@@ -323,14 +321,41 @@ export function registerInviteRoutes(app: import('express').Express): void {
         return
       }
 
-      const { rows: userRows } = await client.query<{ email: string }>(
-        'SELECT email FROM users WHERE id = $1',
-        [auth.userId]
+      // Serialize against a concurrent tenant-policy change (orgTenantRoutes
+      // takes the org row FOR UPDATE): without it, a verdict read here could
+      // be stale by the membership insert, and that change's "newly refused"
+      // snapshots would miss the member this accept creates.
+      await client.query('SELECT 1 FROM orgs WHERE id = $1 FOR SHARE', [row.org_id])
+      const { rows: userRows } = await client.query<{
+        email: string
+        issuer: string
+        email_verified: boolean | null
+        tenant_ok: boolean
+      }>(
+        `SELECT u.email, u.issuer, u.email_verified, ${tenantAllowedSql('u', 'o')} AS tenant_ok
+         FROM users u JOIN orgs o ON o.id = $2
+         WHERE u.id = $1`,
+        [auth.userId, row.org_id]
       )
-      const sessionEmail = userRows[0]?.email ?? ''
+      const sessionUser = userRows[0]
+      // A Microsoft email the IdP did not vouch for is not evidence of who is
+      // holding the link (finding S1) — refuse before comparing it.
+      if (sessionUser && !emailUsableForAuthorization(sessionUser)) {
+        await client.query('ROLLBACK')
+        res.status(403).json({ error: 'email_unverified', invitedEmail: maskEmail(row.email) })
+        return
+      }
+      const sessionEmail = sessionUser?.email ?? ''
       if (sessionEmail.toLowerCase() !== row.email.toLowerCase()) {
         await client.query('ROLLBACK')
         res.status(403).json({ error: 'email_mismatch', invitedEmail: maskEmail(row.email) })
+        return
+      }
+      // The org's Entra tenant allowlist, BEFORE the membership exists: the
+      // mint below would refuse too, but only after this commit had granted it.
+      if (!sessionUser || sessionUser.tenant_ok === false) {
+        await client.query('ROLLBACK')
+        res.status(403).json({ error: 'tenant_not_allowed' })
         return
       }
 

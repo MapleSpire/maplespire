@@ -220,15 +220,83 @@ Tokens: **Account settings → API tokens** (`bvr_…`, shown once, sha256-store
 revocable). Below `AUTH=on` the API is open (same posture as every surface);
 an invalid presented token is still rejected.
 
-**Scopes are enforced** (`server/src/ai/core/tokenScopes.ts`). Every token
-minted today carries the `mcp` scope, which reaches `/mcp` and the AI surface
-`/api/ai/*`: tools, `run`, `skill`, `status`, `chat` and conversations. Any
-other `/api` route answers **403** `insufficient_scope` with a
-`WWW-Authenticate: Bearer error="insufficient_scope"` header, at every
-`AUTH` stage. That covers the model and landscape REST routes, org settings and
-`ai-config`. No scope ever reaches `/api/platform/*` or `/api/me/ai-tokens*`: a
-token cannot mint or revoke tokens. Scripts that used a PAT on other REST
-routes must use a browser session instead.
+**Scopes are enforced** (`server/src/ai/core/tokenScopes.ts`, the catalog; its
+module doc lists every route each scope reaches). A route outside a token's
+scopes answers **403** `insufficient_scope` with a
+`WWW-Authenticate: Bearer error="insufficient_scope"` header, at every `AUTH`
+stage. "Read" means `GET`/`HEAD`; every other method is a write.
+
+| scope | reaches |
+|---|---|
+| `model:read` | reads on `/api/ai/*` (status, tool specs, skill, conversations), reads on `/api/model/*` and `/api/landscapes/*`; the tool door `POST /api/ai/tools/:name` for **read tools only** |
+| `model:write` | writes on `/api/ai/*` (`chat`, `run`, the tool door for model-write tools, deleting a conversation); `POST /api/landscapes/:id/versions`, `PUT …/default-version`, `POST …/drafts/:draftId/merge` |
+| `drafts:write` | `POST /api/landscapes/:id/drafts`, `PATCH …/drafts/:draftId`; the tool door for `create_draft`, and for model-write tools **when the call's workspace is a draft** |
+| `comments:write` | the tool door for `reply_to_comment` and `resolve_comment` |
+| `mcp` | alias: the four scopes above, bounded to `/api/ai/*` — exactly the V0-01 reach (every method on `/api/ai/*`, nothing else) |
+
+Scopes are orthogonal: `model:write` does not include reading, so mint
+`["model:read", "model:write"]` for a read-write integration. **Tools are
+classified from the tool registry** (`mode` in `core/toolRegistry.ts`): read
+tools need `model:read`; write tools need `model:write`, except the comment
+tools (`comments:write`) and `create_draft` (`drafts:write`). `merge_draft`,
+`create_version` and `set_default_version` act on another workspace than the
+call's and always need `model:write`. The check runs in `executeAiTool`, so it
+holds for the tool door, every tool call inside `chat`/`run`, and `/mcp`
+(which lists only the tools the token can call). A refused tool answers 403.
+
+`POST /api/me/ai-tokens` accepts `"scopes": [...]` (catalog names; an unknown
+one answers **400** `unknown_scope` with the `unknown` list; a non-array or an
+empty list answers 400). Without `scopes` the token carries `["mcp"]`, as
+before, and OAuth grants always carry `["mcp"]`. Stored scopes are kept as
+given (an alias is not expanded at rest). Before V0-07 the code minted only
+`mcp` (also the column default), which the alias covers, so no data
+migration is needed; a row carrying any other value grants only the catalog
+scopes it names and nothing for the rest (deny-by-default).
+
+Everything else is refused to every bearer: landscape/version
+create/rename/delete, snapshots create/delete, `/api/automerge/*`,
+`/api/shares*`, `/api/orgs/*`. No scope ever reaches `/api/platform/*` or
+`/api/me/ai-tokens*`: a token cannot mint or revoke tokens.
+
+**Revocation is audited** (`revokeToken` in `core/tokens.ts`, the only
+revocation path). Each revocation writes one `audit_log` event
+`ai_token.revoked` in the same transaction as `revoked_at` (a failed audit
+insert leaves the token live): `actor_user_id`, `impersonator_user_id`,
+`target_kind = 'ai_token'`, `target_id` = token id, `org_id`, `at`, and
+`detail = { ownerUserId, reason, actorRole, tokenKind, revokedAt }`. Paths:
+self-revocation `DELETE /api/me/ai-tokens/:id` (optional `{ "reason" }` body,
+default `revoked by owner`), and OAuth refresh rotation (actor = owner, role
+`system`, reason `oauth refresh rotation`; only the request that actually
+revoked the old pair mints a new one, a concurrent reuse gets
+`invalid_grant`). The `admin` role requires a non-empty reason; no admin
+endpoint for revoking another user's token exists yet (deactivating the user
+or bumping an epoch still ends their tokens, see below).
+
+**Lifetime and revocation (V0-06).** A new PAT **expires after 90 days** by
+default. An org admin can change that with the org setting
+`aiTokenMaxDays` (`PATCH /api/orgs/:orgId` with `{ "settings": { "aiTokenMaxDays": 30 } }`,
+integer 1–365, clamped; unset = 90). That value is both the default lifetime
+and the **ceiling**: `POST /api/me/ai-tokens` accepts `expiresInDays` only up
+to it (a shorter expiry is fine; a longer one answers **400**
+`expires_too_long` with `maxDays`; `0`/negative no longer mean "never
+expires"). Changing the setting never alters tokens already minted. Tokens
+minted before V0-06 keep their stored expiry, which may be none.
+
+Bearer tokens follow the session rules on **every** request (the bridge and
+`/mcp` both go through `verifyBearerIdentity`): the token is refused (401) when
+its owner is missing or not `active`, when its org is missing or `suspended`,
+or when the global epoch, the org epoch or the user's per-org epoch
+(`auth_global_epochs`, `auth_epochs`, `auth_user_epochs`) is no longer the value
+**pinned in the token row at mint** (`pin_global_epoch`, `pin_org_epoch`,
+`pin_user_epoch`), exactly as a session pins `gepoch`/`epoch`/`uepoch`. Epochs
+are compared by equality rather than by timestamp because the epoch tables
+store no time. Rows that existed when the pin columns were added were pinned
+**once** to the then-current epochs, inside the same transaction that adds
+the columns (guarded by the column's absence in `information_schema` and an
+advisory lock, so later boots never re-pin), so deploying does not revoke
+legacy tokens, and a bump afterwards does. A row with a missing pin
+(org-scoped without org/user pins, or any without a global pin) fails closed.
+An OAuth refresh grant applies the same check before rotating.
 
 ### Remote MCP (Streamable HTTP + Bearer/OAuth)
 
@@ -270,7 +338,9 @@ Zero business logic — proxies `GET /api/ai/tools?format=mcp` and
   rotating refresh; the key never returns to a browser.
 - Bearer tokens are scope-limited, deny-by-default (see "Adapters for AI
   agents"); `bearerAuth.scopes.test.ts` pins it, including dot-segment,
-  encoded-separator and case variants.
+  encoded-separator and case variants; `tokenScopes.test.ts` pins the catalog
+  (and `mcp` = the V0-01 reach), `bearerAuth.fineScopes.test.ts` the tool
+  gate end to end.
 - `executeAiTool` enforces the write gate centrally; `resolveAiToolCtx` applies
   the same canonical-workspace read gates as `/api/model/*`. Below `AUTH=on`
   the AI mirrors the editor's permissiveness exactly (never more).

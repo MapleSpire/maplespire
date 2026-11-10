@@ -13,6 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type FormEvent, type RefObject } from 'react'
+import { useDepsChanged } from '../../hooks/useDepsChanged'
 import { createPortal } from 'react-dom'
 import {
   Building2,
@@ -407,11 +408,15 @@ export function OwnerPickerModal({
   const [contact, setContact] = useState({ name: '', email: '', title: '', organization: '' })
   const assigned = useMemo(() => new Set(assignedOwnerIds), [assignedOwnerIds])
 
+  // Loading/error reset during render, on the deps and guard of the fetch below.
+  const directoryInputsChanged = useDepsChanged([isOpen, orgId, query, t])
+  if (directoryInputsChanged && isOpen && orgId) {
+    setLoading(true)
+    setError(null)
+  }
   useEffect(() => {
     if (!isOpen || !orgId) return
     let cancelled = false
-    setLoading(true)
-    setError(null)
     void Promise.all([
       getTeams(orgId, { limit: 100 }),
       getMembers(orgId, { q: query.trim() || undefined, limit: 100 }),

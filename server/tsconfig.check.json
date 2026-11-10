@@ -50,7 +50,7 @@
     "until this line existed. A mutation run proved it rather than assuming it:",
     "dropping 'Readonly' from the return type left the whole suite green."
   ],
-  "files": ["src/automergeRepoCompat.seam.test.ts", "src/syncCells/activityWitness.test.ts", "src/syncCells/placementHysteresis.test.ts", "src/syncCells/placementProposer.test.ts", "src/syncCells/placementProposer.integration.test.ts", "src/syncCells/placementProposerHealth.test.ts", "src/syncCells/placementProposerHealth.integration.test.ts"],
+  "files": ["src/automergeRepoCompat.seam.test.ts", "src/entityFamilyContract.test.ts", "src/syncCells/activityWitness.test.ts", "src/syncCells/placementHysteresis.test.ts", "src/syncCells/placementProposer.test.ts", "src/syncCells/placementProposer.integration.test.ts", "src/syncCells/placementProposerHealth.test.ts", "src/syncCells/placementProposerHealth.integration.test.ts"],
   "include": ["src/**/*", "scripts/**/*", "qa/**/*"],
   "exclude": [
     "src/**/*.test.ts",

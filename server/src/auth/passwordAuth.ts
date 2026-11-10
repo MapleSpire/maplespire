@@ -110,11 +110,16 @@ async function localUser(email: string): Promise<(UserRecord & { passwordHash: s
   } : null
 }
 
-async function sessionFor(user: UserRecord, inviteIntent: boolean, res: Response): Promise<{ orgId: string | null; isPlatformAdmin: boolean } | 'suspended'> {
+async function sessionFor(
+  user: UserRecord,
+  subject: string,
+  inviteIntent: boolean,
+  res: Response,
+): Promise<{ orgId: string | null; isPlatformAdmin: boolean } | 'suspended'> {
   const resolution = await resolveLoginOrg(pool, user, { inviteIntent })
   if (resolution.kind === 'suspended') return 'suspended'
   const orgId = resolution.kind === 'org' ? resolution.orgId : null
-  await bootstrapPlatformAdmin(pool, user.id, user.email)
+  await bootstrapPlatformAdmin(pool, { id: user.id, issuer: 'local', subject })
   const { rows: fresh } = await pool.query<{ is_platform_admin: boolean }>('SELECT is_platform_admin FROM users WHERE id = $1', [user.id])
   const isPlatformAdmin = fresh[0]?.is_platform_admin ?? user.isPlatformAdmin
   setSessionCookie(res, await signCurrentSession(pool, { userId: user.id, orgId, isPlatformAdmin }))
@@ -227,7 +232,9 @@ export function registerPasswordAuthRoutes(app: Express): void {
       }
       if (!user.verified) return void res.status(403).json({ error: 'Please confirm your email before signing in.', code: 'email_not_verified' })
       await recordLegalAcceptance(pool, user.id, req.body?.legalVersion)
-      const session = await sessionFor(user, req.body?.intent === 'invite', res)
+      // `localUser(email)` matched `subject = email`: the normalized address
+      // IS this `local` identity's subject.
+      const session = await sessionFor(user, email, req.body?.intent === 'invite', res)
       if (session === 'suspended') return void res.status(403).json({ error: 'org_suspended' })
       res.json({ user: { id: user.id, email: user.email, isPlatformAdmin: session.isPlatformAdmin }, orgId: session.orgId })
     } catch (err) {

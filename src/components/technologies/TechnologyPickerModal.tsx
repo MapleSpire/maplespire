@@ -13,6 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useDepsChanged } from '../../hooks/useDepsChanged'
 import { Shapes, SlidersHorizontal, Trash2, X } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { useAuthStore } from '../../stores/authStore'
@@ -169,9 +170,9 @@ export function TechnologyPickerModal({
   // that minted it — the server refuses a mismatch — and clearing it 200ms late
   // leaves a window where `loadMore` sends the previous query's cursor with the
   // new query text. Its `loading` guard is still false during that window.
-  useEffect(() => {
-    setNextCursor(null)
-  }, [query, category, recommendedShape, role])
+  // Done during render, which is earlier still than the effect it replaces.
+  const cursorScopeChanged = useDepsChanged([query, category, recommendedShape, role])
+  if (cursorScopeChanged) setNextCursor(null)
 
   useEffect(() => {
     if (!isOpen || !orgId) return

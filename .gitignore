@@ -189,3 +189,9 @@ crash.log
 infra/monitoring/metrics-token
 # Local observer addresses generated from the dedicated SNS configuration.
 infra/monitoring/deadman-observer.json
+
+# The N-1 client bundle built by scripts/build-n-minus-1.mjs for the
+# compatibility harness (e2e/compat-n-1.spec.ts), and its staging directory.
+/.n-minus-1/
+/.n-minus-1.staging/
+/.n-minus-1-*/

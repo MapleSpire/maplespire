@@ -14,7 +14,7 @@
 
 import { getHistory, getHeads, view } from '@automerge/automerge'
 import type { DocHandle } from '@automerge/automerge-repo'
-import { reconcile } from './reconcile'
+import { EXACT, reconcile } from './reconcile'
 import { changeWithDurabilityTracking } from './durableSync'
 import type { DiagramDoc, Checkpoint } from './types'
 
@@ -115,14 +115,18 @@ export function restoreTo(handle: DocHandle<DiagramDoc>, heads: string[]): Diagr
     // Restore every field to the past state, but KEEP the current checkpoint list
     // (restore points should not vanish when you roll back).
     const target: DiagramDoc = keepScopeMap(d, { ...past, checkpoints: d.checkpoints ?? [] })
-    reconcile(d, target)
+    // EXACT, not DIAGRAM_DOC_SCHEMA: the target is the MATERIALIZED past
+    // document, complete with any field this build does not know, so a key it
+    // lacks did not exist at those heads and restoring means removing it.
+    reconcile(d, target, EXACT)
   })
   return past
 }
 
 /**
  * A restore point older than a diagram's first scope override has no
- * `objectScopes`, and `reconcile` deletes a key its target lacks. Deleting the
+ * `objectScopes`, and `reconcile` (EXACT, as both restores use it) deletes a key
+ * its target lacks. Deleting the
  * map loses a peer's concurrent override and reopens the concurrent-creation
  * race (diagramViewWrite.ts), so a restore EMPTIES it instead — same result for
  * this client, nothing lost for the peer (re-review 2026-10-29, F1).
@@ -165,7 +169,8 @@ export function restoreDocToHeads<T extends object>(
     return false
   }
   changeWithDurabilityTracking(handle, (d: T) => {
-    reconcile(d as object, keepScopeMap(d as object, { ...past }))
+    // EXACT for the same reason as `restoreTo`: a materialized past state.
+    reconcile(d as object, keepScopeMap(d as object, { ...past }), EXACT)
   })
   return true
 }

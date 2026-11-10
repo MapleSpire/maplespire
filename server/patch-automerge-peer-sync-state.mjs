@@ -18,6 +18,7 @@ import { dirname, resolve } from 'node:path'
 import { patchDocumentObservedDiffSource, patchFanoutHeadsSource, patchRegistryChangeObserversSource } from './patch-automerge-change-observers.mjs'
 import { patchDocumentSaveBarrierSource, patchDocumentSaveBarrierTypesSource, patchStorageSourceCurrentDocumentSource } from './patch-automerge-document-saves.mjs'
 import { patchCooperativeEventsSource } from './patch-automerge-cooperative-events.mjs'
+import { patchStorageSubsystemCompactionLatchSource } from './patch-automerge-compaction-latch.mjs'
 import { patchInFlightFanoutSource, verifyInFlightSdkVersion } from './patch-automerge-inflight-fanout.mjs'
 import { prepareSyncStateLifetimePatch, applySyncStateLifetimePatch } from './patch-automerge-sync-state-lifetime.mjs'
 
@@ -37,7 +38,63 @@ function dependencyPaths(installRoot = scriptDirectory) {
     throttlePath: resolve(packageRoot, 'helpers/throttle.js'),
     documentPath: resolve(packageRoot, 'Document.js'),
     registryPath: resolve(packageRoot, 'subdoc-handles/handle-registry.js'),
+    urlPath: resolve(packageRoot, 'AutomergeUrl.js'),
   }
+}
+
+const encodeHeadsBefore = `export const encodeHeads = (heads) => heads.map(h => bs58check.encode(uint8ArrayFromHexString(h)));`
+
+const encodeHeadsSentinel = 'maplespire: memoized head encoding'
+
+const encodeHeadsAfter = `// ${encodeHeadsSentinel}.
+// encodeHeads is a pure function of each hex head: a double SHA-256 plus a
+// base58 conversion per head. Its call sites are DocHandle.heads/history/
+// changeAt, SyncStateTracker, SavedHeads and StorageSubsystem; the profiled
+// cost came from two of them, DocumentQuery#handleHasData via DocHandle.heads
+// and SyncStateTracker.handleSyncState on every sync send and receive.
+// Measured on the G4 fleet load, one Repo per Worker thread like one browser
+// tab: 21 % of the clients' inclusive CPU in the fan-out burst, -77 % hashing
+// and -15 % client CPU per cycle with this cache; 0.8 % of a sync cell's CPU
+// (docs/plan-cellulaire/mesures/G4-16b-encode-heads.json).
+// Bounded: the map is cleared when it is full, so a process holds at most
+// ENCODED_HEAD_CACHE_LIMIT entries. Only strings are cached; anything else
+// takes the original path, and a throwing head is never stored.
+const ENCODED_HEAD_CACHE_LIMIT = 4096;
+const encodedHeadCache = new Map();
+const encodeHead = (h) => {
+    if (typeof h !== "string")
+        return bs58check.encode(uint8ArrayFromHexString(h));
+    let encoded = encodedHeadCache.get(h);
+    if (encoded === undefined) {
+        encoded = bs58check.encode(uint8ArrayFromHexString(h));
+        if (encodedHeadCache.size >= ENCODED_HEAD_CACHE_LIMIT)
+            encodedHeadCache.clear();
+        encodedHeadCache.set(h, encoded);
+    }
+    return encoded;
+};
+export const encodeHeads = (heads) => heads.map(h => encodeHead(h));`
+
+export function patchAutomergeUrlEncodeHeadsSource(source) {
+  // "Already patched" means the exact current block, once, and no original
+  // line: a truncated write, a hand-edited body or an older revision of this
+  // patch that kept the marker must fail --check, not pass it.
+  if (source.includes(encodeHeadsSentinel)) {
+    if (source.includes(encodeHeadsBefore)) {
+      throw new Error('AutomergeUrl.js carries the encodeHeads memo marker AND the original encodeHeads; reinstall the dependency.')
+    }
+    if (source.split(encodeHeadsAfter).length !== 2) {
+      throw new Error('AutomergeUrl.js carries a stale, partial or duplicated memoized encodeHeads; reinstall the dependency (npm ci).')
+    }
+    return { source, changed: false }
+  }
+  if (source.split(encodeHeadsBefore).length !== 2) {
+    throw new Error(
+      'Unsupported @automerge/automerge-repo AutomergeUrl encodeHeads. ' +
+      'Review the memoized head-encoding patch before upgrading the dependency.',
+    )
+  }
+  return { source: source.replace(encodeHeadsBefore, encodeHeadsAfter), changed: true }
 }
 
 const asyncThrottleWaitBefore = `        const wait = lastCall + delay - Date.now(); //if negative, executes immediately`
@@ -2025,7 +2082,8 @@ export function patchStorageSubsystemSource(source) {
 function patchInstalledStorageSubsystemSource(source) {
   const existing = patchStorageSubsystemSource(source)
   const barrier = patchDocumentSaveBarrierSource(existing.source)
-  return { source: barrier.source, changed: existing.changed || barrier.changed }
+  const latch = patchStorageSubsystemCompactionLatchSource(barrier.source)
+  return { source: latch.source, changed: existing.changed || barrier.changed || latch.changed }
 }
 
 function patchInstalledStorageSource(source) {
@@ -2080,6 +2138,7 @@ export async function applyAutomergePeerSyncStatePatch(
   documentPath = dependencyPaths().documentPath,
   registryPath = dependencyPaths().registryPath,
   storageSubsystemTypesPath = dependencyPaths().storageSubsystemTypesPath,
+  urlPath = dependencyPaths().urlPath,
 ) {
   verifyInFlightSdkVersion(JSON.parse(await readFile(resolve(dirname(docPath), '../../../automerge/package.json'), 'utf8')))
   const docPatched = patchDocSynchronizerSource(await readFile(docPath, 'utf8'))
@@ -2099,6 +2158,7 @@ export async function applyAutomergePeerSyncStatePatch(
   const documentPatched = patchDocumentObservedDiffSource(await readFile(documentPath, 'utf8'))
   const registryPatched = patchRegistryChangeObserversSource(await readFile(registryPath, 'utf8'))
   const storageTypesPatched = patchDocumentSaveBarrierTypesSource(await readFile(storageSubsystemTypesPath, 'utf8'))
+  const urlPatched = patchAutomergeUrlEncodeHeadsSource(await readFile(urlPath, 'utf8'))
   if (docPatched.changed) await writeFile(docPath, docPatched.source, 'utf8')
   if (collectionPatched.changed) await writeFile(collectionPath, collectionPatched.source, 'utf8')
   if (repoPatched.changed) await writeFile(repoPath, repoPatched.source, 'utf8')
@@ -2110,9 +2170,11 @@ export async function applyAutomergePeerSyncStatePatch(
   if (documentPatched.changed) await writeFile(documentPath, documentPatched.source, 'utf8')
   if (registryPatched.changed) await writeFile(registryPath, registryPatched.source, 'utf8')
   if (storageTypesPatched.changed) await writeFile(storageSubsystemTypesPath, storageTypesPatched.source, 'utf8')
+  if (urlPatched.changed) await writeFile(urlPath, urlPatched.source, 'utf8')
   return docPatched.changed || collectionPatched.changed || repoPatched.changed
     || handlePatched.changed || storageSourcePatched.changed || syncStateTrackerPatched.changed
     || storageSubsystemPatched.changed || throttlePatched.changed || documentPatched.changed || registryPatched.changed || storageTypesPatched.changed
+    || urlPatched.changed
 }
 
 export async function applyAutomergePatchesAtInstallRoot(installRoot = scriptDirectory) {
@@ -2130,6 +2192,7 @@ export async function applyAutomergePatchesAtInstallRoot(installRoot = scriptDir
     paths.documentPath,
     paths.registryPath,
     paths.storageSubsystemTypesPath,
+    paths.urlPath,
   )
   const sdkChanged = await applySyncStateLifetimePatch(sdkPlans)
   return repoChanged || sdkChanged
@@ -2151,6 +2214,7 @@ export async function verifyAutomergePatchesAtInstallRoot(installRoot = scriptDi
     ['Document.js', patchDocumentObservedDiffSource(await readFile(paths.documentPath, 'utf8'))],
     ['HandleRegistry.js', patchRegistryChangeObserversSource(await readFile(paths.registryPath, 'utf8'))],
     ['StorageSubsystem.d.ts', patchDocumentSaveBarrierTypesSource(await readFile(paths.storageSubsystemTypesPath, 'utf8'))],
+    ['AutomergeUrl.js', patchAutomergeUrlEncodeHeadsSource(await readFile(paths.urlPath, 'utf8'))],
   ]
   const stale = results.filter(([, result]) => result.changed).map(([name]) => name)
   stale.push(...sdkPlans.filter(plan => plan.changed).map(plan => plan.path))

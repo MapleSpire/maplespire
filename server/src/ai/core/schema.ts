@@ -62,6 +62,55 @@ export async function ensureAiSchema(pool: Pool): Promise<void> {
       )
     `)
     await client.query(`CREATE INDEX IF NOT EXISTS idx_ai_tokens_user ON ai_api_tokens(user_id, created_at DESC)`)
+    // Authorization epochs pinned at mint, exactly like a session's
+    // epoch/uepoch/gepoch claims (auth/sessionEpoch.ts): a token is refused
+    // once the org's / the user's-in-org / the user's global epoch no longer
+    // equals the pin.
+    //
+    // Rows that exist when the columns are first added are pinned to the
+    // CURRENT epochs, once: reading them as epoch 1 would silently revoke every
+    // legacy token whose user/org epoch had long since moved past 1. The repo
+    // does have a migration ledger (db/schemaMigrations.ts), but the AI tables
+    // are created here, at AI boot, outside it: a ledger entry could run before
+    // `ai_api_tokens` exists, or race this function's own ADD COLUMN. So the
+    // once-only guard is the column itself: the ADD and the
+    // backfill share one transaction, serialized by a transaction-level
+    // advisory lock, and the backfill runs only if `pin_global_epoch` is absent
+    // from information_schema. The column therefore exists only once it is
+    // backfilled (a crash rolls both back), and a later boot finds the column
+    // and skips the backfill, so a legacy token revoked by a bump in between is
+    // not resurrected. Org-less tokens keep NULL org/user pins (never checked).
+    try {
+      await client.query('BEGIN')
+      await client.query(`SELECT pg_advisory_xact_lock(hashtext('ai_api_tokens_epoch_pins'))`)
+      const { rows: have } = await client.query(
+        `SELECT 1 FROM information_schema.columns
+         WHERE table_schema = current_schema() AND table_name = 'ai_api_tokens' AND column_name = 'pin_global_epoch'`
+      )
+      if (have.length === 0) {
+        await client.query(
+          `ALTER TABLE ai_api_tokens
+             ADD COLUMN pin_org_epoch BIGINT, ADD COLUMN pin_user_epoch BIGINT, ADD COLUMN pin_global_epoch BIGINT`
+        )
+        // The epoch tables belong to auth/schema.ts. A fresh database may run
+        // this before it (config.integration.test.ts does), but then the table
+        // has no rows and there is nothing to pin, so the UPDATE is skipped; a
+        // non-empty table that predates the auth tables would fail loudly here.
+        const { rows: existing } = await client.query(`SELECT 1 FROM ai_api_tokens LIMIT 1`)
+        if (existing.length > 0) await client.query(
+          `UPDATE ai_api_tokens t SET
+             pin_global_epoch = COALESCE((SELECT g.epoch FROM auth_global_epochs g WHERE g.user_id = t.user_id), 1),
+             pin_org_epoch = CASE WHEN t.org_id IS NULL THEN NULL
+               ELSE COALESCE((SELECT e.epoch FROM auth_epochs e WHERE e.org_id = t.org_id), 1) END,
+             pin_user_epoch = CASE WHEN t.org_id IS NULL THEN NULL
+               ELSE COALESCE((SELECT ue.epoch FROM auth_user_epochs ue WHERE ue.org_id = t.org_id AND ue.user_id = t.user_id), 1) END`
+        )
+      }
+      await client.query('COMMIT')
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {})
+      throw err
+    }
 
     // Dynamically-registered OAuth clients (RFC 7591) for the remote MCP server.
     // `token_endpoint_auth_method='none'` (public client + PKCE) is the norm for

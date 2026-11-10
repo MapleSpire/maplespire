@@ -24,6 +24,7 @@ import { cachedHandles, findReadyDocument } from './automergeRepoCompat.js'
 import { isDocumentStorageKey } from './automergeStorage.js'
 import { envNumber } from './envNumber.js'
 import { enumerateMaintainableWorkspaces } from './maintenance/maintainableWorkspaces.js'
+import { foldedArrivalPendingSql } from './readModel/ordinaryFoldedArrivals.js'
 
 /**
  * Mark-and-sweep GC of ORPHANED Automerge documents.
@@ -66,6 +67,10 @@ export interface GcResult {
   skippedInMemory: number
   /** Unreachable documents still inside the creation/linking grace period. */
   deferredYoung: number
+  /** Folded ordinary heads past `retain_until`, kept only because storage
+   * holds a late write above their `arrival_watermark` that no poll has
+   * carried yet (G4-16c). Should fall back to 0 within a poll period or two. */
+  foldedKeptPending: number
   /** Old, unreachable documents that an apply run would delete. */
   proposedDeletions: number
   /** Stable fingerprint over sorted proposed document ids. */
@@ -140,6 +145,7 @@ export async function gcOrphanedDocs(repo: Repo, options: GcOptions = {}): Promi
     throw new Error('includeCandidateDocumentIds requires reportOnly')
   }
   let complete = true
+  let foldedKeptPending = 0
   const add = (url?: string) => {
     if (url && isValidAutomergeUrl(url)) reachable.add(docIdOf(url))
   }
@@ -345,6 +351,93 @@ export async function gcOrphanedDocs(repo: Repo, options: GcOptions = {}): Promi
     for (const row of retainedOverlays) add(`automerge:${row.document_id}`)
   }
 
+  // FOLDED ORDINARY HEADS, retained for offline clients (G4-16b phase 4).
+  //
+  // An ordinary chain fold (`readModel/ordinaryChainFoldWriter.ts`) removes
+  // its sources from ModelMeta, so the walk above no longer reaches them. A
+  // client that still holds one can sync a late write into it, which the
+  // projector carries to the current head (`readModel/ordinaryFoldedArrivals.ts`)
+  // — but only while the document and its claim exist. Sweeping it would
+  // delete both, the route gate would then deny the client
+  // (`unindexed-document`, cached per peer) and its edits would be lost
+  // silently. So a `folded` row protects its head until `retain_until`.
+  // A NULL `retain_until` cannot occur on a folded row (the schema's
+  // `folded_check`); the predicate does not rely on that and keeps it.
+  //
+  // AND PAST `retain_until`, while storage holds an arrival above the row's
+  // `arrival_watermark` (G4-16c): a write that landed shortly before the
+  // retention ended and that no poll has carried yet — its forward on its
+  // backoff (up to ten minutes), or no projector attached. Swept, it would go
+  // with its head and its claim, silently. In production the age grace
+  // narrows that window: the late write refreshes the head's MAX(updated_at),
+  // so with the default `GC_MINIMUM_AGE_MS` (24 h) the head is a candidate
+  // only once the write has stayed uncarried for a day — a poll disabled, a
+  // workspace no projector attaches, a forward degraded or backing off for
+  // that long. The grace is not a guarantee, so the root does not lean on it;
+  // `gc.ordinaryHeads.integration.test.ts` runs with `minimumAgeMs: 0` on
+  // purpose, so that only this clause can keep the head.
+  //
+  // The poll carries such a head past its retention too
+  // (`ordinaryFoldedArrivals.ts`), the watermark moves, and the next pass
+  // sweeps it. Every head kept ONLY by this clause is counted
+  // (`foldedKeptPending`, and one `gc.folded_heads_kept_pending` line): a
+  // count that does not fall back to 0 is a head no poll is carrying — the
+  // poll off, a degraded forward, a workspace no cell projects. A NULL watermark counts as pending, as the poll
+  // reads it: with the poll disabled (`AM_ORDINARY_FOLD_ARRIVAL_POLL_MS=0`)
+  // no watermark is ever set, so a folded head is then kept for good — the
+  // safe direction, and an unbounded one. Compaction refuses for the same
+  // reason (`lateWritesPending`), comparing heads; GC loads no folded
+  // document, so it asks storage, one indexed probe per expired row.
+  //
+  // Joined to `versions`, like the overlay root above, so a deleted version
+  // pins nothing.
+  const { rows: retirementsSchema } = await db.query<{ present: boolean }>(
+    `SELECT to_regclass(current_schema() || '.read_model_ordinary_head_retirements') IS NOT NULL AS present`,
+  )
+  if (retirementsSchema[0]?.present) {
+    const { rows: retainedFolded } = await db.query<{ document_id: string; expired: boolean }>(
+      `SELECT retirement.document_id,
+              (retirement.retain_until IS NOT NULL AND retirement.retain_until <= now()) AS expired
+         FROM read_model_ordinary_head_retirements retirement
+         JOIN versions version
+           ON version.landscape_id = retirement.landscape_id
+          AND version.id = retirement.version_id
+        WHERE retirement.status = 'folded'
+          AND (retirement.retain_until IS NULL OR retirement.retain_until > now()
+               OR ${foldedArrivalPendingSql('retirement')})`
+    )
+    // Zero rows is normal (no workspace folds): never `complete = false`.
+    for (const row of retainedFolded) add(`automerge:${row.document_id}`)
+    // Past its retention, a row is selected only by the pending clause.
+    foldedKeptPending = retainedFolded.filter((row) => row.expired).length
+    if (foldedKeptPending > 0) {
+      // A count, no workspace or document id: those are in the read model's
+      // own rows (`arrival_watermark` below the head's highest arrival).
+      console.warn(JSON.stringify({ event: 'gc.folded_heads_kept_pending', count: foldedKeptPending }))
+    }
+  }
+
+  // RECORDED FOLD PRODUCTS (phase 4 step 5). A product recorded but not
+  // listed here may still be listed by a client that received the splice
+  // before its owner flushed it; the writer keeps the record `retainMs`
+  // before abandoning it (`abandonOrdinaryChainFold`), and the product must
+  // exist for that listing to come back. A listed product is reached by the
+  // walk anyway, and a record goes with its fold's rows (the sweep, or the
+  // abandon), so this pins nothing for ever. Joined to `versions` likewise.
+  const { rows: foldsSchema } = await db.query<{ present: boolean }>(
+    `SELECT to_regclass(current_schema() || '.read_model_ordinary_chain_folds') IS NOT NULL AS present`,
+  )
+  if (foldsSchema[0]?.present) {
+    const { rows: recordedProducts } = await db.query<{ document_id: string }>(
+      `SELECT fold.product_document_id AS document_id
+         FROM read_model_ordinary_chain_folds fold
+         JOIN versions version
+           ON version.landscape_id = fold.landscape_id
+          AND version.id = fold.version_id`
+    )
+    for (const row of recordedProducts) add(`automerge:${row.document_id}`)
+  }
+
   // Inventory storage even on an incomplete mark. Operators need the real
   // cardinality to repair the graph, while candidates remain deliberately
   // empty until completeness is proven.
@@ -368,6 +461,7 @@ export async function gcOrphanedDocs(repo: Repo, options: GcOptions = {}): Promi
       deleted: 0,
       skippedInMemory: 0,
       deferredYoung: 0,
+      foldedKeptPending,
       proposedDeletions: 0,
       candidateDigest: null,
       incompleteReasons,
@@ -448,6 +542,7 @@ export async function gcOrphanedDocs(repo: Repo, options: GcOptions = {}): Promi
     deleted,
     skippedInMemory,
     deferredYoung,
+    foldedKeptPending,
     proposedDeletions: candidates.length,
     candidateDigest,
     ...(options.includeCandidateDocumentIds ? { candidateDocumentIds: candidates } : {}),

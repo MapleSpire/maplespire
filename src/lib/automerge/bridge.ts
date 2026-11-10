@@ -65,6 +65,24 @@ import {
   type WorkspaceBinding,
 } from './workspaceBinding'
 import { applyCollectionReconcile, planCollectionReconcile, reconcile, reconcileIsNoop } from './reconcile'
+import {
+  COLLECTION_SCHEMAS,
+  CONNECTION_SCHEMA,
+  C4_OBJECT_SCHEMA,
+  DECISION_RECORD_SCHEMA,
+  DIAGRAM_DOC_SCHEMA,
+  DIAGRAM_META_SCHEMA,
+  ENTITY_SCHEMAS,
+  ROOT_MODEL_SCHEMA,
+  type EntityCollection,
+} from './knownKeys'
+import {
+  ENTITY_FAMILIES,
+  ENTITY_FAMILY_BY_NAME,
+  MODEL_META_INLINE_COLLECTIONS,
+  MONOLITH_COLLECTIONS,
+  entityKeyOf,
+} from './entityFamilies'
 import { applyDiagramViewFields, classifyDiagramViewEdit, ScopeEditTracker, setObjectScopesForReconcile, withObjectScopesAtBirth } from './diagramViewWrite'
 import { syncModelIndex, resetModelIndexSync, applyOffWindowEditsToIndex, notifyServerInvalidation } from '../modelQuery/indexSync'
 import { isBootFromServerEnabled } from '../modelQuery/flag'
@@ -1491,15 +1509,17 @@ function byIdMap<T extends { id: string }>(items: readonly T[]): Record<string, 
  * a meta without `groups` left no group and no journal entry). An EMPTY target
  * creates nothing — two peers each creating the same key is an Automerge
  * conflict that hides the loser's puts — otherwise create, then reconcile the
- * RE-READ proxy (`local/no-detached-container-write`).
+ * RE-READ proxy (`local/no-detached-container-write`). The map's schema is the
+ * collection's (`COLLECTION_SCHEMAS[key]`): an absent id is deleted, an
+ * entity's unknown fields are kept (V0-08).
  */
-function reconcileMapField(doc: object, key: string, target: Record<string, unknown>): void {
+function reconcileMapField(doc: object, key: EntityCollection, target: Record<string, unknown>): void {
   const fields = doc as Record<string, unknown>
   if (fields[key] === undefined || fields[key] === null) {
     if (Object.keys(target).length === 0) return
     fields[key] = {}
   }
-  reconcile(fields[key], target)
+  reconcile(fields[key], target, COLLECTION_SCHEMAS[key])
 }
 
 /** Never copy a server-paged immutable ADR baseline into ModelMeta. */
@@ -1532,7 +1552,7 @@ function reconcileDecisionRecordCollection(meta: ModelMeta, records: readonly De
     const clean = stripUndefined(record)
     // Created only right before a write (`local/no-detached-container-write`).
     if (!meta.decisionRecords) meta.decisionRecords = {}
-    if (meta.decisionRecords[record.id]) reconcile(meta.decisionRecords[record.id], clean)
+    if (meta.decisionRecords[record.id]) reconcile(meta.decisionRecords[record.id], clean, DECISION_RECORD_SCHEMA)
     else meta.decisionRecords[record.id] = clean
   }
   if (lifted.size) {
@@ -1922,17 +1942,18 @@ function reconcileModelShardBucket(
   // foreign shard) keeps the bare reconcile, an absent map is created.
   if (!materialized || typeof materialized !== 'object' || Array.isArray(materialized)) {
     changeAndTrack(handle as unknown as DocHandle<Record<string, unknown>>, (s) => {
-      if (Array.isArray(s[key])) reconcile(s[key], target)
+      if (Array.isArray(s[key])) reconcile(s[key], target, COLLECTION_SCHEMAS[key])
       else reconcileMapField(s, key, target)
     })
     return
   }
-  const plan = planCollectionReconcile(materialized, target)
+  const schema = COLLECTION_SCHEMAS[key]
+  const plan = planCollectionReconcile(materialized, target, schema)
   if (!plan) return
   changeAndTrack(handle as unknown as DocHandle<Record<string, unknown>>, (s) => {
     const draft = s[key]
-    if (draft && typeof draft === 'object' && !Array.isArray(draft)) applyCollectionReconcile(draft as Record<string, unknown>, target, plan)
-    else reconcile(draft, target)
+    if (draft && typeof draft === 'object' && !Array.isArray(draft)) applyCollectionReconcile(draft as Record<string, unknown>, target, plan, schema)
+    else reconcile(draft, target, schema)
   })
 }
 
@@ -2480,10 +2501,9 @@ async function replaySmallCollectionIntents(): Promise<void> {
     })
     // Revision captured BEFORE the durable write — the standing ack contract.
     const revision = pendingEntityIntents.revisionNow
+    // The map key is the family's registered id field (`tagId` for tagSnapshot).
     const keyOfValue = (kind: SmallCollectionIntentKind, value: unknown): string =>
-      kind === 'tagSnapshot'
-        ? String((value as { tagId?: unknown }).tagId ?? '')
-        : String((value as { id?: unknown }).id ?? '')
+      entityKeyOf(ENTITY_FAMILY_BY_NAME[kind], value)
     const replayedByKind: Record<SmallCollectionIntentKind, string[]> = {
       group: [], domain: [], tagSnapshot: [], decisionRecord: [],
     }
@@ -2503,11 +2523,8 @@ async function replaySmallCollectionIntents(): Promise<void> {
       })
       changeAndTrack(metaHandle, (m) => {
         const fields = m as unknown as Record<string, Record<string, unknown> | undefined>
-        const fieldOf: Record<SmallCollectionIntentKind, string> = {
-          group: 'groups', domain: 'domains', tagSnapshot: 'tagSnapshots', decisionRecord: 'decisionRecords',
-        }
         for (const kind of SMALL_INTENT_KINDS) {
-          const field = fieldOf[kind]
+          const field: EntityCollection = ENTITY_FAMILY_BY_NAME[kind].collection
           // Created only for a kind with upserts, then RE-READ (`local/no-detached-container-write`).
           if (!fields[field] && plan.replayUpserts[kind].some((value) => keyOfValue(kind, value))) fields[field] = {}
           const target = fields[field]
@@ -2516,7 +2533,7 @@ async function replaySmallCollectionIntents(): Promise<void> {
             const id = keyOfValue(kind, value)
             if (!id) continue
             const clean = stripUndefined(value)
-            if (target[id]) reconcile(target[id] as Record<string, unknown>, clean)
+            if (target[id]) reconcile(target[id] as Record<string, unknown>, clean, ENTITY_SCHEMAS[field])
             else target[id] = clean
           }
           for (const id of plan.replayDeletes[kind]) delete target[id]
@@ -2716,10 +2733,9 @@ async function replayDiagramCollectionIntents(): Promise<void> {
       })
       changeAndTrack(handle, (d) => {
         const fields = d as unknown as Record<string, Record<string, unknown> | undefined>
-        const fieldOf: Record<DiagramCollectionIntentKind, string> = { comment: 'comments', flow: 'flows' }
         const idOf = (value: unknown) => String((value as { id?: unknown }).id ?? '')
         for (const kind of DIAGRAM_INTENT_KINDS) {
-          const field = fieldOf[kind]
+          const field: EntityCollection = ENTITY_FAMILY_BY_NAME[kind].collection
           // Created only for a kind with upserts, then RE-READ (`local/no-detached-container-write`).
           if (!fields[field] && plan.replayUpserts[kind].some((value) => idOf(value))) fields[field] = {}
           const target = fields[field]
@@ -2728,7 +2744,7 @@ async function replayDiagramCollectionIntents(): Promise<void> {
             const id = idOf(value)
             if (!id) continue
             const clean = stripUndefined(value)
-            if (target[id]) reconcile(target[id] as Record<string, unknown>, clean)
+            if (target[id]) reconcile(target[id] as Record<string, unknown>, clean, ENTITY_SCHEMAS[field])
             else target[id] = clean
           }
           for (const id of plan.replayDeletes[kind]) delete target[id]
@@ -3773,7 +3789,7 @@ function writeEditsShards(): void {
         const o = editsObjects.get(id)
         if (!o) continue
         const clean = stripUndefined(o)
-        if (s.objects[id]) reconcile(s.objects[id], clean)
+        if (s.objects[id]) reconcile(s.objects[id], clean, C4_OBJECT_SCHEMA)
         else s.objects[id] = clean
       }
     })
@@ -3819,7 +3835,7 @@ function writeEditsShards(): void {
         const c = editsConnections.get(id)
         if (!c) continue
         const clean = stripUndefined(c)
-        if (s.connections[id]) reconcile(s.connections[id], clean)
+        if (s.connections[id]) reconcile(s.connections[id], clean, CONNECTION_SCHEMA)
         else s.connections[id] = clean
       }
     })
@@ -4866,10 +4882,12 @@ async function projectActive(id: string | null): Promise<void> {
 // instead of rebuilding all nine arrays on every sync tick. Falls back to full
 // work if a ref always changes, so it never regresses.
 
-const MODEL_KEYS = ['objects', 'connections', 'groups', 'domains', 'tagSnapshots', 'decisionRecords'] as const
+/** The monolithic ModelDoc's collections — derived from the entity-family
+ * registry (`monolith: true`), same order as the literal it replaced. */
+const MODEL_KEYS = MONOLITH_COLLECTIONS
 /** The model collections that stay INLINE on the ModelMeta when sharded (objects +
- * connections move into shards). */
-const MODEL_SMALL_KEYS = ['groups', 'domains', 'tagSnapshots', 'decisionRecords'] as const
+ * connections move into shards) — registry `home: 'modelMeta'`. */
+const MODEL_SMALL_KEYS = MODEL_META_INLINE_COLLECTIONS
 const PROJ_UNSET = Symbol('unset')
 /** Last materialized model-collection refs we projected from. */
 const lastModelColl: Record<string, unknown> = {}
@@ -4988,7 +5006,7 @@ function projectAll(): void {
         const coll = meta[key]
         if (coll === undefined) continue
         if (coll !== lastModelColl[key]) {
-          patch[key === 'tagSnapshots' ? 'tags' : key] = Object.values(coll)
+          patch[ENTITY_FAMILIES[key].storeSlice] = Object.values(coll)
           lastModelColl[key] = coll
         }
       }
@@ -5000,7 +5018,7 @@ function projectAll(): void {
       const coll = collections[key]
       if (coll === undefined) continue
       if (coll !== lastModelColl[key]) {
-        patch[key === 'tagSnapshots' ? 'tags' : key] = Object.values(coll)
+        patch[ENTITY_FAMILIES[key].storeSlice] = Object.values(coll)
         lastModelColl[key] = coll
       }
     }
@@ -5594,7 +5612,7 @@ function writeSummaryLocalRegistry(
 
     if (existingHandle) {
       changeAndTrack(existingHandle, (shard) => {
-        if (shard.diagrams[id]) reconcile(shard.diagrams[id], meta)
+        if (shard.diagrams[id]) reconcile(shard.diagrams[id], meta, DIAGRAM_META_SCHEMA)
         else shard.diagrams[id] = meta
       })
       continue
@@ -5868,7 +5886,8 @@ function flushWrite(): void {
               domains: state.domains,
               tagSnapshots: state.tags,
               decisionRecords: state.decisionRecords,
-            })
+            }),
+            ROOT_MODEL_SCHEMA,
           )
         })
         lastModelSlices = {
@@ -6023,7 +6042,7 @@ function flushWrite(): void {
       const dg = storeDiagramById.get(id)
       if (!dg) return false
       const existing = shard.diagrams[id]
-      return !reconcileIsNoop(existing, registryMetaFor(dg, existing))
+      return !reconcileIsNoop(existing, registryMetaFor(dg, existing), DIAGRAM_META_SCHEMA)
     })
     if (toRemove.length === 0 && toUpdate.length === 0) continue
     changeAndTrack(handle, (s) => {
@@ -6038,7 +6057,7 @@ function flushWrite(): void {
         // Read the shard's CURRENT meta from inside the change callback (the live
         // doc), not a pre-built lookup that can miss — so non-active composition
         // is preserved reliably and never clobbered with empty arrays.
-        reconcile(s.diagrams[id], registryMetaFor(dg, s.diagrams[id]))
+        reconcile(s.diagrams[id], registryMetaFor(dg, s.diagrams[id]), DIAGRAM_META_SCHEMA)
       }
     })
     // Dependent intents die with the removed diagrams: their carrier's
@@ -6113,7 +6132,7 @@ function flushWrite(): void {
         // The scope map is never deleted and never created by an unrelated
         // write: see setObjectScopesForReconcile.
         setObjectScopesForReconcile(target, active.objectScopes, doc, scopeEdits.take(activeDiagramId!))
-        reconcile(doc, target)
+        reconcile(doc, target, DIAGRAM_DOC_SCHEMA)
       })
       if (placementSnapshot) {
         acknowledgePlacementSnapshot(

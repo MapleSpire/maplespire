@@ -17,6 +17,7 @@ import type { Repo } from '@automerge/automerge-repo'
 import type { Pool } from 'pg'
 import { pool } from '../db.js'
 import { appendAudit } from '../auth/audit.js'
+import { orgRoleIfAdmitted } from '../auth/tenantPolicy.js'
 import { seedOrgEnvironment, beginSeed, endSeed } from './seed.js'
 
 /**
@@ -34,11 +35,7 @@ import { seedOrgEnvironment, beginSeed, endSeed } from './seed.js'
 
 async function canManageOrg(db: Pool, orgId: string, auth: { userId: string; isPlatformAdmin: boolean }): Promise<boolean> {
   if (auth.isPlatformAdmin) return true
-  const { rows } = await db.query<{ role: string }>(
-    'SELECT role FROM org_members WHERE org_id = $1 AND user_id = $2',
-    [orgId, auth.userId]
-  )
-  return rows[0]?.role === 'admin'
+  return (await orgRoleIfAdmitted(db, orgId, auth.userId)) === 'admin'
 }
 
 export function registerOrgSeedRoutes(app: Express, repo: Repo): void {

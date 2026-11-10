@@ -13,6 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import { useEffect, useState } from 'react'
+import { useDepsChanged } from '../../hooks/useDepsChanged'
 import { useParams } from '@tanstack/react-router'
 import { Trans, useTranslation } from 'react-i18next'
 import * as api from '../../lib/orgAdmin/api'
@@ -31,8 +32,16 @@ export function AdminOverview() {
     { status: 'loading' } | { status: 'ok'; data: api.OrgOverview } | { status: 'error'; message: string }
   >({ status: 'loading' })
 
+  // An org change resets to loading during render; the effect only fetches.
+  const orgChanged = useDepsChanged([orgId])
+  if (orgChanged) setState({ status: 'loading' })
+
   const load = () => {
     setState({ status: 'loading' })
+    fetchOverview()
+  }
+
+  const fetchOverview = () => {
     api
       .getOverview(orgId)
       .then((data) => setState({ status: 'ok', data }))
@@ -43,7 +52,7 @@ export function AdminOverview() {
   // every language switch would be wasteful, and "Retry" already re-runs load() with the
   // current t.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  useEffect(load, [orgId])
+  useEffect(fetchOverview, [orgId])
 
   return (
     <div data-testid="admin-overview" className="mx-auto max-w-5xl px-8 py-8">

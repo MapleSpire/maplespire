@@ -13,7 +13,8 @@
 // GNU Affero General Public License for more details.
 
 import type { Repo, DocHandle, DocumentId } from '@automerge/automerge-repo'
-import { getHeads } from '@automerge/automerge'
+import { isValidAutomergeUrl, parseAutomergeUrl, stringifyAutomergeUrl, type AutomergeUrl } from '@automerge/automerge-repo'
+import { getHeads, init as initDoc, loadIncremental, merge as mergeDocs, type Doc } from '@automerge/automerge'
 import { randomUUID } from 'node:crypto'
 import {
   headsEqual as watermarkHeadsEqual,
@@ -35,8 +36,8 @@ function tryGetAutomergeHeads(doc: unknown): readonly string[] | null {
     return null
   }
 }
-import { syncedHandle } from '../automergeRepoCompat.js'
-import { pool } from '../db.js'
+import { cachedHandles, syncedHandle } from '../automergeRepoCompat.js'
+import { pool, storageWriteApplication } from '../db.js'
 import { isStaticReadModelWorkspace } from './staticWorkspace.js'
 import {
   assertReadModelWriteFence,
@@ -95,7 +96,50 @@ import { connectionMembershipCounts, servedConnectionRowsChangedBy } from './off
 import { diagramIdsReferencing, servedDiagramRowsChangedBy } from './diagramOffline.js'
 import { changedCacheRowIds, type ServedRowChanges } from './servedRowDigest.js'
 import { withReadModelProjectionTransaction } from './projectionTransaction.js'
-import { ReadModelPlaneError, isProjectionMutexTimeout, isReadModelAuthorityLoss } from './projectionAuthority.js'
+import {
+  ReadModelPlaneError,
+  assertReadModelPlane,
+  isProjectionMutexTimeout,
+  isReadModelAuthorityLoss,
+} from './projectionAuthority.js'
+import { isPool } from './queryableShape.js'
+import { rotateOrdinaryHead } from './ordinaryHeadRotator.js'
+import { ordinaryRotationTelemetry } from './ordinaryRotationTelemetry.js'
+import { foldOrdinaryChain, unrecordedFoldProductOf } from './ordinaryChainFoldWriter.js'
+import { countDocumentLoad, DOCUMENT_LOAD_LOG_MS, type DocumentLoadCaller } from './documentLoadTelemetry.js'
+import {
+  advanceFoldedArrivalWatermark,
+  arrivalAbove,
+  databaseNow,
+  documentContentArrivals,
+  documentContentChunks,
+  foldedHeadsWithArrivals,
+  HANDOVER_BARRIER_WARN_MS,
+  HANDOVER_RECHECK_MAX_ATTEMPTS,
+  HANDOVER_RECHECK_PER_POLL,
+  handoverBarrierBlockers,
+  handoverRecheckDelay,
+  laterArrival,
+  noteHandoverBarrierTimeout,
+  noteHandoverRecheckAbandoned,
+  ordinaryHandoverBarrierMaxWaitMs,
+  withHandoverRecheckPermit,
+  ordinaryFoldArrivalPollMs,
+  ordinaryHandoverRecheckMs,
+  ordinaryRetiredHeadParkMs,
+  parkedStampWait,
+} from './ordinaryFoldedArrivals.js'
+import {
+  foldSourcesToDetach,
+  hasOrdinaryFoldMarker,
+  ORDINARY_FOLD_PRODUCT_CHANGED,
+  ORDINARY_FOLD_SOURCES_NOT_SETTLED,
+  ORDINARY_FOLD_SOURCES_NOT_WATCHED,
+  ordinaryFoldRecordRefusal,
+  ordinaryFoldSourcesOf,
+  readOrdinaryChainFold,
+} from './ordinaryChainFold.js'
+import { createClaimedOverlaySegment, OverlaySegmentAbortedError, publishOverlaySegment, type OverlayMetaLike } from '../overlaySegments.js'
 import {
   ColdBuildAdmission,
   ColdBuildAdmissionStoppedError,
@@ -106,9 +150,26 @@ import { AutomergeResidencyLeases } from '../automergeResidency.js'
 import { collectAutomergeEntityConflicts } from './overlayHistoryProtocol.js'
 import { healWholeEntityConflicts } from './overlayConflictHealing.js'
 import {
+  DEFAULT_ORDINARY_HEAD_ROTATION_MAX_DEFER_MS,
+  DEFAULT_ORDINARY_HEAD_ROTATION_QUIET_MS,
+  ORDINARY_HEAD_ROTATION_OFF,
+  OrdinaryHeadRotationObserver,
+  ordinaryHeadRotationConfig,
+  type OrdinaryHeadKind,
+  type OrdinaryHeadRotationConfig,
+} from './ordinaryHeadRotation.js'
+import {
   acknowledgeOverlayBatches,
   captureOverlayEntityBases,
 } from './overlayHistoryStore.js'
+import {
+  forwardRetiredHead,
+  forwardsLateWrites,
+  loadOrdinaryHeadRetirements,
+  ordinaryHeadLateWritesPending,
+  retirementKey,
+  type OrdinaryHeadRetirement,
+} from './ordinaryHeadForwarding.js'
 
 /**
  * The live server-side projector, one per workspace.
@@ -154,8 +215,8 @@ interface ModelLike {
 /** `writeBatchIds` is the client's own list of the write batches it put into
  * this head (`bridge.ts` `writeEditsShards`, pushed in place), the ids it
  * later asks `/api/model/overlay-batches/status` about. */
-interface ObjShardLike { objects?: Record<string, ObjectInput>; writeBatchIds?: string[] }
-interface ConnShardLike { connections?: Record<string, ConnectionInput>; writeBatchIds?: string[] }
+interface ObjShardLike { objects?: Record<string, ObjectInput>; writeBatchIds?: string[]; forwardedBatchIds?: string[] }
+interface ConnShardLike { connections?: Record<string, ConnectionInput>; writeBatchIds?: string[]; forwardedBatchIds?: string[] }
 // Likewise no `DiagramDocLike`: diagram documents are read through
 // `readEntityMapOrDefect`, so a missing `flows` is reported, not ignored.
 
@@ -721,10 +782,16 @@ export async function startReadModelProjector(
    * production caller could only pass `null`. The fleet records it per entry
    * and exposes it via `residentProjectorInstanceId`. */
   onAttached?: (projectorInstanceId: string) => void,
+  /** `AM_ORDINARY_HEAD_ROTATION` as parsed at boot; OFF for direct callers.
+   * The projector reads the current write heads' `A.stats` (`shadow` logs a
+   * due head; `on` also rotates it, `ordinaryHeadRotator.ts`) — see
+   * `ordinaryHeadRotation.ts`. */
+  ordinaryHeadRotation: OrdinaryHeadRotationConfig = ORDINARY_HEAD_ROTATION_OFF,
 ): Promise<() => void> {
   const orgId = await resolveOrgId(db, key)
   const projectorInstanceId = randomUUID()
   onAttached?.(projectorInstanceId)
+  const headRotation = new OrdinaryHeadRotationObserver(ordinaryHeadRotation, key)
   // The fence value this build must find unchanged when it claims (a CAS, not
   // a blind overwrite): between this read and the claim, any
   // OTHER cold build that commits changes the fence and this build's claim
@@ -942,8 +1009,13 @@ export async function startReadModelProjector(
     let running = false
     let pending = false
     let disposed = false
-    const run = async () => {
+    /** The run in flight, so `idle()` can wait for it. */
+    let active: Promise<void> = Promise.resolve()
+    const kick = () => {
       if (running || disposed) { pending = !disposed; return }
+      active = run()
+    }
+    const run = async () => {
       running = true
       try {
         do {
@@ -954,18 +1026,63 @@ export async function startReadModelProjector(
         console.error(`[read-model] ${label} failed`, error)
       } finally {
         running = false
-        if (pending && !disposed) void run()
+        if (pending && !disposed) kick()
       }
     }
     return {
-      trigger: () => { if (!disposed) void run() },
+      trigger: () => { if (!disposed) kick() },
       dispose: () => { disposed = true; pending = false },
+      /** Resolves once no run is in flight. After `dispose()` nothing starts
+       * another, so dispose-then-idle is "this watcher has finished". */
+      idle: async () => {
+        let seen: Promise<void>
+        do { seen = active; await seen } while (seen !== active)
+      },
     }
   }
 
   const residencyOwner = `projector:${projectorInstanceId}`
   const leasedDocumentIds = new Set<string>()
-  const resolveHandle = async (url: string): Promise<DocHandle<unknown>> => {
+  /** False until the attach returns: the cold build's loads are its own
+   * work, counted under `phase: 'attach'` and summed in one line at its end. */
+  let attachDone = false
+  const attachLoads = { loads: 0, ms: 0 }
+  /**
+   * A NON-RESIDENT load (G4-16, M3, `documentLoadTelemetry.ts`): the document
+   * was not in the Repo's cache, so `repo.find` read every chunk from storage
+   * and `Automerge.load`ed it in ONE synchronous wasm call — 30–70 ms for a
+   * fleet-shaped retired head, on the owner cell's event loop. Counted by
+   * the path that asked; after the attach, one taking at least
+   * `DOCUMENT_LOAD_LOG_MS` is logged with its document, so a stall in the
+   * profile (whose stack ends at `StorageSubsystem.loadDoc`, the caller being
+   * behind an await) can be traced to it. `ms` is the wall time of the
+   * resolution (the storage read included), an upper bound on the
+   * synchronous load. Cheap: one map lookup per resolution.
+   */
+  const noteDocumentLoad = (caller: DocumentLoadCaller, documentId: string, startedAt: number): void => {
+    const ms = Math.round((performance.now() - startedAt) * 10) / 10
+    countDocumentLoad(attachDone ? 'steady' : 'attach', caller)
+    if (!attachDone) {
+      attachLoads.loads += 1
+      attachLoads.ms += ms
+      return
+    }
+    if (ms < DOCUMENT_LOAD_LOG_MS) return
+    console.warn(JSON.stringify({
+      event: 'read_model.document_loaded',
+      workspace: `${key.landscapeId}/${key.versionId}`,
+      caller,
+      documentId,
+      ms,
+    }))
+  }
+  const residentNow = (url: string): boolean => {
+    const documentId = isValidAutomergeUrl(url) ? parseAutomergeUrl(url).documentId : null
+    return !documentId || Boolean(syncedHandle(repo, documentId))
+  }
+  const resolveHandle = async (url: string, caller: DocumentLoadCaller = 'other'): Promise<DocHandle<unknown>> => {
+    const resident = residentNow(url)
+    const startedAt = performance.now()
     const handle = await resolveHandleWithRetry(repo, url, {
       deadlineMs: resolveDeadlineMs,
       // THREE, not the default twenty. The twenty was sized for attempts that
@@ -978,13 +1095,51 @@ export async function startReadModelProjector(
       // the original, an order of magnitude less starvation.
       tries: CONTROL_DOCUMENT_TRIES,
     })
+    if (!resident) noteDocumentLoad(caller, handle.documentId, startedAt)
     if (residency && !leasedDocumentIds.has(handle.documentId)) {
       leasedDocumentIds.add(handle.documentId)
       residency.acquire(handle, residencyOwner, `${key.landscapeId}/${key.versionId}`)
     }
     return handle
   }
-  const resolve: Resolve = async (url) => (await resolveHandle(url)).doc()
+  /** Retired heads this projector PARKED (fold off, see `parkRetiredHead`):
+   * listed, not watched, not leased. url -> what the arrival poll needs. */
+  const parkedRetiredHeads = new Map<string, {
+    kind: 'object' | 'connection'
+    documentId: string
+    /** Highest content arrival already covered, as text (a BIGINT), or null. */
+    watermark: string | null
+    /** What the head serves, as plain JS: its entity map only (`objects` or
+     * `connections`), copied from the live document at park time and again
+     * every time the poll loads it. `resolve` answers from this. JS heap, and
+     * NOT bounded: with the fold off, one per rotation for the projector's
+     * life (O(rotations)), as is the per-head lookup every arrival poll runs
+     * (`documentContentArrivals`). Only the fold, which unlists, bounds them. */
+    snapshot: Record<string, unknown>
+  }>()
+  /** The plain copy a parked head is read from. A document without the map
+   * gives `{}`, so a reader records the same defect the live one would. */
+  const parkedSnapshotOf = (kind: 'object' | 'connection', doc: unknown): Record<string, unknown> => {
+    const field = kind === 'object' ? 'objects' : 'connections'
+    const value = (doc as Record<string, unknown> | undefined)?.[field]
+    return value === undefined ? {} : { [field]: JSON.parse(JSON.stringify(value)) as unknown }
+  }
+  // A parked head is read (a full extraction on every registry edit,
+  // `servedOutsideCurrentHead` on every forward) from its plain snapshot, NOT
+  // from the document: loading it would bring every evicted parked head back
+  // into memory, one storage read each, on the owner cell's event loop, and
+  // keep it there until the idle sweep — the residency parking exists to
+  // give back. The snapshot lags the document only by a late write the poll
+  // has not loaded yet (one poll period). Its readers use the entity map
+  // alone: the extraction's per-shard heads are null for it, and the only
+  // extraction that runs once a head can be parked (`registryProjectLatest`)
+  // keeps the diagrams and the defects, not the heads. The cold build, which
+  // does use them, runs before anything is parked.
+  const resolve: Resolve = async (url) => {
+    const parked = parkedRetiredHeads.get(url)
+    if (parked) return parked.snapshot
+    return (await resolveHandle(url, 'extract')).doc()
+  }
   // Prepare the durable witness before taking projection locks. A drain can
   // wait for active saves; it must neither write an older snapshot nor retain
   // a projection transaction while waiting. Recheck runtime identity at stamp.
@@ -1009,11 +1164,14 @@ export async function startReadModelProjector(
   // only on the next meta or root change. A workspace that appends one shard and
   // then goes quiet would be left degraded with nothing scheduled. Waiting is the
   // whole point of this call, so it keeps a budget sized for waiting.
-  const resolveHandleRetry = async (url: string): Promise<DocHandle<unknown>> => {
+  const resolveHandleRetry = async (url: string, caller: DocumentLoadCaller = 'attach'): Promise<DocHandle<unknown>> => {
+    const resident = residentNow(url)
+    const startedAt = performance.now()
     const handle = await resolveHandleWithRetry(repo, url, {
       deadlineMs: resolveDeadlineMs,
       tries: SHARD_ARRIVAL_TRIES,
     })
+    if (!resident) noteDocumentLoad(caller, handle.documentId, startedAt)
     if (residency && !leasedDocumentIds.has(handle.documentId)) {
       leasedDocumentIds.add(handle.documentId)
       residency.acquire(handle, residencyOwner, `${key.landscapeId}/${key.versionId}`)
@@ -1040,6 +1198,19 @@ export async function startReadModelProjector(
   // new cold build: removing a duplicate URL does not remove phantom rows left
   // by its earlier fold, nor repair a watcher's last-occurrence snapshot.
   const ambiguousShardDocuments = new Set<string>()
+  /** Retired write heads whose late writes are FORWARDED into the current head
+   * rather than projected (`ordinaryHeadForwarding.ts`), by `retirementKey`.
+   * A routing hint only — the forwarder re-reads its row. Loaded at attach and
+   * again when a write-head pointer moves, never per change: the rotator must
+   * commit the `retired` row WITH H_r BEFORE it repoints ModelMeta (the
+   * contract in `ordinaryHeadForwarding.ts`), so reading the pointer first and
+   * the rows second cannot miss the row for that pointer. A row changed
+   * WITHOUT a pointer move (`admitted` promoted later) is not seen until the
+   * next move or re-attach. */
+  let retirements = new Map<string, OrdinaryHeadRetirement>()
+  let retirementsPointer: string | null = null
+  const writeHeadPointer = (meta: MetaLike | undefined): string =>
+    `${meta?.editsObjectShardUrl ?? ''}|${meta?.editsConnectionShardUrl ?? ''}`
   const rememberShardReferences = (objectUrls: readonly string[], connectionUrls: readonly string[]) => {
     const counts = new Map<string, number>()
     for (const url of [...objectUrls, ...connectionUrls]) {
@@ -1130,6 +1301,12 @@ export async function startReadModelProjector(
         await claimReadModelWriteFence(tx, key, orgId, projectorInstanceId, fenceObservedAtStart)
       }
     }, { kind: 'reset', scope: 'all' }, fullExtractionIntegrity(model))
+    // Inside the try, so a failed read releases the leases like every other
+    // boot failure. A failure is NOT read as "no retirements": that would
+    // project a retired head directly and hide its forwarded edits.
+    const pointer = writeHeadPointer(metaHandle?.doc() as MetaLike | undefined)
+    retirements = await loadOrdinaryHeadRetirements(db, key)
+    retirementsPointer = pointer
   } catch (error) {
     if (residency) residency.releaseOwner(residencyOwner)
     throw error
@@ -1957,6 +2134,1792 @@ export async function startReadModelProjector(
     projectionTail = task.then(() => undefined, () => undefined)
     return task
   }
+  /** Re-read the retirement rows when a write-head pointer has moved since the
+   * last read. Pointer first, rows second — see `retirements`. Single-flight,
+   * and re-checked after waiting on someone else's load: that load may have
+   * read its pointer, and its rows, before the move this caller saw. */
+  let retirementsLoad: Promise<void> | null = null
+  const freshRetirements = async (): Promise<void> => {
+    for (;;) {
+      const pointer = writeHeadPointer(metaHandle?.doc() as MetaLike | undefined)
+      if (pointer === retirementsPointer) return
+      if (!retirementsLoad) {
+        retirementsLoad = (async () => {
+          try {
+            retirements = await loadOrdinaryHeadRetirements(db, key)
+            retirementsPointer = pointer
+          } finally {
+            retirementsLoad = null
+          }
+        })()
+      }
+      await retirementsLoad
+    }
+  }
+  /** Is `url` a retired head whose late writes this projector FORWARDS? Yes
+   * only with a `retired` row carrying H_r and a current head that is another
+   * document. No row — a head retired by compaction — or a row without H_r:
+   * no, and the head is projected directly, exactly as before phase 2. */
+  const isForwardedHead = (collection: 'object' | 'connection', documentId: string, url: string): boolean => {
+    if (!forwardsLateWrites(retirements.get(retirementKey(collection, documentId)))) return false
+    const meta = metaHandle?.doc() as MetaLike | undefined
+    const current = collection === 'object' ? meta?.editsObjectShardUrl : meta?.editsConnectionShardUrl
+    return Boolean(current) && current !== url
+  }
+  /** `forwardedBatchIds` exist in an ordinary head only once this projector's
+   * forwarder wrote them, i.e. only when the workspace has a retirement row.
+   * Reading them only then keeps a workspace without rows — every workspace
+   * that has never been rotated — byte-identical to before. */
+  const forwardedBatchIdsOf = (doc: ObjShardLike | ConnShardLike | undefined): string[] =>
+    retirements.size ? doc?.forwardedBatchIds ?? [] : []
+  /** What the segments OTHER than the current head serve for `ids`, ModelMeta
+   * order, later wins — the cold build's `Object.assign` minus its last term. */
+  const servedOutsideCurrentHead = async (
+    collection: 'object' | 'connection',
+    currentUrl: string,
+    ids: readonly string[],
+  ): Promise<Map<string, Record<string, unknown>>> => {
+    const meta = metaHandle?.doc() as MetaLike | undefined
+    const urls = (collection === 'object' ? meta?.objectShardUrls : meta?.connectionShardUrls) ?? []
+    const field = collection === 'object' ? 'objects' : 'connections'
+    const served = new Map<string, Record<string, unknown>>()
+    for (const url of urls) {
+      if (url === currentUrl) continue
+      const entities = ((await resolve(url)) as Record<string, Record<string, unknown> | undefined> | undefined)?.[field]
+      for (const id of ids) {
+        const value = entities?.[id]
+        if (value && typeof value === 'object') served.set(id, JSON.parse(JSON.stringify(value)))
+      }
+    }
+    return served
+  }
+  /** documentId -> the projection trigger of its shard watcher, so one head's
+   * work can ask another head's projection to run: a rotation asks the
+   * retired head to forward what arrived after H_r, a forward asks its target
+   * to publish (see `retiredHeadStamps`). */
+  const shardTriggers = new Map<string, () => void>()
+  /** url -> the teardown of its object/connection shard watcher, so ONE shard
+   * can stop being watched while the projector runs (a folded source,
+   * `ordinaryChainFold.ts`). Every entry still runs at `stop()`; a stop that
+   * ran early is not run twice. */
+  const shardStops = new Map<string, { documentId: DocumentId; stop: () => void; idle: () => Promise<void> }>()
+  /** Fold sources whose detach has begun and not finished: neither watched
+   * nor released yet, so the folded-head poll leaves them alone. */
+  const foldSourcesDetaching = new Set<string>()
+  /** Sources this projector detached. Never attached again: an attach pass
+   * that started on an older ModelMeta (the retry runs beside the meta
+   * pass) would otherwise re-apply one whole, older values over newer rows.
+   * Never projected or forwarded by their old watcher again either: a pass
+   * that starts after the detach took the source returns at once. */
+  const detachedFoldSources = new Set<string>()
+  const watchShardStop = (
+    url: string,
+    documentId: DocumentId,
+    stop: () => void,
+    idle: () => Promise<void>,
+  ): void => {
+    // The reference is dropped once run, so a watcher stopped early is not
+    // kept alive (its snapshot, its handle) by `cleanups` until `stop()`.
+    let pendingStop: (() => void) | null = stop
+    const once = () => { const run = pendingStop; pendingStop = null; run?.() }
+    shardStops.set(url, { documentId, stop: once, idle })
+    cleanups.push(once)
+  }
+  /** The watcher body of a fold product: a change after its seed is never
+   * projected (`ordinaryChainFold.ts`); it degrades the shard, and only a cold
+   * build lifts that. */
+  const refuseFoldProductChange = (url: string, kind: 'object_shard' | 'connection_shard') => async (): Promise<void> => {
+    recordRefusedProjection()
+    const error = new Error(
+      `${ORDINARY_FOLD_PRODUCT_CHANGED}: fold product ${url} changed after it was attached; not projected`)
+    console.error(JSON.stringify({
+      event: 'read_model.ordinary_fold_product_changed',
+      workspace: `${key.landscapeId}/${key.versionId}`,
+      kind,
+      url,
+      error: error.message,
+    }))
+    degradeShard(url, kind, error)
+  }
+  /** documentId -> the heads of the last sample of that shard whose rows
+   * COMMITTED (the cold build's extraction, an initial apply, a delta). The
+   * rotator's H_r comes from here and from nowhere else: the live document,
+   * and `A.stats`, can be ahead of what is published (phase-1 review). */
+  const publishedHeadsByDocument = new Map<string, readonly string[]>()
+  const notePublished = (documentId: string, heads: readonly string[] | null | undefined): void => {
+    if (heads?.length) publishedHeadsByDocument.set(documentId, [...heads])
+  }
+
+  /**
+   * ARRIVAL WATERMARKS OF FORWARDED HEADS. A retired head with a row is never
+   * projected, so nothing re-stamps its `read_model_document_watermarks` row,
+   * and one late write leaves `absenceProvable` refused until a cold build
+   * (the phase-2 review's finding). Stamping it when the forward COMMITS would
+   * be early: the forwarded values are then in the current head's document,
+   * not yet in `ro_*`. So a forward leaves a STAMP here, keyed by the retired
+   * head, naming the heads it forwarded up to and the head it wrote into; the
+   * TARGET's next projection takes it AT SAMPLING (so the sample holds the
+   * forwarded write, which was made synchronously before the stamp existed)
+   * and records it in the SAME transaction as the rows that carry the values,
+   * through the same certificate rule as every shard: durable, sampled and
+   * live heads of the retired head must agree, or the certificate is 0.
+   *
+   * A stamp whose target is itself forwarded before it projects — rotated
+   * again in between — follows the forward: when the target's own forward
+   * commits, stamps registered before that forward began are re-keyed to ITS
+   * target, whose projection then publishes both. A stamp that is never
+   * consumed (a projector stopped first) leaves the proof refused — the safe
+   * direction — until the next cold build stamps every shard.
+   */
+  const retiredHeadStamps = new Map<string, {
+    handle: DocHandle<unknown>
+    heads: string[]
+    target: string
+    seq: number
+  }>()
+  let retiredHeadStampSeq = 0
+  /** Retired heads whose stamp a target's pass has TAKEN and not yet settled
+   * (published, or put back): out of `retiredHeadStamps`, still owed. The
+   * pass re-reads the retired handle when it commits (`liveHeadsForStamp`),
+   * so a park must not evict it meanwhile. retired id -> passes holding one. */
+  const stampsInFlight = new Map<string, number>()
+  const takeRetiredHeadStamps = (targetDocumentId: string) => {
+    const taken = [...retiredHeadStamps.entries()].filter(([, stamp]) => stamp.target === targetDocumentId)
+    for (const [retiredId] of taken) {
+      retiredHeadStamps.delete(retiredId)
+      stampsInFlight.set(retiredId, (stampsInFlight.get(retiredId) ?? 0) + 1)
+    }
+    return taken.map(([, stamp]) => stamp)
+  }
+  /** The pass that took `stamps` is done with them (its `finally`). */
+  const settleTakenStamps = (stamps: ReadonlyArray<{ handle: DocHandle<unknown> }>) => {
+    for (const stamp of stamps) {
+      const id = stamp.handle.documentId
+      const held = (stampsInFlight.get(id) ?? 1) - 1
+      if (held > 0) stampsInFlight.set(id, held)
+      else stampsInFlight.delete(id)
+    }
+  }
+  /** Put back stamps a pass took and did not publish — unless a newer stamp
+   * for the same retired head arrived meanwhile. */
+  const restoreRetiredHeadStamps = (stamps: ReadonlyArray<{ handle: DocHandle<unknown>; heads: string[]; target: string; seq: number }>) => {
+    for (const stamp of stamps) {
+      if (!retiredHeadStamps.has(stamp.handle.documentId)) retiredHeadStamps.set(stamp.handle.documentId, stamp)
+    }
+  }
+  /** The live heads of a retired head for its certificate, under the same
+   * refusals as `recordShardWatermark`: referenced once, not ambiguous, and
+   * still the repo's ready handle. */
+  const liveHeadsForStamp = (handle: DocHandle<unknown>): readonly string[] | null => {
+    const meta = metaHandle?.doc() as MetaLike | undefined
+    const references = rememberShardReferences(meta?.objectShardUrls ?? [], meta?.connectionShardUrls ?? [])
+    if (ambiguousShardDocuments.has(handle.documentId) || references.get(handle.documentId) !== 1) return null
+    const state = repo.synchronizer.docSynchronizers[handle.documentId]?.query.peek()
+    return state?.state === 'ready' && state.handle === handle ? tryGetHeads(handle.doc()) : null
+  }
+  const recordRetiredHeadStamps = async (
+    tx: Queryable,
+    stamps: ReadonlyArray<{ handle: DocHandle<unknown>; heads: string[] }>,
+    preparedWatermarks: PreparedDocumentWatermarks,
+  ): Promise<void> => {
+    for (const stamp of stamps) {
+      await recordSampledDocumentWatermark(
+        tx, key, stamp.handle.documentId, stamp.heads, () => liveHeadsForStamp(stamp.handle), preparedWatermarks,
+      )
+    }
+  }
+
+  /**
+   * A FAILED FORWARD IS RETRIED, AND IT IS VISIBLE. Before this, a forward that
+   * threw (the current head unresolvable, a SQL blip) was logged and then
+   * waited for the retired head's NEXT change — on a head only offline
+   * stragglers write, possibly never — with the late edit invisible in the
+   * product the whole time. Now the retired head is marked in `degradedShards`
+   * (the same signal a shard that failed to attach raises, published as the
+   * workspace's degradation and lifted when it clears), and its projection is
+   * re-triggered on a capped backoff until a forward commits.
+   *
+   * An `unknown-heads` refusal degrades too, and is NOT retried: the row names
+   * heads the document does not hold, which no retry changes; it needs a
+   * person (the refusal's own log line names the heads).
+   *
+   * Two failures are retried WITHOUT degrading (phase-3 review): a failed
+   * read of the routing rows (`freshRetirements`), which is not a forward and
+   * runs for heads that are not forwarded at all; and a projection-mutex
+   * timeout, which clears when the other writer commits. And only a forward
+   * that actually ran (`forwarded`, `superseded`, `nothing`) — or a head no
+   * longer forwarded — lifts what this path raised; `not-owner` and
+   * `not-retired` lift nothing.
+   */
+  const FORWARD_RETRY_DELAYS_MS = [1_000, 5_000, 30_000, 60_000]
+  const forwardRetries = new Map<string, { timer: ReturnType<typeof setTimeout>; attempt: number }>()
+  const scheduleForwardRetry = (documentId: string): void => {
+    if (stopped) return
+    const previous = forwardRetries.get(documentId)
+    if (previous) clearTimeout(previous.timer)
+    const attempt = (previous?.attempt ?? 0) + 1
+    const delay = FORWARD_RETRY_DELAYS_MS[Math.min(attempt, FORWARD_RETRY_DELAYS_MS.length) - 1]
+    const timer = setTimeout(() => {
+      if (!stopped) shardTriggers.get(documentId)?.()
+    }, delay)
+    timer.unref?.()
+    forwardRetries.set(documentId, { timer, attempt })
+  }
+  /** The shard urls THIS path degraded, so that clearing one never lifts a
+   * degradation another path raised for the same url. */
+  const forwardDegradedUrls = new Set<string>()
+  const forwardDegrade = (url: string, kind: DegradationKind, error: unknown): void => {
+    forwardDegradedUrls.add(url)
+    degradeShard(url, kind, error)
+  }
+  /** Nothing is owed for this head any more: a forward committed (or found
+   * nothing to carry), or the head is no longer forwarded at all. */
+  const forwardRecovered = (documentId: string, url: string): void => {
+    const entry = forwardRetries.get(documentId)
+    if (entry) {
+      clearTimeout(entry.timer)
+      forwardRetries.delete(documentId)
+    }
+    if (forwardDegradedUrls.delete(url) && degradedShards.delete(url)) clearDegradationIfRecovered()
+  }
+  cleanups.push(() => {
+    for (const entry of forwardRetries.values()) clearTimeout(entry.timer)
+    forwardRetries.clear()
+    forwardDegradedUrls.clear()
+  })
+
+  /** Forward the late writes of a retired head (see `ordinaryHeadForwarding.ts`)
+   * instead of projecting it. Same authority as every write of this closure:
+   * `stillOwned` before the first byte and again synchronously before the
+   * current head's change, the write fence and plane before the CRDT write,
+   * and the `forwarded_heads` commit fenced and on `projectionTail`. */
+  const forwardInsteadOfProjecting = async (
+    collection: 'object' | 'connection',
+    retired: DocHandle<unknown>,
+    url: string,
+    /** Told what `forwardRetiredHead` answered, when it ran: the folded-head
+     * poll advances its watermark only on a forward that HAPPENED. */
+    onOutcome?: (outcome: Awaited<ReturnType<typeof forwardRetiredHead>>) => void,
+  ): Promise<boolean> => {
+    const meta = metaHandle?.doc() as MetaLike | undefined
+    const currentUrl = collection === 'object' ? meta?.editsObjectShardUrl : meta?.editsConnectionShardUrl
+    // The current head, or no head at all: today's path, and no SQL.
+    if (!currentUrl || currentUrl === url) return false
+    const kind: ProjectionKind = collection === 'object' ? 'object_shard' : 'connection_shard'
+    // Stamps registered before this forward begins were written INTO this
+    // head before it reads itself; if it forwards, they follow it.
+    const stampSeqAtEntry = retiredHeadStampSeq
+    let settledTarget: string | null = null
+    let outcome: Awaited<ReturnType<typeof forwardRetiredHead>>
+    // The ROUTING read, outside the forward's try: a failure here is not a
+    // failed forward, and on a head that turns out not to be forwarded (every
+    // base shard, once any pointer moved — compaction's included, flag off)
+    // nothing would ever clear a degradation raised for it: its retry returns
+    // at `!isForwardedHead` below, before `forwardRecovered` (phase-3 review,
+    // measured). Retried, so the edit this pass was carrying still lands;
+    // not degraded.
+    try {
+      await freshRetirements()
+    } catch (error) {
+      if (isReadModelAuthorityLoss(error)) {
+        reportFenceLost(kind, error)
+        throw error
+      }
+      scheduleForwardRetry(retired.documentId)
+      throw error
+    }
+    if (!isForwardedHead(collection, retired.documentId, url)) {
+      // Projected directly from here on: a retry still pending for it is
+      // spent, and a degradation THIS path raised for it (a forward that failed
+      // before the head stopped being forwarded) is no longer owed.
+      forwardRecovered(retired.documentId, url)
+      return false
+    }
+    try {
+      outcome = await forwardRetiredHead({
+        db, key, collection, retired,
+        current: () => resolveHandle(currentUrl, 'rotation-current'),
+        servedElsewhere: (ids) => servedOutsideCurrentHead(collection, currentUrl, ids),
+        tombstones: () => {
+          const latest = metaHandle?.doc() as MetaLike | undefined
+          return new Set(collection === 'object' ? latest?.deletedObjectIds ?? [] : latest?.deletedConnectionIds ?? [])
+        },
+        mayWrite: () => !stopped && stillOwned(),
+        assertAuthority: async () => {
+          const held = await readWriteFence(db, key)
+          if (held !== projectorInstanceId) throw new ReadModelWriteFenceError(key, projectorInstanceId, held)
+          if (await isStaticReadModelWorkspace(db, key)) throw new ReadModelPlaneError(key, 'ordinary')
+        },
+        flush: (documentIds) => repo.flush(documentIds),
+        commit: (write) => {
+          const task = projectionTail.then(() => withReadModelProjectionTransaction(db, key, 'ordinary', async (tx) => {
+            await write(tx)
+            await assertReadModelWriteFence(tx, key, projectorInstanceId)
+          }))
+          projectionTail = task.then(() => undefined, () => undefined)
+          return task
+        },
+        settled: ({ retiredHeads, targetDocumentId }) => {
+          settledTarget = targetDocumentId
+          for (const stamp of retiredHeadStamps.values()) {
+            if (stamp.target === retired.documentId && stamp.seq <= stampSeqAtEntry) stamp.target = targetDocumentId
+          }
+          retiredHeadStamps.set(retired.documentId, {
+            handle: retired, heads: retiredHeads, target: targetDocumentId, seq: ++retiredHeadStampSeq,
+          })
+        },
+      })
+    } catch (error) {
+      if (isReadModelAuthorityLoss(error)) {
+        reportFenceLost(kind, error)
+        throw error
+      }
+      // Not lost authority: something this projector can try again.
+      scheduleForwardRetry(retired.documentId)
+      // A projection-mutex timeout is RETRIED but not degraded: another writer
+      // holds the mutex and it clears when they commit — a cold build holds it
+      // ~7-9 s against the 5 s ceiling. `runTracked` and the document paths
+      // persist nothing on it either, for the same reason.
+      if (!isProjectionMutexTimeout(error)) forwardDegrade(url, kind, error)
+      throw error
+    }
+    onOutcome?.(outcome)
+    if (outcome === 'unknown-heads') {
+      forwardDegrade(url, kind, new Error(`retired head ${retired.documentId} cannot be forwarded: its row names heads the document does not hold`))
+      return true
+    }
+    // A forward that did not HAPPEN — this projector no longer owns the
+    // workspace, or the fresh row no longer asks for forwarding — proves
+    // nothing about the one that failed: its degradation stays (pinned by
+    // "a forward refused as NOT-RETIRED on its retry does not lift the
+    // degradation…", `ordinaryHeadRotator.integration.test.ts`).
+    if (outcome === 'not-owner' || outcome === 'not-retired') return true
+    forwardRecovered(retired.documentId, url)
+    // Even when the forward wrote nothing into the target (a removed key, a
+    // same-field conflict the current head won): the stamp is consumed by the
+    // target's next PROJECTION, and nothing else would run one.
+    if (settledTarget) shardTriggers.get(settledTarget)?.()
+    return true
+  }
+
+  /**
+   * ROTATION (phase 3, `ordinaryHeadRotator.ts`), requested by a CURRENT head's
+   * projection once that head is due and its sample has published, then
+   * deferred to a quiet moment (`requestRotation` below). One per kind at a
+   * time. A rotation that could not run — the lock held by another writer, a
+   * transient error — is asked for again by the next pass of that head (the
+   * observer keeps answering due, and the pass re-arms the deferral) and, for
+   * a head nobody writes any more, by a capped backoff, which goes straight
+   * to the rotator. A rotation that found the head no longer
+   * current, or no longer this cell's, stops: there is nothing left to retry.
+   */
+  const ROTATION_RETRY_DELAYS_MS = [1_000, 5_000, 30_000, 60_000]
+  /** ModelMeta's two lists for a kind, from the resident handle (G4-16e):
+   * the read order and the overlay list, as the fold's pass line names them. */
+  const listedChain = (kind: OrdinaryHeadKind): { shards: number | null; overlay: number | null } => {
+    const doc = metaHandle?.doc() as Record<string, unknown> | undefined
+    const length = (field: string) => (Array.isArray(doc?.[field]) ? (doc[field] as unknown[]).length : null)
+    return kind === 'object'
+      ? { shards: length('objectShardUrls'), overlay: length('editsObjectShardUrls') }
+      : { shards: length('connectionShardUrls'), overlay: length('editsConnectionShardUrls') }
+  }
+  /** The fold-off chain alert (G4-16e step 3): logs once on the crossing.
+   * Never throws: it runs on the rotation's success path. */
+  const observeChainLength = (kind: OrdinaryHeadKind): void => {
+    try {
+      const listed = listedChain(kind)
+      ordinaryRotationTelemetry.observeChain(key, kind, listed.overlay, ordinaryHeadRotation, listed.shards)
+    } catch { /* telemetry only */ }
+  }
+  const rotationsInFlight = new Set<OrdinaryHeadKind>()
+  const rotationRetries = new Map<OrdinaryHeadKind, {
+    timer: ReturnType<typeof setTimeout> | null
+    attempt: number
+    /** The retry itself, so a fold that held the shared key can run it now. */
+    fire?: () => void
+  }>()
+  /** A rotation waiting on its backoff runs NOW: called when a fold of the
+   * kind lets go of the `overlay-rotation:` key it may have been refused on. */
+  const kickRotationRetry = (kind: OrdinaryHeadKind): void => {
+    const entry = rotationRetries.get(kind)
+    if (!entry?.timer || !entry.fire) return
+    clearTimeout(entry.timer)
+    entry.fire()
+  }
+  cleanups.push(() => {
+    for (const entry of rotationRetries.values()) if (entry.timer) clearTimeout(entry.timer)
+    rotationRetries.clear()
+  })
+  const touchRotatedChild = (handle: DocHandle<unknown>): void => {
+    if (residency && !leasedDocumentIds.has(handle.documentId)) {
+      leasedDocumentIds.add(handle.documentId)
+      residency.acquire(handle, residencyOwner, `${key.landscapeId}/${key.versionId}`)
+    }
+  }
+  /**
+   * A due head is not rotated mid-burst (`DEFAULT_ORDINARY_HEAD_ROTATION_QUIET_MS`,
+   * `ordinaryHeadRotation.ts`, for the measurement): each pass of it while due
+   * re-arms one timer per kind, which fires once its writes have been quiet
+   * for `quietMs`, or `maxMs` after the head was first found due, so a head
+   * written without pause is still rotated. On firing the head must still be
+   * current and due, as for a retry. A rotation in flight or waiting on its
+   * backoff is not deferred: it is already asked for.
+   */
+  const rotationDeferrals = new Map<OrdinaryHeadKind, {
+    url: string
+    firstAt: number
+    resets: number
+    timer: ReturnType<typeof setTimeout>
+  }>()
+  cleanups.push(() => {
+    for (const entry of rotationDeferrals.values()) clearTimeout(entry.timer)
+    rotationDeferrals.clear()
+  })
+  const requestRotation = (kind: OrdinaryHeadKind, handle: DocHandle<unknown>, url: string): void => {
+    if (!headRotation.rotates || stopped || !metaHandle) return
+    if (rotationsInFlight.has(kind) || rotationRetries.get(kind)?.timer) return
+    const quietMs = ordinaryHeadRotation.deferral?.quietMs ?? DEFAULT_ORDINARY_HEAD_ROTATION_QUIET_MS
+    const maxMs = ordinaryHeadRotation.deferral?.maxMs ?? DEFAULT_ORDINARY_HEAD_ROTATION_MAX_DEFER_MS
+    if (quietMs <= 0) {
+      startRotation(kind, handle, url)
+      return
+    }
+    // Monotonic: a wall-clock step must not stretch or cut the cap.
+    const now = performance.now()
+    const prior = rotationDeferrals.get(kind)
+    if (prior) clearTimeout(prior.timer)
+    // A deferral armed for a head that is no longer this one starts over.
+    const same = prior !== undefined && prior.url === url ? prior : undefined
+    const firstAt = same ? same.firstAt : now
+    const left = firstAt + maxMs - now
+    const capped = left <= quietMs
+    const meta = metaHandle
+    const armed = {
+      url,
+      firstAt,
+      resets: same ? same.resets + 1 : 0,
+      timer: setTimeout(() => fire(), Math.max(0, Math.min(quietMs, left))),
+    }
+    const fire = (): void => {
+      if (rotationDeferrals.get(kind) === armed) rotationDeferrals.delete(kind)
+      if (stopped || !headRotation.rotates || !metaHandle) return
+      // Nothing can be in flight or backing off here (requestRotation arms
+      // neither alongside a deferral), so the line below names a rotation
+      // startRotation does start.
+      const latest = meta.doc() as MetaLike | undefined
+      const current = kind === 'object' ? latest?.editsObjectShardUrl : latest?.editsConnectionShardUrl
+      if (current !== url || !observeWriteHead(kind, url, handle.doc())) return
+      console.warn(JSON.stringify({
+        event: 'read_model.ordinary_head_rotation_deferred',
+        workspace: `${key.landscapeId}/${key.versionId}`,
+        kind,
+        url,
+        cause: capped ? 'max-wait' : 'quiet',
+        waitedMs: Math.round(performance.now() - armed.firstAt),
+        resets: armed.resets,
+      }))
+      startRotation(kind, handle, url)
+    }
+    armed.timer.unref?.()
+    rotationDeferrals.set(kind, armed)
+  }
+  const startRotation = (kind: OrdinaryHeadKind, handle: DocHandle<unknown>, url: string): void => {
+    if (!headRotation.rotates || stopped || !metaHandle) return
+    if (rotationsInFlight.has(kind) || rotationRetries.get(kind)?.timer) return
+    rotationsInFlight.add(kind)
+    const meta = metaHandle
+    const collection: 'objects' | 'connections' = kind === 'object' ? 'objects' : 'connections'
+    const scheduleRetry = () => {
+      if (stopped) return
+      const attempt = (rotationRetries.get(kind)?.attempt ?? 0) + 1
+      const delay = ROTATION_RETRY_DELAYS_MS[Math.min(attempt, ROTATION_RETRY_DELAYS_MS.length) - 1]
+      const fire = () => {
+        rotationRetries.set(kind, { timer: null, attempt })
+        if (stopped) return
+        const latest = meta.doc() as MetaLike | undefined
+        const current = kind === 'object' ? latest?.editsObjectShardUrl : latest?.editsConnectionShardUrl
+        // Straight to the rotator: the backoff already waited.
+        if (current === url && observeWriteHead(kind, url, handle.doc())) startRotation(kind, handle, url)
+      }
+      const timer = setTimeout(fire, delay)
+      timer.unref?.()
+      rotationRetries.set(kind, { timer, attempt, fire })
+    }
+    void rotateOrdinaryHead({
+      key,
+      collection: kind,
+      retired: { url, documentId: handle.documentId, doc: () => handle.doc() },
+      meta: { documentId: meta.documentId, doc: () => meta.doc() as Record<string, unknown> | undefined },
+      publishedHeads: () => publishedHeadsByDocument.get(handle.documentId) ?? null,
+      mayWrite: () => !stopped && stillOwned(),
+      assertAuthority: async () => {
+        const held = await readWriteFence(db, key)
+        if (held !== projectorInstanceId) throw new ReadModelWriteFenceError(key, projectorInstanceId, held)
+        if (await isStaticReadModelWorkspace(db, key)) throw new ReadModelPlaneError(key, 'ordinary')
+      },
+      connect: async () => {
+        // A test that hands the projector one transaction-scoped client has no
+        // second session to hold a session lock on: no rotation, loudly.
+        if (!isPool(db)) throw new Error('ordinary head rotation needs a pool (a session-scoped advisory lock)')
+        return db.connect()
+      },
+      createChild: async () => {
+        const child = await createClaimedOverlaySegment(
+          repo, collection, touchRotatedChild, { workspace: key, rootUrl, ownerPlacement: true },
+        )
+        return { url: child.url, documentId: child.documentId }
+      },
+      flush: (documentIds) => repo.flush(documentIds),
+      assertTransactionAuthority: async (tx) => {
+        await assertReadModelPlane(tx, key, 'ordinary')
+        await assertReadModelWriteFence(tx, key, projectorInstanceId)
+      },
+      publish: (childUrl) => publishOverlaySegment(meta as DocHandle<OverlayMetaLike>, collection, childUrl),
+    }).then((result) => {
+      if (result.outcome === 'rotated') {
+        rotationRetries.delete(kind)
+        ordinaryRotationTelemetry.recordRotation(key, kind, headRotation.takeTrigger(url))
+        observeChainLength(kind)
+        // What arrived on the retired head after H_r and before the repoint
+        // was projected directly or not at all; forwarding covers everything
+        // after H_r, and its trigger is a change on the retired head that may
+        // never come. Ask for it now.
+        shardTriggers.get(handle.documentId)?.()
+        // One more retired head: the chain may now be long enough to fold.
+        requestFold(kind)
+        return
+      }
+      if (result.outcome === 'lock-refused') scheduleRetry()
+    }, (error: unknown) => {
+      if (isReadModelAuthorityLoss(error)) {
+        reportFenceLost(kind === 'object' ? 'object_shard' : 'connection_shard', error)
+        return
+      }
+      console.error(JSON.stringify({
+        event: 'read_model.ordinary_head_rotation_failed',
+        workspace: `${key.landscapeId}/${key.versionId}`,
+        kind,
+        url,
+        error: error instanceof Error ? error.message : String(error),
+      }))
+      scheduleRetry()
+    }).finally(() => {
+      rotationsInFlight.delete(kind)
+    })
+  }
+
+  /**
+   * CHAIN FOLD (phase 4, `ordinaryChainFoldWriter.ts`), with
+   * `AM_ORDINARY_CHAIN_FOLD=on` for a workspace rotation rotates. Asked for
+   * after every rotation and once at attach; one per kind at a time. Another
+   * fold is asked for right after one lands (a long chain converges a budget
+   * at a time); a refused lock, a CAS conflict, a superseded or unpublishable
+   * fold and a failure are retried on a capped backoff. A fold with nothing to
+   * do waits for the next rotation.
+   */
+  const chainFold = headRotation.rotates ? ordinaryHeadRotation.chainFold : undefined
+  const FOLD_RETRY_DELAYS_MS = [1_000, 5_000, 30_000, 60_000]
+  const foldsInFlight = new Set<OrdinaryHeadKind>()
+  /** Kinds a SWEEP asked a pass of while one was in flight (G4-16d): that
+   * pass may have read the hold, or the owed set, before they changed, and
+   * `requestFold` drops a request made during a pass — so one more pass runs
+   * when it ends (`requestSweepPass`). */
+  const sweepPassPending = new Set<OrdinaryHeadKind>()
+  /** Ask a fold pass of each kind for the row sweep — now, or right after the
+   * pass in flight. A pending retry timer runs a fresh pass anyway. */
+  const requestSweepPass = (): void => {
+    if (!chainFold || stopped) return
+    for (const kind of ['object', 'connection'] as const) {
+      if (foldsInFlight.has(kind)) sweepPassPending.add(kind)
+      else requestFold(kind)
+    }
+  }
+  const foldRetries = new Map<OrdinaryHeadKind, { timer: ReturnType<typeof setTimeout> | null; attempt: number }>()
+  cleanups.push(() => {
+    for (const entry of foldRetries.values()) if (entry.timer) clearTimeout(entry.timer)
+    foldRetries.clear()
+  })
+  const requestFold = (kind: OrdinaryHeadKind): void => {
+    if (!chainFold || stopped || !metaHandle) return
+    if (foldsInFlight.has(kind) || foldRetries.get(kind)?.timer) return
+    foldsInFlight.add(kind)
+    const meta = metaHandle as DocHandle<Record<string, unknown>>
+    const collection: 'objects' | 'connections' = kind === 'object' ? 'objects' : 'connections'
+    const scheduleRetry = () => {
+      if (stopped) return
+      const attempt = (foldRetries.get(kind)?.attempt ?? 0) + 1
+      const delay = FOLD_RETRY_DELAYS_MS[Math.min(attempt, FOLD_RETRY_DELAYS_MS.length) - 1]
+      const timer = setTimeout(() => {
+        foldRetries.set(kind, { timer: null, attempt })
+        requestFold(kind)
+      }, delay)
+      timer.unref?.()
+      foldRetries.set(kind, { timer, attempt })
+    }
+    // A rotation in flight, waiting on its backoff or deferred to a quiet
+    // moment goes FIRST: a fold holding the shared key would refuse it and
+    // push its backoff out. The rotation asks for a fold once it lands.
+    if (rotationsInFlight.has(kind) || rotationRetries.get(kind)?.timer || rotationDeferrals.has(kind)) {
+      foldsInFlight.delete(kind)
+      scheduleRetry()
+      return
+    }
+    /** An orphan product (no row names it) keeps no residency lease. */
+    const releaseProduct = (documentId: DocumentId): void => {
+      if (residency && leasedDocumentIds.delete(documentId)) residency.release(documentId, residencyOwner)
+    }
+    let again = false
+    const passStartedAt = Date.now()
+    /** One line per pass, for the bench (G4-16b phase 4). `passMs` is the
+     * whole pass (authority reads, the pool wait, the lock and after), so a
+     * loose upper bound; the writer's `ordinary_chain_fold_lock_held` is the
+     * lock itself. `chain` and `overlay` are ModelMeta's lists, what clients
+     * load; `watched` is this projector's list, which follows ModelMeta
+     * asynchronously (attach, then detach once settled). Never throws: a
+     * failed log must not skip the retry below. */
+    const logPass = (outcome: string, extra: Record<string, unknown> = {}): void => {
+      try {
+        const doc = meta.doc()
+        const listed = (field: string) => (Array.isArray(doc?.[field]) ? (doc[field] as unknown[]).length : null)
+        console.warn(JSON.stringify({
+          event: 'read_model.ordinary_chain_fold_pass',
+          workspace: `${key.landscapeId}/${key.versionId}`,
+          kind,
+          at: Date.now(),
+          outcome,
+          ...extra,
+          passMs: Date.now() - passStartedAt,
+          chain: listed(kind === 'object' ? 'objectShardUrls' : 'connectionShardUrls'),
+          overlay: listed(kind === 'object' ? 'editsObjectShardUrls' : 'editsConnectionShardUrls'),
+          watched: (kind === 'object' ? model.objectShardUrls : model.connectionShardUrls).length,
+        }))
+      } catch { /* the pass's outcome is handled below either way */ }
+    }
+    void foldOrdinaryChain({
+      key,
+      collection: kind,
+      meta: {
+        documentId: meta.documentId,
+        doc: () => meta.doc(),
+        change: (fn) => meta.change(fn),
+      },
+      minChain: chainFold.minChain,
+      budget: chainFold.budget,
+      retainMs: chainFold.retainMs,
+      mayWrite: () => !stopped && stillOwned(),
+      watched: (url) => (kind === 'object' ? model.objectShardUrls : model.connectionShardUrls).includes(url),
+      // G4-16d: no fold row of a head owed a handover re-check goes — nor any,
+      // before the re-check has run (`handoverSweepHold`).
+      sweepKeep: () => {
+        const announce = handoverSweepHold && !handoverSweepHoldLogged
+        if (announce) handoverSweepHoldLogged = true
+        return { hold: handoverSweepHold, announce, documentIds: handoverRecheck }
+      },
+      assertAuthority: async () => {
+        const held = await readWriteFence(db, key)
+        if (held !== projectorInstanceId) throw new ReadModelWriteFenceError(key, projectorInstanceId, held)
+        if (await isStaticReadModelWorkspace(db, key)) throw new ReadModelPlaneError(key, 'ordinary')
+      },
+      connect: async () => {
+        if (!isPool(db)) throw new Error('ordinary chain fold needs a pool (a session-scoped advisory lock)')
+        return db.connect()
+      },
+      assertTransactionAuthority: async (tx) => {
+        await assertReadModelPlane(tx, key, 'ordinary')
+        await assertReadModelWriteFence(tx, key, projectorInstanceId)
+      },
+      segment: async (url) => {
+        const handle = await resolveHandle(url, 'fold-sample')
+        return { documentId: handle.documentId, doc: () => handle.doc() }
+      },
+      createProduct: async (entities, fields) => {
+        let built: DocumentId | null = null
+        try {
+          const product = await createClaimedOverlaySegment(
+            repo, collection, (handle) => { built = handle.documentId; touchRotatedChild(handle) },
+            { workspace: key, rootUrl, ownerPlacement: true },
+            {
+              entities, fields,
+              // Stopped between two chunks: no more changes, no claim
+              // (`OverlaySegmentAbortedError`). NOT `stillOwned()`: it is
+              // process-local and flickers with the lease renewal (see
+              // `runTracked`), and must never be a hard abort; the DATABASE's
+              // answer is asked below and in the record's transaction.
+              proceed: () => !stopped,
+              // The write fence, read from the database once the product is
+              // whole and flushed: a lost fence claims nothing (thrown as an
+              // authority loss, reported like every other).
+              beforeClaim: async () => {
+                const held = await readWriteFence(db, key)
+                if (held !== projectorInstanceId) throw new ReadModelWriteFenceError(key, projectorInstanceId, held)
+              },
+            },
+          )
+          return { url: product.url, documentId: product.documentId, doc: () => product.doc() }
+        } catch (error) {
+          // An unclaimed orphan nothing names, whatever stopped it: its lease
+          // goes (after stop() `releaseOwner` took it already).
+          if (built) releaseProduct(built)
+          if (error instanceof OverlaySegmentAbortedError) return null
+          throw error
+        }
+      },
+      flush: (documentIds) => repo.flush(documentIds),
+    }).then((result) => {
+      logPass(result.outcome, {
+        reason: 'reason' in result ? result.reason : undefined,
+        state: 'state' in result ? result.state : undefined,
+        stage: 'stage' in result ? result.stage : undefined,
+      })
+      if (result.outcome === 'folded') {
+        foldRetries.delete(kind)
+        again = true
+        return
+      }
+      if (result.outcome === 'skipped' && result.reason !== 'sources-not-settled') {
+        foldRetries.delete(kind)
+        return
+      }
+      // `not-owner` is `mayWrite()`: `stillOwned()` is process-local and
+      // flickers with the lease renewal, so it ends nothing here — retried on
+      // the backoff while the projector runs. A REAL loss of the workspace
+      // ends through the authority checks (`reportFenceLost`) and `stop()`.
+      if (result.outcome === 'not-owner') {
+        // From a FRESH attempt count: a flicker costs the first, short delay,
+        // not the 30-60 s an attempt count carried over from the deferrals
+        // behind a rotation would reach.
+        foldRetries.delete(kind)
+        if (!stopped) scheduleRetry()
+        return
+      }
+      if (result.outcome === 'conflict' || result.outcome === 'superseded') releaseProduct(result.productDocumentId)
+      scheduleRetry()
+    }, (error: unknown) => {
+      // Thrown after the product existed and before its record committed:
+      // an orphan no row names, whose lease would otherwise stay for good —
+      // one per failed retry.
+      const unrecorded = unrecordedFoldProductOf(error)
+      if (unrecorded) releaseProduct(unrecorded)
+      if (isReadModelAuthorityLoss(error)) {
+        logPass('authority-lost')
+        reportFenceLost(kind === 'object' ? 'object_shard' : 'connection_shard', error)
+        return
+      }
+      logPass('failed')
+      console.error(JSON.stringify({
+        event: 'read_model.ordinary_chain_fold_failed',
+        workspace: `${key.landscapeId}/${key.versionId}`,
+        kind,
+        error: error instanceof Error ? error.message : String(error),
+      }))
+      scheduleRetry()
+    }).finally(() => {
+      foldsInFlight.delete(kind)
+      // A rotation refused while this fold held the key goes before the next fold.
+      kickRotationRetry(kind)
+      // `delete` first: a sweep asked during this pass gets its pass even
+      // when the fold itself asks for another.
+      const sweepAsked = sweepPassPending.delete(kind)
+      if (again || sweepAsked) requestFold(kind)
+    })
+  }
+
+  /**
+   * LATE WRITES TO FOLDED HEADS (phase 4 step 4, `ordinaryFoldedArrivals.ts`).
+   * A folded head is not watched: a poll of storage arrivals finds the ones a
+   * client wrote into since their watermark, and each is forwarded through the
+   * same path a watched retired head takes (`forwardInsteadOfProjecting`),
+   * then its watermark advances. Started at attach when the workspace has a
+   * folded row, and by the first detach; single-flight; one head's failure
+   * does not stop the others, and its watermark stays, so the next poll tries
+   * it again. A head loaded only for this gives its residency lease back.
+   */
+  const foldedArrivalPollMs = ordinaryFoldArrivalPollMs()
+  let foldedArrivalTimer: ReturnType<typeof setInterval> | null = null
+  let foldedArrivalPolling = false
+  /** documentId -> when it may be tried again, and the delay that set it: a
+   * head whose arrival could not be carried (a forward refused, degraded or
+   * failed) backs off, doubling to ten minutes, instead of a full load every
+   * period. Cleared when its watermark advances. */
+  const foldedArrivalBackoff = new Map<string, { until: number; delay: number }>()
+  const FOLDED_ARRIVAL_MAX_BACKOFF_MS = 600_000
+  /** The watermark advance, fenced like every write of this closure: on
+   * `projectionTail`, in a projection transaction that asserts the write
+   * fence, after ownership is re-checked. A stale instance cannot move the
+   * watermark the owner relies on. */
+  const commitFoldedArrival = (hit: { collection: 'object' | 'connection'; documentId: string; watermark: string | null; arrivalSeq: string }) => {
+    const task = projectionTail.then(() => withReadModelProjectionTransaction(db, key, 'ordinary', async (tx) => {
+      if (stopped || !stillOwned()) return
+      await advanceFoldedArrivalWatermark(tx, key, hit.collection, hit.documentId, hit.watermark, hit.arrivalSeq)
+      await assertReadModelWriteFence(tx, key, projectorInstanceId)
+    }))
+    projectionTail = task.then(() => undefined, () => undefined)
+    return task
+  }
+  /** Several advances from NULL in ONE transaction, fenced as above; the ids
+   * whose CAS moved. */
+  const commitDetachedWatermarks = (collection: 'object' | 'connection', hits: ReadonlyArray<{ documentId: string; arrivalSeq: string }>) => {
+    const task = projectionTail.then(() => withReadModelProjectionTransaction(db, key, 'ordinary', async (tx) => {
+      const moved = new Set<string>()
+      if (stopped || !stillOwned()) return moved
+      for (const hit of hits) {
+        if (await advanceFoldedArrivalWatermark(tx, key, collection, hit.documentId, null, hit.arrivalSeq)) moved.add(hit.documentId)
+      }
+      await assertReadModelWriteFence(tx, key, projectorInstanceId)
+      return moved
+    }))
+    projectionTail = task.then(() => undefined, () => undefined)
+    return task
+  }
+  /**
+   * THE DETACH SETS THE WATERMARK (G4-16, M3). A folded row is recorded with
+   * a NULL `arrival_watermark`, and every content chunk is above NULL: the
+   * first poll after the detach used to LOAD every source it had just
+   * evicted — a full `Automerge.load` from storage per source, one
+   * synchronous wasm call of 30–70 ms each on fleet-shaped heads (512
+   * changes, 128 actors), eight in a row after every fold — only to forward
+   * `nothing` and set the watermark to the arrival it read. The detach,
+   * which still holds the resident, leased handles, sets that same watermark
+   * itself, by the parking argument (`parkRetiredHead`, WHY NO LATE WRITE
+   * IS LOST), for all the sources of one pass at once:
+   *  1. the handles are FLUSHED, so what they hold has its chunks;
+   *  2. S, each head's highest content arrival, is read;
+   *  3. then its heads H are sampled, and H must be SETTLED: equal to the
+   *     row's committed `forwarded_heads ?? H_r`, read fresh
+   *     (`ordinaryHeadLateWritesPending`). Every change of a chunk at or
+   *     below S was in the handle before S was read, so it is in H, so it
+   *     has been forwarded. A change not in H entered the handle after the
+   *     sample, so its chunk is saved with an arrival above S (CACHE 1
+   *     sequence, `automergeStorage.ts`): the poll finds it;
+   *  4. the watermark moves NULL -> S by the poll's fenced CAS, every head of
+   *     the pass in one transaction (`commitDetachedWatermarks`), only where
+   *     NULL is what the row holds;
+   *  5. flushed again, so a change after H has its chunk (above S) before
+   *     the eviction removes the save listener; the caller then releases
+   *     the leases synchronously.
+   * A head OWED THE HANDOVER RE-CHECK gets none (asked when the heads are
+   * sampled and again just before the CAS is queued on `projectionTail`):
+   * an old owner's save may sit in storage below S with nothing in the
+   * handle to show it — the same single-writer break the re-check exists
+   * for — and a NULL watermark keeps the poll's load, which reads storage
+   * afresh. It is still FLUSHED, both times, like every resident source of
+   * the pass: what its handle holds must have its chunk before the eviction.
+   * Anything else — not resident, nothing stored, not settled, the CAS
+   * refused, any failure — gets no watermark either and is left to the poll
+   * exactly as before: the load this saves is an optimisation, never what
+   * carries a write. A lost fence is reported.
+   */
+  const watermarkDetachedFoldSources = async (kind: 'object' | 'connection', documentIds: readonly string[]): Promise<Map<string, string>> => {
+    const set = new Map<string, string>()
+    if (!documentIds.length) return set
+    const handles = new Map<string, DocHandle<unknown>>()
+    for (const documentId of documentIds) {
+      const handle = syncedHandle(repo, documentId)
+      if (handle && handle.state === 'ready') handles.set(documentId, handle)
+    }
+    if (!handles.size) return set
+    const ids = [...handles.keys()] as DocumentId[]
+    const failed = (error: unknown) => {
+      if (isReadModelAuthorityLoss(error)) {
+        reportFenceLost(kind === 'object' ? 'object_shard' : 'connection_shard', error)
+        return
+      }
+      console.warn(JSON.stringify({
+        event: 'read_model.ordinary_fold_source_watermark_failed',
+        workspace: `${key.landscapeId}/${key.versionId}`,
+        kind,
+        documentIds,
+        error: error instanceof Error ? error.message : String(error),
+      }))
+    }
+    try {
+      await repo.flush(ids)
+      if (stopped || foldedArrivalPollMs <= 0) return set
+      const arrivals = await documentContentArrivals(db, ids)
+      if (stopped) return set
+      const sampled: Array<{ documentId: string; heads: string[]; current: false; arrival: string }> = []
+      for (const documentId of ids) {
+        if (handoverRecheck.has(documentId)) continue
+        const arrival = arrivals.get(documentId) ?? null
+        const heads = tryGetHeads(handles.get(documentId)!.doc())
+        if (arrival !== null && heads) sampled.push({ documentId, heads: [...heads], current: false, arrival })
+      }
+      if (!sampled.length) return set
+      const pending = new Set(await ordinaryHeadLateWritesPending(db, key, kind, sampled))
+      const settled = sampled.filter((head) => !pending.has(head.documentId) && !handoverRecheck.has(head.documentId))
+      if (!settled.length || stopped || !stillOwned()) return set
+      const moved = await commitDetachedWatermarks(kind,
+        settled.map((head) => ({ documentId: head.documentId, arrivalSeq: head.arrival })))
+      for (const head of settled) {
+        if (!moved.has(head.documentId)) continue
+        detachedWatermarks.set(head.documentId, head.arrival)
+        set.set(head.documentId, head.arrival)
+      }
+      return set
+    } catch (error) {
+      failed(error)
+      return set
+    } finally {
+      // Whatever happened above: a change after the sample has its chunk
+      // (above S) before the caller's synchronous release.
+      try { await repo.flush(ids) } catch (error) { failed(error) }
+    }
+  }
+  /** documentId -> the watermark a detach committed (above). A poll whose
+   * query read the row BEFORE that commit returns it with the older NULL and
+   * would load the head for nothing; the poll applies this floor to such a
+   * hit. Only a poll whose query started after the commit can drop it, which
+   * the next poll does: one entry per detach, for at most one poll. */
+  const detachedWatermarks = new Map<string, string>()
+  cleanups.push(() => {
+    if (foldedArrivalTimer) clearInterval(foldedArrivalTimer)
+    foldedArrivalTimer = null
+  })
+  /** The poll's cost (the query and the forwards it ran), logged every
+   * FOLDED_ARRIVAL_SUMMARY_POLLS polls that ran (about five minutes at the
+   * default period; a poll skipped while one is in flight is not counted),
+   * and the remainder at stop, for the bench (G4-16b phase 4). `rows` is what
+   * the query returned; `loaded` the heads it then loaded to forward.
+   * `expiredRows` the rows among them past `retain_until` (GC keeps such a
+   * head only for its uncarried arrival, `gc.ts`), `expiredCarried` those
+   * whose watermark this projector then advanced (G4-16c). `recheckRows`
+   * the rows listed only for the handover re-check (G4-16d), included in
+   * `rows`, not in `expiredRows`. */
+  const FOLDED_ARRIVAL_SUMMARY_POLLS = 60
+  const emptyFoldedArrivalCost = () => ({ polls: 0, totalMs: 0, maxMs: 0, rows: 0, loaded: 0, expiredRows: 0, expiredCarried: 0, recheckRows: 0 })
+  const foldedArrivalCost = emptyFoldedArrivalCost()
+  const logFoldedArrivalCost = (): void => {
+    if (!foldedArrivalCost.polls) return
+    console.warn(JSON.stringify({
+      event: 'read_model.ordinary_fold_arrival_poll_summary',
+      workspace: `${key.landscapeId}/${key.versionId}`,
+      at: Date.now(),
+      ...foldedArrivalCost,
+    }))
+    Object.assign(foldedArrivalCost, emptyFoldedArrivalCost())
+  }
+  cleanups.push(logFoldedArrivalCost)
+
+  /**
+   * THE HANDOVER RE-CHECK (G4-16d; the why, the invariants and the rejected
+   * alternatives are in `ordinaryFoldedArrivals.ts`, THE HANDOVER RESIDUAL).
+   * `handoverRecheckMs` (plus jitter) after attach, and once THE BARRIER is
+   * clear, every retired head of the workspace and both current write heads
+   * are owed ONE re-check from storage: the document ids land here, and the
+   * poll drains them, `HANDOVER_RECHECK_PER_POLL` a pass — a folded head
+   * through the folded loop, a parked one through `pollParkedRetiredHeads`, a
+   * still-watched one (current heads included) by a merge its own watcher then
+   * forwards or projects. An id leaves on a forward that happened (as a
+   * watermark advance does), when no such head exists any more, or after
+   * `HANDOVER_RECHECK_MAX_ATTEMPTS` failures; a failure otherwise keeps it,
+   * behind the same backoff as an arrival.
+   */
+  const handoverRecheckMs = ordinaryHandoverRecheckMs()
+  const handoverRecheck = new Set<string>()
+  /** documentId -> failed re-checks so far. */
+  const handoverRecheckFailures = new Map<string, number>()
+  let handoverRecheckTimer: ReturnType<typeof setTimeout> | null = null
+  /** The database's clock when the attach ended (after the new fence), or
+   * null if it could not be read: the barrier then reads the clock when it
+   * starts, later, which only makes it wait for more. */
+  let attachClock: Promise<string | null> | null = null
+  /** True from the arm until the LAST owing of this attach (the follow-up
+   * after a barrier timeout included): the fold's row sweep is held
+   * meanwhile (`sweepKeep`). A late save of a previous owner sits below a
+   * folded head's watermark, where nothing but this re-check can find it,
+   * and only from the head's row: a row swept before the re-check ran would
+   * take the write with it. */
+  let handoverSweepHold = true
+  /** The held line is logged once per hold, not on every fold pass. */
+  let handoverSweepHoldLogged = false
+  /** Release the hold, and run the fold pass (and so the sweep) it deferred. */
+  const releaseHandoverSweepHold = (): void => {
+    if (!handoverSweepHold) return
+    handoverSweepHold = false
+    handoverSweepHoldLogged = false
+    requestSweepPass()
+  }
+  cleanups.push(() => {
+    if (handoverRecheckTimer) clearTimeout(handoverRecheckTimer)
+    handoverRecheckTimer = null
+    handoverRecheck.clear()
+  })
+  /** Merge every content chunk storage holds for the head into `handle`: a
+   * handle this Repo loaded before another process's save committed never
+   * sees that save otherwise. Decoded apart first, so a malformed chunk
+   * throws before the handle is touched; a no-op when nothing is missing.
+   * Returns the highest arrival among the chunks merged, null when none was. */
+  const mergeDurableContent = (handle: DocHandle<unknown>): Promise<string | null> => withHandoverRecheckPermit(async () => {
+    const { chunks, maxSeq } = await documentContentChunks(db, handle.documentId)
+    if (!chunks.length || stopped) return null
+    const durable = chunks.reduce((doc, chunk) => loadIncremental(doc, chunk), initDoc<unknown>())
+    handle.update((doc) => mergeDocs(doc as Doc<unknown>, durable))
+    return maxSeq
+  })
+  /** One poll pass's re-check context: its budget, and "was this head in the
+   * Repo's cache, i.e. would a load NOT re-read storage?" from ONE copy of
+   * the cache taken the first time the pass asks (`cachedHandles`, O(resident
+   * documents): once a pass, not once a head — `automergeRepoCompat.ts`).
+   * The cache itself, not `syncedHandle`: a false "absent" would skip an owed
+   * merge. A copy taken at the pass is enough: it is taken after the barrier,
+   * so a head absent from it and loaded later reads storage after every old
+   * save; a head present and evicted since is merged into a fresh load, a
+   * no-op. */
+  interface RecheckPass { left: number; resident: (documentId: string) => boolean }
+  const recheckPass = (): RecheckPass => {
+    let resident: Set<string> | null = null
+    return {
+      left: HANDOVER_RECHECK_PER_POLL,
+      resident: (documentId) => (resident ??= new Set(Object.keys(cachedHandles(repo)))).has(documentId),
+    }
+  }
+  /** An owed head's re-check did not complete: count it, give up at the cap. */
+  const handoverRecheckFailed = (documentId: string): void => {
+    if (!handoverRecheck.has(documentId)) return
+    const failures = (handoverRecheckFailures.get(documentId) ?? 0) + 1
+    if (failures < HANDOVER_RECHECK_MAX_ATTEMPTS) {
+      handoverRecheckFailures.set(documentId, failures)
+      return
+    }
+    handoverRecheck.delete(documentId)
+    handoverRecheckFailures.delete(documentId)
+    noteHandoverRecheckAbandoned()
+    console.error(JSON.stringify({
+      event: 'read_model.ordinary_handover_recheck_abandoned',
+      workspace: `${key.landscapeId}/${key.versionId}`,
+      documentId,
+      failures,
+    }))
+  }
+  const handoverRecheckDone = (documentId: string): void => {
+    handoverRecheck.delete(documentId)
+    handoverRecheckFailures.delete(documentId)
+  }
+  const handoverBarrierMaxWaitMs = ordinaryHandoverBarrierMaxWaitMs()
+  /** THE BARRIER: 'clear' once no storage-write backend of another process
+   * still runs a transaction older than the attach; 'timeout' after
+   * `handoverBarrierMaxWaitMs` (logged and counted); 'stopped' on stop. Says
+   * so every `HANDOVER_BARRIER_WARN_MS` it waits (`ordinaryFoldedArrivals.ts`,
+   * THE BARRIER CANNOT STAY BLOCKED). */
+  const handoverBarrier = async (): Promise<'clear' | 'timeout' | 'stopped'> => {
+    const since = (await attachClock) ?? await databaseNow(db)
+    const startedAt = Date.now()
+    let warnings = 0
+    for (;;) {
+      if (stopped) return 'stopped'
+      const blockers = await handoverBarrierBlockers(db, since, storageWriteApplication)
+      if (!blockers.pids.length) return 'clear'
+      const waited = Date.now() - startedAt
+      const detail = {
+        workspace: `${key.landscapeId}/${key.versionId}`,
+        waitedMs: waited,
+        since,
+        blockers: blockers.pids.length,
+        oldestXactStart: blockers.oldest,
+      }
+      if (waited >= handoverBarrierMaxWaitMs) {
+        noteHandoverBarrierTimeout()
+        console.error(JSON.stringify({ event: 'read_model.ordinary_handover_recheck_barrier_timeout', ...detail }))
+        return 'timeout'
+      }
+      if (waited >= (warnings + 1) * HANDOVER_BARRIER_WARN_MS) {
+        warnings = Math.floor(waited / HANDOVER_BARRIER_WARN_MS)
+        console.warn(JSON.stringify({ event: 'read_model.ordinary_handover_recheck_barrier_waiting', ...detail }))
+      }
+      await new Promise<void>((resolve) => { setTimeout(resolve, foldedArrivalPollMs).unref?.() })
+    }
+  }
+  /** Fill the owed set: every retirement row read FRESH, every parked head,
+   * both current write heads. */
+  const oweHandoverRecheck = async (reason: string): Promise<void> => {
+    // Read fresh, not from the cache: a head this projector folded or
+    // retired since attach is owed the re-check too. An `admitted` row can
+    // name the current head: merged on purpose, as the current heads are.
+    const rows = await loadOrdinaryHeadRetirements(db, key)
+    if (stopped) return
+    for (const row of rows.values()) handoverRecheck.add(row.documentId)
+    for (const entry of parkedRetiredHeads.values()) handoverRecheck.add(entry.documentId)
+    // The current write heads have the same residual (a handle loaded before
+    // the old save committed); one read each.
+    const meta = metaHandle?.doc() as MetaLike | undefined
+    for (const url of [meta?.editsObjectShardUrl, meta?.editsConnectionShardUrl]) {
+      if (url) handoverRecheck.add(parseAutomergeUrl(url as AutomergeUrl).documentId)
+    }
+    console.log(JSON.stringify({
+      event: 'read_model.ordinary_handover_recheck',
+      workspace: `${key.landscapeId}/${key.versionId}`,
+      reason,
+      heads: handoverRecheck.size,
+      retirements: rows.size,
+      afterMs: handoverRecheckMs,
+    }))
+    if (handoverRecheck.size) startFoldedArrivalPoll()
+  }
+  /** Arm the re-check once per attach. Only where retired heads can exist:
+   * a workspace that rotates, or holds retirement rows from an earlier life. */
+  const armHandoverRecheck = (): void => {
+    if (stopped || handoverRecheckTimer) return
+    // Nothing to re-check (the poll or the re-check off, nothing that can
+    // hold a retired head): the hold, on since the attach began, goes.
+    if (foldedArrivalPollMs <= 0 || handoverRecheckMs <= 0 || (!headRotation.rotates && !chainFold && !retirements.size)) {
+      releaseHandoverSweepHold()
+      return
+    }
+    attachClock ??= databaseNow(db).catch(() => null)
+    handoverSweepHold = true
+    handoverRecheckTimer = setTimeout(() => {
+      handoverRecheckTimer = null
+      void (async () => {
+        if (stopped || !stillOwned()) return
+        try {
+          const barrier = await handoverBarrier()
+          if (barrier === 'stopped' || stopped) return
+          await oweHandoverRecheck(barrier === 'clear' ? 'barrier-clear' : 'barrier-timeout')
+          if (barrier === 'timeout') {
+            // An old save may still commit: ONE more re-check, when the
+            // barrier clears or after one more maximum wait.
+            const again = await handoverBarrier()
+            if (again === 'stopped' || stopped) return
+            await oweHandoverRecheck(again === 'clear' ? 'follow-up' : 'follow-up-timeout')
+          }
+          // Owed from here on: the sweep keeps exactly those rows.
+          releaseHandoverSweepHold()
+        } catch (error) {
+          console.error(JSON.stringify({
+            event: 'read_model.ordinary_handover_recheck_failed',
+            workspace: `${key.landscapeId}/${key.versionId}`,
+            error: error instanceof Error ? error.message : String(error),
+          }))
+          armHandoverRecheck()
+        }
+      })()
+    }, handoverRecheckDelay(handoverRecheckMs))
+    handoverRecheckTimer.unref?.()
+  }
+  /** Still-watched heads owed the re-check: the merge only; a change it
+   * brings is forwarded (retired head) or projected (current head) by the
+   * head's own watcher, as any write is. Left owed while the head is being
+   * folded or parked, or backing off. */
+  const recheckWatchedRetiredHeads = async (budget: RecheckPass): Promise<void> => {
+    for (const [url, entry] of [...shardStops]) {
+      if (stopped || !stillOwned() || budget.left <= 0) return
+      if (!handoverRecheck.has(entry.documentId)) continue
+      if (foldSourcesDetaching.has(url) || retiredHeadsParking.has(url) || shardStops.get(url) !== entry) continue
+      const backoff = foldedArrivalBackoff.get(entry.documentId)
+      if (backoff && Date.now() < backoff.until) continue
+      budget.left -= 1
+      // Read before the merge: a head detached during it is in neither list
+      // after. A watched head in neither list (being attached) is named by
+      // its retirement row's collection, objects when it has none.
+      const shardKind: ProjectionKind = model.objectShardUrls.includes(url) ? 'object_shard'
+        : model.connectionShardUrls.includes(url) || retirements.has(retirementKey('connection', entry.documentId))
+          ? 'connection_shard' : 'object_shard'
+      try {
+        await mergeDurableContent(await resolveHandle(url, 'handover-recheck'))
+        // Detached (folded) or parked DURING the merge: its watcher, which
+        // would have carried what the merge brought, was stopped first, and
+        // the handle may already be evicted — merged into, it carries nothing.
+        // Still owed: the folded or parked path re-checks it from storage.
+        if (shardStops.get(url) !== entry) continue
+        handoverRecheckDone(entry.documentId)
+        foldedArrivalBackoff.delete(entry.documentId)
+      } catch (error) {
+        if (isReadModelAuthorityLoss(error)) {
+          reportFenceLost(shardKind, error)
+          return
+        }
+        const delay = Math.min(FOLDED_ARRIVAL_MAX_BACKOFF_MS, Math.max(foldedArrivalPollMs, (backoff?.delay ?? 0) * 2))
+        foldedArrivalBackoff.set(entry.documentId, { until: Date.now() + delay, delay })
+        handoverRecheckFailed(entry.documentId)
+        console.error(JSON.stringify({
+          event: 'read_model.ordinary_handover_recheck_failed',
+          workspace: `${key.landscapeId}/${key.versionId}`,
+          documentId: entry.documentId,
+          error: error instanceof Error ? error.message : String(error),
+        }))
+      }
+    }
+  }
+  /** The document ids some path of this projector answers for now: watched,
+   * parked, or on its way between two of those. */
+  const headsKnownNow = (): Set<string> => {
+    const known = new Set<string>()
+    for (const entry of shardStops.values()) known.add(entry.documentId)
+    for (const entry of parkedRetiredHeads.values()) known.add(entry.documentId)
+    for (const url of [...foldSourcesDetaching, ...retiredHeadsParking]) {
+      known.add(parseAutomergeUrl(url as AutomergeUrl).documentId)
+    }
+    return known
+  }
+  /** Drop owed ids no head answers to any more. Only ids owed when the pass
+   * STARTED (so sent to the folded query), not returned by it, and known to
+   * no path at the start AND at the end of the pass: an id owed mid-pass
+   * (the timer fired meanwhile) was never asked about, and a head that moved
+   * between paths mid-pass (a fold that completed) was known at one end. */
+  const forgetUnknownHandoverRechecks = (
+    owedAtStart: ReadonlySet<string>,
+    knownAtStart: ReadonlySet<string>,
+    foldedIds: ReadonlySet<string>,
+  ): void => {
+    if (!owedAtStart.size) return
+    const knownAtEnd = headsKnownNow()
+    for (const id of owedAtStart) {
+      if (!handoverRecheck.has(id) || foldedIds.has(id) || knownAtStart.has(id) || knownAtEnd.has(id)) continue
+      handoverRecheckDone(id)
+    }
+  }
+
+  /**
+   * PARKED RETIRED HEADS (chain fold OFF, `ordinaryRetiredHeadParkMs`). With
+   * the fold off nothing ever unlists a retired head, and its watcher's lease
+   * kept it resident until `stop()`: one document per rotation, for the life
+   * of the projector (`ordinaryHeadResidency.integration.test.ts`). A head
+   * that has been forwarded for `retiredHeadParkMs` and owes nothing — its
+   * live heads equal its committed `forwarded_heads ?? H_r` — is PARKED: still
+   * listed (and still in `model.*ShardUrls`, so no attach pass re-watches it),
+   * no longer watched, its lease given back. Its late writes are found in
+   * storage by the folded-head poll (`pollParkedRetiredHeads`), against the
+   * arrival read while it was still watched.
+   *
+   * WHY NO LATE WRITE IS LOST. `parkRetiredHead` reads the head's highest
+   * content arrival S, THEN samples its heads H, THEN checks H is settled. A
+   * change in H was forwarded already. A change not in H entered the handle
+   * after the sample, so after S was read; its chunk is saved after it is in
+   * the handle, with a `nextval` (`automergeStorage.ts`) issued after S was
+   * returned, so above S: the poll finds it. That step holds because
+   * `automerge_arrival_seq` has the default CACHE 1 (`db.ts`, `CREATE
+   * SEQUENCE IF NOT EXISTS automerge_arrival_seq`): with a per-session cache
+   * one session can be handed a value BELOW one another session has already
+   * committed, and the argument would not survive it. Before the lease goes back the
+   * head is FLUSHED, so a change still in the handle (saves are debounced) has
+   * its chunk before eviction removes the handle's save listener
+   * (`automergeResidency.ts`, `evict`). The ownership handover breaks the
+   * single-writer step as it does for folded heads — the old owner's save
+   * can commit below S, or below the poll's later watermark — and is covered
+   * the same way, by the handover re-check (`ordinaryFoldedArrivals.ts`, THE
+   * HANDOVER RESIDUAL; `armHandoverRecheck` here), behind the same barrier;
+   * and a projector that stops forgets its parked set, but the next attach
+   * watches every listed head again and forwards from `forwarded_heads`.
+   *
+   * Never with the fold ON: a fold refuses sources that are not watched
+   * (`ORDINARY_FOLD_SOURCES_NOT_WATCHED`), and gives the lease back itself.
+   *
+   * WHEN: the sweep runs every `retiredHeadParkMs` and parks a head on the
+   * first sweep that STARTS at least that long after the sweep that first
+   * found it forwarded — so between one and two periods after its rotation
+   * (10 to 20 minutes at the default), plus however long it takes to settle.
+   *
+   * AFTER STOP: every await that can load or lease is followed by a release
+   * when `stopped` turned true meanwhile — `stop()`'s `releaseOwner` has run
+   * by then, so a lease taken after it would be nobody's to give back.
+   */
+  const retiredHeadParkMs = ordinaryRetiredHeadParkMs()
+  const parksRetiredHeads = !chainFold && headRotation.rotates && Boolean(residency)
+    && foldedArrivalPollMs > 0 && retiredHeadParkMs > 0
+  /** Heads whose park has begun and not finished: the poll leaves them alone. */
+  const retiredHeadsParking = new Set<string>()
+  /** url -> when a park sweep first found it forwarded (monotonic ms). */
+  const forwardedSince = new Map<string, number>()
+  /** Drop this projector's lease on `documentId`, idempotent. */
+  const dropLease = (documentId: string): void => {
+    if (residency && leasedDocumentIds.delete(documentId)) residency.release(documentId as DocumentId, residencyOwner)
+  }
+  /** How many times a park or a release has waited on the stamp keyed by a head. */
+  const stampWaits = new Map<string, number>()
+  /**
+   * A stamp keyed BY `documentId` is pending: should a park, or a parked
+   * head's release, wait for it? Yes — and its target is asked to project —
+   * while that target is the CURRENT write head of the kind (the projection
+   * that consumes stamps) and fewer than `PARKED_STAMP_MAX_WAITS` waits have
+   * passed. Otherwise the stamp is DROPPED and nothing waits: a target that is
+   * itself forwarded (its forward answering `nothing` re-keys nothing) would
+   * otherwise hold the head resident, and re-trigger a projection, for ever.
+   * A dropped stamp leaves the head's watermark refused — the safe direction,
+   * and what an unconsumed stamp left before parking existed.
+   */
+  const waitForStamp = (kind: 'object' | 'connection', documentId: string): boolean => {
+    const stamp = retiredHeadStamps.get(documentId)
+    if (!stamp) {
+      stampWaits.delete(documentId)
+      return false
+    }
+    const meta = metaHandle?.doc() as MetaLike | undefined
+    const currentUrl = kind === 'object' ? meta?.editsObjectShardUrl : meta?.editsConnectionShardUrl
+    const targetProjects = Boolean(currentUrl) && shardStops.get(currentUrl!)?.documentId === stamp.target
+    const waits = stampWaits.get(documentId) ?? 0
+    if (parkedStampWait(waits, targetProjects) === 'drop') {
+      retiredHeadStamps.delete(documentId)
+      stampWaits.delete(documentId)
+      console.warn(JSON.stringify({
+        event: 'read_model.ordinary_parked_head_stamp_dropped',
+        workspace: `${key.landscapeId}/${key.versionId}`,
+        kind,
+        documentId,
+        target: stamp.target,
+        reason: targetProjects ? 'max-waits' : 'target-not-current',
+      }))
+      return false
+    }
+    stampWaits.set(documentId, waits + 1)
+    shardTriggers.get(stamp.target)?.()
+    return true
+  }
+  /** Give a parked head's lease back, durable first. Only between polls: the
+   * poll holds the lease across a forward that reads the handle, and an
+   * eviction under it would replace the document with an empty one.
+   * After `stop()`: released at once, unflushed, as `releaseOwner` does. */
+  const releaseParkedLease = async (url: string): Promise<void> => {
+    const entry = parkedRetiredHeads.get(url)
+    if (!entry || !residency || !leasedDocumentIds.has(entry.documentId)) return
+    if (stopped) { dropLease(entry.documentId); return }
+    // A stamp keyed BY this head is consumed by its target's projection, which
+    // re-reads THIS handle (`liveHeadsForStamp`): evicted first, it certifies
+    // 0. Kept resident until then — ask for that projection — and the poll's
+    // no-arrival branch tries the release again.
+    // A stamp TAKEN by a pass in flight counts the same.
+    if (stampsInFlight.has(entry.documentId) || waitForStamp(entry.kind, entry.documentId)) return
+    await repo.flush([entry.documentId as DocumentId])
+    // Synchronous from here to the eviction `release` starts: no change can
+    // land between the flush and the removal of the save listener.
+    if (parkedRetiredHeads.get(url) !== entry) return
+    dropLease(entry.documentId)
+  }
+  /** A parked head that is no longer forwarded (no row asks for it, or it is
+   * the current head again) is projected directly, by a watcher, as at attach.
+   * Unreachable with the fold off as far as this tree goes — only a fold
+   * deletes a row (`ordinaryChainFold.ts`), and a retired url never becomes
+   * current again — and imperfect: the initial apply upserts, so an entity
+   * removed from the head while it was parked keeps its row until a cold
+   * build. */
+  const unparkRetiredHead = async (url: string): Promise<void> => {
+    const entry = parkedRetiredHeads.get(url)
+    if (!entry || stopped) return
+    parkedRetiredHeads.delete(url)
+    console.warn(JSON.stringify({
+      event: 'read_model.ordinary_retired_head_unparked',
+      workspace: `${key.landscapeId}/${key.versionId}`,
+      kind: entry.kind,
+      url,
+    }))
+    try {
+      if (entry.kind === 'object') await watchObjectShard(url, true)
+      else await watchConnectionShard(url, true)
+    } catch (error) {
+      // Not watched (the watcher registers last and synchronously): parked
+      // again, so the next arrival retries this.
+      if (!shardStops.has(url)) parkedRetiredHeads.set(url, entry)
+      throw error
+    }
+    if (stopped) {
+      // `cleanups` ran before this watcher existed: stop it, and its lease.
+      shardStops.get(url)?.stop()
+      shardStops.delete(url)
+      dropLease(entry.documentId)
+    }
+  }
+  /** One read for every parked head; for each with an arrival above its
+   * watermark, the ordinary forward, then the watermark — only on a forward
+   * that HAPPENED, as for a folded head. */
+  const pollParkedRetiredHeads = async (budget: RecheckPass): Promise<void> => {
+    const parked = [...parkedRetiredHeads.entries()].filter(([url]) => !retiredHeadsParking.has(url))
+    if (!parked.length) return
+    const arrivals = await documentContentArrivals(db, parked.map(([, entry]) => entry.documentId))
+    for (const [url, entry] of parked) {
+      if (stopped || !stillOwned()) return
+      if (parkedRetiredHeads.get(url) !== entry) continue
+      const seq = arrivals.get(entry.documentId) ?? null
+      // Owed the handover re-check (and within this pass's budget): loaded
+      // whatever its watermark. Over budget, it stays owed for the next pass.
+      const rechecking = handoverRecheck.has(entry.documentId) && budget.left > 0
+      if (!rechecking && !arrivalAbove(seq, entry.watermark)) {
+        // A release that failed earlier (its flush) is retried here.
+        if (leasedDocumentIds.has(entry.documentId)) {
+          try {
+            await releaseParkedLease(url)
+          } catch (error) {
+            // Still leased and resident; the next poll tries again.
+            console.error(JSON.stringify({
+              event: 'read_model.ordinary_parked_head_release_failed',
+              workspace: `${key.landscapeId}/${key.versionId}`,
+              collection: entry.kind,
+              documentId: entry.documentId,
+              error: error instanceof Error ? error.message : String(error),
+            }))
+          }
+        }
+        continue
+      }
+      const backoff = foldedArrivalBackoff.get(entry.documentId)
+      if (backoff && Date.now() < backoff.until) continue
+      const backOff = () => {
+        const delay = Math.min(FOLDED_ARRIVAL_MAX_BACKOFF_MS, Math.max(foldedArrivalPollMs, (backoff?.delay ?? 0) * 2))
+        foldedArrivalBackoff.set(entry.documentId, { until: Date.now() + delay, delay })
+        if (rechecking) handoverRecheckFailed(entry.documentId)
+      }
+      if (rechecking) budget.left -= 1
+      // A handle loaded by `resolveHandle` below reflects storage already; one
+      // resident before may predate an old owner's save.
+      const residentBefore = rechecking && budget.resident(entry.documentId)
+      foldedArrivalCost.loaded += 1
+      try {
+        const handle = await resolveHandle(url, 'parked-arrival')
+        // A stop during that load: its `releaseOwner` has run, and the lease
+        // `resolveHandle` just took would be nobody's to give back.
+        if (stopped) {
+          dropLease(entry.documentId)
+          return
+        }
+        try {
+          // The handover re-check: what storage holds, into the handle.
+          const durableSeq = residentBefore ? await mergeDurableContent(handle) : null
+          // Read from the live document while it is loaded: the forward's own
+          // `servedOutsideCurrentHead` reads this head too.
+          if (parkedRetiredHeads.get(url) === entry) entry.snapshot = parkedSnapshotOf(entry.kind, handle.doc())
+          let outcome: string | undefined
+          const forwarded = await forwardInsteadOfProjecting(entry.kind, handle, url, (answer) => { outcome = answer })
+          if (parkedRetiredHeads.get(url) === entry) entry.snapshot = parkedSnapshotOf(entry.kind, handle.doc())
+          if (!forwarded) {
+            // Watched again from here; the merge above already happened.
+            if (rechecking) handoverRecheckDone(entry.documentId)
+            await unparkRetiredHead(url)
+          } else if ((outcome === 'forwarded' || outcome === 'superseded' || outcome === 'nothing')
+            && !forwardDegradedUrls.has(url)) {
+            // The handle loaded (or resident) holds every arrival up to `seq`
+            // (`ordinaryFoldedArrivals.ts`, WHY THAT ADVANCE SKIPS NOTHING),
+            // and after a re-check every chunk it read. Never lowered.
+            const next = laterArrival(seq, durableSeq)
+            if (parkedRetiredHeads.get(url) === entry && arrivalAbove(next, entry.watermark)) entry.watermark = next
+            foldedArrivalBackoff.delete(entry.documentId)
+            if (rechecking) handoverRecheckDone(entry.documentId)
+          } else {
+            backOff()
+          }
+        } finally {
+          await releaseParkedLease(url)
+        }
+      } catch (error) {
+        if (isReadModelAuthorityLoss(error)) {
+          reportFenceLost(entry.kind === 'object' ? 'object_shard' : 'connection_shard', error)
+          return
+        }
+        backOff()
+        console.error(JSON.stringify({
+          event: 'read_model.ordinary_parked_head_arrival_failed',
+          workspace: `${key.landscapeId}/${key.versionId}`,
+          collection: entry.kind,
+          documentId: entry.documentId,
+          error: error instanceof Error ? error.message : String(error),
+        }))
+      }
+    }
+  }
+  /**
+   * Park one watched, forwarded, settled head. Every await between deciding
+   * and handing the head to the poll, and what a throw there leaves:
+   *   1. `resolveHandle` — the resident handle, already leased: nothing moved;
+   *   2. `documentContentArrivals` (S) — nothing moved;
+   *   3. `ordinaryHeadLateWritesPending` — nothing moved; pending: not parked.
+   * Then, SYNCHRONOUSLY with the re-checks: out of `shardStops`, into
+   * `parkedRetiredHeads` (from here the poll covers it), watcher stopped.
+   *   4. `entry.idle()` — the pass in flight finishes (it may forward); it
+   *      does not reject (`coalescedProjection`), and is caught regardless;
+   *   5. `repo.flush` in `releaseParkedLease` — throws: the head stays parked
+   *      AND leased (resident, its Repo save listener intact, so the change is
+   *      saved and the poll finds it), and the poll retries the release. The
+   *      same retry covers a release deferred for a stamp the pass in 4 left.
+   * A stop during 1–3 returns at the re-check (the lease was taken before
+   * and `releaseOwner` gave it back); during 4–5, `releaseParkedLease`
+   * releases without a flush.
+   */
+  const parkRetiredHead = async (kind: 'object' | 'connection', url: string): Promise<boolean> => {
+    const entry = shardStops.get(url)
+    if (!entry || parkedRetiredHeads.has(url) || retiredHeadsParking.has(url)) return false
+    const documentId = entry.documentId
+    const owesNothing = () => !degradedShards.has(url) && !forwardRetries.has(documentId)
+      // A stamp keyed BY this head — waiting, or TAKEN by a target's pass in
+      // flight — is consumed by a projection that re-reads this handle
+      // (`liveHeadsForStamp`): evicted, it certifies 0.
+      && !retiredHeadStamps.has(documentId) && !stampsInFlight.has(documentId)
+      // Owed the handover re-check: an old owner's save may be in storage and
+      // not in this handle. Merged while watched, its watcher carries it; a
+      // park meanwhile would stop that watcher and evict the handle under the
+      // merge (G4-16 M3 review). Parked on a later sweep, once re-checked.
+      && !handoverRecheck.has(documentId)
+    if (waitForStamp(kind, documentId) || !owesNothing()) return false
+    retiredHeadsParking.add(url)
+    let parked = false
+    try {
+      const handle = await resolveHandle(url, 'park')
+      const watermark = (await documentContentArrivals(db, [documentId])).get(documentId) ?? null
+      const heads = tryGetHeads(handle.doc())
+      if (!heads) return false
+      const pending = await ordinaryHeadLateWritesPending(db, key, kind, [{ documentId, heads: [...heads], current: false }])
+      if (pending.length) return false
+      if (stopped || shardStops.get(url) !== entry || !isForwardedHead(kind, documentId, url) || !owesNothing()) return false
+      shardStops.delete(url)
+      parkedRetiredHeads.set(url, { kind, documentId, watermark, snapshot: parkedSnapshotOf(kind, handle.doc()) })
+      parked = true
+      entry.stop()
+      try { await entry.idle() } catch { /* the pass's own handling ran */ }
+      await releaseParkedLease(url)
+      console.log(JSON.stringify({
+        event: 'read_model.ordinary_retired_head_parked',
+        workspace: `${key.landscapeId}/${key.versionId}`,
+        kind,
+        url,
+        watermark,
+      }))
+      return true
+    } finally {
+      retiredHeadsParking.delete(url)
+      forwardedSince.delete(url)
+      if (parked) startFoldedArrivalPoll()
+    }
+  }
+  let parkSweepTimer: ReturnType<typeof setInterval> | null = null
+  let parkSweeping = false
+  cleanups.push(() => {
+    if (parkSweepTimer) clearInterval(parkSweepTimer)
+    parkSweepTimer = null
+  })
+  /** Every `retiredHeadParkMs`: park the watched heads a previous sweep found
+   * forwarded, so each has been retired at least that long (at most twice). */
+  const sweepRetiredHeadsToPark = async (): Promise<void> => {
+    if (parkSweeping || stopped || !metaHandle || !parksRetiredHeads) return
+    parkSweeping = true
+    // The sweep's START, before any await: two sweeps' starts are a whole
+    // interval apart, so a head is parked on the sweep after the one that
+    // first found it forwarded.
+    const now = performance.now()
+    try {
+      await freshRetirements()
+      const seen = new Set<string>()
+      for (const [kind, urls] of [['object', model.objectShardUrls], ['connection', model.connectionShardUrls]] as const) {
+        for (const url of [...urls]) {
+          if (stopped) return
+          const entry = shardStops.get(url)
+          if (!entry || !isForwardedHead(kind, entry.documentId, url)) continue
+          seen.add(url)
+          const since = forwardedSince.get(url)
+          if (since === undefined) { forwardedSince.set(url, now); continue }
+          if (now - since < retiredHeadParkMs) continue
+          try {
+            await parkRetiredHead(kind, url)
+          } catch (error) {
+            if (isReadModelAuthorityLoss(error)) {
+              reportFenceLost(kind === 'object' ? 'object_shard' : 'connection_shard', error)
+              return
+            }
+            console.error(JSON.stringify({
+              event: 'read_model.ordinary_retired_head_park_failed',
+              workspace: `${key.landscapeId}/${key.versionId}`,
+              kind,
+              url,
+              error: error instanceof Error ? error.message : String(error),
+            }))
+          }
+        }
+      }
+      for (const url of forwardedSince.keys()) if (!seen.has(url)) forwardedSince.delete(url)
+    } catch (error) {
+      console.error(JSON.stringify({
+        event: 'read_model.ordinary_retired_head_park_sweep_failed',
+        workspace: `${key.landscapeId}/${key.versionId}`,
+        error: error instanceof Error ? error.message : String(error),
+      }))
+    } finally {
+      parkSweeping = false
+    }
+  }
+  const startRetiredHeadParkSweep = (): void => {
+    if (!chainFold && headRotation.rotates && residency && foldedArrivalPollMs <= 0 && retiredHeadParkMs > 0) {
+      // Said once, at attach: without the poll nothing would find a parked
+      // head's late writes, so every retired head stays watched and leased.
+      console.warn(JSON.stringify({
+        event: 'read_model.ordinary_retired_head_parking_disabled',
+        workspace: `${key.landscapeId}/${key.versionId}`,
+        reason: 'AM_ORDINARY_FOLD_ARRIVAL_POLL_MS=0',
+      }))
+    }
+    if (chainFold && foldedArrivalPollMs <= 0) {
+      // Said once, at attach (G4-16c): no poll ever sets a folded head's
+      // watermark, so nothing carries its late writes, and GC — which counts
+      // a NULL watermark as a pending arrival — keeps every folded head for
+      // good (`foldedArrivalPendingSql`). Safe, and unbounded.
+      console.warn(JSON.stringify({
+        event: 'read_model.ordinary_fold_arrival_poll_disabled',
+        workspace: `${key.landscapeId}/${key.versionId}`,
+        reason: 'AM_ORDINARY_FOLD_ARRIVAL_POLL_MS=0',
+        consequence: 'folded-heads-kept-by-gc',
+      }))
+    }
+    if (!parksRetiredHeads || stopped || parkSweepTimer) return
+    parkSweepTimer = setInterval(() => { void sweepRetiredHeadsToPark() }, retiredHeadParkMs)
+    parkSweepTimer.unref?.()
+  }
+
+  /** Any `folded` row in the cached retirement rows. */
+  const hasFoldedRows = (): boolean => [...retirements.values()].some((row) => row.status === 'folded')
+  const pollFoldedArrivals = async (): Promise<void> => {
+    if (foldedArrivalPolling || stopped || !metaHandle) return
+    foldedArrivalPolling = true
+    const pollStartedAt = Date.now()
+    try {
+      // Fold off and no folded row from an earlier life (see the disarm
+      // below for why the cached rows are enough): no folded head to ask
+      // about, only parked ones.
+      // Heads owed the handover re-check are listed whatever their watermark.
+      // What was owed, and what was known, when this pass STARTED: only
+      // those may be forgotten at its end (`forgetUnknownHandoverRechecks`).
+      const owedAtStart = new Set(handoverRecheck)
+      const knownAtStart = owedAtStart.size ? headsKnownNow() : new Set<string>()
+      const budget = recheckPass()
+      // Floors committed BEFORE this query are in the rows it reads: dropped
+      // (unless a newer detach replaced one meanwhile). Those committed during
+      // it may not be, and lift the stale NULL it returns (`detachedWatermarks`).
+      const floorsBefore = [...detachedWatermarks]
+      const read = !chainFold && !hasFoldedRows() ? [] : await foldedHeadsWithArrivals(db, key, [...owedAtStart])
+      for (const [id, floor] of floorsBefore) if (detachedWatermarks.get(id) === floor) detachedWatermarks.delete(id)
+      const hits = read.map((hit) => {
+        const floor = detachedWatermarks.get(hit.documentId)
+        return floor !== undefined && arrivalAbove(floor, hit.watermark) ? { ...hit, watermark: floor } : hit
+      })
+      foldedArrivalCost.rows += hits.length
+      // A row listed only because it is owed the handover re-check (no arrival
+      // above its watermark) is counted apart: no late write keeps it.
+      foldedArrivalCost.expiredRows += hits.filter((hit) => hit.expired && arrivalAbove(hit.arrivalSeq, hit.watermark)).length
+      foldedArrivalCost.recheckRows += hits.filter((hit) => !arrivalAbove(hit.arrivalSeq, hit.watermark)).length
+      for (const hit of hits) {
+        if (stopped || !stillOwned()) return
+        const url = stringifyAutomergeUrl({ documentId: hit.documentId as DocumentId })
+        // Still listed and watched: its own watcher forwards it. Being
+        // detached: its watcher may still be forwarding it.
+        if ((hit.collection === 'object' ? model.objectShardUrls : model.connectionShardUrls).includes(url)) continue
+        if (foldSourcesDetaching.has(url)) continue
+        const backoff = foldedArrivalBackoff.get(hit.documentId)
+        if (backoff && Date.now() < backoff.until) continue
+        // Owed the re-check and within this pass's budget; over budget, an
+        // owed head with no arrival above its watermark waits for the next.
+        const rechecking = handoverRecheck.has(hit.documentId) && budget.left > 0
+        if (!rechecking && !arrivalAbove(hit.arrivalSeq, hit.watermark)) continue
+        if (rechecking) budget.left -= 1
+        const backOff = () => {
+          const delay = Math.min(FOLDED_ARRIVAL_MAX_BACKOFF_MS, Math.max(foldedArrivalPollMs, (backoff?.delay ?? 0) * 2))
+          foldedArrivalBackoff.set(hit.documentId, { until: Date.now() + delay, delay })
+          if (rechecking) handoverRecheckFailed(hit.documentId)
+        }
+        const leasedBefore = leasedDocumentIds.has(hit.documentId)
+        // A handle `resolveHandle` loads reflects storage already; one resident
+        // before may predate an old owner's save.
+        const residentBefore = rechecking && budget.resident(hit.documentId)
+        foldedArrivalCost.loaded += 1
+        try {
+          const handle = await resolveHandle(url, 'folded-arrival')
+          try {
+            // The handover re-check: what storage holds, into the handle the
+            // forward reads, when this Repo held it before.
+            const durableSeq = residentBefore ? await mergeDurableContent(handle) : null
+            let outcome: string | undefined
+            await forwardInsteadOfProjecting(hit.collection, handle, url, (answer) => { outcome = answer })
+            // Advanced only on a forward that HAPPENED (or found nothing to
+            // carry) and did not degrade. `not-owner` and `not-retired`
+            // carried nothing: advancing on them would hide the write from
+            // every later poll, the next owner's included.
+            if ((outcome === 'forwarded' || outcome === 'superseded' || outcome === 'nothing')
+              && !forwardDegradedUrls.has(url)) {
+              // Never lowered: a re-checked head may hold nothing above it.
+              const next = laterArrival(hit.arrivalSeq, durableSeq)
+              if (next !== null && arrivalAbove(next, hit.watermark)) await commitFoldedArrival({ ...hit, arrivalSeq: next })
+              foldedArrivalBackoff.delete(hit.documentId)
+              // An expired head listed only for the handover re-check (no
+              // arrival above its watermark) carried nothing pending: not
+              // counted as carried.
+              if (hit.expired && arrivalAbove(hit.arrivalSeq, hit.watermark)) {
+                // Past its retention, kept by GC for this arrival only: from
+                // here the next GC pass may sweep it.
+                foldedArrivalCost.expiredCarried += 1
+                console.warn(JSON.stringify({
+                  event: 'read_model.ordinary_fold_arrival_expired_carried',
+                  workspace: `${key.landscapeId}/${key.versionId}`,
+                  collection: hit.collection,
+                  documentId: hit.documentId,
+                  outcome,
+                }))
+              }
+              if (rechecking) handoverRecheckDone(hit.documentId)
+            } else {
+              backOff()
+            }
+          } finally {
+            if (!leasedBefore && residency && leasedDocumentIds.delete(handle.documentId)) {
+              residency.release(handle.documentId, residencyOwner)
+            }
+          }
+        } catch (error) {
+          if (isReadModelAuthorityLoss(error)) {
+            reportFenceLost(hit.collection === 'object' ? 'object_shard' : 'connection_shard', error)
+            return
+          }
+          backOff()
+          console.error(JSON.stringify({
+            event: 'read_model.ordinary_fold_arrival_failed',
+            workspace: `${key.landscapeId}/${key.versionId}`,
+            collection: hit.collection,
+            documentId: hit.documentId,
+            error: error instanceof Error ? error.message : String(error),
+          }))
+        }
+      }
+      if (handoverRecheck.size) await recheckWatchedRetiredHeads(budget)
+      await pollParkedRetiredHeads(budget)
+      forgetUnknownHandoverRechecks(owedAtStart, knownAtStart, new Set(hits.map((hit) => hit.documentId)))
+      // Owed heads left the set: the fold's row sweep kept their rows
+      // (`sweepKeep`) and nothing else would ask for a pass, so ask now —
+      // at most once per pass that shrank the set, so bounded by its size.
+      if (!handoverSweepHold && [...owedAtStart].some((id) => !handoverRecheck.has(id))) requestSweepPass()
+    } catch (error) {
+      console.error(JSON.stringify({
+        event: 'read_model.ordinary_fold_arrival_poll_failed',
+        workspace: `${key.landscapeId}/${key.versionId}`,
+        error: error instanceof Error ? error.message : String(error),
+      }))
+    } finally {
+      foldedArrivalPolling = false
+      const ms = Date.now() - pollStartedAt
+      foldedArrivalCost.polls += 1
+      foldedArrivalCost.totalMs += ms
+      foldedArrivalCost.maxMs = Math.max(foldedArrivalCost.maxMs, ms)
+      if (foldedArrivalCost.polls >= FOLDED_ARRIVAL_SUMMARY_POLLS) logFoldedArrivalCost()
+      // Fold off, nothing parked or parking, no folded row from an earlier
+      // life: nothing left to poll. Disarmed; the next park re-arms it. Only
+      // with the fold off, where nothing makes a row `folded`, so the cached
+      // rows (`retirements`, read at attach and on every pointer move) can
+      // only overstate the folded set, never miss one.
+      if (!chainFold && foldedArrivalTimer && !parkedRetiredHeads.size && !retiredHeadsParking.size && !hasFoldedRows()
+        && !handoverRecheck.size) {
+        clearInterval(foldedArrivalTimer)
+        foldedArrivalTimer = null
+      }
+    }
+  }
+  /** Start the poll (once) and run one pass now. */
+  const startFoldedArrivalPoll = (): void => {
+    if (stopped || foldedArrivalPollMs <= 0) return
+    if (!foldedArrivalTimer) {
+      foldedArrivalTimer = setInterval(() => { void pollFoldedArrivals() }, foldedArrivalPollMs)
+      foldedArrivalTimer.unref?.()
+    }
+    void pollFoldedArrivals()
+  }
+
+  /** The CURRENT write head only — a retired head is no rotation candidate —
+   * and only while this projector still speaks for the workspace, the same
+   * owner gate the health publish uses. Synchronous and read-only. Returns
+   * whether the head is due (`ordinaryHeadRotation.ts`). */
+  const observeWriteHead = (kind: OrdinaryHeadKind, url: string, doc: unknown): boolean => {
+    if (stopped || !stillOwned()) return false
+    return headRotation.observe(kind, url, doc)
+  }
   const watchObjectShard = async (
     url: string,
     applyInitial = false,
@@ -1972,9 +3935,12 @@ export async function startReadModelProjector(
      * assuming no gap is the unsafe direction. */
     extractionHeads?: readonly string[] | null,
   ) => {
-    const h = applyInitial ? await resolveHandleRetry(url) : await resolveHandle(url)
+    const h = applyInitial ? await resolveHandleRetry(url) : await resolveHandle(url, 'attach')
     const attachDoc = h.doc()
     const attachHeads = tryGetHeads(attachDoc)
+    // A fold product, mid-session or at boot, is never projected
+    // (`ordinaryChainFold.ts`): a change after this is refused.
+    const foldProduct = hasOrdinaryFoldMarker(attachDoc)
     // The initial snapshot of a shard appended MID-SESSION. Unlike the delta
     // path this cannot delete anything, so an uninitialised document is not a
     // data-loss risk here — but accepting it silently would still hide a
@@ -2028,21 +3994,35 @@ export async function startReadModelProjector(
     // conditional clear drops the losing branch's fields for good. (The DELTA
     // path below has no such order: `applyObjectShardDelta` is a per-shard
     // upsert by id, so the LAST shard delta wins the `ro_*` row whichever head
-    // it came from.)
+    // it came from.) All of this describes a head retired by COMPACTION, which
+    // has no retirement row. A head with a `retired` row and H_r is neither
+    // projected nor acknowledged here: it is forwarded
+    // (`ordinaryHeadForwarding.ts`, `forwardInsteadOfProjecting`).
+    //
+    // A head the forwarder owns (`isForwardedHead`) acknowledges NOTHING
+    // itself: its late batches are acknowledged by the current head's
+    // projection, from `forwardedBatchIds`, with the rows carrying their
+    // values. Its batches before H_r were acknowledged while it was current.
     const acknowledgedBatchIds = new Set<string>()
     const unacknowledged = (doc: ObjShardLike | undefined): string[] =>
-      (doc?.writeBatchIds ?? []).filter((batchId) => !acknowledgedBatchIds.has(batchId))
+      [...new Set([...(doc?.writeBatchIds ?? []), ...forwardedBatchIdsOf(doc)])]
+        .filter((batchId) => !acknowledgedBatchIds.has(batchId))
     // The attach sample vouches for the attach document's batches only when
     // what is published IS that document — the initial apply below, or the
     // cold build's extraction when the heads prove it equal to the live doc.
     // Otherwise the immediate gap projection acknowledges from its own,
     // fresher sample.
     const currentOverlayAtAttach = (metaHandle?.doc() as MetaLike | undefined)?.editsObjectShardUrl === url
-    const attachBatchIds = extractionSeed === undefined
-      || (extractionHeads && attachHeads && headsEqual(extractionHeads, attachHeads))
+    const dueAtAttach = currentOverlayAtAttach && observeWriteHead('object', url, attachDoc)
+    // What the cold build published for a boot shard is its extraction.
+    if (extractionSeed !== undefined) notePublished(h.documentId, extractionHeads)
+    await freshRetirements()
+    const forwardedAtAttach = isForwardedHead('object', h.documentId, url)
+    const attachBatchIds = !forwardedAtAttach && (extractionSeed === undefined
+      || (extractionHeads && attachHeads && headsEqual(extractionHeads, attachHeads)))
       ? unacknowledged(attachDoc as ObjShardLike | undefined)
       : []
-    if (applyInitial && initial.length) {
+    if (applyInitial && initial.length && !forwardedAtAttach) {
       const parentIds = initial.flatMap((object) => object.parentId ? [object.parentId] : [])
       const candidateIds = [...initial.map((object) => object.id), ...parentIds]
       await repo.flush([h.documentId])
@@ -2068,6 +4048,7 @@ export async function startReadModelProjector(
         // The other three are untouched and keep theirs.
         { unchanged: ['connection', 'group', 'diagram'] },
       )
+      notePublished(h.documentId, attachHeads)
       for (const batchId of attachBatchIds) acknowledgedBatchIds.add(batchId)
       // Deliberately NOT swallowed: a PostgreSQL failure here means the shard's
       // objects are absent from the read model. Propagating leaves the shard
@@ -2088,131 +4069,178 @@ export async function startReadModelProjector(
     }
     let snap = new Map<string, ObjectInput>(initial.map((o) => [o.id, o]))
     const projectLatest = async () => {
+      // Detached (folded): its late writes are the folded poll's. Defence in
+      // depth only: the detach disposes this coalescer (`stop`) and awaits its
+      // pass first, so no pass should start here after it; this return is not
+      // what makes the detach safe.
+      if (detachedFoldSources.has(url)) return
+      // A retired head with H_r is never projected directly: its late writes
+      // go to the current head, whose projection publishes them. Checked per
+      // pass, because a head becomes retired under a running watcher.
+      if (await forwardInsteadOfProjecting('object', h, url)) return
       // Capture one immutable Automerge snapshot, then make that exact revision
       // durable before exposing it through PostgreSQL. Without this ordering an
       // active owner could publish a value from memory, die, and let the takeover
       // cold-build the older persisted snapshot.
       const source = h.doc() as ObjShardLike
       const sampledHeads = tryGetHeads(source)
-      const sourceConflicts = collectAutomergeEntityConflicts(
-        source?.objects as Record<string, unknown> | undefined,
-      )
-      const isCurrentOverlay = (metaHandle?.doc() as MetaLike | undefined)?.editsObjectShardUrl === url
-      // THE SERVER WRITES INTO THIS DOCUMENT IN ONE CASE: two clients put a
-      // whole entity at the same key concurrently (`$`), and the other branch's
-      // fields are invisible until one causal replacement carries their union.
-      // Everything else — a same-field conflict on `hot` from 25 writers
-      // included — converges deterministically in Automerge and is projected,
-      // never touched. The rule, the heads guard and the reasons are ONE module
-      // shared with the static projector (`overlayConflictHealing.ts`).
-      //
-      // Measured (25 writers on one field of 5 objects): healing EVERY conflict
-      // by assigning the whole entity back puts a NEW map at the key, and a
-      // peer whose field write has not yet reached the server keeps writing
-      // into the previous, now unreferenced map — 23 of 25 users' own fields
-      // were lost with no conflict to show for it. A sample-wide gate is wrong
-      // too: it would heal a same-field-only entity alongside a `$` one and
-      // DELETE its contested leaf. Hence per entity, `$` only.
-      if (isCurrentOverlay && sourceConflicts.size) {
-        const outcome = await healWholeEntityConflicts<ObjectInput>({
-          db, key, collection: 'object', handle: h, repo,
-          sourceConflicts, sampledHeads,
-          current: (entityId) => snap.get(entityId),
-          selected: (entityId) => source?.objects?.[entityId],
-        })
-        // `healed`: the heal itself re-triggers this projection, which then
-        // publishes the healed value. `stale`: so does the write that moved the
-        // heads. Never publish the lossy JSON winner of a `$` in either case —
-        // a heal costs exactly ONE generation, the one that publishes the union
-        // (arm 4 of `loadGateSeedProjection.integration.test.ts` counts it;
-        // `=== 'stale'` here would publish the winner first and cost two).
-        if (outcome !== 'none') return
+      // Taken in the SAME synchronous turn as the sample — see
+      // `retiredHeadStamps` — and put back unless this pass publishes.
+      const stamps = takeRetiredHeadStamps(h.documentId)
+      let stampsPublished = false
+      try {
+        const sourceConflicts = collectAutomergeEntityConflicts(
+          source?.objects as Record<string, unknown> | undefined,
+        )
+        const isCurrentOverlay = (metaHandle?.doc() as MetaLike | undefined)?.editsObjectShardUrl === url
+        const due = isCurrentOverlay && observeWriteHead('object', url, source)
+        // THE SERVER WRITES INTO THIS DOCUMENT IN ONE CASE: two clients put a
+        // whole entity at the same key concurrently (`$`), and the other branch's
+        // fields are invisible until one causal replacement carries their union.
+        // Everything else — a same-field conflict on `hot` from 25 writers
+        // included — converges deterministically in Automerge and is projected,
+        // never touched. The rule, the heads guard and the reasons are ONE module
+        // shared with the static projector (`overlayConflictHealing.ts`).
+        //
+        // Measured (25 writers on one field of 5 objects): healing EVERY conflict
+        // by assigning the whole entity back puts a NEW map at the key, and a
+        // peer whose field write has not yet reached the server keeps writing
+        // into the previous, now unreferenced map — 23 of 25 users' own fields
+        // were lost with no conflict to show for it. A sample-wide gate is wrong
+        // too: it would heal a same-field-only entity alongside a `$` one and
+        // DELETE its contested leaf. Hence per entity, `$` only.
+        if (isCurrentOverlay && sourceConflicts.size) {
+          const outcome = await healWholeEntityConflicts<ObjectInput>({
+            db, key, collection: 'object', handle: h, repo,
+            sourceConflicts, sampledHeads,
+            current: (entityId) => snap.get(entityId),
+            selected: (entityId) => source?.objects?.[entityId],
+          })
+          // `healed`: the heal itself re-triggers this projection, which then
+          // publishes the healed value. `stale`: so does the write that moved the
+          // heads. Never publish the lossy JSON winner of a `$` in either case —
+          // a heal costs exactly ONE generation, the one that publishes the union
+          // (arm 4 of `loadGateSeedProjection.integration.test.ts` counts it;
+          // `=== 'stale'` here would publish the winner first and cost two).
+          if (outcome !== 'none') return
+        }
+        // A shard delta DELETES every id that was in the previous snapshot and is
+        // not in this one. `{ objects: {} }` legitimately means the user removed
+        // them all and must still delete. A document with NO `objects` key was
+        // never initialised — no writer in this product produces one — so acting
+        // on it would destroy rows on the strength of a document that failed to
+        // load. Refuse, record, leave the rows and the snapshot alone; the next
+        // real change re-runs this with a readable document.
+        const read = readEntityMapOrDefect<ObjectInput>(source, 'objects', 'object-shard', url)
+        if (isUninformative(read.defect)) {
+          recordRefusedProjection()
+          console.warn(
+            `[read-model] refused an object-shard delta for ${key.landscapeId}/${key.versionId}: ` +
+              `${url} carries no objects map; ${snap.size} row(s) left untouched`)
+          return
+        }
+        const objects = Object.values(read.map)
+        await repo.flush([h.documentId])
+        const preparedWatermarks = await prepareShardWatermarks([
+          h.documentId, ...stamps.map((stamp) => stamp.handle.documentId as DocumentId),
+        ])
+        const oldIds = [...snap.keys()]
+        const next = new Map(objects.map((o) => [o.id, o]))
+        const deletedIds = oldIds.filter((id) => !next.has(id))
+        const parentIds = [
+          ...objects.flatMap((object) => object.parentId ? [object.parentId] : []),
+          ...[...snap.values()].flatMap((object) => object.parentId ? [object.parentId] : []),
+        ]
+        const batchIds = unacknowledged(source)
+        // The shard is rewritten whole, but the feed names only the candidates
+        // whose SERVED row (`roObjectCacheByIds`) differs after the write — read
+        // from the database, not from `snap`: an id can live in several shards
+        // (base + overlay heads) and the last shard written wins its row, so this
+        // closure's own snapshot cannot tell whether the row moved (the shared-id
+        // arm of `projectorService.integration.test.ts` goes red on that diff).
+        // Measured 2026-10-15 before this, 10-object workspace: one rename listed
+        // all 10 ids, and every consumer filtering on them (inline expansions,
+        // the offline cache's by-ids re-fetch) re-read for edits not theirs.
+        // The candidates are this shard's ids, the parents it names, the ids it
+        // deletes, and their neighbours read from the rows — children and groups
+        // in OTHER shards, which the old whole-shard listing happened to refresh
+        // on the shard's next edit and a precise feed would otherwise never name
+        // (`servedObjectRowsChangedBy`).
+        const candidateIds = [...objects.map((object) => object.id), ...parentIds, ...deletedIds]
+        await runTracked(
+          'object_shard',
+          async (tx) => {
+            // LOAD-BEARING for two online first writes into a fresh head after a
+            // rotation (G4-16g): this captures the SERVED value as the heal base
+            // before the first client's put is projected. Without it, a second
+            // client's concurrent put heals against the first client's value
+            // and the first edit is lost with no signal — the mutant that drops
+            // this call turns `ordinaryHeadFirstWriteConflict.integration.test.ts`
+            // (a-projected-first) red.
+            if (isCurrentOverlay) {
+              await captureOverlayEntityBases(
+                tx, key, 'object', h.documentId, [...oldIds, ...objects.map((object) => object.id)],
+              )
+            }
+            await acknowledgeOverlayBatches(tx, key, 'object', h.documentId, batchIds, 'projected', 0, 0)
+            // `deleteObjects` also rewrites the manifests listing a deleted id.
+            let objectChanges: ServedRowChanges = { upsertIds: [], deleteIds: [] }
+            const diagramChanges = await servedDiagramRowsChangedBy(tx, key,
+              () => diagramIdsReferencing(tx, key, deletedIds, []),
+              async () => {
+                objectChanges = await servedObjectRowsChangedBy(tx, key, candidateIds,
+                  () => applyObjectShardDelta(tx, key, orgId, oldIds, objects))
+              })
+            await recordShardWatermark(tx, h, sampledHeads, preparedWatermarks)
+            await recordRetiredHeadStamps(tx, stamps, preparedWatermarks)
+            return { objects: objectChanges, diagrams: diagramChanges }
+          },
+          // A row that vanished is a delete; one that appeared or moved, an
+          // upsert. Objects only — the plain event — unless a manifest moved.
+          (changes): ReadModelChangePayload => ({ kind: 'exact', changes }),
+          { unchanged: ['connection', 'group', 'diagram'] },
+        )
+        stampsPublished = true
+        // Advance only after rows + feed + generation commit atomically.
+        snap = next
+        for (const batchId of batchIds) acknowledgedBatchIds.add(batchId)
+        notePublished(h.documentId, sampledHeads)
+        if (due) requestRotation('object', h, url)
+      } finally {
+        if (!stampsPublished) restoreRetiredHeadStamps(stamps)
+        settleTakenStamps(stamps)
       }
-      // A shard delta DELETES every id that was in the previous snapshot and is
-      // not in this one. `{ objects: {} }` legitimately means the user removed
-      // them all and must still delete. A document with NO `objects` key was
-      // never initialised — no writer in this product produces one — so acting
-      // on it would destroy rows on the strength of a document that failed to
-      // load. Refuse, record, leave the rows and the snapshot alone; the next
-      // real change re-runs this with a readable document.
-      const read = readEntityMapOrDefect<ObjectInput>(source, 'objects', 'object-shard', url)
-      if (isUninformative(read.defect)) {
-        recordRefusedProjection()
-        console.warn(
-          `[read-model] refused an object-shard delta for ${key.landscapeId}/${key.versionId}: ` +
-            `${url} carries no objects map; ${snap.size} row(s) left untouched`)
-        return
-      }
-      const objects = Object.values(read.map)
-      await repo.flush([h.documentId])
-      const preparedWatermarks = await prepareShardWatermarks([h.documentId])
-      const oldIds = [...snap.keys()]
-      const next = new Map(objects.map((o) => [o.id, o]))
-      const deletedIds = oldIds.filter((id) => !next.has(id))
-      const parentIds = [
-        ...objects.flatMap((object) => object.parentId ? [object.parentId] : []),
-        ...[...snap.values()].flatMap((object) => object.parentId ? [object.parentId] : []),
-      ]
-      const batchIds = unacknowledged(source)
-      // The shard is rewritten whole, but the feed names only the candidates
-      // whose SERVED row (`roObjectCacheByIds`) differs after the write — read
-      // from the database, not from `snap`: an id can live in several shards
-      // (base + overlay heads) and the last shard written wins its row, so this
-      // closure's own snapshot cannot tell whether the row moved (the shared-id
-      // arm of `projectorService.integration.test.ts` goes red on that diff).
-      // Measured 2026-10-15 before this, 10-object workspace: one rename listed
-      // all 10 ids, and every consumer filtering on them (inline expansions,
-      // the offline cache's by-ids re-fetch) re-read for edits not theirs.
-      // The candidates are this shard's ids, the parents it names, the ids it
-      // deletes, and their neighbours read from the rows — children and groups
-      // in OTHER shards, which the old whole-shard listing happened to refresh
-      // on the shard's next edit and a precise feed would otherwise never name
-      // (`servedObjectRowsChangedBy`).
-      const candidateIds = [...objects.map((object) => object.id), ...parentIds, ...deletedIds]
-      await runTracked(
-        'object_shard',
-        async (tx) => {
-          if (isCurrentOverlay) {
-            await captureOverlayEntityBases(
-              tx, key, 'object', h.documentId, [...oldIds, ...objects.map((object) => object.id)],
-            )
-          }
-          await acknowledgeOverlayBatches(tx, key, 'object', h.documentId, batchIds, 'projected', 0, 0)
-          // `deleteObjects` also rewrites the manifests listing a deleted id.
-          let objectChanges: ServedRowChanges = { upsertIds: [], deleteIds: [] }
-          const diagramChanges = await servedDiagramRowsChangedBy(tx, key,
-            () => diagramIdsReferencing(tx, key, deletedIds, []),
-            async () => {
-              objectChanges = await servedObjectRowsChangedBy(tx, key, candidateIds,
-                () => applyObjectShardDelta(tx, key, orgId, oldIds, objects))
-            })
-          await recordShardWatermark(tx, h, sampledHeads, preparedWatermarks)
-          return { objects: objectChanges, diagrams: diagramChanges }
-        },
-        // A row that vanished is a delete; one that appeared or moved, an
-        // upsert. Objects only — the plain event — unless a manifest moved.
-        (changes): ReadModelChangePayload => ({ kind: 'exact', changes }),
-        { unchanged: ['connection', 'group', 'diagram'] },
-      )
-      // Advance only after rows + feed + generation commit atomically.
-      snap = next
-      for (const batchId of batchIds) acknowledgedBatchIds.add(batchId)
     }
-    const coalescer = coalescedProjection('object shard delta', projectLatest)
+    const coalescer = coalescedProjection('object shard delta',
+      foldProduct ? refuseFoldProductChange(url, 'object_shard') : projectLatest)
     const onChange = coalescer.trigger
     h.on('change', onChange)
-    cleanups.push(() => { coalescer.dispose(); h.off('change', onChange) })
+    shardTriggers.set(h.documentId, coalescer.trigger)
+    watchShardStop(url, h.documentId, () => {
+      coalescer.dispose(); h.off('change', onChange); shardTriggers.delete(h.documentId)
+    }, coalescer.idle)
     // Extraction-seeded boot shards project once immediately WHEN the live
     // heads differ from the extraction's (or either is unknown): the delta vs
     // the extraction baseline emits exactly the arrivals the cold build's
     // sampling missed. Read heads AFTER registration: an acknowledgement above
     // can await SQL while a new edit arrives before this listener is installed.
     // Equal current heads need no extra projection/generation.
+    //
+    // A forwarded head runs once at attach WHATEVER its heads: what it owes is
+    // measured from `forwarded_heads`, not from the extraction — late writes
+    // that arrived while no projector was attached.
     const watchedHeads = tryGetHeads(h.doc())
     const projectedHeads = extractionSeed !== undefined ? extractionHeads : attachHeads
-    if ((extractionSeed !== undefined || applyInitial)
-      && !(projectedHeads && watchedHeads && headsEqual(projectedHeads, watchedHeads))) {
+    // A fold product has a `retired` row (so a later fold can take it) but is
+    // never projected or forwarded: only a change since its seed fires, and
+    // that is refused.
+    if ((forwardedAtAttach && !foldProduct) || ((extractionSeed !== undefined || applyInitial)
+      && !(projectedHeads && watchedHeads && headsEqual(projectedHeads, watchedHeads)))) {
       coalescer.trigger()
+    } else if (dueAtAttach) {
+      // Already due and nothing to project: rotate now rather than at the next
+      // write. When a projection was triggered above, it asks itself.
+      requestRotation('object', h, url)
     }
   }
   const watchConnectionShard = async (
@@ -2223,9 +4251,12 @@ export async function startReadModelProjector(
     /** See watchObjectShard — equal heads at attach skip the boot projection. */
     extractionHeads?: readonly string[] | null,
   ) => {
-    const h = applyInitial ? await resolveHandleRetry(url) : await resolveHandle(url)
+    const h = applyInitial ? await resolveHandleRetry(url) : await resolveHandle(url, 'attach')
     const attachDoc = h.doc()
     const attachHeads = tryGetHeads(attachDoc)
+    // A fold product, mid-session or at boot, is never projected
+    // (`ordinaryChainFold.ts`): a change after this is refused.
+    const foldProduct = hasOrdinaryFoldMarker(attachDoc)
     // See watchObjectShard: reported, not refused — this path cannot delete.
     const readInitial = extractionSeed !== undefined
       ? { map: extractionSeed, defect: undefined }
@@ -2239,15 +4270,21 @@ export async function startReadModelProjector(
     const initial = Object.values(readInitial.map)
     // See watchObjectShard: every projector acknowledges, every head it
     // projects, the retired ones included — same rule.
+    // A forwarded head acknowledges nothing itself — see watchObjectShard.
     const acknowledgedBatchIds = new Set<string>()
     const unacknowledged = (doc: ConnShardLike | undefined): string[] =>
-      (doc?.writeBatchIds ?? []).filter((batchId) => !acknowledgedBatchIds.has(batchId))
+      [...new Set([...(doc?.writeBatchIds ?? []), ...forwardedBatchIdsOf(doc)])]
+        .filter((batchId) => !acknowledgedBatchIds.has(batchId))
     const currentOverlayAtAttach = (metaHandle?.doc() as MetaLike | undefined)?.editsConnectionShardUrl === url
-    const attachBatchIds = extractionSeed === undefined
-      || (extractionHeads && attachHeads && headsEqual(extractionHeads, attachHeads))
+    const dueAtAttach = currentOverlayAtAttach && observeWriteHead('connection', url, attachDoc)
+    if (extractionSeed !== undefined) notePublished(h.documentId, extractionHeads)
+    await freshRetirements()
+    const forwardedAtAttach = isForwardedHead('connection', h.documentId, url)
+    const attachBatchIds = !forwardedAtAttach && (extractionSeed === undefined
+      || (extractionHeads && attachHeads && headsEqual(extractionHeads, attachHeads)))
       ? unacknowledged(attachDoc as ConnShardLike | undefined)
       : []
-    if (applyInitial && initial.length) {
+    if (applyInitial && initial.length && !forwardedAtAttach) {
       await repo.flush([h.documentId])
       const preparedWatermarks = await prepareShardWatermarks([h.documentId])
       await runTracked(
@@ -2268,6 +4305,7 @@ export async function startReadModelProjector(
         (changes) => ({ kind: 'connections', ...changes }),
         { unchanged: ['object', 'group', 'diagram'] },
       )
+      notePublished(h.documentId, attachHeads)
       for (const batchId of attachBatchIds) acknowledgedBatchIds.add(batchId)
       // See watchObjectShard: an initial apply failure must not be absorbed.
     } else if (attachBatchIds.length) {
@@ -2283,83 +4321,112 @@ export async function startReadModelProjector(
     }
     let snap = new Map<string, ConnectionInput>(initial.map((c) => [c.id, c]))
     const projectLatest = async () => {
+      // See watchObjectShard: defence in depth behind the disposed coalescer.
+      if (detachedFoldSources.has(url)) return
+      // See watchObjectShard: a retired head with H_r is forwarded instead.
+      if (await forwardInsteadOfProjecting('connection', h, url)) return
       // Sample the exact revision whose rows this pass will publish.
       const source = h.doc() as ConnShardLike
       const sampledHeads = tryGetHeads(source)
-      const sourceConflicts = collectAutomergeEntityConflicts(
-        source?.connections as Record<string, unknown> | undefined,
-      )
-      const isCurrentOverlay = (metaHandle?.doc() as MetaLike | undefined)?.editsConnectionShardUrl === url
-      // Same rule and same measurement as `watchObjectShard` above, from the
-      // same module: `$` entities only, one replacement each, heads guarded.
-      if (isCurrentOverlay && sourceConflicts.size) {
-        const outcome = await healWholeEntityConflicts<ConnectionInput>({
-          db, key, collection: 'connection', handle: h, repo,
-          sourceConflicts, sampledHeads,
-          current: (entityId) => snap.get(entityId),
-          selected: (entityId) => source?.connections?.[entityId],
-        })
-        if (outcome !== 'none') return
+      // See watchObjectShard: stamps are taken with the sample.
+      const stamps = takeRetiredHeadStamps(h.documentId)
+      let stampsPublished = false
+      try {
+        const sourceConflicts = collectAutomergeEntityConflicts(
+          source?.connections as Record<string, unknown> | undefined,
+        )
+        const isCurrentOverlay = (metaHandle?.doc() as MetaLike | undefined)?.editsConnectionShardUrl === url
+        const due = isCurrentOverlay && observeWriteHead('connection', url, source)
+        // Same rule and same measurement as `watchObjectShard` above, from the
+        // same module: `$` entities only, one replacement each, heads guarded.
+        if (isCurrentOverlay && sourceConflicts.size) {
+          const outcome = await healWholeEntityConflicts<ConnectionInput>({
+            db, key, collection: 'connection', handle: h, repo,
+            sourceConflicts, sampledHeads,
+            current: (entityId) => snap.get(entityId),
+            selected: (entityId) => source?.connections?.[entityId],
+          })
+          if (outcome !== 'none') return
+        }
+        // See watchObjectShard: an uninitialised shard document is evidence of
+        // nothing, and this delta deletes on the strength of it.
+        const read = readEntityMapOrDefect<ConnectionInput>(source, 'connections', 'connection-shard', url)
+        if (isUninformative(read.defect)) {
+          recordRefusedProjection()
+          console.warn(
+            `[read-model] refused a connection-shard delta for ${key.landscapeId}/${key.versionId}: ` +
+              `${url} carries no connections map; ${snap.size} row(s) left untouched`)
+          return
+        }
+        const connections = Object.values(read.map)
+        await repo.flush([h.documentId])
+        const preparedWatermarks = await prepareShardWatermarks([
+          h.documentId, ...stamps.map((stamp) => stamp.handle.documentId as DocumentId),
+        ])
+        const oldIds = [...snap.keys()]
+        const next = new Map(connections.map((c) => [c.id, c]))
+        const deletedIds = oldIds.filter((id) => !next.has(id))
+        const batchIds = unacknowledged(source)
+        await runTracked(
+          'connection_shard',
+          async (tx) => {
+            if (isCurrentOverlay) {
+              await captureOverlayEntityBases(
+                tx, key, 'connection', h.documentId,
+                [...oldIds, ...connections.map((connection) => connection.id)],
+              )
+            }
+            await acknowledgeOverlayBatches(tx, key, 'connection', h.documentId, batchIds, 'projected', 0, 0)
+            // Same rule as the object shard: the whole shard is rewritten, the
+            // feed names the served rows that moved (a shared id included — a
+            // base shard and an overlay head both carry an edited connection).
+            // `deleteConnections` also rewrites the manifests listing a deleted id.
+            let connectionChanges: ServedRowChanges = { upsertIds: [], deleteIds: [] }
+            const diagramChanges = await servedDiagramRowsChangedBy(tx, key,
+              () => diagramIdsReferencing(tx, key, [], deletedIds),
+              async () => {
+                connectionChanges = await servedConnectionRowsChangedBy(tx, key,
+                  [...connections.map((connection) => connection.id), ...deletedIds],
+                  () => applyConnectionShardDelta(tx, key, orgId, oldIds, connections))
+              })
+            await recordShardWatermark(tx, h, sampledHeads, preparedWatermarks)
+            await recordRetiredHeadStamps(tx, stamps, preparedWatermarks)
+            return { connections: connectionChanges, diagrams: diagramChanges }
+          },
+          (changes): ReadModelChangePayload => ({ kind: 'exact', changes }),
+          { unchanged: ['object', 'group', 'diagram'] },
+        )
+        stampsPublished = true
+        snap = next
+        for (const batchId of batchIds) acknowledgedBatchIds.add(batchId)
+        notePublished(h.documentId, sampledHeads)
+        if (due) requestRotation('connection', h, url)
+      } finally {
+        if (!stampsPublished) restoreRetiredHeadStamps(stamps)
+        settleTakenStamps(stamps)
       }
-      // See watchObjectShard: an uninitialised shard document is evidence of
-      // nothing, and this delta deletes on the strength of it.
-      const read = readEntityMapOrDefect<ConnectionInput>(source, 'connections', 'connection-shard', url)
-      if (isUninformative(read.defect)) {
-        recordRefusedProjection()
-        console.warn(
-          `[read-model] refused a connection-shard delta for ${key.landscapeId}/${key.versionId}: ` +
-            `${url} carries no connections map; ${snap.size} row(s) left untouched`)
-        return
-      }
-      const connections = Object.values(read.map)
-      await repo.flush([h.documentId])
-      const preparedWatermarks = await prepareShardWatermarks([h.documentId])
-      const oldIds = [...snap.keys()]
-      const next = new Map(connections.map((c) => [c.id, c]))
-      const deletedIds = oldIds.filter((id) => !next.has(id))
-      const batchIds = unacknowledged(source)
-      await runTracked(
-        'connection_shard',
-        async (tx) => {
-          if (isCurrentOverlay) {
-            await captureOverlayEntityBases(
-              tx, key, 'connection', h.documentId,
-              [...oldIds, ...connections.map((connection) => connection.id)],
-            )
-          }
-          await acknowledgeOverlayBatches(tx, key, 'connection', h.documentId, batchIds, 'projected', 0, 0)
-          // Same rule as the object shard: the whole shard is rewritten, the
-          // feed names the served rows that moved (a shared id included — a
-          // base shard and an overlay head both carry an edited connection).
-          // `deleteConnections` also rewrites the manifests listing a deleted id.
-          let connectionChanges: ServedRowChanges = { upsertIds: [], deleteIds: [] }
-          const diagramChanges = await servedDiagramRowsChangedBy(tx, key,
-            () => diagramIdsReferencing(tx, key, [], deletedIds),
-            async () => {
-              connectionChanges = await servedConnectionRowsChangedBy(tx, key,
-                [...connections.map((connection) => connection.id), ...deletedIds],
-                () => applyConnectionShardDelta(tx, key, orgId, oldIds, connections))
-            })
-          await recordShardWatermark(tx, h, sampledHeads, preparedWatermarks)
-          return { connections: connectionChanges, diagrams: diagramChanges }
-        },
-        (changes): ReadModelChangePayload => ({ kind: 'exact', changes }),
-        { unchanged: ['object', 'group', 'diagram'] },
-      )
-      snap = next
-      for (const batchId of batchIds) acknowledgedBatchIds.add(batchId)
     }
-    const coalescer = coalescedProjection('connection shard delta', projectLatest)
+    const coalescer = coalescedProjection('connection shard delta',
+      foldProduct ? refuseFoldProductChange(url, 'connection_shard') : projectLatest)
     const onChange = coalescer.trigger
     h.on('change', onChange)
-    cleanups.push(() => { coalescer.dispose(); h.off('change', onChange) })
+    shardTriggers.set(h.documentId, coalescer.trigger)
+    watchShardStop(url, h.documentId, () => {
+      coalescer.dispose(); h.off('change', onChange); shardTriggers.delete(h.documentId)
+    }, coalescer.idle)
     // See watchObjectShard: seeded boot shards project the extraction gap once
-    // — only when the heads say a gap is possible.
+    // — only when the heads say a gap is possible — and a forwarded head
+    // forwards once, whatever its heads.
     const watchedHeads = tryGetHeads(h.doc())
     const projectedHeads = extractionSeed !== undefined ? extractionHeads : attachHeads
-    if ((extractionSeed !== undefined || applyInitial)
-      && !(projectedHeads && watchedHeads && headsEqual(projectedHeads, watchedHeads))) {
+    // A fold product has a `retired` row (so a later fold can take it) but is
+    // never projected or forwarded: only a change since its seed fires, and
+    // that is refused.
+    if ((forwardedAtAttach && !foldProduct) || ((extractionSeed !== undefined || applyInitial)
+      && !(projectedHeads && watchedHeads && headsEqual(projectedHeads, watchedHeads)))) {
       coalescer.trigger()
+    } else if (dueAtAttach) {
+      requestRotation('connection', h, url)
     }
   }
 
@@ -2411,7 +4478,7 @@ export async function startReadModelProjector(
   cleanups.push(() => registryCoalescer.dispose())
 
   const watchRegistryShard = async (url: string) => {
-    const h = await resolveHandle(url)
+    const h = await resolveHandle(url, 'attach')
     const onChange = registryCoalescer.trigger
     h.on('change', onChange)
     cleanups.push(() => { h.off('change', onChange) })
@@ -2620,28 +4687,296 @@ export async function startReadModelProjector(
       // budget is `SHARD_ARRIVAL_TRIES` (20) rather than the root path's 3 —
       // ~219 s during which `degradedShards` is empty. The health beat must
       // not read that silence as a finished pass.
+      await attachNewShards(meta)
+    }
+    /** Shards whose attach is running now — the meta pass and the retry
+     * below can overlap, and a shard must not get two watchers. */
+    const attachingShards = new Set<string>()
+    /**
+     * A FAILED ATTACH IS RETRIED (phase-3 review). It used to wait for the
+     * next ModelMeta change, which may never come — and after a rotation the
+     * shard that failed is the CURRENT head, so every edit to it stayed out of
+     * `ro_*` (its attach reads the retirement rows, `freshRetirements`, and a
+     * transient SQL error there was enough). Same capped backoff as a failed
+     * forward; retried until an attach of every listed shard succeeds or the
+     * projector stops. The degradation stays until then.
+     */
+    let attachRetry: { timer: ReturnType<typeof setTimeout> | null; attempt: number } | null = null
+    const scheduleAttachRetry = (): void => {
+      if (stopped || attachRetry?.timer) return
+      const attempt = (attachRetry?.attempt ?? 0) + 1
+      const delay = FORWARD_RETRY_DELAYS_MS[Math.min(attempt, FORWARD_RETRY_DELAYS_MS.length) - 1]
+      const timer = setTimeout(() => {
+        attachRetry = { timer: null, attempt }
+        if (stopped) return
+        const latest = metaHandle.doc() as MetaLike | undefined
+        if (latest) void attachNewShards(latest)
+      }, delay)
+      timer.unref?.()
+      attachRetry = { timer, attempt }
+    }
+    cleanups.push(() => {
+      if (attachRetry?.timer) clearTimeout(attachRetry.timer)
+      attachRetry = null
+    })
+    /** product url -> the sources it replaces, for every fold product this
+     * projector attached mid-session (`ordinaryChainFold.ts`). */
+    const foldSourcesByProduct = new Map<string, string[]>()
+    /** Sources whose writes are not all served yet (`ordinaryChainFold.ts`,
+     * SETTLED). Called after the record check, so every source's row is
+     * `folded` and forwards: a source is settled when its live heads equal
+     * its committed `forwarded_heads` (or H_r), read FRESH after sampling
+     * them (`ordinaryHeadLateWritesPending`; a forward in flight reads as
+     * pending). The current write head, or a source whose heads cannot be
+     * read, is never settled. */
+    const unsettledFoldSources = async (kind: 'object' | 'connection', sources: readonly string[]): Promise<string[]> => {
+      const latest = metaHandle.doc() as MetaLike | undefined
+      const current = kind === 'object' ? latest?.editsObjectShardUrl : latest?.editsConnectionShardUrl
+      const unsettled: string[] = []
+      const sampled: Array<{ url: string; documentId: string; heads: string[]; current: false }> = []
+      for (const source of sources) {
+        const entry = shardStops.get(source)
+        const heads = entry && source !== current ? tryGetHeads((await resolveHandle(source, 'fold-settle')).doc()) : null
+        if (!entry || !heads) { unsettled.push(source); continue }
+        sampled.push({ url: source, documentId: entry.documentId, heads: [...heads], current: false })
+      }
+      const pending = new Set(await ordinaryHeadLateWritesPending(db, key, kind, sampled))
+      return [...unsettled, ...sampled.filter((source) => pending.has(source.documentId)).map((source) => source.url)]
+    }
+    /** A fold product is attached with its live content as the baseline,
+     * never applied: see `ordinaryChainFold.ts`. Null: not a fold product. */
+    const foldProductSeed = async <T>(
+      url: string,
+      field: 'objects' | 'connections',
+      watched: readonly string[],
+    ): Promise<{ map: Record<string, T>; heads: readonly string[] | null; sources: string[] } | null> => {
+      const h = await resolveHandleRetry(url, 'fold-product')
+      const doc = h.doc()
+      const sources = ordinaryFoldSourcesOf(doc)
+      if (!sources) return null
+      const latest = metaHandle.doc() as MetaLike | undefined
+      const current = field === 'objects' ? latest?.editsObjectShardUrl : latest?.editsConnectionShardUrl
+      if (current === url) throw new Error(`fold product ${url} is the current write head`)
+      const unwatched = sources.filter((source) => !watched.includes(source))
+      if (unwatched.length) {
+        throw new Error(`${ORDINARY_FOLD_SOURCES_NOT_WATCHED}: ${url} replaces ${unwatched.join(', ')}`)
+      }
+      // The marker is a claim in a client-writable document; the record is the
+      // authority (`ordinaryChainFold.ts`, step 2).
+      // Read FRESH, not from `retirements`: that cache reloads only when a
+      // write-head pointer moves, and a fold moves none.
+      const kind = field === 'objects' ? 'object' : 'connection'
+      const sourceIds = sources.map((source) => shardStops.get(source)?.documentId ?? source)
+      const record = await readOrdinaryChainFold(db, key, kind, h.documentId)
+      const rows = await loadOrdinaryHeadRetirements(db, key)
+      const refusal = ordinaryFoldRecordRefusal(record, sourceIds,
+        (documentId) => rows.get(retirementKey(kind, documentId)))
+      if (refusal) throw new Error(`${refusal}: ${url} replaces ${sources.join(', ')}`)
+      const unsettled = await unsettledFoldSources(kind, sources)
+      if (unsettled.length) {
+        throw new Error(`${ORDINARY_FOLD_SOURCES_NOT_SETTLED}: ${url} replaces ${unsettled.join(', ')}`)
+      }
+      const read = readEntityMapOrDefect<T>(doc, field, field === 'objects' ? 'object-shard' : 'connection-shard', url)
+      if (read.defect) throw new Error(`fold product ${url}: ${summarizeModelDefects([read.defect])}`)
+      return { map: read.map, heads: tryGetHeads(doc), sources }
+    }
+    /** Stop watching a folded source and give its lease back. What reaches it
+     * after this is not projected or forwarded by this projector (phase 4.4). */
+    /** Is `url` in the LATEST ModelMeta, and not a source this projector
+     * detached? A retry pass iterates the ModelMeta it started on. */
+    const stillListed = (kind: 'object' | 'connection', url: string): boolean => {
+      if (detachedFoldSources.has(url)) return false
+      const latest = metaHandle.doc() as MetaLike | undefined
+      return Boolean((kind === 'object' ? latest?.objectShardUrls : latest?.connectionShardUrls)?.includes(url))
+    }
+    /** The sources of one kind a pass detaches, TOGETHER: their watchers
+     * stopped and waited for, their state cleared, ONE batch of watermark
+     * statements for all of them (`watermarkDetachedFoldSources`), then
+     * every lease given back in the same synchronous turn.
+     *
+     * Whatever throws on the way, every source already taken out of the
+     * watched set is FINISHED in the `finally` — its state cleared, its lease
+     * given back, out of `foldSourcesDetaching` (which the poll and the
+     * re-check skip), the poll started — so a late write to it is still found
+     * in storage. Without a watermark (the throw came first, or none could
+     * be set) its row keeps NULL: the poll reloads it, the safe direction. */
+    const detachFoldSources = async (urls: readonly string[], watched: string[], kind: 'object' | 'connection'): Promise<void> => {
+      const detaching: Array<{ url: string; entry: ReturnType<typeof shardStops.get> }> = []
+      let watermarks = new Map<string, string>()
+      let idled = false
+      /** The watermark step ran (it flushes, whatever happens inside it). */
+      let watermarked = false
+      const clearState = (url: string, entry: ReturnType<typeof shardStops.get>) => {
+        degradedShards.delete(url)
+        forwardDegradedUrls.delete(url)
+        model.objectsByShardUrl.delete(url)
+        model.connectionsByShardUrl.delete(url)
+        model.objectShardHeadsByUrl.delete(url)
+        model.connectionShardHeadsByUrl.delete(url)
+        if (!entry) return
+        const retry = forwardRetries.get(entry.documentId)
+        if (retry) clearTimeout(retry.timer)
+        forwardRetries.delete(entry.documentId)
+        publishedHeadsByDocument.delete(entry.documentId)
+        // A stamp waiting for THIS head's projection is never consumed now;
+        // the watermark it would have certified stays refused (the safe
+        // direction) until a cold build. A stamp keyed BY this head and
+        // targeting another stays: `liveHeadsForStamp` refuses an unlisted
+        // head, so it certifies 0.
+        for (const [retiredId, stamp] of retiredHeadStamps) {
+          if (stamp.target === entry.documentId) retiredHeadStamps.delete(retiredId)
+        }
+      }
+      try {
+        for (const url of urls) {
+          const latest = metaHandle.doc() as MetaLike | undefined
+          if ((kind === 'object' ? latest?.editsObjectShardUrl : latest?.editsConnectionShardUrl) === url) {
+            degradeShard(url, kind === 'object' ? 'object_shard' : 'connection_shard',
+              new Error(`fold source ${url} is the current write head; not detached`))
+            continue
+          }
+          // Out of the watched set FIRST, synchronously: a concurrent attach
+          // pass then skips it (`detachedFoldSources`) for the whole wait
+          // below, and the folded-head poll skips it until the detach is done.
+          detachedFoldSources.add(url)
+          foldSourcesDetaching.add(url)
+          const at = watched.indexOf(url)
+          if (at >= 0) watched.splice(at, 1)
+          const entry = shardStops.get(url)
+          shardStops.delete(url)
+          // Listed for the `finally` BEFORE its stop, which may throw.
+          detaching.push({ url, entry })
+          // Stop future passes; the one in flight is waited for below.
+          entry?.stop()
+        }
+        // WAIT for the passes in flight — all of them, whatever one does: a
+        // forward parked on an await would otherwise resume after the state
+        // below is cleared — re-degrading, re-scheduling, re-noting it — and on
+        // a document the release has just evicted.
+        await Promise.allSettled(detaching.map(({ entry }) => entry?.idle()))
+        idled = true
+        for (const { url, entry } of detaching) clearState(url, entry)
+        // Still resident and leased: the watermark set here spares the poll a
+        // full reload of heads this detach is about to evict (G4-16, M3).
+        watermarked = true
+        watermarks = await watermarkDetachedFoldSources(kind,
+          detaching.flatMap(({ entry }) => (entry ? [entry.documentId] : [])))
+      } finally {
+        // After a throw that came first, the same two duties as above before
+        // any lease goes. Every pass in flight is waited for: one parked on an
+        // await would resume on cleared state and an evicted document. (A pass
+        // starting later returns at once: `detachedFoldSources`.)
+        if (!idled) await Promise.allSettled(detaching.map(({ entry }) => entry?.idle()))
+        // And every resident source is flushed: the eviction drops a change
+        // whose save has not started (it refuses only a FAILED save).
+        // Best-effort: what it cannot save stays to the eviction's own guard.
+        if (!watermarked) {
+          const ids = detaching.flatMap(({ entry }) =>
+            (entry && syncedHandle(repo, entry.documentId)?.state === 'ready' ? [entry.documentId] : []))
+          if (ids.length) {
+            await repo.flush(ids).catch((error: unknown) => {
+              console.warn(JSON.stringify({
+                event: 'read_model.ordinary_fold_source_watermark_failed',
+                workspace: `${key.landscapeId}/${key.versionId}`,
+                kind,
+                documentIds: ids,
+                error: error instanceof Error ? error.message : String(error),
+              }))
+            })
+          }
+        }
+        // Idempotent: cleared again after a throw that came before it.
+        for (const { url, entry } of detaching) clearState(url, entry)
+        // Synchronous from the last flush of the batch to every eviction
+        // `release` starts.
+        for (const { entry } of detaching) {
+          if (entry && residency && leasedDocumentIds.delete(entry.documentId)) residency.release(entry.documentId, residencyOwner)
+        }
+        for (const { url, entry } of detaching) {
+          foldSourcesDetaching.delete(url)
+          console.log(JSON.stringify({
+            event: 'read_model.ordinary_fold_source_detached',
+            workspace: `${key.landscapeId}/${key.versionId}`,
+            kind,
+            url,
+            // The watermark this detach KNOWS it set; null otherwise — also
+            // after a commit that succeeded but threw on the client, whose
+            // row then holds S while this says null (the poll reads the row).
+            watermark: (entry && watermarks.get(entry.documentId)) ?? null,
+          }))
+        }
+        // From here a late write to them is found in storage, not by a
+        // watcher; one pass now covers what arrived between the settle check
+        // and here.
+        if (detaching.length) startFoldedArrivalPoll()
+      }
+    }
+    const attachNewShards = async (meta: MetaLike): Promise<void> => {
+      let failed = false
       await withReconciling(async () => {
-        for (const url of meta.objectShardUrls ?? []) if (!model.objectShardUrls.includes(url)) {
+        for (const url of meta.objectShardUrls ?? []) {
+          // No `stopped` check here: the meta pass's behaviour after `stop()`
+          // is unchanged (pinned by "does not MARK degraded after it is
+          // stopped either", `projectorService.test.ts`); the RETRY checks it.
+          if (model.objectShardUrls.includes(url) || attachingShards.has(url)) continue
+          if (!stillListed('object', url)) continue
+          attachingShards.add(url)
           try {
-            await watchObjectShard(url, true)
+            const seed = await foldProductSeed<ObjectInput>(url, 'objects', model.objectShardUrls)
+            if (seed) {
+              await watchObjectShard(url, false, seed.map, seed.heads)
+              foldSourcesByProduct.set(url, seed.sources)
+            } else {
+              await watchObjectShard(url, true)
+            }
             model.objectShardUrls.push(url)
             degradedShards.delete(url)
           } catch (error) {
             console.error('[read-model] new object shard initial apply failed', error)
             degradeShard(url, 'object_shard', error)
+            if (!isReadModelAuthorityLoss(error)) failed = true
+          } finally {
+            attachingShards.delete(url)
           }
         }
-        for (const url of meta.connectionShardUrls ?? []) if (!model.connectionShardUrls.includes(url)) {
+        for (const url of meta.connectionShardUrls ?? []) {
+          if (model.connectionShardUrls.includes(url) || attachingShards.has(url)) continue
+          if (!stillListed('connection', url)) continue
+          attachingShards.add(url)
           try {
-            await watchConnectionShard(url, true)
+            const seed = await foldProductSeed<ConnectionInput>(url, 'connections', model.connectionShardUrls)
+            if (seed) {
+              await watchConnectionShard(url, false, seed.map, seed.heads)
+              foldSourcesByProduct.set(url, seed.sources)
+            } else {
+              await watchConnectionShard(url, true)
+            }
             model.connectionShardUrls.push(url)
             degradedShards.delete(url)
           } catch (error) {
             console.error('[read-model] new connection shard initial apply failed', error)
             degradeShard(url, 'connection_shard', error)
+            if (!isReadModelAuthorityLoss(error)) failed = true
+          } finally {
+            attachingShards.delete(url)
           }
         }
+        // After the attaches: a source is detached only once the product that
+        // replaces it is attached, so no value is ever served by neither.
+        // Against the LATEST ModelMeta, not the one this pass started on.
+        const latest = metaHandle.doc() as MetaLike | undefined
+        for (const product of foldSourcesByProduct.keys()) {
+          if (!latest?.objectShardUrls?.includes(product) && !latest?.connectionShardUrls?.includes(product)) {
+            foldSourcesByProduct.delete(product)
+          }
+        }
+        await detachFoldSources(foldSourcesToDetach(model.objectShardUrls, latest?.objectShardUrls ?? [], foldSourcesByProduct),
+          model.objectShardUrls, 'object')
+        await detachFoldSources(foldSourcesToDetach(model.connectionShardUrls, latest?.connectionShardUrls ?? [], foldSourcesByProduct),
+          model.connectionShardUrls, 'connection')
       })
+      if (failed) scheduleAttachRetry()
+      else if (!attachRetry?.timer) attachRetry = null
       // Outside the guard, and that is the point: inside it this call would
       // return at `reconciling > 0` and do nothing (see the end of
       // `reconcilePass`).
@@ -2852,6 +5187,63 @@ export async function startReadModelProjector(
   // the recycle hook is the recovery. Before this line it was a failed boot,
   // which the throw already reports.
   bootComplete = true
+  // A chain already long at attach folds without waiting for a rotation.
+  requestFold('object')
+  requestFold('connection')
+  // Folded heads from an earlier life are never attached: poll them.
+  if ([...retirements.values()].some((row) => row.status === 'folded')) startFoldedArrivalPoll()
+  // Fold off: retired heads are parked once settled (`parkRetiredHead`).
+  startRetiredHeadParkSweep()
+  // G4-16e: what this projector already holds, published by the stats route
+  // and /metrics (`ordinaryRotationTelemetry.ts`). Rotating workspaces only,
+  // and only while this cell still owns it: a build that finished after its
+  // ownership moved must neither publish the workspace nor log its chain
+  // alert from a cell that no longer serves it (the fleet stops it next).
+  if (headRotation.rotates && stillOwned()) {
+    cleanups.push(ordinaryRotationTelemetry.register(key, {
+      listed: listedChain,
+      parkedHeads: (kind) => {
+        let count = 0
+        for (const entry of parkedRetiredHeads.values()) if (entry.kind === kind) count += 1
+        return count
+      },
+      rows: (kind) => {
+        let retired = 0
+        let folded = 0
+        const createdAtMs: number[] = []
+        for (const row of retirements.values()) {
+          if (row.collection !== kind) continue
+          if (row.status === 'retired') retired += 1
+          else if (row.status === 'folded') folded += 1
+          else continue
+          // A fold PRODUCT's row is no rotation (G4-16e); NULL (older rows)
+          // counts as one — see the backfill in `schema.ts`.
+          if (row.createdAtMs !== undefined && row.origin !== 'fold-product') createdAtMs.push(row.createdAtMs)
+        }
+        return { retired, folded, createdAtMs }
+      },
+      currentHead: (kind) => {
+        const meta = metaHandle?.doc() as MetaLike | undefined
+        return headRotation.lastObserved(kind, kind === 'object' ? meta?.editsObjectShardUrl : meta?.editsConnectionShardUrl)
+      },
+    }))
+    observeChainLength('object')
+    observeChainLength('connection')
+  }
+  // A previous owner's save may still commit below a watermark this
+  // projector moves (G4-16d): every retired head is re-checked from storage
+  // once, `handoverRecheckMs` from now.
+  armHandoverRecheck()
+  attachDone = true
+  // One line for the attach's own loads (G4-16 M3, `documentLoadTelemetry.ts`).
+  // `ms` is the SUM of each load's wall time (storage read included); loads
+  // run concurrently during an attach, so it overstates the time they took.
+  console.log(JSON.stringify({
+    event: 'read_model.attach_document_loads',
+    workspace: `${key.landscapeId}/${key.versionId}`,
+    loads: attachLoads.loads,
+    ms: Math.round(attachLoads.ms),
+  }))
 
   return () => {
     if (stopped) return
@@ -2928,6 +5320,9 @@ export interface ProjectorFleetOptions {
    * `read_model_static_workspaces` lookup on `db`; injectable so the refusal
    * can be tested without a schema. */
   isStaticWorkspace?: (key: WorkspaceKey) => Promise<boolean>
+  /** Production passes the value `index.ts` parsed at boot, where an invalid
+   * `AM_ORDINARY_HEAD_ROTATION` refuses to start; defaults to the same parse. */
+  ordinaryHeadRotation?: OrdinaryHeadRotationConfig
 }
 
 export interface ProjectorFleetSnapshot extends ColdBuildAdmissionSnapshot {
@@ -3014,6 +5409,7 @@ export class ProjectorFleet {
   private readonly ownsWorkspace: (key: WorkspaceKey) => boolean
   private readonly isStaticWorkspace: (key: WorkspaceKey) => Promise<boolean>
   private readonly residency?: AutomergeResidencyLeases
+  private readonly ordinaryHeadRotation: OrdinaryHeadRotationConfig
 
   private readonly byKey = new Map<string, FleetEntry>()
   private readonly inFlight = new Map<string, Promise<boolean>>()
@@ -3048,6 +5444,7 @@ export class ProjectorFleet {
       }
     })
     this.residency = opts.residency
+    this.ordinaryHeadRotation = opts.ordinaryHeadRotation ?? ordinaryHeadRotationConfig()
   }
 
   /** Keep a fleet-managed workspace resident across LRU pressure. Ownership
@@ -3145,6 +5542,7 @@ export class ProjectorFleet {
       stop = await this.startProjector(
         this.repo, rootUrl, this.db, key, this.residency, undefined, undefined, stillOwned, onFenceLost,
         (instanceId) => { projectorInstanceId = instanceId },
+        this.ordinaryHeadRotation,
       )
     } catch (error) {
       if (isReadModelAuthorityLoss(error)) {

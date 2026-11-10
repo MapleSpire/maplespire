@@ -71,9 +71,17 @@ async function serve(handler) {
   servers.push(server)
   return server
 }
-// A real RESP endpoint on a dedicated loopback address, with no DNS, port
-// translation, Redis process or Docker. A collision fails instead of reusing
-// an existing listener. Tests in the parent file execute sequentially.
+// A real RESP endpoint on loopback, with no DNS, Redis process or Docker. A
+// collision fails instead of reusing an existing listener. Tests in the parent
+// file execute sequentially.
+//
+// It binds 127.0.0.1, not redisIp: macOS configures only 127.0.0.1 on lo0, so
+// listening on 127.0.0.77 fails with EADDRNOTAVAIL before the preload can
+// write its report (measured 2026-11-02, Darwin 27.2, sandbox on and off;
+// Linux and Windows route all of 127/8, which is why it passed there). The
+// gate still has to resolve and ask for redisIp:6379 — the connect hook
+// asserts that — and the socket is routed here.
+const redisBindHost = '127.0.0.1'
 if (witnessEnabled) {
   const redis = net.createServer(socket => {
     redisConnections++
@@ -115,24 +123,33 @@ if (witnessEnabled) {
     // Redis service on 0.0.0.0, a parallel test) would make this bind fail.
     // The gate still has to ask for redisIp:6379; the connect hook below
     // asserts that and then routes the socket here.
-    redis.listen({ host: redisIp, port: 0, exclusive: true }, resolve)
+    redis.listen({ host: redisBindHost, port: 0, exclusive: true }, resolve)
   })
   servers.push(redis)
   const redisPort = redis.address().port
+  const realRemote = name => Object.getOwnPropertyDescriptor(net.Socket.prototype, name).get
+  const realRemoteAddress = realRemote('remoteAddress'), realRemotePort = realRemote('remotePort')
   net.createConnection = (options, ...args) => {
     // Some Node releases use this export for HTTP agent sockets too. Keep
     // those real connections to this fixture's bound HTTP/WS listeners; only
     // the Redis witness socket receives the delayed-close instrumentation.
+    // The Redis listener itself is excluded: reaching it directly would skip
+    // the endpoint assertion below.
     if (options?.host === '127.0.0.1' && servers.some(server => {
       const address = server.address()
-      return address?.address === '127.0.0.1' && String(address.port) === String(options.port)
+      return server !== redis && address?.address === '127.0.0.1' && String(address.port) === String(options.port)
     })) return originalConnect(options, ...args)
     assert.deepEqual(options, { host: redisIp, port: 6379, family: 4 }, 'witness must use the verified endpoint')
-    const socket = originalConnect({ ...options, port: redisPort }, ...args)
+    const socket = originalConnect({ ...options, host: redisBindHost, port: redisPort }, ...args)
     // The witness checks the peer is the endpoint it asked for; report that
-    // port, since the fixture listens elsewhere. The peer check itself is
-    // covered by sync-cell-redis-pause-witness.test.mjs.
-    Object.defineProperty(socket, 'remotePort', { get: () => options.port })
+    // endpoint, since the fixture listens on 127.0.0.1 (macOS routes no other
+    // loopback address). `routed()` is always true for the socket opened just
+    // above; it only keeps a future edit of that redirect from spoofing a
+    // socket that went elsewhere. The witness's own peer check (a real
+    // mismatch) is covered by sync-cell-redis-pause-witness.test.mjs.
+    const routed = () => realRemoteAddress.call(socket) === redisBindHost && realRemotePort.call(socket) === redisPort
+    Object.defineProperty(socket, 'remoteAddress', { get: () => routed() ? options.host : realRemoteAddress.call(socket) })
+    Object.defineProperty(socket, 'remotePort', { get: () => routed() ? options.port : realRemotePort.call(socket) })
     const emit = socket.emit
     socket.emit = function (name, ...args) {
       if (name === 'close') {

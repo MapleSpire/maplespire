@@ -13,7 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import { createHash, randomBytes } from 'node:crypto'
-import { mkdir, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { spawn } from 'node:child_process'
 import { setTimeout as sleep } from 'node:timers/promises'
@@ -1512,7 +1512,7 @@ async function ensureNewBundleDirectory(bundleDirectory: string): Promise<void> 
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
   }
-  await mkdir(dirname(target), { recursive: true })
+  await mkdir(dirname(target), { recursive: true, mode: 0o700 })
 }
 
 /**
@@ -1560,7 +1560,7 @@ export async function createDatabaseBackup(options: BackupCreationOptions): Prom
   const target = resolve(options.bundleDirectory)
   await ensureNewBundleDirectory(target)
   const temporary = `${target}.partial-${process.pid}-${randomBytes(6).toString('hex')}`
-  await mkdir(temporary, { recursive: true })
+  await mkdir(temporary, { recursive: true, mode: 0o700 })
   // Claim the directory on the RESOURCE, immediately after creating it and
   // before a single byte goes in. Otherwise the only thing keeping a rival's
   // recursive delete off this directory would be its AGE, and the parties that
@@ -1619,6 +1619,9 @@ export async function createDatabaseBackup(options: BackupCreationOptions): Prom
       signal: options.signal,
       lockWaitTimeoutMs: options.dumpLockWaitTimeoutMs,
     })
+    // pg_dump / docker cp create the file under the process umask (typically
+    // 0644); the dump holds every row, so narrow it to the owner.
+    await chmod(dumpFile, 0o600)
     await client.query('COMMIT')
     transactionOpen = false
     // Let a booting server migrate while the assets are archived. Ignoring the
@@ -1658,6 +1661,7 @@ export async function createDatabaseBackup(options: BackupCreationOptions): Prom
     await writeFile(join(temporary, MANIFEST_FILE), `${JSON.stringify(manifest, null, 2)}\n`, {
       encoding: 'utf8',
       flag: 'wx',
+      mode: 0o600,
     })
     // The RENAME first, the claim second, for two independent reasons.
     //

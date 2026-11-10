@@ -46,10 +46,16 @@ const after = `                                if (!preparedHeads.every(head => 
                                         peer.dirty = true;
                                 }`
 
-/** The native None/reset ordering is version-specific; upgrades need a review. */
+/** The native None/reset ordering is version-specific; upgrades need a review.
+ * So is what `src/readModel/ordinaryHeadForwarding.ts` (the retired-head
+ * forward plan, G4-16) relies on: `getChangeMetaByHash` null for a QUEUED
+ * hash (as `hasHeads`), `getChangesMeta(heads)` listing exactly the changes
+ * after `heads`, `diffPath` on an object id returning ABSOLUTE paths in
+ * `A.diff`'s order for field edits, and `getWithType` / `materialize` at
+ * explicit heads. Its unit tests pin each against the whole-document plan. */
 export function verifyInFlightSdkVersion(packageInfo) {
   if (packageInfo.name !== '@automerge/automerge' || packageInfo.version !== '3.2.6') {
-    throw new Error('Unsupported Automerge SDK for in-flight fan-out; review native sync semantics before upgrading.')
+    throw new Error('Unsupported Automerge SDK for in-flight fan-out and the retired-head forward plan (ordinaryHeadForwarding.ts); review native sync semantics and the plan\'s backend reads before upgrading.')
   }
 }
 

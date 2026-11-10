@@ -63,6 +63,34 @@ describe('AutomergeResidencyLeases', () => {
     expect(repo.handles[handle.documentId]).toBeUndefined()
   })
 
+  it('releases ONE document of an owner and keeps its other leases and other owners', async () => {
+    const repo = new Repo({ network: [] })
+    const folded = repo.create({ objects: { a: { id: 'a' } } })
+    const kept = repo.create({ objects: { b: { id: 'b' } } })
+    const shared = repo.create({ objects: { c: { id: 'c' } } })
+    const residency = new AutomergeResidencyLeases(repo)
+    residency.acquire(folded, 'projector-a', 'landscape-a/v1')
+    residency.acquire(kept, 'projector-a', 'landscape-a/v1')
+    residency.acquire(shared, 'projector-a', 'landscape-a/v1')
+    residency.acquire(shared, 'projector-b', 'landscape-b/v1')
+
+    expect(residency.release(folded.documentId, 'projector-a')).toBe(true)
+    expect(residency.release(shared.documentId, 'projector-a')).toBe(true)
+    await residency.drain()
+    expect(repo.handles[folded.documentId]).toBeUndefined()
+    expect(residency.isLeased(folded.documentId)).toBe(false)
+    expect(repo.handles[kept.documentId]).toBe(kept)
+    expect(residency.isLeased(kept.documentId)).toBe(true)
+    // Another owner still holds it: not evicted, still leased.
+    expect(repo.handles[shared.documentId]).toBe(shared)
+    expect(residency.isLeased(shared.documentId)).toBe(true)
+    // Not held (any more) by this owner: nothing happens.
+    expect(residency.release(folded.documentId, 'projector-a')).toBe(false)
+    expect(residency.release(kept.documentId, 'projector-b')).toBe(false)
+    await residency.drain()
+    expect(repo.handles[kept.documentId]).toBe(kept)
+  })
+
   it('never evicts the protected process root', async () => {
     const repo = new Repo({ network: [] })
     const root = repo.create({ modelUrl: '', shardUrls: [] as string[] })

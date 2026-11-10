@@ -21,6 +21,8 @@ import { test } from 'node:test'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { randomBytes } from 'node:crypto'
 import { once } from 'node:events'
+import { createServer } from 'node:http'
+import * as A from '@automerge/automerge'
 import { Repo, documentIdToBinary } from '@automerge/automerge-repo'
 import { WebSocketServer } from 'ws'
 import {
@@ -36,7 +38,13 @@ import {
   completeQualificationCleanup,
   collectBaselineOwnership,
   convergedResult,
+  currentObjectWriteHead,
   defaultRunDeadlineMs,
+  FOLLOW_WRITE_HEAD_FLAG,
+  followLoadTargets,
+  OVERLAY_WRITE_HEAD_VERSION,
+  parseFollowWriteHead,
+  WriteHeadLedger,
   loadProcessesReadyForFailure,
   LOAD_PROFILES,
   MetricsAccumulator,
@@ -57,6 +65,30 @@ import {
   shutdownRepo,
   summarizeLoadNetworkDiagnostics,
   summarizeCycleConvergence,
+  ORDINARY_HEAD_EVENTS,
+  ORDINARY_HEAD_ROTATION_ARM_FLAG,
+  evaluateOrdinaryHeadRotationArm,
+  inspectOrdinaryHeadRotation,
+  ordinaryHeadRotationConfigVoids,
+  parseOrdinaryHeadRotationArm,
+  preselectWorkspaces,
+  selectPartitionWorkspaces,
+  summarizeOrdinaryHeadEvents,
+  summarizeOrdinaryHeadRotationConfigs,
+  summarizeOrdinaryChainFoldEvents,
+  collectOrdinaryHeadEvents,
+  ordinaryChainFoldConcerns,
+  parseOrdinaryChainFoldArm,
+  summarizeRssTrend,
+  summarizeResidencyTrend,
+  residencySample,
+  RESIDENCY_TREND_COLUMNS,
+  rotationSample,
+  summarizeRotationTrend,
+  ROTATION_TREND_COLUMNS,
+  writeHeadStats,
+  judgeRehearsalRotationArm,
+  rehearsalSupplementaryFailures,
 } from './verify-sync-cell-load-soak.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -1859,6 +1891,120 @@ test('turns a sampled retired-document threshold crossing into qualification evi
   assert.equal(metrics.retiredDocumentLimitExceeded, true)
 })
 
+test('G4-16b defer2h memory: a recorded sample reaches the summary residency trend with its handles and peers', () => {
+  const MiB = 1_048_576
+  const snapshot = (rss, handles) => ({
+    service: 'sync-cell-b',
+    stats: {
+      totalHandles: handles,
+      synchronizer: { documentsWithPeers: 3, totalPeerBindings: 40 },
+      transport: { processMemoryBytes: { rss: rss * MiB, heapUsed: 90 * MiB, external: 25 * MiB } },
+    },
+    fleet: { foreignResidentProjectors: 0 },
+    ownership: { storageFence: {} },
+  })
+  const accumulator = new MetricsAccumulator([snapshot(200, 10)])
+  accumulator.record([snapshot(250, 17)])
+  const metrics = accumulator.summarize([snapshot(250, 17)])
+  assert.deepEqual(metrics.residencyByService['sync-cell-b'].points, [[0, 250, 90, 25, 17, 3, 40, null, null, null]])
+  // The same samples feed the existing RSS summary, unchanged.
+  assert.equal(metrics.rssByService['sync-cell-b'].last, 250 * MiB)
+  // ...and the pass report, which is what the evidence file keeps, carries it.
+  const base = evidence()
+  const output = evaluateLoadSoakEvidence({ ...base, metrics: { ...base.metrics, residencyByService: metrics.residencyByService } }, config)
+  assert.equal(output.outcome, 'passed')
+  assert.deepEqual(output.residencyByService['sync-cell-b'].points, [[0, 250, 90, 25, 17, 3, 40, null, null, null]])
+})
+
+test('G4-16e: a cell\'s rotation counters reach the summary and the pass report, one series per rotating workspace/collection', () => {
+  const MiB = 1_048_576
+  const entry = (collection, rotations, overlayChain, extra = {}) => ({
+    workspace: 'ls-hot/v1', collection, resident: true, observedAt: null, rotations,
+    rotationsByTrigger: { actors: 0, changes: rotations, both: 0, unknown: 0 },
+    rotationsLast24h: rotations, rotationsLast7d: rotations, rotationsLast30d: rotations,
+    lastRotatedAt: null, listedShards: overlayChain + 24, overlayChain, parkedHeads: rotations,
+    retiredRows: rotations, foldedRows: 0, currentHead: { actors: 9, changes: 70 }, chainAlert: overlayChain > 64, ...extra,
+  })
+  const snapshot = (rss, rotations) => ({
+    service: 'sync-cell-b',
+    stats: {
+      processBootId: 'boot-b1',
+      transport: { processMemoryBytes: { rss: rss * MiB } },
+      ordinaryHeadRotation: { mode: 'on', chainFold: false, chainAlertLength: 64, chainAlerts: 0, entries: [
+        entry('object', rotations, rotations + 1), entry('connection', 0, 1, { currentHead: null }),
+      ] },
+    },
+    fleet: { foreignResidentProjectors: 0 },
+    ownership: { storageFence: {} },
+  })
+  // A cell with no rotation block (an older image) gets no series at all;
+  // one that rotates nothing (empty entries) gets an EMPTY series, not none.
+  const older = { service: 'sync-cell-c', stats: { transport: { processMemoryBytes: { rss: MiB } } }, fleet: {}, ownership: { storageFence: {} } }
+  const idle = { service: 'sync-cell-a', stats: { processBootId: 'boot-a1', transport: { processMemoryBytes: { rss: MiB } }, ordinaryHeadRotation: { entries: [] } }, fleet: {}, ownership: { storageFence: {} } }
+  const accumulator = new MetricsAccumulator([snapshot(200, 2), older, idle])
+  accumulator.record([snapshot(250, 3), older, idle])
+  const metrics = accumulator.summarize([snapshot(250, 3), older, idle])
+  assert.deepEqual(metrics.rotationByService['sync-cell-b'], {
+    bucketMs: 60_000,
+    columns: ROTATION_TREND_COLUMNS,
+    bootIds: ['boot-b1'],
+    series: {
+      'ls-hot/v1/connection': [[0, 0, 0, 25, 1, 0, 0, 0, null, null, false, 0, 0, 0, true, false]],
+      'ls-hot/v1/object': [[0, 3, 3, 28, 4, 3, 3, 0, 9, 70, false, 0, 3, 0, true, false]],
+    },
+  })
+  assert.equal(metrics.rotationByService['sync-cell-c'], undefined)
+  assert.deepEqual(metrics.rotationByService['sync-cell-a'], { bucketMs: 60_000, columns: ROTATION_TREND_COLUMNS, bootIds: ['boot-a1'], series: {} })
+  const base = evidence()
+  const output = evaluateLoadSoakEvidence({ ...base, metrics: { ...base.metrics, rotationByService: metrics.rotationByService } }, config)
+  assert.equal(output.outcome, 'passed')
+  assert.deepEqual(output.rotationByService, metrics.rotationByService)
+  // An evidence file written before G4-16e has none: null, not {}.
+  assert.equal(evaluateLoadSoakEvidence(base, config).rotationByService, null)
+})
+
+test('G4-16e: a rotation sample keeps what the entry says and nulls what it lacks — never 0 or false', () => {
+  assert.equal(rotationSample(1, undefined), null)
+  assert.equal(rotationSample(1, { ordinaryHeadRotation: {} }), null)
+  assert.deepEqual(rotationSample(1, { ordinaryHeadRotation: { entries: [] } }), { at: 1, bootId: null, series: {} })
+  const allNull = {
+    rotations: null, rotationsLast24h: null, listedShards: null, overlayChain: null, parkedHeads: null,
+    retiredRows: null, foldedRows: null, actors: null, changes: null, chainAlert: null,
+    byActors: null, byChanges: null, byBoth: null, resident: null,
+  }
+  // Every field null or absent, chainAlert absent: all null, chainAlert null too.
+  assert.deepEqual(rotationSample(5, { processBootId: 'b', ordinaryHeadRotation: { entries: [
+    { workspace: 'l/v', collection: 'object', rotations: null, overlayChain: null, currentHead: null, rotationsByTrigger: null },
+    { workspace: 'l/v', collection: 'connection', overlayChain: 'x', chainAlert: 'yes', resident: 1 },
+    { collection: 'object' },
+  ] } }), { at: 5, bootId: 'b', series: { 'l/v/object': allNull, 'l/v/connection': allNull } })
+  // A measured zero and a measured false stay what they are.
+  assert.deepEqual(rotationSample(6, { ordinaryHeadRotation: { entries: [
+    { workspace: 'l/v', collection: 'object', rotations: 0, chainAlert: false, resident: false, rotationsByTrigger: { actors: 0 } },
+  ] } }).series['l/v/object'], { ...allNull, rotations: 0, chainAlert: false, resident: false, byActors: 0 })
+})
+
+test('G4-16e: the rotation trend keeps the last sample per minute, and a restart reads as a reset, not a fall', () => {
+  const point = (at, rotations, bootId = 'boot-1') => ({ at, bootId, series: { 'l/v/object': { rotations, overlayChain: rotations + 1, chainAlert: false } } })
+  const trend = summarizeRotationTrend({
+    'sync-cell-b': [point(1_000, 1), point(50_000, 2), point(61_000, 3), point(185_000, 0, 'boot-2'), point(250_000, 1, 'boot-2')],
+    'sync-cell-c': [],
+  })
+  const rows = trend['sync-cell-b'].series['l/v/object']
+  assert.deepEqual(rows.map((row) => row.slice(0, 2)), [[0, 2], [1, 3], [3, 0], [4, 1]])
+  // `processRestarted` is the last column: only the first point after the change.
+  assert.deepEqual(rows.map((row) => row.at(-1)), [false, false, true, false])
+  assert.deepEqual(trend['sync-cell-b'].bootIds, ['boot-1', 'boot-2'])
+  assert.deepEqual(rows[1], [1, 3, null, null, 4, null, null, null, null, null, false, null, null, null, null, false])
+  // An unknown boot id on either side: not known to be a restart, not false either.
+  const unknown = summarizeRotationTrend({ 'sync-cell-b': [point(1_000, 1, null), point(70_000, 2)] })
+  assert.deepEqual(unknown['sync-cell-b'].series['l/v/object'].map((row) => row.at(-1)), [false, null])
+  assert.deepEqual(unknown['sync-cell-b'].bootIds, ['boot-1'])
+  assert.equal(trend['sync-cell-c'], null)
+  assert.deepEqual(ROTATION_TREND_COLUMNS, ['minute', 'rotations', 'rotationsLast24h', 'listedShards', 'overlayChain', 'parkedHeads', 'retiredRows', 'foldedRows', 'actors', 'changes', 'chainAlert', 'byActors', 'byChanges', 'byBoth', 'resident', 'processRestarted'])
+  assert.deepEqual(summarizeRotationTrend(undefined), {})
+})
+
 test('reports distinct fenced chunks separately from their shared document', () => {
   const snapshot = (storageFence) => ({
     service: 'sync-cell-a',
@@ -2189,6 +2335,109 @@ test('moves every sustained phase to the newly published overlay write head', as
     previous,
     async (_selection, target) => target,
   ), /did not publish a fresh overlay write head/)
+})
+
+test('SYNC_LOAD_FOLLOW_WRITE_HEAD is off unless explicitly on, and refuses anything else', () => {
+  assert.equal(FOLLOW_WRITE_HEAD_FLAG, 'SYNC_LOAD_FOLLOW_WRITE_HEAD')
+  for (const raw of [undefined, '', '  ', 'off', ' off ']) assert.equal(parseFollowWriteHead(raw), false)
+  assert.equal(parseFollowWriteHead('on'), true)
+  assert.equal(parseFollowWriteHead(' on '), true)
+  for (const raw of ['ON', 'true', '1', 'yes', 'shadow']) {
+    assert.throws(() => parseFollowWriteHead(raw), /SYNC_LOAD_FOLLOW_WRITE_HEAD must be on or off/)
+  }
+  assert.equal(parseLoadSoakConfig({}, []).followWriteHead, false)
+  assert.equal(parseLoadSoakConfig({ SYNC_LOAD_FOLLOW_WRITE_HEAD: 'off' }, []).followWriteHead, false)
+  assert.equal(parseLoadSoakConfig({ SYNC_LOAD_FOLLOW_WRITE_HEAD: 'on' }, []).followWriteHead, true)
+  assert.throws(() => parseLoadSoakConfig({ SYNC_LOAD_FOLLOW_WRITE_HEAD: 'maybe' }, []), /must be on or off/)
+  assert.throws(() => parseLoadSoakConfig({
+    SYNC_LOAD_FOLLOW_WRITE_HEAD: 'on', SYNC_LOAD_SEGMENTED_WORKSPACES: 'on',
+  }, []), /cannot be combined with SYNC_LOAD_SEGMENTED_WORKSPACES/)
+  // The shipped soak posture still qualifies with the flag on: it changes the
+  // target, not the declared load shape.
+  const posture = { SYNC_BENCH_POSTURE: 'shipped', SYNC_LOAD_PROFILE: 'fleet' }
+  assert.equal(parseLoadSoakConfig({ ...posture, SYNC_LOAD_FOLLOW_WRITE_HEAD: 'on' }, ['--mode=soak']).followWriteHead, true)
+})
+
+test('off leaves every other parsed field and the run deadline unchanged', () => {
+  const envs = [{}, { SYNC_LOAD_PROFILE: 'fleet', SYNC_BENCH_POSTURE: 'shipped' }]
+  for (const env of envs) {
+    const argv = env.SYNC_BENCH_POSTURE ? ['--mode=soak'] : []
+    const absent = parseLoadSoakConfig(env, argv)
+    const off = parseLoadSoakConfig({ ...env, SYNC_LOAD_FOLLOW_WRITE_HEAD: 'off' }, argv)
+    assert.deepEqual(off, absent)
+    const on = parseLoadSoakConfig({ ...env, SYNC_LOAD_FOLLOW_WRITE_HEAD: 'on' }, argv)
+    const { followWriteHead: _on, runDeadlineMs: onDeadline, ...onRest } = on
+    const { followWriteHead: _off, runDeadlineMs: offDeadline, ...offRest } = absent
+    assert.deepEqual(onRest, offRest)
+    // One extra two-target resolution budget per run, for the per-cycle follow.
+    assert.equal(onDeadline - offDeadline, 2 * (30_000 + 4 * absent.settleMs))
+    assert.equal(defaultRunDeadlineMs({ ...absent, followWriteHead: undefined }), offDeadline)
+  }
+})
+
+test('the followed head is the bridge write head, not a segment or base shard', () => {
+  assert.equal(OVERLAY_WRITE_HEAD_VERSION, Number(/export const OVERLAY_WRITE_HEAD_VERSION = (\d+)/
+    .exec(readFileSync(resolve(here, '../../src/lib/automerge/overlayWriteHead.ts'), 'utf8'))?.[1]))
+  const head = 'automerge:2j9knpCseyhnK8izDmLpGP5WMdZQ'
+  const segment = 'automerge:4NMNnkMhL8jXrdJ9jamS58PAVdXu'
+  const valid = (url) => url === head || url === segment
+  assert.equal(currentObjectWriteHead({
+    editsOverlayWriteHeadVersion: 1, editsObjectShardUrl: head, editsObjectShardUrls: [segment, head], objectShardUrls: [segment],
+  }, valid), head)
+  // No head yet: wait (null), never fall back to the newest segment or base shard.
+  assert.equal(currentObjectWriteHead({
+    editsOverlayWriteHeadVersion: 1, editsObjectShardUrls: [segment], objectShardUrls: [segment],
+  }, valid), null)
+  assert.equal(currentObjectWriteHead({ editsOverlayWriteHeadVersion: 1, editsObjectShardUrl: 'automerge:typo' }, valid), null)
+  assert.equal(currentObjectWriteHead(undefined, valid), null)
+  assert.throws(() => currentObjectWriteHead({ editsObjectShardUrl: head }, valid), /legacy write-head version undefined/)
+  // Default validator is automerge-repo's own.
+  assert.equal(currentObjectWriteHead({ editsOverlayWriteHeadVersion: 1, editsObjectShardUrl: 'not-a-url' }), null)
+})
+
+test('following accepts an unchanged head and picks up a rotated one, per partition', async () => {
+  const selections = new Map([[0, { workspace: 'zero' }], [1, { workspace: 'one' }]])
+  const heads = new Map([[0, 'head-a'], [1, 'head-x']])
+  const calls = []
+  const resolveTarget = async (selection, previous, partition) => {
+    calls.push({ selection, previous, partition })
+    return heads.get(partition)
+  }
+  let targets = new Map(heads)
+  const ledger = new WriteHeadLedger()
+  ledger.record('baseline', 0, targets)
+  ledger.record('failover', 0, targets)
+  targets = await followLoadTargets(selections, targets, resolveTarget)
+  ledger.record('soak', 1, targets)
+  assert.deepEqual([...targets], [[0, 'head-a'], [1, 'head-x']])
+  heads.set(0, 'head-b') // the server rotated partition 0 between cycles
+  targets = await followLoadTargets(selections, targets, resolveTarget)
+  ledger.record('soak', 2, targets)
+  assert.deepEqual([...targets], [[0, 'head-b'], [1, 'head-x']])
+  assert.deepEqual(calls.map(({ selection, previous, partition }) => [selection.workspace, previous, partition]), [
+    ['zero', 'head-a', 0], ['one', 'head-x', 1], ['zero', 'head-a', 0], ['one', 'head-x', 1],
+  ])
+  const summary = ledger.summary()
+  assert.equal(summary.followWriteHead, true)
+  assert.deepEqual(summary.partitions.map((row) => [row.partition, row.distinctWriteHeads, row.rotated, row.writeHeads]), [
+    [0, 2, true, ['head-a', 'head-b']],
+    [1, 1, false, ['head-x']],
+  ])
+  assert.deepEqual(summary.partitions[0].episodes, [
+    { phase: 'baseline', cycle: 0, writeHeadIndex: 0 }, { phase: 'failover', cycle: 0, writeHeadIndex: 0 },
+    { phase: 'soak', cycle: 1, writeHeadIndex: 0 }, { phase: 'soak', cycle: 2, writeHeadIndex: 1 },
+  ])
+  await assert.rejects(followLoadTargets(selections, targets, async () => null), /partition 0 has no current overlay write head/)
+  assert.throws(() => ledger.record('soak', 3, new Map([[0, 'head-b']])), /partition 1 has no target/)
+})
+
+test('the soak report carries the write-head ledger only when following', () => {
+  assert.equal(Object.hasOwn(evaluateLoadSoakEvidence(evidence(), config), 'writeHeads'), false)
+  const writeHeads = { followWriteHead: true, partitions: [{ partition: 0, distinctWriteHeads: 2, rotated: true }] }
+  assert.deepEqual(evaluateLoadSoakEvidence(evidence({ writeHeads }), config).writeHeads, writeHeads)
+  assert.throws(() => evaluateLoadSoakEvidence(evidence({
+    writeHeads, failoverResults: [{ ...result(8_000), hotDiverged: 1 }],
+  }), config), /"writeHeads":\{"followWriteHead":true/)
 })
 
 test('cleans disposable workspaces through another route when one owner route is stale', async () => {
@@ -3207,6 +3456,804 @@ test('outside a posture qualification, cohorts are released together and only on
   await assert.rejects(releaseCohortsIfReady(barrierId, ready, () => barrierId), /separate nonce/)
 })
 
+// ── G4-16b: the ordinary-head rotation A/B arm ───────────────────────────────
+
+const hotWorkspaces = [{ landscapeId: 'land-0', versionId: 'ver-0' }, { landscapeId: 'land-1', versionId: 'ver-1' }]
+const hotKeys = ['land-0/ver-0', 'land-1/ver-1']
+function rotationServer(mode, overrides = {}) {
+  const row = { mode, allowlist: hotKeys, maxActors: 8, maxChanges: 512, ...overrides }
+  return summarizeOrdinaryHeadRotationConfigs(['sync-cell-a', 'sync-cell-b', 'sync-cell-c'].map((service) => ({ service, ...row })))
+}
+function rotationLedger(rotatedPartitions = []) {
+  const ledger = new WriteHeadLedger()
+  ledger.record('baseline', 0, new Map([[0, 'head-0'], [1, 'head-1']]))
+  ledger.record('soak', 1, new Map([[0, rotatedPartitions.includes(0) ? 'head-0b' : 'head-0'],
+    [1, rotatedPartitions.includes(1) ? 'head-1b' : 'head-1']]))
+  return ledger.summary()
+}
+function rotationEvents(rotatedHot = 0, rotatedElsewhere = 0) {
+  const lines = []
+  for (let index = 0; index < rotatedHot; index += 1) {
+    lines.push(JSON.stringify({ event: 'read_model.ordinary_head_rotated', workspace: hotKeys[index % 2], collection: 'objects', retired: `r${index}`, child: `c${index}`, retirementHeads: 1 }))
+  }
+  for (let index = 0; index < rotatedElsewhere; index += 1) {
+    lines.push(JSON.stringify({ event: 'read_model.ordinary_head_rotated', workspace: 'other/ver', collection: 'objects' }))
+  }
+  return summarizeOrdinaryHeadEvents({ 'sync-cell-a': lines.join('\n'), 'sync-cell-b': '', 'sync-cell-c': '' }, hotWorkspaces)
+}
+const armInput = (requested, overrides = {}) => ({
+  requested, server: rotationServer(requested), workspaces: hotWorkspaces, followWriteHead: true,
+  writeHeads: rotationLedger(requested === 'on' ? [0] : []), serverEvents: rotationEvents(requested === 'on' ? 1 : 0),
+  ...overrides,
+})
+
+test('G4-16b SYNC_LOAD_ORDINARY_HEAD_ROTATION: unset is no arm, off/shadow/on name one, anything else throws', () => {
+  assert.equal(ORDINARY_HEAD_ROTATION_ARM_FLAG, 'SYNC_LOAD_ORDINARY_HEAD_ROTATION')
+  for (const raw of [undefined, '', '   ']) assert.equal(parseOrdinaryHeadRotationArm(raw), null)
+  for (const raw of ['off', 'shadow', 'on', ' on ']) assert.equal(parseOrdinaryHeadRotationArm(raw), raw.trim())
+  for (const raw of ['ON', 'true', '1', 'rotate']) assert.throws(() => parseOrdinaryHeadRotationArm(raw), /must be off, shadow or on/)
+})
+
+test('G4-16b no arm parses to the byte-identical config, with no new key and the old deadline', () => {
+  for (const [env, argv] of [[{}, []], [{ SYNC_LOAD_PROFILE: 'fleet', SYNC_BENCH_POSTURE: 'shipped' }, ['--mode=soak']]]) {
+    const absent = parseLoadSoakConfig(env, argv)
+    const blank = parseLoadSoakConfig({ ...env, SYNC_LOAD_ORDINARY_HEAD_ROTATION: '', SYNC_LOAD_PRESELECTED_WORKSPACES: '' }, argv)
+    assert.equal(JSON.stringify(blank), JSON.stringify(absent))
+    for (const key of ['ordinaryHeadRotation', 'preselectedWorkspaces', 'preselectOnly']) assert.equal(Object.hasOwn(absent, key), false, key)
+  }
+  const follow = { SYNC_LOAD_FOLLOW_WRITE_HEAD: 'on' }
+  const plain = parseLoadSoakConfig(follow, [])
+  for (const mode of ['off', 'shadow', 'on']) {
+    const armed = parseLoadSoakConfig({ ...follow, SYNC_LOAD_ORDINARY_HEAD_ROTATION: mode }, [])
+    assert.equal(armed.ordinaryHeadRotation, mode)
+    const { ordinaryHeadRotation: _mode, runDeadlineMs, ...rest } = armed
+    const { runDeadlineMs: plainDeadline, ...plainRest } = plain
+    assert.deepEqual(rest, plainRest)
+    // Three cell config reads (30 s) and three whole-log reads (120 s): literal.
+    assert.equal(runDeadlineMs - plainDeadline, 450_000)
+  }
+})
+
+test('G4-16b the arm refuses on without following, segmented mode, and malformed preselections', () => {
+  assert.throws(() => parseLoadSoakConfig({ SYNC_LOAD_ORDINARY_HEAD_ROTATION: 'on' }, []), /=on requires SYNC_LOAD_FOLLOW_WRITE_HEAD=on/)
+  assert.equal(parseLoadSoakConfig({ SYNC_LOAD_ORDINARY_HEAD_ROTATION: 'off' }, []).followWriteHead, false)
+  assert.equal(parseLoadSoakConfig({ SYNC_LOAD_ORDINARY_HEAD_ROTATION: 'shadow' }, []).ordinaryHeadRotation, 'shadow')
+  assert.throws(() => parseLoadSoakConfig({ SYNC_LOAD_ORDINARY_HEAD_ROTATION: 'off', SYNC_LOAD_SEGMENTED_WORKSPACES: 'on' }, []), /cannot be combined with SYNC_LOAD_SEGMENTED_WORKSPACES/)
+  const pair = 'land-0:ver-0,land-1:ver-1'
+  assert.deepEqual(parseLoadSoakConfig({ SYNC_LOAD_PRESELECTED_WORKSPACES: pair }, []).preselectedWorkspaces, hotWorkspaces)
+  assert.throws(() => parseLoadSoakConfig({ SYNC_LOAD_PRESELECTED_WORKSPACES: 'land-0:ver-0' }, []), /exactly two workspaces/)
+  assert.throws(() => parseLoadSoakConfig({ SYNC_LOAD_PRESELECTED_WORKSPACES: 'land-0/ver-0,land-1/ver-1' }, []), /SYNC_LOAD_PRESELECTED_WORKSPACES entries must use landscapeId:versionId/)
+  assert.throws(() => parseLoadSoakConfig({ SYNC_LOAD_PRESELECTED_WORKSPACES: pair, SYNC_LOAD_WORKSPACES: pair }, []), /cannot be combined with SYNC_LOAD_WORKSPACES/)
+  assert.throws(() => parseLoadSoakConfig({ SYNC_LOAD_PRESELECTED_WORKSPACES: pair }, ['--preselect-workspaces']), /chooses the workspaces/)
+  assert.equal(parseLoadSoakConfig({}, ['--preselect-workspaces']).preselectOnly, true)
+  // Unlike SYNC_LOAD_WORKSPACES, a preselection may be fresh: it was created
+  // for this run. The shipped G4 soak still qualifies with the whole arm set.
+  assert.throws(() => parseLoadSoakConfig({ SYNC_LOAD_FRESH_WORKSPACES: 'on', SYNC_LOAD_WORKSPACES: pair }, []), /cannot be combined with fresh/)
+  const soak = parseLoadSoakConfig({ SYNC_BENCH_POSTURE: 'shipped', SYNC_LOAD_PROFILE: 'fleet', SYNC_LOAD_FOLLOW_WRITE_HEAD: 'on',
+    SYNC_LOAD_ORDINARY_HEAD_ROTATION: 'on', SYNC_LOAD_PRESELECTED_WORKSPACES: pair }, ['--mode=soak'])
+  assert.deepEqual([soak.freshWorkspaces, soak.ordinaryHeadRotation, soak.preselectedWorkspaces.length], [true, 'on', 2])
+})
+
+test('G4-16b log events are counted per hot workspace, with forwarding totals and the boot line', () => {
+  const hot = hotKeys[0]
+  const log = [
+    '[read-model] ordinary head rotation: on, 2 workspace(s), maxActors=8 maxChanges=512',
+    JSON.stringify({ event: 'read_model.ordinary_head_rotation_due', mode: 'on', workspace: hot, kind: 'object', url: 'automerge:x', numActors: 9, numChanges: 40, crossed: ['actors'], newlyCrossed: ['actors'], thresholds: { maxActors: 8, maxChanges: 512 } }),
+    JSON.stringify({ event: 'read_model.ordinary_head_rotated', workspace: hot, collection: 'objects', retired: 'r', child: 'c', retirementHeads: 2 }),
+    JSON.stringify({ event: 'read_model.ordinary_head_forwarded', workspace: hot, collection: 'objects', retired: 'r', current: 'c', entities: 3, written: 2, created: 1, ignored: 0, batchIdsAdded: [], conflicts: [{ id: 'x' }], committed: true }),
+    JSON.stringify({ event: 'read_model.ordinary_head_forwarded', workspace: hot, written: 0, created: 0, conflicts: [], committed: false }),
+    JSON.stringify({ event: 'read_model.ordinary_head_forward_refused', reason: 'unknown-heads', workspace: hot }),
+    'prefix ' + JSON.stringify({ event: 'read_model.ordinary_head_rotation_failed', workspace: hot, error: 'boom' }),
+    JSON.stringify({ event: 'read_model.ordinary_head_rotated', workspace: 'someone/else' }),
+    JSON.stringify({ event: 'read_model.something_else', workspace: hot }),
+    '{"event":"read_model.ordinary_head_rotated", truncated',
+  ].join('\n')
+  const summary = summarizeOrdinaryHeadEvents({ 'sync-cell-a': log, 'sync-cell-b': 'nothing', 'sync-cell-c': '' }, hotWorkspaces)
+  assert.equal(summary.counts['read_model.ordinary_head_rotated'], 1)
+  assert.equal(summary.counts['read_model.ordinary_head_rotation_due'], 1)
+  assert.equal(summary.counts['read_model.ordinary_head_forwarded'], 2)
+  assert.equal(summary.counts['read_model.ordinary_head_forward_refused'], 1)
+  assert.equal(summary.counts['read_model.ordinary_head_rotation_failed'], 1)
+  assert.equal(summary.otherWorkspaceCounts['read_model.ordinary_head_rotated'], 1)
+  assert.deepEqual([summary.rotatedHot, summary.rotatedTotal, summary.forwardedHot, summary.forwardsCommitted, summary.forwardedEntities, summary.forwardConflicts],
+    [1, 2, 2, 1, 3, 1])
+  assert.deepEqual(summary.rotations, [{ service: 'sync-cell-a', workspace: hot, collection: 'objects', retired: 'r', child: 'c', retirementHeads: 2 }])
+  assert.equal(summary.due[0].numActors, 9)
+  assert.deepEqual(summary.conflictSamples, [{ service: 'sync-cell-a', workspace: hot, retired: 'r', current: 'c', conflict: { id: 'x' } }])
+  assert.deepEqual(summary.problems.map((entry) => [entry.event, entry.reason]), [
+    ['read_model.ordinary_head_forward_refused', 'unknown-heads'], ['read_model.ordinary_head_rotation_failed', 'boom']])
+  assert.deepEqual(summary.bootLines, { 'sync-cell-a': '[read-model] ordinary head rotation: on, 2 workspace(s), maxActors=8 maxChanges=512', 'sync-cell-b': null, 'sync-cell-c': null })
+  assert.equal(summary.unparseableLines, 1)
+  assert.deepEqual(ORDINARY_HEAD_EVENTS.length, 6)
+})
+
+test('G4-16b the probe reads the cells\' OWN parse, and runs against the real config function', async () => {
+  const calls = []
+  const env = { AM_ORDINARY_HEAD_ROTATION: 'on', AM_ORDINARY_HEAD_ROTATION_WORKSPACE_ALLOWLIST: 'land-1/ver-1 land-0/ver-0',
+    AM_ORDINARY_HEAD_ROTATION_MAX_ACTORS: '8', AM_ORDINARY_HEAD_ROTATION_MAX_CHANGES: '' }
+  // The probe text the gate sends, executed with src/ in place of dist/: a
+  // typo in the probe or a renamed export fails here, not on the bench.
+  const exec = async (_config, ...args) => {
+    calls.push(args)
+    const probe = args.at(-1).replace('./dist/readModel/ordinaryHeadRotation.js', './src/readModel/ordinaryHeadRotation.ts')
+    const stdout = execFileSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', probe],
+      { cwd: resolve(here, '..'), env: { PATH: process.env.PATH, ...env }, encoding: 'utf8', timeout: 30_000 })
+    return { stdout }
+  }
+  const server = await inspectOrdinaryHeadRotation({ cellPorts: [1, 2, 3], host: '127.0.0.1' }, exec)
+  assert.deepEqual([server.mode, server.allowlist, server.maxActors, server.maxChanges, server.agree], ['on', hotKeys, 8, 512, true])
+  assert.deepEqual(calls.map((args) => args.slice(0, 7)), ['sync-cell-a', 'sync-cell-b', 'sync-cell-c'].map((service) => (
+    ['exec', '-T', '-e', 'NODE_OPTIONS=', '-w', '/app', service])))
+  await assert.rejects(inspectOrdinaryHeadRotation({ cellPorts: [1, 2, 3] }, async () => ({ stdout: 'hello\n' })), /printed no ordinary-head rotation configuration/)
+  const mixed = summarizeOrdinaryHeadRotationConfigs([{ service: 'a', mode: 'on', allowlist: hotKeys, maxActors: 8, maxChanges: 512 },
+    { service: 'b', mode: 'on', allowlist: hotKeys, maxActors: 8, maxChanges: 512 }, { service: 'c', mode: 'on', allowlist: hotKeys, maxActors: 128, maxChanges: 512 }])
+  assert.equal(mixed.agree, false)
+  assert.equal(summarizeOrdinaryHeadRotationConfigs(mixed.cells.slice(0, 2)).agree, false, 'two cells are not the fleet')
+})
+
+test('G4-16b VOID rules: the observed rotation must agree with the requested mode', () => {
+  for (const requested of ['off', 'shadow', 'on']) {
+    const arm = evaluateOrdinaryHeadRotationArm(armInput(requested))
+    assert.equal(arm.status, 'CONSISTENT', `${requested}: ${arm.voidReasons.join('; ')}`)
+    assert.deepEqual([arm.requestedMode, arm.serverMode, arm.thresholds], [requested, requested, { maxActors: 8, maxChanges: 512 }])
+  }
+  const voids = [
+    ['on', { writeHeads: rotationLedger([]) }, /no partition's writers were handed a new write head/],
+    ['on', { writeHeads: undefined }, /did not follow the write head/],
+    ['on', { serverEvents: rotationEvents(0) }, /no cell logged read_model.ordinary_head_rotated for a hot workspace/],
+    ['on', { serverEvents: rotationEvents(0, 1) }, /no cell logged read_model.ordinary_head_rotated for a hot workspace/],
+    ['on', { server: rotationServer('off') }, /requested ordinary-head rotation on, but the cells run off/],
+    ['on', { server: rotationServer('on', { allowlist: [] }) }, /allow-list naming exactly the two hot workspaces/],
+    ['on', { server: rotationServer('on', { allowlist: [hotKeys[0]] }) }, /allow-list naming/],
+    ['shadow', { server: rotationServer('shadow', { allowlist: 'all' }) }, /allow-list naming/],
+    ['off', { writeHeads: rotationLedger([1]) }, /rotation off, but a partition's writers were handed a new write head/],
+    ['off', { serverEvents: rotationEvents(1) }, /rotation off, but a cell logged/],
+    ['off', { serverEvents: rotationEvents(0, 1) }, /rotation off, but a cell logged/],
+    ['shadow', { writeHeads: rotationLedger([0]) }, /rotation shadow, but a partition's writers/],
+    ['shadow', { serverEvents: rotationEvents(1) }, /rotation shadow, but a cell logged/],
+    ['off', { server: rotationServer('on') }, /requested ordinary-head rotation off, but the cells run on/],
+    ['off', { server: null }, /configuration was not observed/],
+    ['off', { serverEvents: null }, /log events were not read/],
+    ['on', { server: { ...rotationServer('on'), agree: false } }, /parsed different/],
+  ]
+  for (const [requested, change, reason] of voids) {
+    const arm = evaluateOrdinaryHeadRotationArm(armInput(requested, change))
+    assert.equal(arm.status, 'VOID', `${requested} ${JSON.stringify(Object.keys(change))}`)
+    assert.ok(arm.voidReasons.some((entry) => reason.test(entry)), arm.voidReasons.join('; '))
+  }
+  // off reads no allow-list: an empty one is not a reason to void it.
+  assert.equal(evaluateOrdinaryHeadRotationArm(armInput('off', { server: rotationServer('off', { allowlist: [] }) })).status, 'CONSISTENT')
+  // One rotated partition of two is enough for `on`.
+  assert.equal(evaluateOrdinaryHeadRotationArm(armInput('on', { writeHeads: rotationLedger([1]) })).status, 'CONSISTENT')
+  assert.deepEqual(ordinaryHeadRotationConfigVoids('on', rotationServer('on'), hotWorkspaces), [])
+})
+
+test('G4-16b the report records the arm, and a VOID arm is a VOID verdict that still carries its failures', () => {
+  // No arm: no new key, same report.
+  const plain = evaluateLoadSoakEvidence(evidence(), config)
+  assert.equal(Object.hasOwn(plain, 'ordinaryHeadRotation'), false)
+  assert.equal(JSON.stringify(evaluateLoadSoakEvidence(evidence({ ordinaryHeadRotation: { server: rotationServer('on') } }), config)), JSON.stringify(plain))
+  const armConfig = { ...config, ordinaryHeadRotation: 'on', followWriteHead: true }
+  const armEvidence = (overrides = {}) => evidence({
+    writeHeads: rotationLedger([0]),
+    ordinaryHeadRotation: { workspaces: hotWorkspaces, server: rotationServer('on'), serverEvents: rotationEvents(2) },
+    ...overrides,
+  })
+  const passed = evaluateLoadSoakEvidence(armEvidence(), armConfig)
+  assert.equal(passed.outcome, 'passed')
+  assert.deepEqual([passed.ordinaryHeadRotation.status, passed.ordinaryHeadRotation.serverMode, passed.ordinaryHeadRotation.serverEvents.rotatedHot], ['CONSISTENT', 'on', 2])
+  const { ordinaryHeadRotation: _arm, writeHeads: _heads, ...passedRest } = passed
+  assert.deepEqual(passedRest, plain)
+  const voided = evaluateLoadSoakEvidence(armEvidence({ writeHeads: rotationLedger([]),
+    failoverResults: [resultWithRejectedEdits(1, 8_000), { ...result(1_100, 1), missingFields: 2 }] }), armConfig)
+  assert.deepEqual([voided.outcome, voided.status], ['void', 'VOID'])
+  assert.match(voided.reasons.join('; '), /no partition's writers/)
+  assert.ok(voided.failures.includes('a failover workspace diverged'))
+  assert.deepEqual([voided.rejectedClientEdits, voided.missingFields], [1, 2])
+  assert.equal(voided.ordinaryHeadRotation.requestedMode, 'on')
+  // A red arm that is CONSISTENT stays a thrown failure, with the arm in it.
+  assert.throws(() => evaluateLoadSoakEvidence(armEvidence({ failoverResults: [{ ...result(8_000), hotDiverged: 1 }] }), armConfig),
+    /"ordinaryHeadRotation":\{"requestedMode":"on"/)
+  // And the verdict guard exits 1 on it: VOID is not a pass.
+  const proc = { exitCode: null, on() {}, removeListener() {} }
+  const lines = []
+  const guard = createVerdictGuard({ proc, log: (line) => lines.push(line), error: (line) => lines.push(line) })
+  guard.arm()
+  guard.settle(voided)
+  assert.equal(proc.exitCode, 1)
+  assert.match(lines.join('\n'), /verdict outcome is "void"/)
+})
+
+test('G4-16b the write-head ledger carries per-cycle A.stats only where it was read', async () => {
+  const doc = A.change(A.from({ objects: {} }), (draft) => { draft.objects.x = { name: 'x' } })
+  assert.deepEqual(writeHeadStats(doc), { numActors: 1, numChanges: 2, numOps: A.stats(doc).numOps })
+  assert.equal(writeHeadStats({ objects: {} }), null)
+  assert.equal(writeHeadStats(undefined), null)
+  // A document as the gate holds it: from automerge-repo, not from `A.from`.
+  const repo = new Repo({ network: [] })
+  try {
+    const handle = repo.create({ objects: {} })
+    handle.change((draft) => { draft.objects.y = { name: 'y' } })
+    assert.equal(writeHeadStats(handle.doc())?.numChanges, 2)
+  } finally {
+    await shutdownRepo(repo)
+  }
+  const ledger = new WriteHeadLedger()
+  ledger.record('baseline', 0, new Map([[0, 'h0'], [1, 'h1']]))
+  ledger.record('soak', 1, new Map([[0, 'h0b'], [1, 'h1']]), new Map([[0, { numActors: 3, numChanges: 4, numOps: 5 }]]))
+  const [zero, one] = ledger.summary().partitions
+  assert.deepEqual(zero.episodes, [{ phase: 'baseline', cycle: 0, writeHeadIndex: 0 },
+    { phase: 'soak', cycle: 1, writeHeadIndex: 1, headStats: { numActors: 3, numChanges: 4, numOps: 5 } }])
+  assert.deepEqual(one.episodes, [{ phase: 'baseline', cycle: 0, writeHeadIndex: 0 }, { phase: 'soak', cycle: 1, writeHeadIndex: 0 }])
+})
+
+/** Three fake cells: partition = the landscape id's trailing digit, mod 2. */
+async function fakeCells({ landscapes = [] } = {}) {
+  const created = []
+  const deleted = []
+  const owners = [0, 1, null]
+  const known = [...landscapes]
+  const servers = await Promise.all(owners.map((partition, index) => new Promise((resolveServer) => {
+    const server = createServer(async (incoming, response) => {
+      const url = new URL(incoming.url, 'http://cell')
+      const send = (status, body, headers = {}) => {
+        response.writeHead(status, { 'content-type': 'application/json', ...headers })
+        response.end(JSON.stringify(body))
+      }
+      if (url.pathname === '/api/health') return send(200, { ok: true })
+      if (url.pathname === '/api/auth/dev-login') return send(200, { user: { isPlatformAdmin: true }, orgId: 'org' }, { 'set-cookie': 'maplespire_session=s; HttpOnly' })
+      if (url.pathname === '/api/platform/sync-cell') return send(200, { ready: partition !== null, partitionIndex: partition })
+      if (url.pathname === '/api/landscapes' && incoming.method === 'GET') return send(200, { landscapes: known.map((id) => ({ id, defaultVersionId: `${id}-v` })) })
+      if (url.pathname === '/api/landscapes' && incoming.method === 'POST') {
+        const id = ['new-0', 'new-2', 'new-1', 'new-3'][created.length]
+        created.push(id)
+        known.push(id)
+        return send(200, { landscape: { id, defaultVersionId: `${id}-v` } })
+      }
+      if (url.pathname.startsWith('/api/landscapes/') && incoming.method === 'DELETE') {
+        deleted.push(decodeURIComponent(url.pathname.slice('/api/landscapes/'.length)))
+        return send(200, {})
+      }
+      if (url.pathname === '/api/automerge/root') {
+        const owner = Number(url.searchParams.get('landscapeId').at(-1)) % 2
+        return send(200, { url: `automerge:root-${url.searchParams.get('landscapeId')}` }, { 'x-maplespire-sync-route': owner === partition ? 'owner' : 'proxied' })
+      }
+      send(404, {})
+    })
+    server.listen(0, '127.0.0.1', () => resolveServer(server))
+    void index
+  })))
+  const ports = servers.map((server) => server.address().port)
+  return {
+    ports, created, deleted,
+    env: { SYNC_FAILOVER_CELL_A_PORT: String(ports[0]), SYNC_FAILOVER_CELL_B_PORT: String(ports[1]), SYNC_FAILOVER_CELL_C_PORT: String(ports[2]) },
+    allCells: ports.map((port, index) => ({ service: `sync-cell-${'abc'[index]}`, baseUrl: `http://127.0.0.1:${port}` })),
+    states: owners.map((partition) => ({ ready: partition !== null, partitionIndex: partition })),
+    close: () => Promise.all(servers.map((server) => new Promise((done) => server.close(done)))),
+  }
+}
+
+test('G4-16b preselection chooses as a run would, deletes the fresh landscapes it did not choose, and prints both spellings', async () => {
+  const cellsUnderTest = await fakeCells()
+  try {
+    const config = parseLoadSoakConfig({ ...cellsUnderTest.env, SYNC_LOAD_FRESH_WORKSPACES: 'on' }, ['--preselect-workspaces'])
+    const verdict = await preselectWorkspaces(config)
+    assert.equal(verdict.outcome, 'passed')
+    // new-0 (partition 0), new-2 (partition 0 again: the selection keeps the
+    // LATER one, as a run does), new-1 (partition 1). new-0 is not chosen.
+    assert.deepEqual(cellsUnderTest.created, ['new-0', 'new-2', 'new-1'])
+    assert.deepEqual(cellsUnderTest.deleted, ['new-0'])
+    assert.deepEqual(verdict.preselection, {
+      workspaces: [{ partition: 0, landscapeId: 'new-2', versionId: 'new-2-v' }, { partition: 1, landscapeId: 'new-1', versionId: 'new-1-v' }],
+      freshWorkspaces: true,
+      createdLandscapeIds: ['new-2', 'new-1'],
+      SYNC_LOAD_PRESELECTED_WORKSPACES: 'new-2:new-2-v,new-1:new-1-v',
+      allowlist: 'new-2/new-2-v,new-1/new-1-v',
+    })
+  } finally {
+    await cellsUnderTest.close()
+  }
+})
+
+test('G4-16b a preselected pair is used as given, owned for cleanup when fresh, and never extended by a third', async () => {
+  const cellsUnderTest = await fakeCells({ landscapes: ['old-0', 'old-1', 'old-2'] })
+  try {
+    const env = { ...cellsUnderTest.env, SYNC_LOAD_PRESELECTED_WORKSPACES: 'old-1:old-1-v,old-0:old-0-v' }
+    const created = []
+    const selected = await selectPartitionWorkspaces(parseLoadSoakConfig({ ...env, SYNC_LOAD_FRESH_WORKSPACES: 'on' }, []),
+      cellsUnderTest.allCells, cellsUnderTest.states, 'maplespire_session=s', created)
+    assert.deepEqual([selected.get(0).workspace.landscapeId, selected.get(1).workspace.landscapeId], ['old-0', 'old-1'])
+    assert.deepEqual(created, ['old-1', 'old-0'], 'fresh: the run that uses them deletes them')
+    const notFresh = []
+    await selectPartitionWorkspaces(parseLoadSoakConfig(env, []), cellsUnderTest.allCells, cellsUnderTest.states, 'maplespire_session=s', notFresh)
+    assert.deepEqual(notFresh, [])
+    const samePartition = []
+    await assert.rejects(selectPartitionWorkspaces(parseLoadSoakConfig({ ...cellsUnderTest.env, SYNC_LOAD_PRESELECTED_WORKSPACES: 'old-0:old-0-v,old-2:old-2-v' }, []),
+      cellsUnderTest.allCells, cellsUnderTest.states, 'maplespire_session=s', samePartition), /could not select one workspace in each partition/)
+    assert.deepEqual(cellsUnderTest.created, [], 'a preselected pair is never extended by a created landscape')
+    await assert.rejects(selectPartitionWorkspaces(parseLoadSoakConfig({ ...cellsUnderTest.env, SYNC_LOAD_PRESELECTED_WORKSPACES: 'old-0:old-0-v,gone-1:gone-1-v' }, []),
+      cellsUnderTest.allCells, cellsUnderTest.states, 'maplespire_session=s', []), /SYNC_LOAD_PRESELECTED_WORKSPACES entry is not an accessible active workspace/)
+  } finally {
+    await cellsUnderTest.close()
+  }
+})
+
+test('G4-16b the bench runner names the arm, writes the allow-list itself, and refuses an arm it cannot observe', () => {
+  const probe = spawnSync(process.execPath, [
+    '--input-type=module',
+    '-e',
+    `import { ordinaryHeadRotationArm, followWriteHeadOverride, rotationArmEnvironment, parsePreselection, assertRotationArmResolves } from ${JSON.stringify(pathToFileURL(benchPath).href)}
+const attempt = (fn) => { try { return { value: fn() } } catch (error) { return { error: error.message } } }
+const out = {}
+out.none = attempt(() => ordinaryHeadRotationArm(['--leg=load-soak'], {}))
+out.ambientIgnoredFollow = attempt(() => ordinaryHeadRotationArm([], { SYNC_LOAD_FOLLOW_WRITE_HEAD: 'on' }))
+out.armB = attempt(() => ordinaryHeadRotationArm(['--ordinary-head-rotation=on', '--follow-write-head=on', '--ordinary-head-max-actors=8'], {}))
+out.armA = attempt(() => ordinaryHeadRotationArm(['--ordinary-head-rotation=off', '--ordinary-head-max-actors=8'], { SYNC_LOAD_FOLLOW_WRITE_HEAD: 'on' }))
+out.ambientArmIgnored = attempt(() => ordinaryHeadRotationArm([], { SYNC_BENCH_ORDINARY_HEAD_ROTATION: 'on', SYNC_BENCH_ORDINARY_HEAD_MAX_ACTORS: '8', SYNC_LOAD_FOLLOW_WRITE_HEAD: 'on' }))
+out.cliWins = attempt(() => ordinaryHeadRotationArm(['--ordinary-head-rotation=shadow'], { SYNC_BENCH_ORDINARY_HEAD_ROTATION: 'on' }))
+out.onNoFollow = attempt(() => ordinaryHeadRotationArm(['--ordinary-head-rotation=on'], {}))
+out.badMode = attempt(() => ordinaryHeadRotationArm(['--ordinary-head-rotation=yes'], {}))
+out.badThreshold = attempt(() => ordinaryHeadRotationArm(['--ordinary-head-rotation=off', '--ordinary-head-max-changes=0'], {}))
+out.thresholdNoArm = attempt(() => ordinaryHeadRotationArm(['--ordinary-head-max-actors=8'], {}))
+out.foldOn = attempt(() => ordinaryHeadRotationArm(['--ordinary-head-rotation=on', '--follow-write-head=on', '--ordinary-chain-fold=on'], {}))
+out.foldNoArm = attempt(() => ordinaryHeadRotationArm(['--ordinary-chain-fold=on'], {}))
+out.foldShadow = attempt(() => ordinaryHeadRotationArm(['--ordinary-head-rotation=shadow', '--ordinary-chain-fold=on'], {}))
+out.foldOffArmOff = attempt(() => ordinaryHeadRotationArm(['--ordinary-head-rotation=off', '--ordinary-chain-fold=off'], {}))
+out.foldBad = attempt(() => ordinaryHeadRotationArm(['--ordinary-head-rotation=on', '--follow-write-head=on', '--ordinary-chain-fold=yes'], {}))
+out.retain = attempt(() => ordinaryHeadRotationArm(['--ordinary-head-rotation=on', '--follow-write-head=on', '--ordinary-chain-fold=on', '--ordinary-chain-fold-retain-hours=1'], {}))
+out.retainNoFold = attempt(() => ordinaryHeadRotationArm(['--ordinary-head-rotation=on', '--follow-write-head=on', '--ordinary-chain-fold-retain-hours=1'], {}))
+out.retainBad = attempt(() => ordinaryHeadRotationArm(['--ordinary-head-rotation=on', '--follow-write-head=on', '--ordinary-chain-fold=on', '--ordinary-chain-fold-retain-hours=9000'], {}))
+out.badFollow = attempt(() => followWriteHeadOverride(['--follow-write-head=yes']))
+out.follow = attempt(() => [followWriteHeadOverride(['--follow-write-head=on']), followWriteHeadOverride([])])
+const pre = { workspaces: [{ partition: 0, landscapeId: 'l0', versionId: 'v0' }, { partition: 1, landscapeId: 'l1', versionId: 'v1' }],
+  SYNC_LOAD_PRESELECTED_WORKSPACES: 'l0:v0,l1:v1', allowlist: 'l0/v0,l1/v1' }
+out.envNone = attempt(() => rotationArmEnvironment(null))
+out.envBefore = attempt(() => rotationArmEnvironment({ mode: 'on', maxActors: '8', maxChanges: null }))
+out.envB = attempt(() => rotationArmEnvironment({ mode: 'on', maxActors: '8', maxChanges: null }, pre))
+out.envA = attempt(() => rotationArmEnvironment({ mode: 'off', maxActors: '8', maxChanges: null }, pre))
+out.envFold = attempt(() => rotationArmEnvironment({ mode: 'on', maxActors: '8', maxChanges: null, chainFold: 'on' }, pre))
+out.parsed = attempt(() => parsePreselection('noise\\n' + JSON.stringify({ outcome: 'passed', preselection: pre }) + '\\n'))
+out.parsedOne = attempt(() => parsePreselection(JSON.stringify({ outcome: 'passed', preselection: { ...pre, workspaces: pre.workspaces.slice(0, 1) } })))
+out.parsedLie = attempt(() => parsePreselection(JSON.stringify({ outcome: 'passed', preselection: { ...pre, allowlist: 'l0/v0' } })))
+out.parsedFailed = attempt(() => parsePreselection(JSON.stringify({ outcome: 'failed', preselection: pre })))
+const cell = (env) => ({ environment: { AM_ORDINARY_HEAD_ROTATION: 'on', AM_ORDINARY_HEAD_ROTATION_WORKSPACE_ALLOWLIST: 'l0/v0,l1/v1', AM_ORDINARY_HEAD_ROTATION_MAX_ACTORS: '8', AM_ORDINARY_HEAD_ROTATION_MAX_CHANGES: '', AM_ORDINARY_CHAIN_FOLD: 'off', AM_ORDINARY_CHAIN_FOLD_RETAIN_HOURS: '', ...env } })
+const services = ['sync-cell-a', 'sync-cell-b', 'sync-cell-c', 'router']
+out.resolves = attempt(() => assertRotationArmResolves({ services: { 'sync-cell-a': cell({}), 'sync-cell-b': cell({}), 'sync-cell-c': cell({}) } }, services, { mode: 'on', maxActors: '8', maxChanges: null }, pre))
+out.drift = attempt(() => assertRotationArmResolves({ services: { 'sync-cell-a': cell({}), 'sync-cell-b': cell({}), 'sync-cell-c': cell({ AM_ORDINARY_HEAD_ROTATION_WORKSPACE_ALLOWLIST: '' }) } }, services, { mode: 'on', maxActors: '8', maxChanges: null }, pre))
+out.foldDrift = attempt(() => assertRotationArmResolves({ services: { 'sync-cell-a': cell({ AM_ORDINARY_CHAIN_FOLD: 'on' }), 'sync-cell-b': cell({ AM_ORDINARY_CHAIN_FOLD: 'on' }), 'sync-cell-c': cell({}) } }, services, { mode: 'on', maxActors: '8', maxChanges: null, chainFold: 'on' }, pre))
+console.log('ARM ' + JSON.stringify(out))`,
+    '--', 'ignored-argv1', '--help',
+  ], { encoding: 'utf8', timeout: 30_000 })
+  assert.equal(probe.status, 0, `runner probe exited ${probe.status}: ${probe.stderr}`)
+  const out = JSON.parse(probe.stdout.split(/\r?\n/).find((line) => line.startsWith('ARM ')).slice(4))
+  assert.deepEqual(out.none, { value: null })
+  assert.deepEqual(out.ambientIgnoredFollow, { value: null })
+  assert.deepEqual(out.armB, { value: { mode: 'on', maxActors: '8', maxChanges: null, chainFold: 'off', chainFoldRetainHours: null, followWriteHead: true } })
+  assert.deepEqual(out.armA, { value: { mode: 'off', maxActors: '8', maxChanges: null, chainFold: 'off', chainFoldRetainHours: null, followWriteHead: true } })
+  assert.equal(out.retain.value.chainFoldRetainHours, '1')
+  assert.match(out.retainNoFold.error, /--ordinary-chain-fold-retain-hours needs --ordinary-chain-fold=on/)
+  assert.match(out.retainBad.error, /integer from 1 to 8760/)
+  assert.equal(out.foldOn.value.chainFold, 'on')
+  assert.match(out.foldNoArm.error, /--ordinary-chain-fold needs --ordinary-head-rotation/)
+  assert.match(out.foldShadow.error, /--ordinary-chain-fold=on needs --ordinary-head-rotation=on/)
+  assert.equal(out.foldOffArmOff.value.chainFold, 'off')
+  assert.match(out.foldBad.error, /--ordinary-chain-fold must be on or off/)
+  assert.deepEqual(out.ambientArmIgnored, { value: null })
+  assert.equal(out.cliWins.value.mode, 'shadow')
+  assert.match(out.onNoFollow.error, /needs --follow-write-head=on/)
+  assert.match(out.badMode.error, /must be off, shadow or on/)
+  assert.match(out.badThreshold.error, /integer from 1 to 999999/)
+  assert.match(out.thresholdNoArm.error, /need --ordinary-head-rotation/)
+  assert.match(out.badFollow.error, /must be on or off/)
+  assert.deepEqual(out.follow.value, [{ SYNC_LOAD_FOLLOW_WRITE_HEAD: 'on' }, {}])
+  const blank = { SYNC_FAILOVER_ORDINARY_HEAD_ROTATION: '', SYNC_FAILOVER_ORDINARY_HEAD_ROTATION_ALLOWLIST: '', SYNC_FAILOVER_ORDINARY_HEAD_ROTATION_MAX_ACTORS: '',
+    SYNC_FAILOVER_ORDINARY_HEAD_ROTATION_MAX_CHANGES: '', SYNC_FAILOVER_ORDINARY_CHAIN_FOLD: '',
+    SYNC_FAILOVER_ORDINARY_CHAIN_FOLD_RETAIN_HOURS: '', SYNC_LOAD_ORDINARY_HEAD_ROTATION: '', SYNC_LOAD_ORDINARY_CHAIN_FOLD: '',
+    SYNC_LOAD_PRESELECTED_WORKSPACES: '' }
+  assert.deepEqual(out.envNone.value, blank)
+  assert.deepEqual(out.envBefore.value, blank, 'the first boot, before the preselection, is the plain stack')
+  assert.deepEqual(out.envB.value, { SYNC_FAILOVER_ORDINARY_HEAD_ROTATION: 'on', SYNC_FAILOVER_ORDINARY_HEAD_ROTATION_ALLOWLIST: 'l0/v0,l1/v1',
+    SYNC_FAILOVER_ORDINARY_HEAD_ROTATION_MAX_ACTORS: '8', SYNC_FAILOVER_ORDINARY_HEAD_ROTATION_MAX_CHANGES: '',
+    SYNC_FAILOVER_ORDINARY_CHAIN_FOLD: 'off', SYNC_FAILOVER_ORDINARY_CHAIN_FOLD_RETAIN_HOURS: '',
+    SYNC_LOAD_ORDINARY_HEAD_ROTATION: 'on', SYNC_LOAD_ORDINARY_CHAIN_FOLD: 'off', SYNC_LOAD_PRESELECTED_WORKSPACES: 'l0:v0,l1:v1' })
+  assert.equal(out.envFold.value.SYNC_FAILOVER_ORDINARY_CHAIN_FOLD, 'on')
+  // The two arms differ in the mode and in nothing else.
+  assert.deepEqual(Object.keys(out.envB.value).filter((key) => out.envA.value[key] !== out.envB.value[key]),
+    ['SYNC_FAILOVER_ORDINARY_HEAD_ROTATION', 'SYNC_LOAD_ORDINARY_HEAD_ROTATION'])
+  assert.equal(out.parsed.value.allowlist, 'l0/v0,l1/v1')
+  assert.match(out.parsedOne.error, /no usable pair/)
+  assert.match(out.parsedLie.error, /disagree/)
+  assert.match(out.parsedFailed.error, /no usable pair/)
+  assert.equal(out.resolves.value.AM_ORDINARY_HEAD_ROTATION, 'on')
+  assert.match(out.drift.error, /sync-cell-c resolves AM_ORDINARY_HEAD_ROTATION_WORKSPACE_ALLOWLIST=""/)
+  assert.match(out.foldDrift.error, /sync-cell-c resolves AM_ORDINARY_CHAIN_FOLD="off", but this arm needs "on"/)
+})
+
+test('G4-16b phase 4: the chain fold\'s events are summarized for the hot workspaces, by quarter of the run', () => {
+  const line = (entry) => JSON.stringify(entry)
+  // The read order also lists 24 base shards no fold touches, as on the PC
+  // (2026-11-03): the summary follows the overlay list.
+  const pass = (at, overlay, outcome = 'folded', passMs = 10, extra = {}) => line({
+    event: 'read_model.ordinary_chain_fold_pass', workspace: hotKeys[0], kind: 'object', at, outcome, passMs,
+    chain: overlay + 24, overlay, ...extra,
+  })
+  const logs = {
+    'sync-cell-a': [
+      pass(1_000, 9, 'folded', 40),
+      line({ event: 'read_model.ordinary_chain_fold_lock_held', workspace: hotKeys[0], at: 1_000, heldMs: 30 }),
+      line({ event: 'read_model.ordinary_chain_folded', workspace: hotKeys[0], recovered: true }),
+      pass(2_000, 4, 'skipped', 10),
+      line({ event: 'read_model.ordinary_chain_fold_rows_swept', workspace: hotKeys[0], rows: 6, records: 2 }),
+      line({ event: 'read_model.ordinary_fold_arrival_poll_summary', workspace: hotKeys[0], at: 2_500, polls: 60, totalMs: 120, maxMs: 9, rows: 3, loaded: 1 }),
+      line({ event: 'read_model.ordinary_chain_fold_failed', workspace: hotKeys[0], error: 'boom' }),
+      pass(3_000, 6, 'failed', 5),
+      line({ event: 'read_model.overlay_rotation_lock_contended', path: 'rotate', landscapeId: 'land-0', versionId: 'ver-0' }),
+      line({ event: 'read_model.overlay_rotation_lock_contended', path: 'fold', landscapeId: 'other', versionId: 'ws' }),
+      '{"event":"read_model.ordinary_chain_fold_pass", cut',
+    ].join('\n'),
+    // A handover: the workspace's later passes are in another cell's log.
+    'sync-cell-b': [
+      pass(5_000, 5, 'folded', 200),
+      line({ event: 'read_model.ordinary_chain_fold_lock_held', workspace: hotKeys[0], at: 5_000, heldMs: 90 }),
+      line({ event: 'read_model.ordinary_chain_folded', workspace: 'other/ws', recovered: true }),
+    ].join('\n'),
+    'sync-cell-c': '',
+  }
+  const fold = summarizeOrdinaryChainFoldEvents(logs, hotWorkspaces)
+  assert.equal(fold.foldedHot, 1)
+  assert.equal(fold.foldedTotal, 2)
+  assert.equal(fold.recovered, 1, 'a recovery elsewhere is not this one')
+  assert.deepEqual(fold.window, { startAt: 1_000, endAt: 5_000 })
+  assert.deepEqual(fold.passOutcomes, { folded: 2, skipped: 1, failed: 1 })
+  assert.deepEqual(fold.passMs.folded, { count: 2, p50: 40, p99: 200, max: 200 })
+  assert.deepEqual(fold.passMs.failed, { count: 1, p50: 5, p99: 5, max: 5 })
+  assert.deepEqual(fold.lockHeldMs, { count: 2, p50: 30, p99: 90, max: 90, quarterMax: [30, null, null, 90] })
+  assert.deepEqual(fold.lockContendedByPath, { rotate: 1 })
+  // Quarters of [1000, 5000]: 1000 in the first, 2000 in the second, 3000 in the third, 5000 in the last.
+  assert.deepEqual(fold.chains[`${hotKeys[0]}/object`], {
+    passes: 4, max: 9, quarterMax: [9, 4, 6, 5], first: { at: 1_000, overlay: 9 }, last: { at: 5_000, overlay: 5 },
+    readOrderMax: 33,
+  })
+  assert.deepEqual([fold.sweptRows, fold.sweptRecords], [6, 2])
+  assert.deepEqual(fold.poll, { summaries: 1, polls: 60, totalMs: 120, maxMs: 9, rows: 3, loaded: 1, meanMs: 2 })
+  assert.deepEqual(fold.problems.map((entry) => entry.event), ['read_model.ordinary_chain_fold_failed'])
+  assert.equal(fold.unparseableLines, 1)
+
+  // Concerns, not VOIDs: a last quarter past minChain + budget, and failing passes.
+  const foldConfig = { minChain: 2, budget: 2, retainMs: 3_600_000 }
+  assert.deepEqual(ordinaryChainFoldConcerns(foldConfig, fold), [
+    `${hotKeys[0]}/object: the overlay chain reached 5 in the last quarter, past minChain + budget = 4`,
+    '1 of 4 fold passes failed',
+  ])
+  // A read order of 29 past a bound of 16 is no concern: its base shards never fold.
+  assert.deepEqual(ordinaryChainFoldConcerns({ minChain: 8, budget: 8, retainMs: 1 }, fold), ['1 of 4 fold passes failed'])
+  assert.deepEqual(ordinaryChainFoldConcerns({ minChain: 8, budget: 8, retainMs: 1 }, { ...fold, passOutcomes: { folded: 19, failed: 1 } }), [])
+  assert.deepEqual(ordinaryChainFoldConcerns(null, fold), [])
+})
+
+test('G4-16b phase 4: a fold pass line without the overlay list names no chain', () => {
+  const fold = summarizeOrdinaryChainFoldEvents({
+    'sync-cell-a': JSON.stringify({
+      event: 'read_model.ordinary_chain_fold_pass', workspace: hotKeys[0], kind: 'object', at: 1_000, outcome: 'skipped', passMs: 3, chain: 30,
+    }),
+    'sync-cell-b': '',
+    'sync-cell-c': '',
+  }, hotWorkspaces)
+  assert.deepEqual(fold.passOutcomes, { skipped: 1 })
+  assert.deepEqual(fold.chains, {}, 'the read order alone is not the chain the fold shortens')
+})
+
+test('G4-16b phase 4: the fold the bench asked for is compared with the cells\', and a fold arm that never folds is VOID', () => {
+  const line = (entry) => JSON.stringify(entry)
+  const folded = summarizeOrdinaryChainFoldEvents({ 'sync-cell-a': line({ event: 'read_model.ordinary_chain_folded', workspace: hotKeys[0] }), 'sync-cell-b': '', 'sync-cell-c': '' }, hotWorkspaces)
+  const none = summarizeOrdinaryChainFoldEvents({ 'sync-cell-a': '', 'sync-cell-b': '', 'sync-cell-c': '' }, hotWorkspaces)
+  const cut = summarizeOrdinaryChainFoldEvents({ 'sync-cell-a': '{"event":"read_model.ordinary_chain_folded", cut', 'sync-cell-b': '', 'sync-cell-c': '' }, hotWorkspaces)
+  const foldConfig = { minChain: 8, budget: 8, retainMs: 86_400_000 }
+  const events = (chainFold) => ({ ...summarizeOrdinaryHeadEvents({ 'sync-cell-a': line({ event: 'read_model.ordinary_head_rotated', workspace: hotKeys[0] }), 'sync-cell-b': '', 'sync-cell-c': '' }, hotWorkspaces), ...(chainFold ? { chainFold } : {}) })
+  const judge = (foldEvents, serverFold, requestedChainFold = null) => evaluateOrdinaryHeadRotationArm(armInput('on', {
+    server: { ...rotationServer('on'), chainFold: serverFold }, serverEvents: events(foldEvents), requestedChainFold,
+  }))
+  assert.equal(judge(folded, foldConfig, 'on').status, 'CONSISTENT')
+  assert.deepEqual([judge(folded, foldConfig, 'on').chainFold, judge(folded, foldConfig, 'on').requestedChainFold], [foldConfig, 'on'])
+  assert.deepEqual(judge(folded, foldConfig, 'on').chainFoldConcerns, [])
+  assert.match(judge(none, foldConfig).voidReasons.join('; '), /chain fold on, but no cell logged read_model.ordinary_chain_folded/)
+  assert.match(judge(folded, null).voidReasons.join('; '), /chain fold off, but a cell logged read_model.ordinary_chain_folded/)
+  assert.match(judge(cut, null).voidReasons.join('; '), /chain fold off, but 1 chain-fold log line\(s\) could not be parsed/)
+  assert.equal(judge(none, null).status, 'CONSISTENT')
+  // The image without phase 4: asked on, parsed nothing.
+  assert.match(judge(none, null, 'on').voidReasons.join('; '), /requested chain fold on, but the cells parsed no chain fold/)
+  assert.match(judge(folded, foldConfig, 'off').voidReasons.join('; '), /requested chain fold off, but the cells parsed one/)
+  assert.match(judge(null, foldConfig, 'on').voidReasons.join('; '), /chain-fold log events were not read/)
+  assert.deepEqual(ordinaryHeadRotationConfigVoids('on', { ...rotationServer('on'), chainFold: null }, hotWorkspaces, 'on'),
+    ['requested chain fold on, but the cells parsed no chain fold'])
+  assert.deepEqual(ordinaryHeadRotationConfigVoids('on', rotationServer('on'), hotWorkspaces), [])
+  assert.equal(parseOrdinaryChainFoldArm(undefined), null)
+  assert.equal(parseOrdinaryChainFoldArm(' '), null)
+  assert.equal(parseOrdinaryChainFoldArm('on'), 'on')
+  assert.throws(() => parseOrdinaryChainFoldArm('yes'), /SYNC_LOAD_ORDINARY_CHAIN_FOLD must be off or on/)
+})
+
+test('G4-16b phase 4: resident memory is summarized per service, by quarter of its sampled span', () => {
+  assert.deepEqual(summarizeRssTrend({
+    'sync-cell-a': [{ at: 0, rss: 100 }, { at: 10, rss: 300 }, { at: 30, rss: 200 }, { at: 40, rss: 250 }],
+    'sync-cell-b': [{ at: 5, rss: 50 }],
+    'sync-cell-c': [],
+  }), {
+    'sync-cell-a': { samples: 4, first: 100, last: 250, max: 300, quarterMax: [100, 300, null, 250] },
+    'sync-cell-b': { samples: 1, first: 50, last: 50, max: 50, quarterMax: [50, null, null, null] },
+    'sync-cell-c': null,
+  })
+  assert.deepEqual(summarizeRssTrend(undefined), {})
+})
+
+test('G4-16b defer2h memory: a sample carries what the stats body says may hold the memory, null where it is silent', () => {
+  const MiB = 1_048_576
+  assert.deepEqual(residencySample(7, 300 * MiB, {
+    totalHandles: 42,
+    synchronizer: { documentsWithPeers: 9, totalPeerBindings: 0 },
+    transport: { processMemoryBytes: { heapUsed: 80 * MiB, external: 20 * MiB } },
+  }), { at: 7, rss: 300 * MiB, heapUsed: 80 * MiB, external: 20 * MiB, handles: 42, documentsWithPeers: 9, peerBindings: 0, heapTotal: null, arrayBuffers: null, wasm: null })
+  // The wasm gauge's fields, when the cell reports them (wasm is inside external).
+  assert.deepEqual(residencySample(8, 1, { transport: { processMemoryBytes: { heapTotal: 100 * MiB, arrayBuffers: 0, wasm: 14 * MiB } } }),
+    { at: 8, rss: 1, heapUsed: null, external: null, handles: null, documentsWithPeers: null, peerBindings: null, heapTotal: 100 * MiB, arrayBuffers: 0, wasm: 14 * MiB })
+  // A measured zero stays a zero; an absent or non-numeric field is null.
+  assert.deepEqual(residencySample(1, 5, { totalHandles: 0, synchronizer: { documentsWithPeers: null, totalPeerBindings: 'x' } }),
+    { at: 1, rss: 5, heapUsed: null, external: null, handles: 0, documentsWithPeers: null, peerBindings: null, heapTotal: null, arrayBuffers: null, wasm: null })
+  assert.deepEqual(residencySample(1, 5, undefined),
+    { at: 1, rss: 5, heapUsed: null, external: null, handles: null, documentsWithPeers: null, peerBindings: null, heapTotal: null, arrayBuffers: null, wasm: null })
+})
+
+test('G4-16b defer2h memory: the residency trend keeps the LAST sample of each minute, for the whole run, per service', () => {
+  const MiB = 1_048_576
+  const point = (at, rss, handles) => ({ at, rss: rss * MiB, heapUsed: 10 * MiB, external: null, handles, documentsWithPeers: 1, peerBindings: 2, heapTotal: 20 * MiB, arrayBuffers: null, wasm: rss * MiB / 10 })
+  const trend = summarizeResidencyTrend({
+    'sync-cell-b': [point(1_000, 100, 5), point(30_000, 110, 6), point(61_000, 120, 7), point(185_000, 150.04, 9)],
+    'sync-cell-c': [],
+  })
+  assert.deepEqual(trend['sync-cell-b'], {
+    bucketMs: 60_000,
+    columns: RESIDENCY_TREND_COLUMNS,
+    // Minute 0 keeps its later sample (110, 6); minute 2 had no sample and
+    // is absent rather than invented; minutes count from the first sample.
+    points: [[0, 110, 10, null, 6, 1, 2, 20, null, 11], [1, 120, 10, null, 7, 1, 2, 20, null, 12], [3, 150, 10, null, 9, 1, 2, 20, null, 15]],
+  })
+  assert.equal(trend['sync-cell-c'], null)
+  assert.deepEqual(RESIDENCY_TREND_COLUMNS, ['minute', 'rssMiB', 'heapUsedMiB', 'externalMiB', 'handles', 'documentsWithPeers', 'peerBindings', 'heapTotalMiB', 'arrayBuffersMiB', 'wasmMiB'])
+  assert.deepEqual(summarizeResidencyTrend(undefined), {})
+})
+
+test('G4-16b off/shadow: an ordinary-head log line that does not parse voids the arm; on does not need it', () => {
+  const truncated = summarizeOrdinaryHeadEvents({ 'sync-cell-a': '{"event":"read_model.ordinary_head_rotated", truncated', 'sync-cell-b': '', 'sync-cell-c': '' }, hotWorkspaces)
+  for (const requested of ['off', 'shadow']) {
+    const arm = evaluateOrdinaryHeadRotationArm(armInput(requested, { serverEvents: truncated }))
+    assert.equal(arm.status, 'VOID', requested)
+    assert.match(arm.voidReasons.join('; '), /1 ordinary-head log line\(s\) could not be parsed/)
+  }
+  const onEvents = summarizeOrdinaryHeadEvents({ 'sync-cell-a': [JSON.stringify({ event: 'read_model.ordinary_head_rotated', workspace: hotKeys[0] }), '{"event":"read_model.ordinary_head_forwarded", cut'].join('\n'), 'sync-cell-b': '', 'sync-cell-c': '' }, hotWorkspaces)
+  assert.equal(evaluateOrdinaryHeadRotationArm(armInput('on', { serverEvents: onEvents })).status, 'CONSISTENT')
+})
+
+test('G4-16b G4-7 rehearsal: the arm is judged through refuse, an unobserved arm is refused, and no arm is untouched', async () => {
+  let time = 1_000
+  const recorder = () => new RehearsalObservations({ initialSnapshots: rehearsalSnapshots(20, 0), publish() {}, wall: () => time, monotonic: () => time })
+  const armed = { ...config, ordinaryHeadRotation: 'on', followWriteHead: true }
+  const evidenceOf = { workspaces: hotWorkspaces, server: rotationServer('on') }
+  const quiet = () => null
+  const reads = []
+  const collect = (rotated) => async (_config, workspaces) => { reads.push(workspaces); return rotationEvents(rotated) }
+  // CONSISTENT: emitted, nothing refused.
+  const clean = recorder()
+  const consistent = await judgeRehearsalRotationArm({ config: armed, rotationEvidence: evidenceOf, writeHeads: rotationLedger([0]), observations: clean, collect: collect(1) })
+  assert.equal(consistent.status, 'CONSISTENT')
+  assert.deepEqual(clean.invalid, [])
+  assert.deepEqual(reads, [hotWorkspaces])
+  // VOID: every reason becomes an invalid observation, so finish() says VOID.
+  const voided = recorder()
+  const arm = await judgeRehearsalRotationArm({ config: armed, rotationEvidence: evidenceOf, writeHeads: rotationLedger([]), observations: voided, collect: collect(0) })
+  assert.equal(arm.status, 'VOID')
+  assert.deepEqual(voided.invalid.map((entry) => entry.reason), arm.voidReasons)
+  assert.ok(arm.voidReasons.length >= 2)
+  // Unreadable logs and a missing inspection are refusals, not skips.
+  const unread = recorder()
+  const original = console.error
+  console.error = quiet
+  try {
+    await judgeRehearsalRotationArm({ config: armed, rotationEvidence: evidenceOf, writeHeads: rotationLedger([0]), observations: unread, collect: async () => { throw new Error('docker gone') } })
+  } finally {
+    console.error = original
+  }
+  assert.match(unread.invalid.map((entry) => entry.reason).join('; '), /log events were not read/)
+  const uninspected = recorder()
+  await judgeRehearsalRotationArm({ config: armed, rotationEvidence: null, writeHeads: rotationLedger([0]), observations: uninspected, collect: collect(1) })
+  assert.match(uninspected.invalid.map((entry) => entry.reason).join('; '), /configuration was not observed/)
+  // No arm: nothing read, nothing emitted.
+  const none = recorder()
+  const emitted = none.episodes.length
+  assert.equal(await judgeRehearsalRotationArm({ config, rotationEvidence: evidenceOf, writeHeads: null, observations: none, collect: async () => { throw new Error('read') } }), null)
+  assert.deepEqual([none.invalid, none.episodes.length], [[], emitted])
+  time += 1
+})
+
+test('G4-16b G4-7 rehearsal: the older evaluator still reports its failures on an armed config', () => {
+  const armed = { ...config, ordinaryHeadRotation: 'on', followWriteHead: true }
+  // The rehearsal's evidence carries no `ordinaryHeadRotation`.
+  const failing = evidence({ failoverResults: [{ ...result(8_000), hotDiverged: 1 }] })
+  const failures = rehearsalSupplementaryFailures(failing, armed)
+  assert.equal(failures.length, 1)
+  assert.match(failures[0], /multi-cell load\/soak gate failed/)
+  assert.deepEqual(rehearsalSupplementaryFailures(evidence(), armed), [])
+})
+
+// ---- QA lens (bench fold arm): kill tests ----
+test('QA bench fold: the runner never writes the fold before the preselection, armed or not', () => {
+  const probe = spawnSync(process.execPath, ['--input-type=module', '-e',
+    `import { rotationArmEnvironment } from ${JSON.stringify(pathToFileURL(benchPath).href)}
+console.log('ENV ' + JSON.stringify(rotationArmEnvironment({ mode: 'on', maxActors: null, maxChanges: null, chainFold: 'on' })))`,
+  '--', 'ignored-argv1', '--help'], { encoding: 'utf8', timeout: 30_000 })
+  assert.equal(probe.status, 0, probe.stderr)
+  const env = JSON.parse(probe.stdout.split(/\r?\n/).find((line) => line.startsWith('ENV ')).slice(4))
+  assert.equal(env.SYNC_FAILOVER_ORDINARY_CHAIN_FOLD, '', 'the first boot, before the preselection, is the plain stack')
+  assert.equal(env.SYNC_LOAD_ORDINARY_CHAIN_FOLD, '')
+})
+
+test('QA bench fold: the cell probe reports the parsed chainFold, and null when the fold is off', () => {
+  const source = readFileSync(resolve(here, 'verify-sync-cell-load-soak.mjs'), 'utf8')
+  const match = source.match(/const ORDINARY_HEAD_ROTATION_PROBE = \[([\s\S]*?)\]\.join\('\\n'\)/)
+  assert.ok(match, 'the probe source was found')
+  const lines = new Function(`return [${match[1]}]`)()
+  for (const [chainFold, expected] of [[{ minChain: 8, budget: 16, retainMs: 3_600_000 }, { minChain: 8, budget: 16, retainMs: 3_600_000 }], [undefined, null]]) {
+    const stub = `export const ordinaryHeadRotationConfig = () => ({ mode: 'on', allowlist: new Set(['b/1', 'a/1']), maxActors: 8, maxChanges: 64${chainFold ? `, chainFold: ${JSON.stringify(chainFold)}` : ''} })`
+    const program = lines.join('\n').replace("'./dist/readModel/ordinaryHeadRotation.js'", JSON.stringify('data:text/javascript,' + encodeURIComponent(stub)))
+    assert.notEqual(program, lines.join('\n'), 'the probe imports the parser it is meant to')
+    const run = spawnSync(process.execPath, ['--input-type=module', '-e', program], { encoding: 'utf8', timeout: 30_000 })
+    assert.equal(run.status, 0, run.stderr)
+    const row = JSON.parse(run.stdout.split(/\r?\n/).find((line) => line.startsWith('ORDINARY_HEAD_ROTATION=')).slice('ORDINARY_HEAD_ROTATION='.length))
+    assert.deepEqual(row, { mode: 'on', allowlist: ['a/1', 'b/1'], maxActors: 8, maxChanges: 64, chainFold: expected })
+  }
+})
+
+test('QA bench fold: the config summary carries the first cell\'s chainFold, and a fleet split on the fold does not agree', () => {
+  const fold = { minChain: 8, budget: 16, retainMs: 86_400_000 }
+  const row = { mode: 'on', allowlist: hotKeys, maxActors: 8, maxChanges: 512 }
+  const same = summarizeOrdinaryHeadRotationConfigs(['a', 'b', 'c'].map((service) => ({ service, ...row, chainFold: fold })))
+  assert.deepEqual(same.chainFold, fold)
+  assert.equal(same.agree, true)
+  const split = summarizeOrdinaryHeadRotationConfigs([{ service: 'a', ...row, chainFold: fold }, { service: 'b', ...row, chainFold: fold }, { service: 'c', ...row, chainFold: null }])
+  assert.equal(split.agree, false, 'a fleet where one cell does not fold is not the fold arm')
+  const budget = summarizeOrdinaryHeadRotationConfigs([{ service: 'a', ...row, chainFold: fold }, { service: 'b', ...row, chainFold: fold }, { service: 'c', ...row, chainFold: { ...fold, budget: 4 } }])
+  assert.equal(budget.agree, false, 'nor is one that folds with another budget')
+})
+
+test('QA bench fold: the collected events carry the fold summary the VOID rules read', async () => {
+  const logs = { 'sync-cell-a': JSON.stringify({ event: 'read_model.ordinary_chain_folded', workspace: hotKeys[0] }), 'sync-cell-b': '', 'sync-cell-c': '' }
+  const collected = await collectOrdinaryHeadEvents({ cellPorts: [1, 2, 3] }, hotWorkspaces, async (_config, service) => logs[service])
+  assert.equal(collected.chainFold?.foldedHot, 1)
+})
+
+test('QA bench fold: max is the largest pass whatever the log order; unpublished is not a problem; a problem keeps its error', () => {
+  const line = (entry) => JSON.stringify(entry)
+  const fold = summarizeOrdinaryChainFoldEvents({
+    'sync-cell-a': [
+      line({ event: 'read_model.ordinary_chain_fold_pass', workspace: hotKeys[0], kind: 'object', outcome: 'folded', passMs: 300, chain: 3 }),
+      line({ event: 'read_model.ordinary_chain_fold_pass', workspace: hotKeys[0], kind: 'object', outcome: 'skipped', passMs: 5, chain: 3 }),
+      line({ event: 'read_model.ordinary_chain_fold_unpublished', workspace: hotKeys[0], reason: 'meta-moved' }),
+      line({ event: 'read_model.ordinary_chain_fold_conflict', workspace: hotKeys[1], error: 'cas-lost' }),
+    ].join('\n'),
+    'sync-cell-b': '', 'sync-cell-c': '',
+  }, hotWorkspaces)
+  assert.equal(fold.passMs.folded.max, 300)
+  assert.equal(fold.counts['read_model.ordinary_chain_fold_unpublished'], 1)
+  assert.deepEqual(fold.problems, [{ service: 'sync-cell-a', workspace: hotKeys[1], event: 'read_model.ordinary_chain_fold_conflict', reason: 'cas-lost' }])
+})
+
+test('QA bench fold: the VOID rules read the right count, and survive missing evidence', () => {
+  const line = (entry) => JSON.stringify(entry)
+  const foldConfig = { minChain: 8, budget: 16, retainMs: 86_400_000 }
+  const elsewhereOnly = summarizeOrdinaryChainFoldEvents({ 'sync-cell-a': line({ event: 'read_model.ordinary_chain_folded', workspace: 'other/ws' }), 'sync-cell-b': '', 'sync-cell-c': '' }, hotWorkspaces)
+  assert.deepEqual([elsewhereOnly.foldedHot, elsewhereOnly.foldedTotal], [0, 1])
+  const events = (chainFold) => ({ ...summarizeOrdinaryHeadEvents({ 'sync-cell-a': line({ event: 'read_model.ordinary_head_rotated', workspace: hotKeys[0] }), 'sync-cell-b': '', 'sync-cell-c': '' }, hotWorkspaces), chainFold })
+  const judge = (serverFold, overrides = {}) => evaluateOrdinaryHeadRotationArm(armInput('on', {
+    server: { ...rotationServer('on'), chainFold: serverFold }, serverEvents: events(elsewhereOnly), ...overrides,
+  }))
+  assert.match(judge(foldConfig).voidReasons.join('; '), /chain fold on, but no cell logged read_model.ordinary_chain_folded for a hot workspace/,
+    'a fold elsewhere is not a fold of the arm')
+  assert.match(judge(null).voidReasons.join('; '), /chain fold off, but a cell logged read_model.ordinary_chain_folded/,
+    'off means nothing folded ANYWHERE')
+  // Events unread: VOID for that reason, not a TypeError.
+  const unread = judge(foldConfig, { serverEvents: null })
+  assert.equal(unread.status, 'VOID')
+  assert.doesNotMatch(unread.voidReasons.join('; '), /chain fold/)
+  // Configuration unobserved: the fold rule says nothing about a parse it never saw.
+  const unobserved = evaluateOrdinaryHeadRotationArm(armInput('on', { server: null, serverEvents: events(elsewhereOnly) }))
+  assert.equal(unobserved.status, 'VOID')
+  assert.doesNotMatch(unobserved.voidReasons.join('; '), /chain fold/)
+})
+
+test('G4 stall diagnosis: --cpu-profile is CLI-owned, blank when off, bind-mounted when on, and never reaches the calibration', () => {
+  const root = mkdtempSync(join(tmpdir(), 'bench-cpu-profile-'))
+  try {
+    const run = join(root, 'failover-cell-a-boot-1')
+    mkdirSync(run)
+    writeFileSync(join(run, 'manifest.json'), JSON.stringify({ cellId: 'failover-cell-a', bootId: 'boot-1', anchor: { wallMs: 4 } }))
+    writeFileSync(join(run, 'cpu-000000.cpuprofile.gz'), 'xx')
+    mkdirSync(join(root, 'compose-logs'))
+    const probe = spawnSync(process.execPath, [
+      '--input-type=module',
+      '-e',
+      `import { cpuProfileCaptureRequest, cpuProfileEnvironment, assertCpuProfileResolves, cpuProfileRuns, currentCpuProfileRuns, thisRunsCaptures, runGateTeed, CPU_PROFILE_CONTAINER_DIR } from ${JSON.stringify(pathToFileURL(benchPath).href)}
+const attempt = (fn) => { try { return { value: fn() } } catch (error) { return { error: error.message } } }
+const out = {}
+const at = { now: Date.parse('2026-11-04T10:00:00.000Z'), temporaryRoot: ${JSON.stringify(root)} }
+out.none = attempt(() => cpuProfileCaptureRequest(['--leg=load-soak'], at))
+out.off = attempt(() => cpuProfileCaptureRequest(['--cpu-profile=off'], at))
+out.orphanDir = attempt(() => cpuProfileCaptureRequest(['--cpu-profile-dir=/x'], at))
+out.offWithDir = attempt(() => cpuProfileCaptureRequest(['--cpu-profile=off', '--cpu-profile-chunk-seconds=10'], at))
+out.bad = attempt(() => cpuProfileCaptureRequest(['--cpu-profile=yes'], at))
+out.badInterval = attempt(() => cpuProfileCaptureRequest(['--cpu-profile=on', '--cpu-profile-interval-us=50'], at))
+out.badChunk = attempt(() => cpuProfileCaptureRequest(['--cpu-profile=on', '--cpu-profile-chunk-seconds=4'], at))
+out.defaulted = attempt(() => cpuProfileCaptureRequest(['--cpu-profile=on'], at))
+out.explicit = attempt(() => cpuProfileCaptureRequest(['--cpu-profile=on', '--cpu-profile-dir=${root.replace(/\\/g, '/')}/x', '--cpu-profile-interval-us=500', '--cpu-profile-chunk-seconds=20'], at))
+out.envNone = cpuProfileEnvironment(null)
+out.envOn = cpuProfileEnvironment({ hostDir: 'C:\\\\runs\\\\one', intervalUs: '', chunkSeconds: '20' })
+const capture = { hostDir: '/host/runs', intervalUs: '', chunkSeconds: '' }
+const cell = (env = {}, volumes = [{ type: 'bind', source: '/host/runs', target: CPU_PROFILE_CONTAINER_DIR }]) => ({ environment: { SYNC_DIAG_CPU_PROFILE: 'on', SYNC_DIAG_CPU_PROFILE_DIR: CPU_PROFILE_CONTAINER_DIR, ...env }, volumes })
+const services = ['postgres', 'sync-cell-a', 'sync-cell-b', 'sync-cell-c']
+out.resolves = attempt(() => assertCpuProfileResolves({ services: { 'sync-cell-a': cell(), 'sync-cell-b': cell(), 'sync-cell-c': cell() } }, services, capture))
+out.flagOff = attempt(() => assertCpuProfileResolves({ services: { 'sync-cell-a': cell(), 'sync-cell-b': cell({ SYNC_DIAG_CPU_PROFILE: 'off' }), 'sync-cell-c': cell() } }, services, capture))
+out.namedVolume = attempt(() => assertCpuProfileResolves({ services: { 'sync-cell-a': cell(), 'sync-cell-b': cell(), 'sync-cell-c': cell({}, [{ type: 'volume', source: 'diag_unused', target: CPU_PROFILE_CONTAINER_DIR }]) } }, services, capture))
+out.runs = cpuProfileRuns(${JSON.stringify(root)})
+out.current = currentCpuProfileRuns([{ run: 'a1', cellId: 'a', startedAtMs: 1 }, { run: 'a2', cellId: 'a', startedAtMs: 5 }, { run: 'b1', cellId: 'b', startedAtMs: 3 }]).map((run) => run.run)
+out.fresh = thisRunsCaptures({ hostDir: ${JSON.stringify(root)}, preexisting: new Set(['failover-cell-a-boot-1']) })
+out.teed = await runGateTeed(process.execPath, ['-e', "process.stdout.write('G47_EVENT \\u00e9t\\u00e9\\\\n'); process.stderr.write('to stderr\\\\n'); process.exitCode = 3"], {}, ${JSON.stringify(join(root, 'gate.log'))})
+out.missing = cpuProfileRuns(${JSON.stringify(join(root, 'nope'))})
+console.log('CPU ' + JSON.stringify(out))`,
+      '--', 'ignored-argv1', '--help',
+    ], { encoding: 'utf8', timeout: 30_000 })
+    assert.equal(probe.status, 0, `runner probe exited ${probe.status}: ${probe.stderr}`)
+    assert.match(probe.stdout, /--cpu-profile=on\|off/, 'the usage documents the flag')
+    const out = JSON.parse(probe.stdout.split(/\r?\n/).find((line) => line.startsWith('CPU ')).slice(4))
+    assert.deepEqual(out.none, { value: null })
+    assert.deepEqual(out.off, { value: null })
+    assert.match(out.orphanDir.error, /need --cpu-profile=on/)
+    assert.match(out.offWithDir.error, /need --cpu-profile=on/)
+    assert.match(out.bad.error, /must be on or off/)
+    assert.match(out.badInterval.error, /integer from 100 to 99999/)
+    assert.match(out.badChunk.error, /integer from 5 to 999/)
+    assert.deepEqual(out.defaulted.value, { hostDir: join(root, 'maplespire-cpu-profile-2026-11-04T10-00-00-000Z'), intervalUs: '', chunkSeconds: '' })
+    assert.deepEqual(out.explicit.value, { hostDir: resolve(root, 'x'), intervalUs: '500', chunkSeconds: '20' })
+    assert.deepEqual(out.envNone, { SYNC_FAILOVER_DIAG_CPU_PROFILE: '', SYNC_FAILOVER_DIAG_CPU_PROFILE_DIR: '',
+      SYNC_FAILOVER_DIAG_CPU_PROFILE_INTERVAL_US: '', SYNC_FAILOVER_DIAG_CPU_PROFILE_CHUNK_SECONDS: '', SYNC_FAILOVER_DIAG_HOST_DIR: '' })
+    assert.deepEqual(out.envOn, { SYNC_FAILOVER_DIAG_CPU_PROFILE: 'on', SYNC_FAILOVER_DIAG_CPU_PROFILE_DIR: '/var/lib/maplespire/diag',
+      SYNC_FAILOVER_DIAG_CPU_PROFILE_INTERVAL_US: '', SYNC_FAILOVER_DIAG_CPU_PROFILE_CHUNK_SECONDS: '20', SYNC_FAILOVER_DIAG_HOST_DIR: 'C:/runs/one' })
+    assert.deepEqual(out.resolves.value, ['sync-cell-a', 'sync-cell-b', 'sync-cell-c'])
+    assert.match(out.flagOff.error, /sync-cell-b does not resolve SYNC_DIAG_CPU_PROFILE=on/)
+    assert.match(out.namedVolume.error, /sync-cell-c does not bind-mount \/host\/runs/)
+    assert.deepEqual(out.runs, [{ run: 'failover-cell-a-boot-1', cellId: 'failover-cell-a', bootId: 'boot-1', startedAtMs: 4, chunks: 1, bytes: out.runs[0].bytes }])
+    assert.deepEqual(out.current, ['a2', 'b1'], 'the latest boot of each cell is the running one')
+    assert.ok(out.runs[0].bytes > 2)
+    assert.deepEqual(out.missing, [])
+    assert.deepEqual(out.fresh, [], 'a reused directory\'s older runs are not this run\'s manifests')
+    assert.deepEqual(out.teed, { status: 3, signal: null }, 'the teed gate resolves like spawnSync')
+    const teedLog = readFileSync(join(root, 'gate.log'), 'utf8')
+    assert.match(teedLog, /G47_EVENT été\n/, 'UTF-8, byte for byte')
+    assert.match(teedLog, /to stderr\n/)
+    assert.match(probe.stdout, /G47_EVENT été/, 'and still on the console')
+    // Wiring: blank from the start (no inherited value arms the calibration),
+    // applied only after the calibration stage, logs saved before the teardown.
+    const source = readFileSync(benchPath, 'utf8')
+    const main = source.slice(source.indexOf('async function main()'))
+    assert.ok(main.indexOf('...cpuProfileEnvironment(null)') > 0)
+    assert.ok(main.indexOf('runIsolatedCalibrationStage(') < main.indexOf('Object.assign(env, cpuProfileEnvironment(capture))'))
+    assert.ok(main.indexOf('Object.assign(env, cpuProfileEnvironment(capture))') < main.indexOf("compose(env, ['up', '-d', '--wait'"))
+    assert.ok(main.indexOf('await flushCpuProfiles(env') < main.indexOf('saveCpuProfileLogs(env'), 'flush the held chunk before saving logs')
+    assert.match(main, /const gate = capture\n\s+\? await runGateTeed\(process\.execPath, \[gateFile, \.\.\.gateArgs, \.\.\.legArgs\], gateOptions, join\(capture\.hostDir, 'gate\.log'\)\)/)
+    assert.ok(main.indexOf('capture.preexisting = new Set(') < main.indexOf("compose(env, ['up', '-d', '--wait'"), 'older runs are listed before the cells boot')
+    assert.ok(main.indexOf('saveCpuProfileLogs(env') < main.indexOf('compose(env, TEARDOWN)\n      } catch'))
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
 // QA lens on D60 (2026-10-21) — each test below was RED on a named mutant and
 // green on the real code; adapted to the failover-not-pooled revision.
 test('D60 QA nearest rank: a fractional rank rounds UP, so below 100 members the p99 is the maximum', () => {
@@ -3317,7 +4364,14 @@ test('D60 QA only the rehearsal is population-gated, and its takeover stays a pe
   const start = gateSource.indexOf('async function runLocalRehearsal(')
   assert.notEqual(start, -1)
   const rehearsal = gateSource.slice(start, gateSource.indexOf('\n}\n', start))
-  assert.match(rehearsal, /evaluateLoadSoakEvidence\(evidence, \{ \.\.\.config, benchPosture: null, populationGated: true \}\)/)
+  // Since G4-16b the rehearsal reaches the older evaluator through
+  // rehearsalSupplementaryFailures, and that helper is where the gate is set.
+  assert.match(rehearsal, /const extraFailures = rehearsalSupplementaryFailures\(evidence, config\)/)
+  const helperStart = gateSource.indexOf('export function rehearsalSupplementaryFailures(')
+  assert.notEqual(helperStart, -1)
+  const helper = gateSource.slice(helperStart, gateSource.indexOf('\n}\n', helperStart))
+  assert.match(helper, /evaluateLoadSoakEvidence\(evidence, \{ \.\.\.config, benchPosture: null, ordinaryHeadRotation: undefined, populationGated: true \}\)/)
+  assert.equal((gateSource.match(/rehearsalSupplementaryFailures\(/g) ?? []).length, 2, 'the helper is defined once and called only by the rehearsal')
   assert.equal((gateSource.match(/populationGated: true/g) ?? []).length, 1, 'no other caller is population-gated')
   assert.match(rehearsal, /if \(value\.takeoverMs >= 2_000\) observations\.fail\('takeover', value\.takeoverMs,/)
 })

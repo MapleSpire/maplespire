@@ -394,6 +394,28 @@
         "editorGroupCreationTitle": "Allow Editors to create Tag groups",
         "editorGroupCreationDescription": "Disabled by default because groups change the organization-wide taxonomy. Org Admins can always create groups.",
         "serverEnforced": "Permissions and these policies are re-evaluated by the server on every mutation."
+      },
+      "entraTenants": {
+        "title": "Allowed Entra tenants",
+        "description": "Microsoft work or school accounts can join and use this organization only from the tenants listed here.",
+        "loadFailed": "Failed to load the allowed Entra tenants",
+        "noRestrictionWarning": "No tenant is listed, so any Microsoft account (every Entra tenant and personal accounts) can accept an invitation and use this organization. Add your tenant ID to restrict it.",
+        "listLabel": "Allowed tenant IDs",
+        "empty": "No tenant restriction.",
+        "inputLabel": "Entra tenant ID",
+        "add": "Add tenant",
+        "remove": "Remove tenant {{tenantId}}",
+        "personalTitle": "Allow personal Microsoft accounts",
+        "personalDescription": "Outlook.com, Hotmail and Live accounts. Applies once at least one tenant is listed; without a list every account is accepted.",
+        "serverEnforced": "Checked by the server at every sign-in, invitation acceptance and organization switch. Members a change excludes are signed out of this organization.",
+        "revoked_one": "{{count}} member was signed out of this organization.",
+        "revoked_other": "{{count}} members were signed out of this organization.",
+        "error": {
+          "lockOutSelf": "This change would exclude your own account. Add your own tenant first.",
+          "alreadyAllowed": "This tenant is already listed.",
+          "personalTenant": "Use the personal accounts switch instead of listing that tenant.",
+          "invalidTenant": "Enter a tenant ID (a GUID such as 00000000-0000-0000-0000-000000000000)."
+        }
       }
     },
     "technologies": {

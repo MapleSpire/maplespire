@@ -169,6 +169,22 @@ describe('checkShareAudienceAccess', () => {
 
     expect(await checkShareAudienceAccess(db, { ...share, allowedEmailDomain: null }, claims())).toBe('forbidden')
   })
+
+  it('domain: an unverified Microsoft email never satisfies the domain (V0-02 / nOAuth)', async () => {
+    const { checkShareAudienceAccess } = await import('./shares.js')
+    const share = { audience: 'domain' as const, orgId: null, allowedEmailDomain: 'montreal.ca' }
+    const entra = 'https://login.microsoftonline.com/common/v2.0'
+
+    // Any tenant can present this address: the IdP did not vouch for it.
+    queryMock.mockResolvedValueOnce({ rows: [{ email: 'jean@montreal.ca', issuer: entra, email_verified: false }] })
+    expect(await checkShareAudienceAccess(db, share, claims())).toBe('forbidden')
+    // Unknown (signed in before V0-02 recorded it) is refused too.
+    queryMock.mockResolvedValueOnce({ rows: [{ email: 'jean@montreal.ca', issuer: entra, email_verified: null }] })
+    expect(await checkShareAudienceAccess(db, share, claims())).toBe('forbidden')
+    // Control: `xms_edov`/`email_verified` recorded true → the domain decides.
+    queryMock.mockResolvedValueOnce({ rows: [{ email: 'jean@montreal.ca', issuer: entra, email_verified: true }] })
+    expect(await checkShareAudienceAccess(db, share, claims())).toBe('allow')
+  })
 })
 
 describe('getShareGateInfo', () => {
@@ -453,5 +469,48 @@ describe('checkShareRateLimit', () => {
       expect((await checkShareRateLimit('tokG', null)).allowed).toBe(true)
     }
     expect((await checkShareRateLimit('tokG', null)).allowed).toBe(false)
+  })
+})
+
+describe('parseShareUpdate (PATCH /api/shares/:token body, V0-03)', () => {
+  it('accepts every field the client sends, and an empty body', async () => {
+    const { parseShareUpdate } = await import('./shares.js')
+    expect(parseShareUpdate({})).toEqual({ ok: true, value: {} })
+    const full = {
+      enabled: true, limitToDiagram: false, mode: 'pinned', scope: 'landscape',
+      checkpointId: 'c1', checkpointLabel: null, heads: ['h1', 'h2'], snapshot: okSnapshot,
+      audience: 'domain', allowedEmailDomain: null, allow3d: false,
+    }
+    expect(parseShareUpdate(full)).toEqual({ ok: true, value: full })
+    expect(parseShareUpdate({ heads: null, checkpointId: null })).toEqual({ ok: true, value: { heads: null, checkpointId: null } })
+  })
+
+  it('drops unknown keys (including a client-supplied sessionOrgId) instead of passing them through', async () => {
+    const { parseShareUpdate } = await import('./shares.js')
+    expect(parseShareUpdate({ enabled: false, sessionOrgId: 'evil-org', token: 'x' })).toEqual({
+      ok: true, value: { enabled: false },
+    })
+  })
+
+  it('rejects ill-typed fields and non-object bodies', async () => {
+    const { parseShareUpdate } = await import('./shares.js')
+    const bad: unknown[] = [
+      null, 'str', [], [{ enabled: true }],
+      { enabled: 'no' }, { limitToDiagram: 1 }, { mode: 'bogus' }, { scope: 'org' },
+      { checkpointId: 3 }, { checkpointLabel: {} }, { heads: 'abc' }, { heads: [1] },
+      { snapshot: 'x' }, { snapshot: null }, { snapshot: [] }, { audience: 'everyone' },
+      { allowedEmailDomain: 5 }, { allow3d: 'true' },
+    ]
+    for (const body of bad) {
+      const r = parseShareUpdate(body)
+      expect(r.ok, JSON.stringify(body)).toBe(false)
+      if (!r.ok) expect(typeof r.error).toBe('string')
+    }
+  })
+
+  it('rejects an oversized snapshot', async () => {
+    const { parseShareUpdate } = await import('./shares.js')
+    const r = parseShareUpdate({ snapshot: { blob: 'x'.repeat(25_000_001) } })
+    expect(r).toEqual({ ok: false, error: 'snapshot too large' })
   })
 })

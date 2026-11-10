@@ -30,10 +30,12 @@ const ROOT = path.resolve(import.meta.dirname, '..')
 const tempDir = () => mkdtempSync(path.join(os.tmpdir(), 'ci-lock-'))
 
 test('every known flag parses, and --help starts nothing', () => {
-  assert.deepEqual(parseCiLocalArgs([]), { help: false, static: false, updateAllowlist: false, down: false })
+  assert.deepEqual(parseCiLocalArgs([]), { help: false, static: false, updateAllowlist: false, down: false, compat: false })
   assert.deepEqual(parseCiLocalArgs(['--static', '--update-allowlist']), {
-    help: false, static: true, updateAllowlist: true, down: false,
+    help: false, static: true, updateAllowlist: true, down: false, compat: false,
   })
+  assert.equal(parseCiLocalArgs(['--compat']).compat, true)
+  assert.match(parseCiLocalArgs(['--compat=1']).error, /--compat=1/)
   assert.equal(parseCiLocalArgs(['--help']).help, true)
   assert.equal(parseCiLocalArgs(['-h']).help, true)
 })

@@ -279,6 +279,41 @@ export function updateOrg(
   })
 }
 
+// ── Allowed Microsoft Entra tenants (server/src/auth/orgTenantRoutes.ts) ────
+
+export interface OrgTenantPolicy {
+  tenants: Array<{ provider: 'microsoft'; tenantId: string; addedBy: string; addedAt: string }>
+  microsoftPersonalAccountsAllowed: boolean
+  /** 'no_tenant_restriction' while the list is empty: any tenant may join. */
+  warning: 'no_tenant_restriction' | null
+  /** On a change: members whose sessions it revoked. */
+  revokedMembers?: number
+}
+
+export function getOrgTenantPolicy(orgId: string, signal?: AbortSignal): Promise<OrgTenantPolicy> {
+  return request(`/api/orgs/${encodeURIComponent(orgId)}/idp-tenants`, signal ? { signal } : undefined)
+}
+
+export function addOrgAllowedTenant(orgId: string, tenantId: string): Promise<OrgTenantPolicy> {
+  return request(`/api/orgs/${encodeURIComponent(orgId)}/idp-tenants`, {
+    method: 'POST',
+    body: JSON.stringify({ tenantId }),
+  })
+}
+
+export function removeOrgAllowedTenant(orgId: string, tenantId: string): Promise<OrgTenantPolicy> {
+  return request(`/api/orgs/${encodeURIComponent(orgId)}/idp-tenants/${encodeURIComponent(tenantId)}`, {
+    method: 'DELETE',
+  })
+}
+
+export function setOrgPersonalMicrosoftAccounts(orgId: string, allowed: boolean): Promise<OrgTenantPolicy> {
+  return request(`/api/orgs/${encodeURIComponent(orgId)}/idp-tenant-policy`, {
+    method: 'PATCH',
+    body: JSON.stringify({ microsoftPersonalAccountsAllowed: allowed }),
+  })
+}
+
 // ── B3 — Teams ──────────────────────────────────────────────────────────────
 
 export interface OrgTeam {

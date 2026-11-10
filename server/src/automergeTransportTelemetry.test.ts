@@ -33,21 +33,47 @@ function fakeSocket(bufferedAmount = 0): TransportSocket & { close: (code?: numb
 }
 
 describe('automerge transport configuration', () => {
-  it('samples process memory without the page-walking process.memoryUsage path', () => {
-    const rss = vi.fn(() => 321)
-    const heapStatistics = vi.fn(() => ({
-      used_heap_size: 123,
-      external_memory: 45,
-    }))
+  it('samples process memory once, with arrayBuffers and the wasm linear memory', () => {
+    const memoryUsage = vi.fn(() => ({ rss: 321, heapTotal: 999, heapUsed: 123, external: 45, arrayBuffers: 6 }))
+    const wasm = vi.fn(() => ({ bytes: 40, instances: 1 }))
 
-    expect(lightweightProcessMemoryBytes(rss, heapStatistics as never)).toEqual({
+    expect(lightweightProcessMemoryBytes(memoryUsage, wasm)).toEqual({
       rss: 321,
       heapUsed: 123,
+      heapTotal: 999,
       external: 45,
-      arrayBuffers: null,
+      arrayBuffers: 6,
+      wasm: 40,
+      wasmInstances: 1,
     })
-    expect(rss).toHaveBeenCalledOnce()
-    expect(heapStatistics).toHaveBeenCalledOnce()
+    expect(memoryUsage).toHaveBeenCalledOnce()
+    expect(wasm).toHaveBeenCalledOnce()
+  })
+
+  it('reports wasm as unknown rather than zero when no instance was observed', () => {
+    const memoryUsage = () => ({ rss: 1, heapTotal: 1, heapUsed: 1, external: 1, arrayBuffers: 1 })
+    expect(lightweightProcessMemoryBytes(memoryUsage, () => ({ bytes: null, instances: 0 }))).toMatchObject({
+      wasm: null,
+      wasmInstances: 0,
+    })
+  })
+
+  it('exposes the memory fields in the snapshot and the structured log line', () => {
+    const telemetry = new AutomergeTransportTelemetry(automergeTransportConfig({ AM_WS_TELEMETRY_INTERVAL_MS: '0' }))
+    const memory = telemetry.snapshot().processMemoryBytes
+    expect(typeof memory.arrayBuffers).toBe('number')
+    expect(memory).toHaveProperty('wasm')
+    expect(memory).toHaveProperty('wasmInstances')
+    const line = (telemetry as unknown as { structuredLogSnapshot(): Record<string, unknown> }).structuredLogSnapshot()
+    expect(line).toHaveProperty('arrayBufferBytes', expect.any(Number))
+    expect(line).toHaveProperty('wasmMemoryBytes')
+    expect(line).toHaveProperty('heapTotalBytes', expect.any(Number))
+    // Each field carries ITS value, not a neighbour's: `wasm` (null here, no
+    // gauge installed in this worker) is not `external`, and V8's committed
+    // heap is strictly larger than the part in use.
+    expect(line.wasmMemoryBytes).toBe(memory.wasm)
+    expect(line.wasmMemoryBytes).not.toBe(line.externalBytes)
+    expect(line.heapTotalBytes as number).toBeGreaterThan(line.heapUsedBytes as number)
   })
 
   it('reports only aggregate current synchronizer peer cardinalities', () => {

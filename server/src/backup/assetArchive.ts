@@ -190,7 +190,7 @@ export async function archiveAssets(options: {
   let bytes = 0
   let referencedByRevision = 0
 
-  if (options.inventory.length > 0) await mkdir(destination, { recursive: true })
+  if (options.inventory.length > 0) await mkdir(destination, { recursive: true, mode: 0o700 })
   for (const entry of options.inventory) {
     if (!present.has(entry.filename)) {
       if (entry.referencedByRevision) missingReferenced.push(entry.filename)
@@ -202,7 +202,7 @@ export async function archiveAssets(options: {
       corrupt.push(entry.filename)
       continue
     }
-    await writeFile(join(destination, entry.filename), content, { flag: 'wx', mode: 0o644 })
+    await writeFile(join(destination, entry.filename), content, { flag: 'wx', mode: 0o600 })
     archived.push(entry.filename)
     bytes += content.byteLength
     if (entry.referencedByRevision) referencedByRevision += 1

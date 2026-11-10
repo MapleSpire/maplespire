@@ -12,8 +12,9 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU Affero General Public License for more details.
 
-import { useRef, useEffect, useLayoutEffect, useMemo, useState, useCallback } from 'react'
+import { useRef, useEffect, useEffectEvent, useLayoutEffect, useMemo, useState, useCallback } from 'react'
 import { useTranslation } from 'react-i18next'
+import { useDepsChanged } from '../../hooks/useDepsChanged'
 import { useShallow } from 'zustand/shallow'
 import { ZoomIn, ZoomOut, Maximize, Grid2x2, RotateCw, TriangleAlert } from 'lucide-react'
 import { cn } from '../../lib/utils'
@@ -632,6 +633,11 @@ export function CanvasView() {
     else restoreCanvasViewFor(id)
   }, [currentDiagram?.id, restoreCanvasViewFor, setCanvasViewMode])
 
+  // The skin a NEW engine starts with. Read through an effect event so a skin
+  // change does not destroy and rebuild the engine — the `setSkin` effect
+  // below pushes later skin changes into the live engine.
+  const readSkinForNewEngine = useEffectEvent(() => resolvedSkin)
+
   // Initialize engine
   useEffect(() => {
     if (isLoading) return
@@ -881,7 +887,7 @@ export function CanvasView() {
       onWrapperMetricsChanged: () => {
         if (Object.keys(useUIStore.getState().inlineExpansions).length > 0) syncEngineFromStore()
       },
-    }, resolvedSkin)
+    }, readSkinForNewEngine())
 
     engineRef.current = engine
     engine.setResolvedTheme(useThemeStore.getState().resolved)
@@ -943,7 +949,10 @@ export function CanvasView() {
       engine.destroy()
       engineRef.current = null
     }
-  }, [isLoading, selectObjects, selectGroup, updatePlacementsBatch, addConnection, updateConnection, setZoom, syncEngineFromStore, expandedContentsRef])
+    // The store actions listed are zustand actions — created once with the
+    // store (the undo wrapper replaces some exactly once, at module load), so
+    // listing them never re-runs this effect.
+  }, [isLoading, selectObjects, selectConnection, selectGroup, toggleSelectItem, clearSelection, updatePlacementsBatch, addConnection, updateConnection, updateComment, setOpenCommentId, setZoom, syncEngineFromStore, expandedContentsRef])
 
   // Sync lower connections whenever the current diagram changes
   useEffect(() => {
@@ -1109,17 +1118,15 @@ export function CanvasView() {
   // the pin is OFF-SCREEN (e.g. the comment was opened from the comments panel);
   // clicking a pin that's already visible must NOT move the canvas. The box is
   // positioned after any pan so it lands against the pin on the first open.
+  // A different (or no) open comment drops the previous box position during
+  // render; the effect then measures and places the box for the new one.
+  const openCommentChanged = useDepsChanged([openCommentId])
+  if (openCommentChanged) setCommentBoxPos(null)
   useEffect(() => {
     const engine = engineRef.current
-    if (!openCommentId || !engine) {
-      setCommentBoxPos(null)
-      return
-    }
+    if (!openCommentId || !engine) return
     const comment = diagramComments.find((c) => c.id === openCommentId)
-    if (!comment) {
-      setCommentBoxPos(null)
-      return
-    }
+    if (!comment) return
     const vw = canvasRef.current?.clientWidth ?? 0
     const vh = canvasRef.current?.clientHeight ?? 0
     // Where the pin is DRAWN, which an open expansion may have displaced.

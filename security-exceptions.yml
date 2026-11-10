@@ -1,0 +1,16 @@
+# Security exceptions that EXPIRE (V0-12). Validated by scripts/security-exceptions.mjs,
+# which FAILS on a malformed entry and on an expired one.
+#
+# Fields (all required except `path`): id, tool, justification, owner, expires (ISO date,
+# the LAST day it applies, at most 90 days out). `path` (optional) narrows the waiver to
+# findings whose file starts with it. One-line values only; quote anything with a colon.
+#
+# npm-audit ids are `pkg:<name>`: one entry waives every advisory of that package in
+# BOTH lockfiles (root and server/), which is coarse on purpose, because the advisory list
+# for a package moves daily. Reachability was NOT analysed per advisory; the justification
+# says only whether the package is a runtime dependency (from `npm audit --omit=dev`).
+#
+# History: 17 temporary npm-audit waivers were added 2026-11-08 and all removed the same
+# day by the dependency pass (lockfile bumps within semver, plus vite ^8.3.6 in the root
+# package.json). No high or critical finding remains in either lockfile.
+exceptions: []

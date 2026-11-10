@@ -131,6 +131,11 @@ export default defineConfig(({ mode }) => {
     build: { target: 'esnext' },
     server: {
       port: devPort,
+      // Agent worktrees live under .claude/worktrees/ inside this checkout.
+      // Watched, every build or checkout there full-reloads this page (measured
+      // 2026-11-08: dozens of "page reload .claude/worktrees/.../index.html"
+      // lines in one session's Vite log, seen as the app reloading on its own).
+      watch: { ignored: ['**/.claude/**'] },
       proxy: {
         '/api': {
           target: apiTarget,

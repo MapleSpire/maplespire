@@ -219,6 +219,7 @@ export function useVirtualRows({
   overscan = 5,
   getItemKey,
 }: UseVirtualRowsOptions): UseVirtualRowsResult {
+  // eslint-disable-next-line react-hooks/incompatible-library -- TanStack Virtual's useVirtualizer returns a mutable instance whose methods the React Compiler cannot memoize; there is no compatible API to switch to, and this app does not run the compiler, so the skip costs nothing
   const virtualizer = useVirtualizer({
     count,
     getScrollElement: () => scrollRef.current,

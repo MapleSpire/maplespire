@@ -344,6 +344,9 @@ describe('DECLARED_BARE_ENV_PARSES', () => {
       // absence of a bare-parse exemption, not behavior.
       ['server/src/syncCells/ownerRouteMap.ts', ['SYNC_CELL_ROUTE_MAP_REFRESH_MS', 'SYNC_CELL_ROUTE_MAP_MAX_AGE_MS']],
       ['server/src/overlaySegments.ts', ['AM_OVERLAY_SEGMENT_SIZE']],
+      // G4-16e: born bounded (`envNumber`, floor 0 = disabled, a blank keeps
+      // the default). Its parse cases are in ordinaryRotationTelemetry.test.ts.
+      ['server/src/readModel/ordinaryHeadRotation.ts', ['AM_ORDINARY_CHAIN_ALERT_LENGTH']],
       // Computed access (`intEnv`). Unbounded, a blank `AI_AGENT_MAX_STEPS=`
       // collapsed the agent from 20 steps to 1.
       ['server/src/ai/core/agent.ts', ['AI_AGENT_MAX_STEPS', 'AI_AGENT_MAX_ROUNDS', 'AI_AGENT_ROUND_TIMEOUT_MS']],

@@ -51,6 +51,9 @@ export interface AutomergeResidencySnapshot {
   protectedDocuments: number
   evictedDocuments: number
   evictionSkippedActivePeer: number
+  /** Evictions refused because the document's last content save failed and
+   * its delta is held only in memory (G4-16d round 3). */
+  evictionSkippedUnsavedWrite: number
   /** Evictions refused because the document the caller decided about is no
    * longer the one this process holds. Without it a refusal appears in
    * NEITHER `evicted` NOR any `skipped*`, and the sweep's payload stops adding
@@ -94,6 +97,16 @@ export interface AutomergeResidencyStorageProbe {
     trackedChunkBytes: number
   }
   forget(documentId: string): void
+  /** True while a content save of the document failed and nothing has made
+   * that delta durable since (`PostgresStorageAdapter.hasUnsavedWrite`):
+   * evicting it would drop the only copy, since eviction does not flush. */
+  hasUnsavedWrite?(documentId: string): boolean
+  /** The storage's save cursor, read before a flush of an unsaved document. */
+  saveCursor?(): number
+  /** That flush RESOLVED (`PostgresStorageAdapter.flushSettled`): marks of
+   * saves started before it are no longer the only copy — or, for a handle
+   * dropped and re-read meanwhile, no longer anyone's copy. */
+  flushSettled?(documentId: string, cursor: number): void
 }
 
 function recordCount(target: Record<string, number>, key: string): void {
@@ -109,6 +122,12 @@ function recordCount(target: Record<string, number>, key: string): void {
  * silently becoming noise, or, far worse, silently going quiet.
  */
 export const REPO_BASELINE_CHANGE_LISTENERS = 0
+
+/** The first wait before an unsaved document whose eviction was refused is
+ * flushed again, doubling up to `UNSAVED_FLUSH_MAX_MS`. The first refusal
+ * flushes at once. */
+const UNSAVED_FLUSH_FIRST_MS = 30_000
+const UNSAVED_FLUSH_MAX_MS = 600_000
 
 export function classifyAutomergeDocument(value: unknown): AutomergeDocumentType {
   if (!value || typeof value !== 'object') return 'unknown'
@@ -147,6 +166,10 @@ export class AutomergeResidencyLeases {
   private readonly pending = new Set<Promise<unknown>>()
   private evictedDocuments = 0
   private evictionSkippedActivePeer = 0
+  private evictionSkippedUnsavedWrite = 0
+  /** documentId -> when an unsaved document may be flushed again, and the
+   * delay that set it (30 s doubling to 10 min). */
+  private readonly unsavedFlushes = new Map<DocumentId, { next: number; delay: number }>()
   private evictionSkippedStaleHandle = 0
   /** Documents carrying the idle sweep's ambient 'change' tracker. The sweep
    * attaches one to every ready handle it iterates, BEFORE the lease check, so
@@ -202,6 +225,20 @@ export class AutomergeResidencyLeases {
       this.leases.delete(documentId)
       this.track(this.evict(documentId))
     }
+  }
+
+  /** Drop ONE document from `owner`'s lease, evicting it when no other owner
+   * holds it. For a document the owner stops watching while it keeps running
+   * (a folded ordinary head, `ordinaryChainFold.ts`); `releaseOwner` drops all
+   * of them. Returns whether `owner` held it. */
+  release(documentId: DocumentId, owner: string): boolean {
+    const lease = this.leases.get(documentId)
+    if (!lease || !lease.owners.delete(owner)) return false
+    if (lease.owners.size === 0) {
+      this.leases.delete(documentId)
+      this.track(this.evict(documentId))
+    }
+    return true
   }
 
   releaseOwner(owner: string): void {
@@ -317,6 +354,18 @@ export class AutomergeResidencyLeases {
       this.evictionSkippedActivePeer += 1
       return false
     }
+    // An unsaved delta: eviction does not flush (see below), so it would be
+    // the only copy that goes. Kept until a save of the document succeeds —
+    // and asked for: a backed-off flush re-saves it without waiting for an
+    // edit. A cell that no longer owns the document is refused by the fence,
+    // which clears the mark (`PostgresStorageAdapter.hasUnsavedWrite`), so
+    // this cannot hold a document for ever.
+    if (this.storageProbe?.hasUnsavedWrite?.(documentId)) {
+      this.evictionSkippedUnsavedWrite += 1
+      this.flushUnsaved(id)
+      return false
+    }
+    this.unsavedFlushes.delete(id)
     // A lease may have been acquired while the peer check was in flight.
     if (this.leases.has(id)) return false
     // Notify FIRST, then count. An orphan is a listener still attached after
@@ -339,6 +388,29 @@ export class AutomergeResidencyLeases {
     this.ambientListeners.delete(documentId)
     this.evictedDocuments += 1
     return true
+  }
+
+  /** Re-save a document whose last content save failed, at most once per
+   * backoff period. Never throws; a failure is logged and backs off. */
+  private flushUnsaved(documentId: DocumentId): void {
+    const now = Date.now()
+    const entry = this.unsavedFlushes.get(documentId)
+    if (entry && now < entry.next) return
+    const delay = entry ? Math.min(UNSAVED_FLUSH_MAX_MS, entry.delay * 2) : UNSAVED_FLUSH_FIRST_MS
+    this.unsavedFlushes.set(documentId, { next: now + delay, delay })
+    const cursor = this.storageProbe?.saveCursor?.() ?? 0
+    void this.repo.flush([documentId]).then(() => {
+      // Saved, or nothing to save (stored heads are the document's): a mark
+      // older than the flush is stale — the next eviction may go through.
+      this.storageProbe?.flushSettled?.(documentId, cursor)
+    }, (error: unknown) => {
+      console.warn(JSON.stringify({
+        event: 'automerge.unsaved_document_flush_failed',
+        documentId,
+        retryInMs: delay,
+        error: error instanceof Error ? error.message : String(error),
+      }))
+    })
   }
 
   /**
@@ -475,6 +547,7 @@ export class AutomergeResidencyLeases {
       protectedDocuments: this.protectedIds.size,
       evictedDocuments: this.evictedDocuments,
       evictionSkippedActivePeer: this.evictionSkippedActivePeer,
+      evictionSkippedUnsavedWrite: this.evictionSkippedUnsavedWrite,
       evictionSkippedStaleHandle: this.evictionSkippedStaleHandle,
       orphanedListenerEvictions: this.orphanedListenerEvictions,
       orphanedListenersByType: { ...this.orphanedListenersByType },

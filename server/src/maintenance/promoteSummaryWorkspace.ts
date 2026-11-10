@@ -117,6 +117,7 @@ import {
   releaseLifecycleApplyLock,
 } from './lifecycleApplyLock.js'
 import type { WorkspaceKey } from '../readModel/projector.js'
+import { countOrdinaryHeadRetirements } from '../readModel/ordinaryHeadForwarding.js'
 import type { Queryable } from '../readModel/types.js'
 import { collectReferencedUrls, fsckWorkspace, type WorkspaceFsckReport } from './workspaceFsck.js'
 
@@ -167,6 +168,11 @@ export type PromotionBlockerCode =
    * evidence-gathering and the transaction. The verdict is stale by
    * construction, so it is discarded rather than acted on. */
   | 'witness-moved'
+  /** The workspace has ordinary write-head retirement rows
+   * (`ordinaryHeadForwarding.ts`): its retired heads' late writes are carried
+   * by the ORDINARY projector's forwarder, which promotion detaches for good,
+   * and the static plane projects every segment directly. */
+  | 'ordinary-head-retirements'
   | 'fsck-not-clean'
   | 'read-model-not-sealed'
   | 'read-model-not-caught-up'
@@ -505,6 +511,9 @@ export interface PromotionFacts {
   /** `id -> docUrl` read from `ro_diagrams`. */
   readModelDiagrams: ReadonlyMap<string, string> | null
   unresolvedRegistryShards: readonly string[]
+  /** Rows in `read_model_ordinary_head_retirements` for this workspace, any
+   * status; `null` when they could not be counted — never read as zero. */
+  ordinaryHeadRetirements: number | null
 }
 
 /** How many mismatching ids a blocker message names before it truncates. */
@@ -670,6 +679,24 @@ export function evaluatePromotionPreconditions(facts: PromotionFacts): Promotion
         + `(${sample(urlMismatch)}): the allow-list would admit one document and the client would open the other`,
       )
     }
+  }
+
+  // ── ordinary writer-head rotation ─────────────────────────────────────────
+  // A rotated ordinary workspace keeps its retired heads listed, and a client
+  // offline across the rotation keeps writing into one. The ordinary
+  // projector forwards those writes into the current head
+  // (`ordinaryHeadForwarding.ts`); the static plane knows nothing of the rows
+  // and would project the retired head directly, where a whole entity in the
+  // current head hides the late field edit. Refused until the static plane
+  // learns the rows — not a state this promotion can repair.
+  if (facts.ordinaryHeadRetirements === null) {
+    block('ordinary-head-retirements', 'read_model_ordinary_head_retirements could not be read, so it is not known '
+      + 'whether a retired write head still depends on the ordinary forwarder')
+  } else if (facts.ordinaryHeadRetirements > 0) {
+    block('ordinary-head-retirements', `${facts.ordinaryHeadRetirements} ordinary write head(s) were retired by `
+      + 'rotation (AM_ORDINARY_HEAD_ROTATION): their late writes are forwarded by the ordinary projector, which '
+      + 'promotion detaches, and the static plane would project them directly. Promotion of a rotated '
+      + 'workspace is not supported.')
   }
 
   // ── 5. document-claim coverage marker present ─────────────────────────────
@@ -931,6 +958,18 @@ function applyRootShape(handle: DocHandle<Record<string, unknown>>, next: Worksp
   })
 }
 
+/** Thrown INSIDE the step-3 transaction when retirement rows are visible after
+ * the write fence: an ordinary rotation committed between the evidence and the
+ * fence. Rolled back and reported as the `ordinary-head-retirements` blocker. */
+class RotatedDuringPromotionError extends Error {
+  constructor(readonly retirements: number) {
+    super(`${retirements} ordinary write-head retirement row(s) committed while this promotion was applying `
+      + '(a rotation ran after the evidence was gathered). The step-3 transaction was rolled back: no static '
+      + 'row, no allow-list, no fence. The minted write head is unclaimed and named by nothing.')
+    this.name = 'RotatedDuringPromotionError'
+  }
+}
+
 /**
  * Re-read, under the lock and immediately before BEGIN, the witnesses that can
  * MOVE — and refuse the apply if any of them did.
@@ -962,6 +1001,13 @@ async function volatileWitnessesMoved(args: {
   connectedPeers?: () => number | null | Promise<number | null>
 }): Promise<string | null> {
   const { db, workspace, rootHandle, before } = args
+
+  // A rotation committing its first row while the evidence was gathered.
+  const retirements = await countOrdinaryHeadRetirements(db, workspace)
+  if (retirements > 0) {
+    return `${retirements} ordinary write-head retirement row(s) appeared while this promotion was gathering `
+      + 'its evidence (a rotation ran). Nothing was written.'
+  }
 
   const staticSource = await readStaticSource(db, workspace)
   if (staticSource !== before.staticSource) {
@@ -1077,7 +1123,7 @@ async function runSummaryPromotion(
       projectorInstanceId: null, expectedProjectorInstanceId, coverage: null,
       connectedPeers: null, quiesceAssertedByOperator: assumeQuiesced,
       staticSource: null, crdtDiagrams: null, readModelDiagrams: null,
-      unresolvedRegistryShards: [],
+      unresolvedRegistryShards: [], ordinaryHeadRetirements: null,
     })
     return report
   }
@@ -1174,6 +1220,7 @@ async function runSummaryPromotion(
     crdtDiagrams: materialized.diagrams,
     readModelDiagrams,
     unresolvedRegistryShards: materialized.unresolved,
+    ordinaryHeadRetirements: await countOrdinaryHeadRetirements(db, workspace).catch(() => null),
   })
   if (materialized.duplicateIds.length) {
     report.blockers.push({
@@ -1367,6 +1414,7 @@ async function runSummaryPromotion(
     say('3/6 committing the static row, the allow-list and the write-head claim')
     const client: PoolClient = await db.connect()
     let rollbackFailure: Error | true | undefined
+    let rotatedDuring: RotatedDuringPromotionError | undefined
     try {
       await client.query('BEGIN')
       // LOCK ORDER: this transaction is the ONE exception to the global one.
@@ -1458,6 +1506,25 @@ async function runSummaryPromotion(
       // it reads the sentinel as its own `expectedPrevious` and its CAS then
       // succeeds.
       await claimLifecycleWriteFence(client, workspace)
+      // THE RETIREMENT ROWS, RE-COUNTED HERE — after the fence, on this client.
+      //
+      // The verdict and `volatileWitnessesMoved` counted them OUTSIDE this
+      // transaction, so an ordinary rotation committing its row (and then
+      // repointing ModelMeta) after those reads would be promoted: its child
+      // absent from the allow-list just built, its retired head projected
+      // directly by the static plane (phase-3 review, both lenses).
+      //
+      // AFTER the fence, because the fence is what serializes the two: the
+      // rotator's row transaction takes `read_model_projection_state` FOR
+      // UPDATE (`assertReadModelWriteFence`, `health.ts`) before it inserts.
+      // So a rotator transaction open now makes the UPDATE above WAIT for its
+      // COMMIT, and this READ COMMITTED statement then sees its row; one that
+      // begins after the UPDATE waits on OUR row lock and then finds the
+      // lifecycle fence and throws. Counted before the fence, the first case
+      // slips through. Both interleavings are pinned in
+      // `promoteSummaryWorkspace.integration.test.ts`.
+      const lateRetirements = await countOrdinaryHeadRetirements(client, workspace)
+      if (lateRetirements > 0) throw new RotatedDuringPromotionError(lateRetirements)
       await client.query('COMMIT')
     } catch (error) {
       // Release WITH the failure. This transaction holds FOUR row-lock sets by
@@ -1473,9 +1540,18 @@ async function runSummaryPromotion(
       await client.query('ROLLBACK').catch((rollbackError: unknown) => {
         rollbackFailure = rollbackError instanceof Error ? rollbackError : true
       })
-      throw error
+      // A REFUSAL, not a failure: reported as the blocker the verdict would
+      // have raised. Nothing committed either way — a failed ROLLBACK destroys
+      // the session below, which aborts the transaction server-side.
+      if (!(error instanceof RotatedDuringPromotionError)) throw error
+      rotatedDuring = error
     } finally {
       client.release(rollbackFailure)
+    }
+    if (rotatedDuring) {
+      report.blockers.push({ code: 'ordinary-head-retirements', detail: rotatedDuring.message })
+      say(`REFUSED: ${rotatedDuring.message}`)
+      return report
     }
     const committedAt = clock()
     await hooks.onStep?.('static-committed')

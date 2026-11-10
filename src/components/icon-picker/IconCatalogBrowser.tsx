@@ -18,6 +18,7 @@ import { useTranslation } from 'react-i18next'
 import type { IconDefinition, ShapeType } from '../../lib/techIcons'
 import { getIconPage, getIconPacks } from '../../lib/icons/api'
 import { useDebouncedValue } from '../../hooks/useDebouncedValue'
+import { useDepsChanged } from '../../hooks/useDepsChanged'
 import { cn } from '../../lib/utils'
 import { useThemeStore } from '../../stores/themeStore'
 import { CatalogBrowser } from '../catalog/CatalogBrowser'
@@ -70,11 +71,17 @@ export function IconCatalogBrowser({
     return () => controller.abort()
   }, [])
 
+  // A new search/pack/retry shows the loader again — reset during render, on
+  // the same deps that re-run the fetch effect below.
+  const pageInputsChanged = useDepsChanged([activePack, debouncedSearch, retryToken])
+  if (pageInputsChanged) {
+    setLoading(true)
+    setError(null)
+  }
+
   useEffect(() => {
     const controller = new AbortController()
     const generation = ++requestGeneration.current
-    setLoading(true)
-    setError(null)
     getIconPage({
       q: debouncedSearch || undefined,
       pack: activePack,

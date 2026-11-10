@@ -297,6 +297,42 @@ test('T-POST resolved posture refuses an inherited fanout override or an unclass
   }
 })
 
+test('G4-16b the ordinary-head rotation arm resolves off by default and moves no qualified setting', () => {
+  const cells = ['sync-cell-a', 'sync-cell-b', 'sync-cell-c']
+  const arms = registry.experimentArms ?? []
+  assert.deepEqual(arms.map(entry => entry.variable), ['AM_ORDINARY_HEAD_ROTATION', 'AM_ORDINARY_CHAIN_FOLD'])
+  const [arm, fold] = arms
+  for (const entry of arms) {
+    assert.ok(typeof entry.reason === 'string' && entry.reason.trim(), 'an experiment arm requires a reason')
+    assert.deepEqual([entry.benchDefault, entry.shippedDefault], ['off', 'off'])
+    // Shipped = off by ABSENCE: the delivered anchor and services never name it.
+    assert.equal(Object.hasOwn(shippedAnchor, entry.variable), false)
+    for (const service of Object.values(deliveredConfig.services)) {
+      for (const name of [entry.variable, ...entry.companions]) assert.equal(Object.hasOwn(service.environment ?? {}, name), false, name)
+    }
+    // Unset on the bench: off and blank on every cell, in both postures.
+    for (const config of [benchConfig, shippedConfig]) {
+      for (const name of cells) {
+        const environment = config.services[name].environment
+        assert.equal(environment[entry.variable], 'off', name)
+        for (const companion of entry.companions) assert.equal(environment[companion], '', name + '/' + companion)
+      }
+      assert.equal(Object.hasOwn(config.services['sync-ws-router'].environment, entry.variable), false)
+    }
+  }
+  // Selected: every cell carries the arm (and the fold riding on it), and the
+  // nine settings stay shipped.
+  const armed = resolveBench({ ...shippedOverrides(shipped), SYNC_FAILOVER_ORDINARY_HEAD_ROTATION: 'on',
+    SYNC_FAILOVER_ORDINARY_HEAD_ROTATION_ALLOWLIST: 'l-1/v-1,l-2/v-2', SYNC_FAILOVER_ORDINARY_HEAD_ROTATION_MAX_ACTORS: '8',
+    SYNC_FAILOVER_ORDINARY_HEAD_ROTATION_MAX_CHANGES: '64', SYNC_FAILOVER_ORDINARY_CHAIN_FOLD: 'on',
+    SYNC_FAILOVER_ORDINARY_CHAIN_FOLD_RETAIN_HOURS: '1' })
+  for (const name of cells) {
+    assert.deepEqual([arm.variable, ...arm.companions].map(key => armed.services[name].environment[key]), ['on', 'l-1/v-1,l-2/v-2', '8', '64'], name)
+    assert.deepEqual([fold.variable, ...fold.companions].map(key => armed.services[name].environment[key]), ['on', '1'], name)
+  }
+  assert.deepEqual(resolvedBenchPosture(armed, shipped).values, shipped.values)
+})
+
 function milliseconds(value) {
   const match = /^(\d+(?:\.\d+)?)(ms|s)$/.exec(String(value))
   assert.ok(match, `unexpected Compose duration ${value}`)

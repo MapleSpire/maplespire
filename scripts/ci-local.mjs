@@ -42,7 +42,8 @@
  *   node scripts/ci-local.mjs              # services up, full test job, skip check
  *   node scripts/ci-local.mjs --static     # also lint/build (the other CI job)
  *   node scripts/ci-local.mjs --update-allowlist
- *   node scripts/ci-local.mjs --down       # remove the containers and exit
+ *   node scripts/ci-local.mjs --compat     # also the N-1 <-> N harness (local-only)
+ *   node scripts/ci-local.mjs --down      # remove the containers and exit
  *   node scripts/ci-local.mjs --help       # usage; starts nothing
  *
  * Any other argument is refused, and one run at a time holds the containers
@@ -447,6 +448,18 @@ async function main() {
   const fireDrill = await runStreamed('npm', ['run', '--silent', 'qa:eviction-fire-drill'],
     { cwd: path.join(ROOT, 'server'), env, logFile: path.join(RUN_DIR, 'eviction-fire-drill.log') })
 
+  // OPT-IN, and LOCAL-ONLY: `ci.yml` runs no browser suite, so this leg is
+  // not parity with CI and must never run by default — otherwise this script
+  // could print RED for something CI never runs (`ci-local-parity.test.mjs`
+  // pins that it stays behind the flag). It owns its stack (Postgres 55439,
+  // server 3240, origins 5240/5241, Vite 5249) and none of the `env` above.
+  // Last, because it is the slowest and depends on nothing before it.
+  let compat = null
+  if (args.compat) {
+    console.log('\n=== N-1 <-> N compatibility harness (local-only, --compat) ===')
+    compat = await runStreamed('node', ['scripts/compat-n-1.mjs'], { logFile: path.join(RUN_DIR, 'compat.log') })
+  }
+
   const failed = [
     harness.status !== 0 && 'harness self-tests',
     frontend.status !== 0 && 'frontend tests',
@@ -459,6 +472,7 @@ async function main() {
     // 3041 was busy".
     fireDrill.status === 2 && 'eviction gate fire drill (VOID — the drill did not run)',
     fireDrill.status !== 0 && fireDrill.status !== 2 && 'eviction gate fire drill (the gate cannot discriminate)',
+    compat && compat.status !== 0 && 'N-1 <-> N compatibility harness (--compat, not in ci.yml)',
   ].filter(Boolean)
   if (failed.length > 0) {
     console.error(`\nCI would be RED: ${failed.join(', ')}`)
@@ -473,6 +487,7 @@ async function main() {
     process.exit(1)
   }
   console.log('\nCI would be GREEN.')
+  if (compat) console.log('The local-only N-1 <-> N compatibility harness (--compat) is GREEN too.')
 }
 
 await main()

@@ -33,6 +33,9 @@ export const USAGE = `Usage:
   node scripts/ci-local.mjs              services up, full test job, skip check
   node scripts/ci-local.mjs --static     also lint/build (the other CI job)
   node scripts/ci-local.mjs --update-allowlist
+  node scripts/ci-local.mjs --compat     also the N-1 <-> N compatibility harness
+                                         (scripts/compat-n-1.mjs, its own stack;
+                                         a LOCAL-ONLY leg: ci.yml does not run it)
   node scripts/ci-local.mjs --down       remove the containers and exit
   node scripts/ci-local.mjs --help       this text; starts nothing
 
@@ -42,9 +45,9 @@ a pair: a second one refuses to start. For a separate pair, set BOTH
 CI_LOCAL_PG_PORT and CI_LOCAL_REDIS_PORT — the containers are named after
 their ports.`
 
-const KNOWN = new Set(['--static', '--update-allowlist', '--down', '--help', '-h'])
+const KNOWN = new Set(['--static', '--update-allowlist', '--down', '--compat', '--help', '-h'])
 
-/** @returns {{ help: boolean, static: boolean, updateAllowlist: boolean, down: boolean } | { error: string }} */
+/** @returns {{ help: boolean, static: boolean, updateAllowlist: boolean, down: boolean, compat: boolean } | { error: string }} */
 export function parseCiLocalArgs(argv) {
   const unknown = argv.filter((arg) => !KNOWN.has(arg))
   if (unknown.length) return { error: `Unknown argument(s): ${unknown.join(' ')}` }
@@ -54,6 +57,7 @@ export function parseCiLocalArgs(argv) {
     static: has('--static'),
     updateAllowlist: has('--update-allowlist'),
     down: has('--down'),
+    compat: has('--compat'),
   }
 }
 

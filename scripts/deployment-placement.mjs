@@ -36,6 +36,8 @@ const NON_DEPLOYMENT_YAML = new Set([
   'infra/monitoring/grafana/provisioning/dashboards/maplespire.yml',
   'infra/monitoring/grafana/provisioning/datasources/prometheus.yml', 'infra/monitoring/prometheus.yml',
   'scripts/fixtures/promtool-must-fail.yml', 'scripts/fixtures/promtool-testrules-must-fail.yml',
+  // V0-12 security tooling: Semgrep rules and the expiring waivers.
+  '.semgrep.yml', 'security-exceptions.yml',
 ])
 /** A finite structural boundary for the technical YAML files. This is
  * not a YAML evaluator: their current top-level block keys are pinned and a
@@ -45,6 +47,9 @@ const NON_DEPLOYMENT_YAML = new Set([
 export function assertTechnicalYamlRole(file, source) {
   const expected = file.startsWith('.github/workflows/') ? ['name', 'on', 'concurrency', 'permissions', 'jobs']
     : file === '.github/FUNDING.yml' ? ['github']
+    : file === '.semgrep.yml' ? ['rules']
+    : file === 'security-exceptions.yml' ? ['exceptions']
+    : file.endsWith('pnpm-lock.yaml') ? ['lockfileVersion', 'settings', 'importers', 'packages', 'snapshots']
       : file.endsWith('/alerts.yml') || file.endsWith('/promtool-must-fail.yml') ? ['groups']
         : file.includes('/provisioning/dashboards/') ? ['apiVersion', 'providers']
           : file.includes('/provisioning/datasources/') ? ['apiVersion', 'datasources']

@@ -803,6 +803,7 @@ export function ViewerGrid({
     const toParent: ParentId = path.length ? path[path.length - 1] : null
     const inData = levelParentId === toParent ? { model, connections } : peekLevel(toParent)
     if (!inData) return
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- queues the zoom for a path change from outside (breadcrumb, Back, deep link) once its level is in the viewer's level cache (peekLevel); that cache is filled asynchronously outside React, so whether the transition can start is not derivable during render
     beginTransition(path, inData)
     // renderPath is a dep so a path change that arrived MID-transition (guarded
     // out above) is re-examined once the commit lands, instead of being lost;
