@@ -127,6 +127,7 @@ async function sessionFor(
 }
 
 export function registerPasswordAuthRoutes(app: Express): void {
+  // nosemgrep: sr-authz-route-without-middleware -- public: account registration
   app.post('/api/auth/register', async (req, res) => {
     if (!enabled()) return void res.status(404).json({ error: 'Not found' })
     if (!legalRequestAccepted(req.body?.legalVersion)) {
@@ -161,6 +162,7 @@ export function registerPasswordAuthRoutes(app: Express): void {
     }
   })
 
+  // nosemgrep: sr-authz-route-without-middleware -- public: resends the verification email
   app.post('/api/auth/resend-verification', async (req, res) => {
     if (!enabled()) return void res.status(404).json({ error: 'Not found' })
     const email = normalizedEmail(req.body?.email)
@@ -176,6 +178,7 @@ export function registerPasswordAuthRoutes(app: Express): void {
     }
   })
 
+  // nosemgrep: sr-authz-route-without-middleware -- public: the emailed one-time token is the capability
   app.get('/api/auth/verify-email', async (req, res) => {
     if (!enabled()) return void res.status(404).json({ error: 'Not found' })
     const token = typeof req.query.token === 'string' ? req.query.token : ''
@@ -203,6 +206,7 @@ export function registerPasswordAuthRoutes(app: Express): void {
     res.redirect(303, appUrl(verified ? '/login?verified=1' : '/login?error=verification_failed'))
   })
 
+  // nosemgrep: sr-authz-route-without-middleware -- public: the sign-in itself
   app.post('/api/auth/password-login', async (req, res) => {
     if (!enabled()) return void res.status(404).json({ error: 'Not found' })
     if (!legalRequestAccepted(req.body?.legalVersion)) {

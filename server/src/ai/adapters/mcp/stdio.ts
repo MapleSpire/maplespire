@@ -33,7 +33,25 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 
-const BASE = (process.env.MAPLESPIRE_URL ?? 'http://localhost:3001').replace(/\/$/, '')
+/** MAPLESPIRE_URL, parsed once: an http(s) origin plus an optional path prefix. */
+const BASE = parseBaseUrl(process.env.MAPLESPIRE_URL ?? 'http://localhost:3001')
+
+function parseBaseUrl(raw: string): URL {
+  const url = new URL(raw)
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw new Error(`MAPLESPIRE_URL must be an http(s) URL, got ${url.protocol}`)
+  }
+  return url
+}
+
+/** An API URL under BASE. `path` is a fixed route; callers encode any segment. */
+function apiUrl(path: string, query: Record<string, string> = {}): URL {
+  const url = new URL(BASE.href)
+  url.pathname = `${url.pathname.replace(/\/$/, '')}${path}`
+  url.search = ''
+  for (const [key, value] of Object.entries(query)) url.searchParams.set(key, value)
+  return url
+}
 const TOKEN = process.env.MAPLESPIRE_TOKEN
 
 function headers(): Record<string, string> {
@@ -54,7 +72,7 @@ let toolCache: RemoteTool[] | null = null
 
 async function fetchTools(): Promise<RemoteTool[]> {
   if (toolCache) return toolCache
-  const res = await fetch(`${BASE}/api/ai/tools?format=mcp`, { headers: headers() })
+  const res = await fetch(apiUrl('/api/ai/tools', { format: 'mcp' }), { headers: headers() })
   if (!res.ok) {
     throw new Error(`MapleSpire tool listing failed: HTTP ${res.status} — check MAPLESPIRE_URL/MAPLESPIRE_TOKEN`)
   }
@@ -81,7 +99,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   // Encoded into ONE path segment before it meets the URL: the tool name comes
   // from the MCP client and must never reach the host or add a path segment.
   const toolSegment = encodeURIComponent(name)
-  const res = await fetch(`${BASE}/api/ai/tools/${toolSegment}`, {
+  const res = await fetch(apiUrl(`/api/ai/tools/${toolSegment}`), {
     method: 'POST',
     headers: headers(),
     body: JSON.stringify({

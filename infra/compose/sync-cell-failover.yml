@@ -338,6 +338,10 @@ services:
     profiles: ["maintenance"]
     restart: "no"
     command: ["node", "dist/maintenance/globalGcWorker.js"]
+    # A batch worker with no HTTP listener: the image's /api/ready probe would
+    # only ever report it unhealthy.
+    healthcheck:
+      disable: true
     environment:
       <<: *sync-environment
       # Validation keeps the production 24h grace by default. The gate inserts

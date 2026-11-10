@@ -18,6 +18,7 @@ import { pool } from '../db.js'
 import { appendAudit } from './audit.js'
 import { setSessionCookie } from './tokens.js'
 import { signCurrentSession } from './sessionEpoch.js'
+import { requireSessionAuth } from './sessionGuard.js'
 import { getEmailProvider } from '../email/index.js'
 import { inviteEmail } from '../email/templates.js'
 import { emailUsableForAuthorization, orgRoleIfAdmitted, tenantAllowedSql } from './tenantPolicy.js'
@@ -129,11 +130,8 @@ export function registerInviteRoutes(app: import('express').Express): void {
   // session in ANY auth stage (dev/testing needs this reachable even before
   // AUTH=on enforces it globally) and org-admin/platform-admin authorization.
   app.post('/api/orgs/:orgId/invites', async (req, res) => {
-    const auth = req.auth
-    if (!auth) {
-      res.status(401).json({ error: 'Authentication required' })
-      return
-    }
+    const auth = requireSessionAuth(req, res)
+    if (!auth) return
     const orgId = req.params.orgId
     try {
       if (!(await canManageOrg(pool, orgId, auth))) {
@@ -212,6 +210,7 @@ export function registerInviteRoutes(app: import('express').Express): void {
 
   // GET /api/auth/invite/:token — public preview (org name, role, inviter,
   // expired/accepted flags). Never returns the hash or any other invite row data.
+  // nosemgrep: sr-authz-route-without-middleware -- public: the unguessable invite token is the capability
   app.get('/api/auth/invite/:token', async (req, res) => {
     const token = req.params.token
     if (!token) {
@@ -271,11 +270,8 @@ export function registerInviteRoutes(app: import('express').Express): void {
   //     same transaction, so the invitee's fine-grained permissions are live
   //     the instant the membership is.
   app.post('/api/auth/invite/:token/accept', async (req, res) => {
-    const auth = req.auth
-    if (!auth) {
-      res.status(401).json({ error: 'sign_in_required' })
-      return
-    }
+    const auth = requireSessionAuth(req, res, 'sign_in_required')
+    if (!auth) return
     const token = req.params.token
     if (!token) {
       res.status(400).json({ error: 'Missing token' })

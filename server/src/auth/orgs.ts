@@ -13,6 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import type { Express, Request, Response } from 'express'
+import { requireSessionAuth } from './sessionGuard.js'
 import { pool } from '../db.js'
 import { setSessionCookie } from './tokens.js'
 import { mintRefusalBody, signCurrentSession } from './sessionEpoch.js'
@@ -49,11 +50,8 @@ async function checkOrgCreateRateLimit(userId: string) {
 
 export function registerOrgRoutes(app: Express): void {
   app.get('/api/me/orgs', async (req: Request, res: Response) => {
-    const auth = req.auth
-    if (!auth) {
-      res.status(401).json({ error: 'Authentication required' })
-      return
-    }
+    const auth = requireSessionAuth(req, res)
+    if (!auth) return
     try {
       const { rows } = await pool.query<{
         id: string
@@ -89,11 +87,8 @@ export function registerOrgRoutes(app: Express): void {
   // a first login (org + admin membership + landscape + starter diagram), so
   // the org is immediately usable after the switch.
   app.post('/api/orgs', async (req: Request, res: Response) => {
-    const auth = req.auth
-    if (!auth) {
-      res.status(401).json({ error: 'Authentication required' })
-      return
-    }
+    const auth = requireSessionAuth(req, res)
+    if (!auth) return
     try {
       const { rows: userRows } = await pool.query<{ status: string }>(
         'SELECT status FROM users WHERE id = $1',
@@ -150,11 +145,8 @@ export function registerOrgRoutes(app: Express): void {
   // impersonating (an admin driving someone's session must not leave it in a
   // different org than they found it).
   app.post('/api/auth/switch-org', async (req: Request, res: Response) => {
-    const auth = req.auth
-    if (!auth) {
-      res.status(401).json({ error: 'Authentication required' })
-      return
-    }
+    const auth = requireSessionAuth(req, res)
+    if (!auth) return
     if (auth.imp) {
       res.status(403).json({ error: 'forbidden_while_impersonating' })
       return

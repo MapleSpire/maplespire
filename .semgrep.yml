@@ -40,6 +40,13 @@ rules:
             await $AUTH($REQ, $RES, ...)
             ...
           })
+      # Guards that take a dependency first: requireOrgAdmin(pool, req, res).
+      - pattern-not-inside: |
+          $APP.$M($PATH, async ($REQ, $RES) => {
+            ...
+            await $AUTH($DEP, $REQ, $RES, ...)
+            ...
+          })
     metadata:
       category: security
       cwe: 'CWE-862: Missing Authorization'
