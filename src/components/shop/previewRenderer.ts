@@ -15,6 +15,7 @@
 import type { SkinConfig } from '../../skins/types'
 import { buildImperfectPath, drawScratchOverlay } from '../../canvas/engine/cyberpunkEffects'
 import { storeCapRy, buildCylinderPath, strokeStoreLid, drawPixelArtCylinder, lightenHex } from '../../canvas/engine/objectBox'
+import { personGeometry, tracePersonOutline } from '../../canvas/personShape'
 
 interface PreviewObject {
   type: 'actor' | 'system' | 'store'
@@ -129,6 +130,38 @@ function drawPreviewStore(
   ctx.strokeStyle = graffitiLid ? s.stroke : s.cylinderLine
   ctx.lineWidth = graffitiLid ? (skin.renderStyle.doubleStroke?.innerWidth ?? 1.5) : 1
   strokeStoreLid(ctx, x, y, w, cap, mode === 'default' ? lightenHex(s.fill, 0.25) : undefined)
+}
+
+/**
+ * Draw the actor sample as the C4 person figure (themes with
+ * `renderStyle.actorShape: 'person'`) — the canvas silhouette, flat-filled.
+ */
+/** The sample carries only its name: proportions only, no text reserve. */
+function personPreviewGeometry(obj: PreviewObject) {
+  return personGeometry(obj.x, obj.y, obj.w, obj.h, { reserveText: false })
+}
+
+function drawPreviewPerson(
+  ctx: CanvasRenderingContext2D,
+  skin: SkinConfig,
+  obj: PreviewObject
+): void {
+  const s = skin.objects.actor
+  const g = personPreviewGeometry(obj)
+  ctx.save()
+  ctx.shadowColor = s.shadowColor
+  ctx.shadowBlur = s.shadowBlur
+  ctx.shadowOffsetY = s.shadowOffsetY
+  ctx.beginPath()
+  tracePersonOutline(ctx, g)
+  ctx.fillStyle = s.fill
+  ctx.fill()
+  ctx.restore()
+  ctx.strokeStyle = s.stroke
+  ctx.lineWidth = s.strokeWidth
+  ctx.beginPath()
+  tracePersonOutline(ctx, g)
+  ctx.stroke()
 }
 
 export function renderSkinPreview(
@@ -328,14 +361,20 @@ export function renderSkinPreview(
     const r = isEightBit ? 0 : objSkin.cornerRadius
 
     // Stores render as a database cylinder (its own per-theme box + name); the
-    // shared rect/icon path below is skipped for them.
-    if (obj.type === 'store') {
-      drawPreviewStore(ctx, skin, obj)
+    // shared rect/icon path below is skipped for them. So does an actor under
+    // a theme that draws the C4 person figure.
+    const isPerson = obj.type === 'actor' && skin.renderStyle.actorShape === 'person'
+    if (obj.type === 'store' || isPerson) {
+      if (isPerson) drawPreviewPerson(ctx, skin, obj)
+      else drawPreviewStore(ctx, skin, obj)
       ctx.fillStyle = objSkin.text
       ctx.font = `600 ${Math.min(10, obj.w / 6)}px ${skin.renderStyle.fontFamily || 'Inter'}`
       ctx.textAlign = 'center'
       ctx.textBaseline = 'top'
-      ctx.fillText(obj.name, obj.x + obj.w / 2, obj.y + 26)
+      // a person's name sits in its body, under the head
+      const head = isPerson ? personPreviewGeometry(obj) : null
+      const nameY = head ? Math.max(obj.y + 26, head.headCy + head.headR + 3) : obj.y + 26
+      ctx.fillText(obj.name, obj.x + obj.w / 2, nameY)
       continue
     }
 

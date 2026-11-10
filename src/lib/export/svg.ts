@@ -16,6 +16,14 @@ import type { C4Object, Connection, Group } from '../../types'
 import type { SkinConfig } from '../../skins/types'
 import { storeCapRy, lightenHex } from '../../canvas/engine/objectBox'
 import {
+  personContentTop,
+  personGeometry,
+  personNeckPathD,
+  personNeckSeamOpacity,
+  personPathD,
+  personTextBox,
+} from '../../canvas/personShape'
+import {
   DESCRIPTION_TO_TYPE_BADGE_GAP,
   TYPE_BADGE_BOTTOM_INSET,
   TYPE_BADGE_HEIGHT,
@@ -327,9 +335,24 @@ export function renderExportSvg(
     const textColor = isExternal ? objSkin.textExternal : objSkin.text
     const alpha = isExternal && !skin.renderStyle.solidExternal ? 0.55 : 1
     const isStore = o.type === 'store'
+    // C4 person figure (renderStyle.actorShape) — CanvasEngine's silhouette.
+    const person = o.type === 'actor' && skin.renderStyle.actorShape === 'person'
+      ? personGeometry(x, y, w, h)
+      : null
 
     parts.push(`<g${alpha < 1 ? ` opacity="${alpha}"` : ''}>`)
-    if (isStore) {
+    if (person) {
+      parts.push(
+        `<path d="${personPathD(person, tx, ty)}" fill="${fill}" stroke="${objSkin.stroke}" stroke-width="${objSkin.strokeWidth}"/>`,
+      )
+      const neck = personNeckPathD(person, tx, ty)
+      if (neck) {
+        const seam = personNeckSeamOpacity(fill, objSkin.stroke)
+        parts.push(
+          `<path d="${neck}" fill="none" stroke="${objSkin.stroke}" stroke-width="${objSkin.strokeWidth}" stroke-opacity="${seam}"/>`,
+        )
+      }
+    } else if (isStore) {
       const capRy = storeCapRy(w, h)
       parts.push(
         `<path d="${cylinderPathD(x - minX + pad, y - minY + pad, w, h, capRy)}" fill="${fill}" stroke="${objSkin.stroke}" stroke-width="${objSkin.strokeWidth}"/>`,
@@ -355,12 +378,12 @@ export function renderExportSvg(
     const iconColor = isExternal ? objSkin.iconExternal : objSkin.icon
     const cx = x + w / 2
     const iconY = y + 22
-    const artworkPath = exportIconPath(o, theme)
+    const artworkPath = person ? undefined : exportIconPath(o, theme)
     const iconId = artworkPath ? iconIds.get(artworkPath) : undefined
     if (iconId) {
       // Lifted 1px like the canvas: logos sit visually low against the title.
       parts.push(`<use href="#${iconId}" x="${n(tx(cx) - 10)}" y="${n(ty(iconY - 1) - 10)}"/>`)
-    } else if (!isStore) {
+    } else if (!isStore && !person) {
       if (o.type === 'actor') {
         parts.push(`<circle cx="${tx(cx)}" cy="${ty(iconY - 4)}" r="5" fill="${iconColor}"/>`)
         parts.push(
@@ -373,21 +396,31 @@ export function renderExportSvg(
       }
     }
 
-    // Title (fitted then truncated, weight 600, top-anchored at y+38).
-    const textMaxWidth = w - 16
+    // Title (fitted then truncated, weight 600, top-anchored at y+38). A
+    // person's text wraps to its body, narrower than the box.
+    const textMaxWidth = person ? personTextBox(person).width : w - 16
     const titleBase = skin.renderStyle.titleSize?.base ?? 13
     const titleMin = skin.renderStyle.titleSize?.min ?? 9
     let titleSize = titleBase
     while (titleSize > titleMin && measure(o.name, titleSize, 600) > textMaxWidth) titleSize -= 0.5
     const title = truncate(o.name, textMaxWidth, titleSize, 600, measure)
-    parts.push(`<text x="${tx(cx)}" y="${ty(y + 38 + titleSize * 0.8)}" ${font(titleSize, 600, textColor)}>${esc(title)}</text>`)
+    const description = objectShortDescription(o)
+    // A person's text block is centred in its body, under the head.
+    const contentTop = person
+      ? personContentTop({
+          width: w,
+          height: h,
+          descriptionLines: description ? wrapText(description, textMaxWidth, 11, measure).length : 0,
+          titleSize: titleBase,
+        })
+      : 0
+    parts.push(`<text x="${tx(cx)}" y="${ty(y + 38 + contentTop + titleSize * 0.8)}" ${font(titleSize, 600, textColor)}>${esc(title)}</text>`)
 
     // Description — the canvas's vertical fit: try 11px down to 9px until the
     // wrapped block fits above the badge, else truncate to the lines that do.
     const badgeY = y + h - TYPE_BADGE_HEIGHT - TYPE_BADGE_BOTTOM_INSET
-    const descriptionTopY = y + 54
+    const descriptionTopY = y + 54 + contentTop
     const available = Math.max(0, badgeY - DESCRIPTION_TO_TYPE_BADGE_GAP - descriptionTopY)
-    const description = objectShortDescription(o)
     if (description && available >= 9) {
       const descColor = isExternal ? objSkin.descriptionExternal : objSkin.description
       let descSize = 9
@@ -411,14 +444,14 @@ export function renderExportSvg(
       const lineH = descSize * 1.15
       lines.forEach((line, i) => {
         parts.push(
-          `<text x="${tx(cx)}" y="${ty(y + 54 + i * lineH + descSize * 0.8)}" ${font(descSize, 400, descColor)}>${esc(line)}</text>`,
+          `<text x="${tx(cx)}" y="${ty(descriptionTopY + i * lineH + descSize * 0.8)}" ${font(descSize, 400, descColor)}>${esc(line)}</text>`,
         )
       })
     }
 
     // Localised shape-type badge, bottom-centered and independent of technology.
     const badgeText = objectTypeBadgeLabel(o.type)
-    const badgeW = Math.min(w - 16, measure(badgeText, 9, 500) + 12)
+    const badgeW = Math.min(textMaxWidth, measure(badgeText, 9, 500) + 12)
     const badgeX = cx - badgeW / 2
     parts.push(
       `<rect x="${tx(badgeX)}" y="${ty(badgeY)}" width="${n(badgeW)}" height="${TYPE_BADGE_HEIGHT}" rx="4" fill="${objSkin.badgeBg}"/>`,

@@ -109,6 +109,15 @@ export const GRAFFITI_ANIM: ConnectionAnimationColors = {
   electric: '#39F5C8', // electric spray teal
 }
 
+/** C4 Model — the notation's own blue ladder (Person → Component) plus the
+ *  theme's amber selection accent. */
+export const C4_ANIM: ConnectionAnimationColors = {
+  color: '#1168BD',
+  highlight: '#85BBF0',
+  strands: ['#08427B', '#1168BD', '#438DD5', '#F59E0B'],
+  electric: '#5AA6F2',
+}
+
 /**
  * Resolve the effective animation colors a skin provides, filling every field from
  * the classic-blue default. The color comes straight from the theme's own

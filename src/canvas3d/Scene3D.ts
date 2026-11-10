@@ -167,6 +167,7 @@ import {
   type Palette3d,
 } from './palette'
 import { disposeIconTextures, iconTexture, techIconTexture } from './icons'
+import { offsetPerson, personContentTop, personGeometry, personOutlinePoints, personTextBox } from '../canvas/personShape'
 import { orderedTechnologyUsages } from '../lib/technologyUsage'
 import { objectShortDescription } from '../lib/objectDescription'
 import { objectTypeBadgeLabel } from '../lib/objectTypeBadge'
@@ -3827,7 +3828,31 @@ export class Scene3D {
   }
 
   private objectRect(o: C4Object): Rect {
-    return { x: o.position.x, y: o.position.y, w: o.size.width, h: o.size.height }
+    const rect: Rect = { x: o.position.x, y: o.position.y, w: o.size.width, h: o.size.height }
+    // C4 person figure: connections and anchors land on it (connectionPath).
+    if (this.isPersonActor(o)) rect.shape = 'person'
+    return rect
+  }
+
+  /** An actor drawn as the C4 person figure (skin `renderStyle.actorShape`). */
+  private isPersonActor(o: C4Object): boolean {
+    return o.type === 'actor' && this.skin?.renderStyle.actorShape === 'person'
+  }
+
+  /** The person figure's outline in the card frame (top-left origin, same
+   * axis convention as roundedShape), inflated by `offset` (negative = inset). */
+  private personShape(w: number, h: number, offset = 0): THREE.Shape {
+    const pts = personOutlinePoints(offsetPerson(personGeometry(0, 0, w, h), offset), 10)
+    return new THREE.Shape(pts.map((p) => new THREE.Vector2(p.x, -p.y)))
+  }
+
+  /** Flat person-outline band between two offsets (selection ring, edge glow). */
+  private personRing(w: number, h: number, outer: number, inner: number, material: THREE.Material): THREE.Mesh {
+    const shape = this.personShape(w, h, outer)
+    shape.holes.push(new THREE.Path(this.personShape(w, h, inner).getPoints()))
+    const geo = new THREE.ShapeGeometry(shape)
+    geo.rotateX(-Math.PI / 2)
+    return new THREE.Mesh(geo, material)
   }
 
   private captureSmartGuideCandidates(
@@ -4812,12 +4837,16 @@ export class Scene3D {
     depth: number,
     capMaterial: THREE.Material,
     sideMaterial: THREE.Material,
+    /** Extrude this outline instead of the rounded rect (the person figure);
+     * `key` identifies it in the lit geometry cache. */
+    outline?: { key: string; build: () => THREE.Shape },
   ): THREE.Mesh {
+    const shapeOf = () => (outline ? outline.build() : this.boardShape(w, h, r))
     if (this.renderProfile === 'lit') {
       // cached by every input the geometry depends on (boardShape reads the
       // theme's pixel-snap); the mesh is marked so teardown keeps the buffers
       const snap = this.theme3d?.pixelSnap != null ? this.pixelStep(w, h) : -1
-      const key = `${w}|${h}|${r}|${depth}|${snap}`
+      const key = `${w}|${h}|${r}|${depth}|${snap}${outline ? `|${outline.key}` : ''}`
       this.slabGeoUsed.add(key)
       const hit = this.slabGeoCache.get(key)
       if (hit) {
@@ -4833,7 +4862,7 @@ export class Scene3D {
       // corner + 4 bevel rings keep the silhouette curve and the bevel
       // shading band clean at close-up zoom (8/2 reads faceted).
       // Cost is vertices only, zero extra draw calls.
-      const raw = new THREE.ExtrudeGeometry(this.boardShape(w, h, r), {
+      const raw = new THREE.ExtrudeGeometry(shapeOf(), {
         depth,
         curveSegments: 24,
         bevelEnabled: true,
@@ -4855,7 +4884,7 @@ export class Scene3D {
       mesh.userData.sharedGeometry = true
       return mesh
     }
-    const geo = new THREE.ExtrudeGeometry(this.boardShape(w, h, r), {
+    const geo = new THREE.ExtrudeGeometry(shapeOf(), {
       depth,
       bevelEnabled: false,
       curveSegments: 8,
@@ -6168,6 +6197,9 @@ export class Scene3D {
     const external = o.scope === 'external'
     const w = o.size.width
     const h = o.size.height
+    // C4 person figure (skin renderStyle.actorShape): the same silhouette as
+    // the 2D canvas, extruded; the text sits in the body under the head.
+    const person = this.isPersonActor(o) ? personGeometry(0, 0, w, h) : null
 
     let cardBg = external ? objSkin.fillExternal : objSkin.fill
     // Theme node spec: sanitized overrides for this card.
@@ -6189,7 +6221,7 @@ export class Scene3D {
     if (ps) depth = Math.max(ps * 2, Math.round(depth / ps) * ps)
     const radius = spec?.cornerRadius ?? (ps ? Math.min(3, ps) : CARD_RADIUS)
 
-    const borderColor = selected ? objSkin.strokeSelected : objSkin.stroke
+    const borderColor = selected ? objSkin.strokeSelected : (spec?.materials?.border ?? objSkin.stroke)
     const wallMix = this.env3d?.shading?.wallMix ?? 1
     const derived = nodeWallColors(palette, cardBg, selected, wallMix)
     const walls = {
@@ -6210,13 +6242,19 @@ export class Scene3D {
     // floor shadow (kit: inset 2, offset 10/12, opacity .55) — a rounded-rect
     // SDF matching the slab footprint, so it reads seated, not an oval blob
     const shadowSoft = 12
+    // a person casts the body's shadow (the head's is a small, soft extra the
+    // rounded-rect SDF cannot follow — a box shadow would darken the empty
+    // corners beside the head)
+    const sh = person
+      ? { w: person.bodyW, h: person.bodyH, r: person.shoulderR, cz: person.bodyY + person.bodyH / 2 }
+      : { w, h, r: radius + 1, cz: h / 2 }
     const shadow = new THREE.Mesh(
-      new THREE.PlaneGeometry(w + 2 * shadowSoft, h + 2 * shadowSoft),
-      this.shadowMaterial(w, h, radius + 1, palette.shadowColor, (selected ? 0.7 : 0.55) * (this.renderProfile === 'lit' ? 0.4 : 1), shadowSoft),
+      new THREE.PlaneGeometry(sh.w + 2 * shadowSoft, sh.h + 2 * shadowSoft),
+      this.shadowMaterial(sh.w, sh.h, sh.r, palette.shadowColor, (selected ? 0.7 : 0.55) * (this.renderProfile === 'lit' ? 0.4 : 1), shadowSoft),
     )
     shadow.userData.shadowShape = 'roundedRect' // dev-probe marker
     shadow.rotation.x = -Math.PI / 2
-    shadow.position.set(w / 2 + (selected ? 13 : 10), baseY + 0.3, h / 2 + (selected ? 16 : 12))
+    shadow.position.set(w / 2 + (selected ? 13 : 10), baseY + 0.3, sh.cz + (selected ? 16 : 12))
     unit.add(shadow)
 
     // theme custom body: a billboard/GLTF asset replaces the slab;
@@ -6257,7 +6295,9 @@ export class Scene3D {
           walls.side,
           ps ? { h: Math.max(ps * 2, Math.round((depth * 0.25) / ps) * ps), depth } : undefined,
         )
-    const body = this.slab(w, h, radius, depth, capMat, sideMat)
+    const body = person
+      ? this.slab(w, h, radius, depth, capMat, sideMat, { key: 'person', build: () => this.personShape(w, h) })
+      : this.slab(w, h, radius, depth, capMat, sideMat)
     body.position.y = baseY
     if (cardLighting) {
       body.castShadow = true
@@ -6279,8 +6319,12 @@ export class Scene3D {
         clearcoatRoughness: 0.3,
         envMapIntensity: 0.5,
       })
-      const plinth = this.slab(w + 14, h + 14, radius + 5, 2.6, plinthMat, plinthMat)
-      plinth.position.set(-7, baseY, -7)
+      const plinth = person
+        ? this.slab(w, h, radius, 2.6, plinthMat, plinthMat, { key: 'person+7', build: () => this.personShape(w, h, 7) })
+        : this.slab(w + 14, h + 14, radius + 5, 2.6, plinthMat, plinthMat)
+      // the person outline is already in the card frame (offset around it)
+      if (person) plinth.position.set(0, baseY, 0)
+      else plinth.position.set(-7, baseY, -7)
       plinth.castShadow = true
       plinth.receiveShadow = true
       plinth.userData.plinth = true // dev-probe marker
@@ -6294,8 +6338,16 @@ export class Scene3D {
     const topY = baseY + depth
     const borderW = selected ? 2 : 1
     const fillMat = this.surface('cardFill', cardBg)
-    const fillPlate = this.plate(w - 2 * borderW, h - 2 * borderW, Math.max(this.pxr(1), radius - borderW), fillMat)
-    fillPlate.position.set(borderW, topY + 0.15, borderW)
+    let fillPlate: THREE.Mesh
+    if (person) {
+      const geo = new THREE.ShapeGeometry(this.personShape(w, h, -borderW))
+      geo.rotateX(-Math.PI / 2)
+      fillPlate = new THREE.Mesh(geo, fillMat)
+      fillPlate.position.set(0, topY + 0.15, 0)
+    } else {
+      fillPlate = this.plate(w - 2 * borderW, h - 2 * borderW, Math.max(this.pxr(1), radius - borderW), fillMat)
+      fillPlate.position.set(borderW, topY + 0.15, borderW)
+    }
     fillPlate.userData.pick = { kind: 'object', id: o.id } satisfies PickTarget
     if (this.renderProfile === 'lit') fillPlate.receiveShadow = true
     unit.add(fillPlate)
@@ -6319,8 +6371,12 @@ export class Scene3D {
     // theme edge glow: a thin bright rim riding the top face (neon signature)
     if (spec?.edgeGlow) {
       const gw = spec.edgeGlow.width ?? 1.5
-      const glow = this.ringPlate(w + 2, h + 2, radius + 1, gw, this.surface('glow', spec.edgeGlow.color, { depthWrite: false }))
-      glow.position.set(-1, topY + 0.22, -1)
+      const glowMat = this.surface('glow', spec.edgeGlow.color, { depthWrite: false })
+      const glow = person
+        ? this.personRing(w, h, 1, 1 - gw, glowMat)
+        : this.ringPlate(w + 2, h + 2, radius + 1, gw, glowMat)
+      if (person) glow.position.set(0, topY + 0.22, 0)
+      else glow.position.set(-1, topY + 0.22, -1)
       glow.userData.edgeGlow = true // dev-probe marker
       unit.add(glow)
     }
@@ -6328,8 +6384,12 @@ export class Scene3D {
     // selection ring (kit: 4px accent @15% around the card)
     if (selected) {
       const ringCss = withAlpha(objSkin.strokeSelected, 0.15)
-      const ring = this.ringPlate(w + 8, h + 8, this.pxr(radius + 4), 4, this.surface('selectionRing', ringCss, { depthWrite: false }))
-      ring.position.set(-4, topY + 0.1, -4)
+      const ringMat = this.surface('selectionRing', ringCss, { depthWrite: false })
+      const ring = person
+        ? this.personRing(w, h, 4, 0, ringMat)
+        : this.ringPlate(w + 8, h + 8, this.pxr(radius + 4), 4, ringMat)
+      if (person) ring.position.set(0, topY + 0.1, 0)
+      else ring.position.set(-4, topY + 0.1, -4)
       unit.add(ring)
     }
 
@@ -6338,21 +6398,33 @@ export class Scene3D {
     // type tile + glyph — a set obj.icon swaps the type glyph for the
     // technology icon (image or generated badge), the 2D engine's rule
     const sub = objectShortDescription(o) ?? ''
-    const textMaxW = w - 16
-    const fittedDescription = fitObjectDescription({
+    // a person's text wraps to its body (narrower than the box), 2D parity
+    const textMaxW = person ? personTextBox(person).width : w - 16
+    const fitDescription = (maxHeight: number) => fitObjectDescription({
       text: sub,
       maxWidth: textMaxW,
       measureText: approxTextWidth,
-      maxHeight: Math.max(0, h - 54 - 20 - DESCRIPTION_TO_TYPE_BADGE_GAP),
+      maxHeight,
     })
-    const descriptionLines = fittedDescription.lines.length
-    const contentTop = centeredObjectContentTop({
-      height: h,
-      descriptionLines,
-      hasBadge: true,
-      titleSize: NAME_SIZE,
-      descriptionSize: fittedDescription.fontSize,
-    })
+    let fittedDescription = fitDescription(Math.max(0, h - 54 - 20 - DESCRIPTION_TO_TYPE_BADGE_GAP))
+    let contentTop: number
+    if (person) {
+      // the 2D rule (personContentTop): the block centres in the body, so
+      // refit the description to the room left under the shoulders
+      const personTop = (lines: number, size: number) =>
+        personContentTop({ width: w, height: h, descriptionLines: lines, titleSize: NAME_SIZE, descriptionSize: size })
+      contentTop = personTop(fittedDescription.lines.length, fittedDescription.fontSize)
+      fittedDescription = fitDescription(Math.max(0, h - 54 - contentTop - 20 - DESCRIPTION_TO_TYPE_BADGE_GAP))
+      contentTop = personTop(fittedDescription.lines.length, fittedDescription.fontSize)
+    } else {
+      contentTop = centeredObjectContentTop({
+        height: h,
+        descriptionLines: fittedDescription.lines.length,
+        hasBadge: true,
+        titleSize: NAME_SIZE,
+        descriptionSize: fittedDescription.fontSize,
+      })
+    }
     const content = objectContentLayout({ x: 0, y: 0, width: w, height: h, contentTop })
     const typeColor = external ? objSkin.iconExternal : objSkin.icon
     const techTex = o.icon
@@ -6366,13 +6438,17 @@ export class Scene3D {
         new THREE.PlaneGeometry(20, 20),
         new THREE.MeshBasicMaterial({ map: techTex, transparent: true, depthWrite: false, toneMapped: false }),
       )
+      // a person carries its technology icon in its head (2D parity)
+      const iconAt = person ? { x: person.headCx, z: person.headCy } : { x: content.centerX, z: content.iconCenterY }
       glyph.userData.techIcon = o.icon
       glyph.userData.cardContentRole = 'icon'
-      glyph.userData.cardContentAnchor = { x: content.centerX, z: content.iconCenterY }
+      glyph.userData.cardContentAnchor = iconAt
       glyph.userData.lod = LOD_PRIMARY
       glyph.rotation.x = -Math.PI / 2
-      glyph.position.set(content.centerX, z + 0.1, content.iconCenterY)
+      glyph.position.set(iconAt.x, z + 0.1, iconAt.z)
       unit.add(glyph)
+    } else if (person) {
+      // no type glyph — the figure is the icon
     } else if (o.type === 'actor') {
       const actorTex = iconTexture('user', typeColor)
       if (actorTex) {
@@ -6457,7 +6533,7 @@ export class Scene3D {
     // Compact shape-type badge. Technology stays represented by the icon and
     // perspective bars; this identity line is stable and localized like 2D.
     const typeLabel = objectTypeBadgeLabel(o.type)
-    const pillW = Math.min(w - CARD_PAD_X * 2, approxTextWidth(typeLabel, PILL_SIZE) + 14)
+    const pillW = Math.min((person ? person.bodyW : w) - CARD_PAD_X * 2, approxTextWidth(typeLabel, PILL_SIZE) + 14)
     const pillX = (w - pillW) / 2
     const pill = this.plate(pillW, PILL_H, this.pxr(PILL_RADIUS), this.surface('chrome', objSkin.badgeBg, { depthWrite: false }))
     pill.userData.cardContentRole = 'typeBadge'
@@ -6506,21 +6582,23 @@ export class Scene3D {
         this.activeTagGroupId,
       )
       const bb = skin.bottomBar
+      // a person's spans its body (2D parity)
       this.addAccentBar(unit, colors, {
-        x: borderW,
-        w: w - 2 * borderW,
+        x: (person ? person.bodyX : 0) + borderW,
+        w: (person ? person.bodyW : w) - 2 * borderW,
         zTop: h - bb.height - borderW,
         y: z,
         h: bb.height,
-        r: Math.max(0, radius - borderW),
+        r: Math.max(0, (person ? person.footR : radius) - borderW),
         opacity: bb.opacity,
       })
     }
 
     // expand-into-lower-level affordance, mirroring the type tile top-right
+    // (a person's top-right corner is empty air: it rides the right shoulder)
     this.addExpandGlyph(unit, o, z, {
-      x: w - CARD_PAD_X - 26,
-      z: CARD_PAD_Y + 2,
+      x: (person ? person.bodyX + person.bodyW : w) - CARD_PAD_X - 26,
+      z: person ? person.bodyY + person.shoulderR * 0.5 : CARD_PAD_Y + 2,
       bg: mixColors(cardBg, typeColor, 0.14),
       fg: typeColor,
     })

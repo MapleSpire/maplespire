@@ -25,6 +25,17 @@ import type { SkinConfig } from '../../skins/types'
 import { defaultSkin } from '../../skins/defaultSkin'
 import { setCyberpunkAnimationsEnabled } from './cyberpunkAnimations'
 import { buildRoundRectPath, strokeSelectionGlow, storeCapRy, buildCylinderPath, strokeStoreLid, lightenHex, clipGroupAccentToBox, clipObjectAccentToBox } from './objectBox'
+import {
+  offsetPerson,
+  personAnchorPoint,
+  personContentTop,
+  personEdgePoint,
+  personGeometry,
+  personLinkIndicator,
+  personTextBox,
+  tracePersonOutline,
+  type ObjectSilhouette,
+} from '../personShape'
 import { resolveConnectionAnimation, hexToRgba, drawStrands, isDarkColor } from '../../skins/connectionAnimation'
 import { resolveGroupBottomBarColors, resolveObjectBottomBarColors, resolveStatusColor, resolveTagColor, resolveTeamColor, resolveTechnologyColor } from '../bottomBarColors'
 import { markClientTimeline, startClientTimelineMeasure } from '../../lib/observability/clientTimeline'
@@ -625,7 +636,10 @@ export class CanvasEngine {
     this.groupHeaderCache.clear()
     this.objectTextLayoutCache.clear()
     this.groupSpatialIndex = null
+    // A skin may draw actors as a person figure (renderStyle.actorShape), which
+    // moves their edge points and faces: connections re-route on a skin change.
     this.connectionGeometryCache.clear()
+    this.shapeConnectionSidesCache.clear()
     this.connectionSpatialIndex = null
     // Community (untrusted) themes route to the sandbox worker; official themes
     // run on the main thread. The base skin still renders non-replaced seams.
@@ -3495,11 +3509,11 @@ export class CanvasEngine {
             const to = this.getConnectionEndpoint(conn.toId, conn.lockedToAnchors ? conn.toAnchor : undefined)
             if (from && to) {
               if (this.draggingConnEndpoint === 'source') {
-                const edge = this.getEdgePoint(from.cx, from.cy, to.cx, to.cy, from.width, from.height)
+                const edge = this.getEdgePoint(from.cx, from.cy, to.cx, to.cy, from.width, from.height, from.shape)
                 const nearest = this.findNearestAnchor(conn.fromId, edge.x, edge.y)
                 if (nearest !== null) skipIdx = nearest
               } else {
-                const edge = this.getEdgePoint(to.cx, to.cy, from.cx, from.cy, to.width, to.height)
+                const edge = this.getEdgePoint(to.cx, to.cy, from.cx, from.cy, to.width, to.height, to.shape)
                 const nearest = this.findNearestAnchor(conn.toId, edge.x, edge.y)
                 if (nearest !== null) skipIdx = nearest
               }
@@ -4617,6 +4631,9 @@ export class CanvasEngine {
     if (obj.type === 'component') ctx.setLineDash([4, 4])
     if (obj.type === 'store') {
       buildCylinderPath(ctx, x, y, width, height, storeCapRy(width, height))
+    } else if (this.objectSilhouette(obj) === 'person') {
+      ctx.beginPath()
+      tracePersonOutline(ctx, personGeometry(x, y, width, height))
     } else {
       buildRoundRectPath(ctx, x, y, width, height, 8)
     }
@@ -4704,6 +4721,20 @@ export class CanvasEngine {
       const bottomOff = badgeTopOff + TYPE_BADGE_HEIGHT
       const blockH = bottomOff - topOff
       contentTop = Math.round(usableTop + Math.max(0, (usableH - blockH) / 2) - topOff)
+    } else if (this.objectSilhouette(obj) === 'person') {
+      // Person figure: no type glyph (the head is the icon) — the title +
+      // description sit in the body under the chin, above the badge reserve,
+      // and wrap to the body's width (the body is narrower than the box).
+      if (description) {
+        ctx.font = this.getCanvasFont('400', 11)
+        descBaseWrap = this.wrapText(ctx, description, personTextBox(personGeometry(0, 0, w, h)).width)
+      }
+      contentTop = personContentTop({
+        width: w,
+        height: h,
+        descriptionLines: descBaseWrap?.length ?? 0,
+        titleSize: titleBase,
+      })
     } else {
       // Non-store: vertically centre the icon + title + description block in the body
       // (mirrors the store path) so content doesn't cluster at the top of a tall box.
@@ -4727,7 +4758,7 @@ export class CanvasEngine {
     }
 
     // Title
-    const textMaxWidth = w - 16
+    const textMaxWidth = this.objectTextBox(obj, 0, w, h).width
     const titleSize = this.getFittedFontSize(ctx, obj.name, textMaxWidth, titleBase, titleMin, '600', 'title')
     ctx.font = this.getCanvasFont('600', titleSize, 'Inter', 'title')
     const titleText = this.truncateText(ctx, obj.name, textMaxWidth)
@@ -4939,6 +4970,8 @@ export class CanvasEngine {
     // top lid so nothing overlaps the curved caps. Zero for every other type.
     const isStore = obj.type === 'store'
     const storeCap = isStore ? storeCapRy(w, h) : 0
+    // Person figure (theme `actorShape: 'person'`): fitted inside the same box.
+    const person = this.objectSilhouette(obj) === 'person' ? personGeometry(x, y, w, h) : null
     const textLayout = this.getObjectTextLayout(ctx, obj, description, w, h)
     const contentLayout = objectContentLayout({ x, y, width: w, height: h, contentTop: textLayout.contentTop })
 
@@ -4980,6 +5013,12 @@ export class CanvasEngine {
         // reads as a lit top in light mode yet stays a subdued dark-grey in dark
         // mode — distinct from the near-black body without reading as a white cap.
         strokeStoreLid(ctx, x, y, w, storeCap, isExternal ? undefined : lightenHex(objSkin.fill, 0.25))
+      } else if (person) {
+        ctx.beginPath()
+        tracePersonOutline(ctx, person)
+        ctx.fillStyle = gradient
+        ctx.fill()
+        ctx.stroke()
       } else {
         buildRoundRectPath(ctx, x, y, w, h, cornerR)
         ctx.fillStyle = gradient
@@ -5000,11 +5039,15 @@ export class CanvasEngine {
     // Icon
     const iconY = contentLayout.iconCenterY
     if (obj.icon) {
-      this.renderTechnologyIcon(ctx, obj, contentLayout.centerX, iconY)
+      // A person carries its technology icon in its head.
+      if (person) this.renderTechnologyIcon(ctx, obj, person.headCx, person.headCy + 1)
+      else this.renderTechnologyIcon(ctx, obj, contentLayout.centerX, iconY)
     } else {
       const iconColor = isExternal ? objSkin.iconExternal : objSkin.icon
 
-      if (obj.type === 'store') {
+      if (person) {
+        // No inner glyph — the figure is the icon.
+      } else if (obj.type === 'store') {
         // No inner glyph — the database cylinder silhouette is the icon.
       } else if (obj.type === 'actor') {
         // Person silhouette
@@ -5035,7 +5078,8 @@ export class CanvasEngine {
     }
 
     // Title
-    const textMaxWidth = w - 16
+    const textBox = this.objectTextBox(obj, x, w, h)
+    const textMaxWidth = textBox.width
     ctx.fillStyle = isExternal ? objSkin.textExternal : objSkin.text
     ctx.textAlign = 'center'
     ctx.textBaseline = 'top'
@@ -5062,7 +5106,7 @@ export class CanvasEngine {
     // Record what was painted, for the inline editor to sit exactly on top of.
     const paintedText: ObjectTextBounds = {
       title: {
-        x: x + 8,
+        x: textBox.x,
         y: contentLayout.titleTopY,
         width: textMaxWidth,
         height: titleDrawnPx,
@@ -5091,7 +5135,7 @@ export class CanvasEngine {
         }
       }
       paintedText.description = {
-        x: x + 8,
+        x: textBox.x,
         y: contentLayout.descriptionTopY,
         width: textMaxWidth,
         height: Math.max(lines.length, 1) * lineHeight,
@@ -5105,7 +5149,7 @@ export class CanvasEngine {
       // a description can only ever be added from the sidebar.
       const emptySize = Math.max(this.themeBridge.fontMinSize ?? 11, 11)
       paintedText.description = {
-        x: x + 8,
+        x: textBox.x,
         y: contentLayout.descriptionTopY,
         width: textMaxWidth,
         height: emptySize * 1.15,
@@ -5119,7 +5163,7 @@ export class CanvasEngine {
     const badgeText = objectTypeBadgeLabel(obj.type)
     ctx.font = this.getCanvasFont('500', 9)
     const textWidth = ctx.measureText(badgeText).width
-    const badgeW = Math.min(w - 16, textWidth + 12)
+    const badgeW = Math.min(textMaxWidth, textWidth + 12)
     const badgeH = TYPE_BADGE_HEIGHT
     const badgeX = x + (w - badgeW) / 2
     const badgeY = contentLayout.typeBadgeTopY
@@ -5138,7 +5182,12 @@ export class CanvasEngine {
     if (obj.links && obj.links.length > 0) {
       const linkCount = obj.links.length
       const isLinkHovered = this.hoveredLinkId === obj.id
-      const linkColor = isLinkHovered ? this.skin.connections.highlight : objSkin.iconExternal
+      // A person's indicator sits on the canvas beside the head, outside the
+      // figure: the element's ink (white on the C4 blues) would vanish there.
+      const personLink = person ? personLinkIndicator(person, y) : null
+      const linkColor = isLinkHovered
+        ? this.skin.connections.highlight
+        : personLink ? this.skin.groups.linkColor : objSkin.iconExternal
 
       ctx.font = this.getCanvasFont('500', 9)
       ctx.textBaseline = 'middle'
@@ -5148,10 +5197,11 @@ export class CanvasEngine {
       const iconSlotW = 12
       const gap = 4
 
-      const anchorLeft = x + 4
+      const anchorLeft = personLink ? personLink.left : x + 4
       // Stores: pin the top-corner indicators just below the lid (see storeIndicatorCY)
       // — a fixed, clickable corner spot independent of the centred content block.
-      const indicatorY = isStore ? y + 2 * storeCap + 4 : y + 10
+      // A person's floats above its left shoulder, beside the head.
+      const indicatorY = isStore ? y + 2 * storeCap + 4 : personLink ? personLink.cy : y + 10
       let drawX = anchorLeft
 
       ctx.textAlign = 'left'
@@ -5190,8 +5240,15 @@ export class CanvasEngine {
       }
     }
 
-    // Perspective bottom bar (tags / technology / status)
-    this.renderObjectBottomBar(ctx, obj, objectArgs.geom)
+    // Perspective bottom bar (tags / technology / status) — a person's spans
+    // its body, clipped to the body's bottom corners.
+    this.renderObjectBottomBar(
+      ctx,
+      obj,
+      person
+        ? { ...objectArgs.geom, x: person.bodyX, w: person.bodyW, cornerRadius: person.footR }
+        : objectArgs.geom,
+    )
 
     // Latest matching pin owns the outline. Labels remain in functional Tag
     // assignment order so pinning never reshuffles object metadata.
@@ -5206,7 +5263,8 @@ export class CanvasEngine {
       ctx.lineWidth = 1.5
       ctx.setLineDash([3, 3])
       ctx.beginPath()
-      ctx.roundRect(x - 1, y - 1, w + 2, h + 2, r + 1)
+      if (person) tracePersonOutline(ctx, offsetPerson(person, 1))
+      else ctx.roundRect(x - 1, y - 1, w + 2, h + 2, r + 1)
       ctx.stroke()
       ctx.setLineDash([])
 
@@ -5221,11 +5279,14 @@ export class CanvasEngine {
       ctx.font = this.getCanvasFont('500', 9)
       const labelH = 16
       const labelY = y + h - labelH - 6
-      let labelX = x + 4
+      // a person's labels stay on its body (narrower than the box)
+      const labelLeft = person ? person.bodyX + Math.max(4, person.footR * 0.5) : x + 4
+      const labelRight = person ? person.bodyX + person.bodyW - Math.max(4, person.footR * 0.5) : x + w - 4
+      let labelX = labelLeft
       for (let index = 0; index < labelTexts.length; index += 1) {
         const labelText = labelTexts[index]
         const labelW = ctx.measureText(labelText).width + 8
-        if (labelX + labelW > x + w - 4) break
+        if (labelX + labelW > labelRight) break
         const labelColor = labelColors[index] ?? outlineColor
         ctx.fillStyle = labelColor + 'E6'
         ctx.beginPath()
@@ -5359,11 +5420,14 @@ export class CanvasEngine {
   private isClickOnLinkIndicator(obj: C4Object, worldX: number, worldY: number): boolean {
     const x = obj.position.x
     const y = obj.position.y
-    void obj.size.width
-    const cy = obj.type === 'store' ? this.storeIndicatorCY(obj) : y + 10
+    const personLink = this.objectSilhouette(obj) === 'person'
+      ? personLinkIndicator(personGeometry(x, y, obj.size.width, obj.size.height), y)
+      : null
+    const cy = obj.type === 'store' ? this.storeIndicatorCY(obj) : personLink ? personLink.cy : y + 10
     // Approximate hit area for the link indicator in the top-left corner
-    const hitLeft = x + 2
-    const hitRight = x + 46
+    const left = personLink ? personLink.left : x + 4
+    const hitLeft = left - 2
+    const hitRight = left + 42
     const hitTop = cy - 10
     const hitBottom = cy + 10
     return worldX >= hitLeft && worldX <= hitRight && worldY >= hitTop && worldY <= hitBottom
@@ -5653,15 +5717,35 @@ export class CanvasEngine {
     left: [9, 10, 11],
   }
 
+  /**
+   * The silhouette an object is drawn with when it is not the theme's card:
+   * `'person'` for actors under a theme declaring `renderStyle.actorShape`.
+   * Connection edges and anchors follow it so links land on the figure.
+   */
+  private objectSilhouette(obj: Pick<C4Object, 'type'>): ObjectSilhouette | undefined {
+    return obj.type === 'actor' && this.skin.renderStyle.actorShape === 'person' ? 'person' : undefined
+  }
+
+  /** The horizontal band an object's text (title, description, type badge) is
+   *  laid out in: a card's `x + 8`, `w − 16`; a person's body, inset alike. */
+  private objectTextBox(obj: C4Object, x: number, w: number, h: number): { x: number; width: number } {
+    if (this.objectSilhouette(obj) === 'person') return personTextBox(personGeometry(x, 0, w, h))
+    return { x: x + 8, width: w - 16 }
+  }
+
   private getAnchorPoint(
     cx: number,
     cy: number,
     w: number,
     h: number,
-    anchorIndex: number
+    anchorIndex: number,
+    shape?: ObjectSilhouette,
   ): { x: number; y: number; face: 'top' | 'bottom' | 'left' | 'right' } {
     const def = this.anchorDefs[anchorIndex]
     if (!def) return { x: cx, y: cy, face: 'top' }
+    if (shape === 'person') {
+      return personAnchorPoint({ x: cx - w / 2, y: cy - h / 2, w, h }, def.side, def.ratio)
+    }
     const hw = w / 2
     const hh = h / 2
     const left = cx - hw
@@ -5701,16 +5785,17 @@ export class CanvasEngine {
     return { x, y, face: def.side }
   }
 
-  private getConnectionEndpoint(id: string, anchorIndex?: number): { cx: number; cy: number; width: number; height: number; face?: 'top' | 'bottom' | 'left' | 'right' } | null {
+  private getConnectionEndpoint(id: string, anchorIndex?: number): { cx: number; cy: number; width: number; height: number; face?: 'top' | 'bottom' | 'left' | 'right'; shape?: ObjectSilhouette } | null {
     const obj = this.objectMap.get(id)
     if (obj) {
       const cx = obj.position.x + obj.size.width / 2
       const cy = obj.position.y + obj.size.height / 2
+      const shape = this.objectSilhouette(obj)
       if (anchorIndex !== undefined) {
-        const pt = this.getAnchorPoint(cx, cy, obj.size.width, obj.size.height, anchorIndex)
-        return { cx: pt.x, cy: pt.y, width: obj.size.width, height: obj.size.height, face: pt.face }
+        const pt = this.getAnchorPoint(cx, cy, obj.size.width, obj.size.height, anchorIndex, shape)
+        return { cx: pt.x, cy: pt.y, width: obj.size.width, height: obj.size.height, face: pt.face, shape }
       }
-      return { cx, cy, width: obj.size.width, height: obj.size.height }
+      return { cx, cy, width: obj.size.width, height: obj.size.height, shape }
     }
     const group = this.groupMap.get(id)
     if (group) {
@@ -5971,12 +6056,12 @@ export class CanvasEngine {
     if (conn.lockedToAnchors && conn.fromAnchor !== undefined && from.face) {
       fromEdge = { x: from.cx, y: from.cy, face: from.face }
     } else {
-      fromEdge = this.getEdgePoint(from.cx, from.cy, to.cx, to.cy, from.width, from.height)
+      fromEdge = this.getEdgePoint(from.cx, from.cy, to.cx, to.cy, from.width, from.height, from.shape)
     }
     if (conn.lockedToAnchors && conn.toAnchor !== undefined && to.face) {
       toEdge = { x: to.cx, y: to.cy, face: to.face }
     } else {
-      toEdge = this.getEdgePoint(to.cx, to.cy, from.cx, from.cy, to.width, to.height)
+      toEdge = this.getEdgePoint(to.cx, to.cy, from.cx, from.cy, to.width, to.height, to.shape)
     }
 
     const segments = this.buildConnectionSegments(
@@ -6812,7 +6897,7 @@ export class CanvasEngine {
     let nearestDist = Infinity
     for (const i of activeIndices) {
       if (i === skipAnchorIndex) continue
-      const pt = this.getAnchorPoint(cx, cy, w, h, i)
+      const pt = this.getAnchorPoint(cx, cy, w, h, i, obj ? this.objectSilhouette(obj) : undefined)
       const dist = Math.hypot(cursorX - pt.x, cursorY - pt.y)
       if (dist < nearestDist) {
         nearestDist = dist
@@ -6823,7 +6908,7 @@ export class CanvasEngine {
     ctx.save()
     for (const i of activeIndices) {
       if (i === skipAnchorIndex) continue
-      const pt = this.getAnchorPoint(cx, cy, w, h, i)
+      const pt = this.getAnchorPoint(cx, cy, w, h, i, obj ? this.objectSilhouette(obj) : undefined)
       const isNearest = i === nearestIdx
       ctx.fillStyle = isNearest ? this.skin.anchors.colorHighlighted : this.skin.anchors.color
       ctx.beginPath()
@@ -6856,7 +6941,7 @@ export class CanvasEngine {
 
     const fromEdge = fixed.face
       ? { x: fromX, y: fromY, face: fixed.face }
-      : this.getEdgePoint(fromX, fromY, toX, toY, fixed.width, fixed.height)
+      : this.getEdgePoint(fromX, fromY, toX, toY, fixed.width, fixed.height, fixed.shape)
 
     // Preview line always follows the mouse; hovered shape is only for anchor dots
     const toEdge = this.estimateEdgePoint(toX, toY, fromEdge.x, fromEdge.y)
@@ -6920,7 +7005,7 @@ export class CanvasEngine {
     const from = this.getConnectionEndpoint(fromId)
     if (!from) return
 
-    const fromEdge = this.getEdgePoint(from.cx, from.cy, to.x, to.y, from.width, from.height)
+    const fromEdge = this.getEdgePoint(from.cx, from.cy, to.x, to.y, from.width, from.height, from.shape)
     const toEdge = this.estimateEdgePoint(to.x, to.y, fromEdge.x, fromEdge.y)
 
     const normals = {
@@ -6992,7 +7077,7 @@ export class CanvasEngine {
     ctx.save()
     for (const i of activeIndices) {
       if (i === options?.skipIndex) continue
-      const pt = this.getAnchorPoint(cx, cy, w, h, i)
+      const pt = this.getAnchorPoint(cx, cy, w, h, i, obj ? this.objectSilhouette(obj) : undefined)
       const isHovered = options?.hoveredIndex === i
       const isHighlighted = options?.highlightedIndex === i
       const baseRadius = isHovered ? 7 : (isHighlighted ? 6 : 4)
@@ -7034,7 +7119,7 @@ export class CanvasEngine {
 
     const fromEdge = from.face
       ? { x: from.cx, y: from.cy, face: from.face }
-      : this.getEdgePoint(from.cx, from.cy, toX, toY, from.width, from.height)
+      : this.getEdgePoint(from.cx, from.cy, toX, toY, from.width, from.height, from.shape)
 
     // Preview line always follows the mouse; hovered shape is only for anchor dots
     const toEdge = this.estimateEdgePoint(toX, toY, fromEdge.x, fromEdge.y)
@@ -7103,7 +7188,7 @@ export class CanvasEngine {
     const threshold = 10 / this.viewport.scale
     const activeIndices = this.getActiveAnchorIndices(shapeOrGroupId)
     for (const i of activeIndices) {
-      const pt = this.getAnchorPoint(cx, cy, w, h, i)
+      const pt = this.getAnchorPoint(cx, cy, w, h, i, obj ? this.objectSilhouette(obj) : undefined)
       if (Math.hypot(x - pt.x, y - pt.y) < threshold) {
         return { shapeId: shapeOrGroupId, anchorIndex: i }
       }
@@ -7772,7 +7857,7 @@ export class CanvasEngine {
     if (conn.lockedToAnchors && conn.fromAnchor !== undefined && from.face) {
       fromEdge = { x: from.cx, y: from.cy }
     } else {
-      fromEdge = this.getEdgePoint(from.cx, from.cy, to.cx, to.cy, from.width, from.height)
+      fromEdge = this.getEdgePoint(from.cx, from.cy, to.cx, to.cy, from.width, from.height, from.shape)
     }
     if (Math.hypot(x - fromEdge.x, y - fromEdge.y) < threshold) {
       return { connId: conn.id, end: 'source' }
@@ -7783,7 +7868,7 @@ export class CanvasEngine {
     if (conn.lockedToAnchors && conn.toAnchor !== undefined && to.face) {
       toEdge = { x: to.cx, y: to.cy }
     } else {
-      toEdge = this.getEdgePoint(to.cx, to.cy, from.cx, from.cy, to.width, to.height)
+      toEdge = this.getEdgePoint(to.cx, to.cy, from.cx, from.cy, to.width, to.height, to.shape)
     }
     if (Math.hypot(x - toEdge.x, y - toEdge.y) < threshold) {
       return { connId: conn.id, end: 'target' }
@@ -7958,8 +8043,12 @@ export class CanvasEngine {
     tx: number,
     ty: number,
     w: number,
-    h: number
+    h: number,
+    shape?: ObjectSilhouette,
   ): { x: number; y: number; face: 'top' | 'bottom' | 'left' | 'right' } {
+    if (shape === 'person') {
+      return personEdgePoint({ x: cx - w / 2, y: cy - h / 2, w, h }, tx, ty)
+    }
     const angle = Math.atan2(ty - cy, tx - cx)
     const hw = w / 2
     const hh = h / 2
@@ -8064,7 +8153,7 @@ export class CanvasEngine {
       let bestIdx: number | null = null
       let bestDist = Infinity
       for (const i of indices) {
-        const pt = this.getAnchorPoint(cx, cy, obj.size.width, obj.size.height, i)
+        const pt = this.getAnchorPoint(cx, cy, obj.size.width, obj.size.height, i, this.objectSilhouette(obj))
         const dist = Math.hypot(x - pt.x, y - pt.y)
         if (dist < bestDist) {
           bestDist = dist
@@ -8106,8 +8195,8 @@ export class CanvasEngine {
     const to = this.getConnectionEndpoint(conn.toId, undefined)
     if (!from || !to) return null
 
-    const fromEdge = this.getEdgePoint(from.cx, from.cy, to.cx, to.cy, from.width, from.height)
-    const toEdge = this.getEdgePoint(to.cx, to.cy, from.cx, from.cy, to.width, to.height)
+    const fromEdge = this.getEdgePoint(from.cx, from.cy, to.cx, to.cy, from.width, from.height, from.shape)
+    const toEdge = this.getEdgePoint(to.cx, to.cy, from.cx, from.cy, to.width, to.height, to.shape)
 
     const result: { fromAnchor?: number; toAnchor?: number } = {}
     if (ends?.from ?? conn.fromAnchor === undefined) {

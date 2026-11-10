@@ -26,6 +26,8 @@ import { eightBitSkin } from './eightBitSkin'
 import { eightBitSkinDark } from './eightBitSkinDark'
 import { graffitiSkin } from './graffitiSkin'
 import { graffitiSkinDark } from './graffitiSkinDark'
+import { c4Skin } from './c4Skin'
+import { c4SkinDark } from './c4SkinDark'
 
 /**
  * Per-theme appearance variants for the built-in skins. The skin store consults
@@ -48,6 +50,7 @@ export const skinVariants: Record<string, SkinVariantPair> = {
   cyberpunk: { light: cyberpunkSkinLight, dark: cyberpunkSkin },
   eightbit: { light: eightBitSkin, dark: eightBitSkinDark },
   graffiti: { light: graffitiSkin, dark: graffitiSkinDark },
+  c4: { light: c4Skin, dark: c4SkinDark },
 }
 
 /**

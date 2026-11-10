@@ -21,6 +21,7 @@ import { slateSkin } from '../../skins/slateSkin'
 import { cyberpunkSkin } from '../../skins/cyberpunkSkin'
 import { eightBitSkin } from '../../skins/eightBitSkin'
 import { graffitiSkin } from '../../skins/graffitiSkin'
+import { c4Skin } from '../../skins/c4Skin'
 
 /**
  * Wrap an existing built-in {@link SkinConfig} into a {@link ThemePlugin}. The
@@ -57,6 +58,7 @@ export const builtinPlugins: ThemePlugin[] = [
   builtin(cyberpunkSkin),
   builtin(eightBitSkin),
   builtin(graffitiSkin),
+  builtin(c4Skin),
 ]
 
 /** Id of the universal fallback theme. Never uninstallable. */

@@ -210,6 +210,14 @@ export interface SkinConfig {
      * (`.ba-node--external` only swaps the background); omit for the classic fade.
      */
     solidExternal?: boolean
+    /**
+     * `'person'` draws actors as the C4 Person figure (round head on rounded
+     * shoulders, see `src/canvas/personShape.ts`) instead of a card, in every
+     * renderer — 2D canvas, 3D board, SVG export, shop preview — and makes
+     * connections and anchors land on the figure. The figure stays inside the
+     * object's box, so layout and hit-testing are unchanged. Omit for the card.
+     */
+    actorShape?: 'person'
     glowIntensity?: number
     roughness?: number
     pixelSize?: number
