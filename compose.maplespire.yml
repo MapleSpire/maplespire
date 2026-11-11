@@ -51,6 +51,9 @@ x-api-environment: &api-environment
   AI_ALLOWED_BASE_URLS: ${AI_ALLOWED_BASE_URLS:-}
   METRICS_TOKEN: ${MAPLESPIRE_METRICS_TOKEN:?Run node scripts/init-env.mjs first - see docs/getting-started.md}
   PLATFORM_ADMIN_BOOTSTRAP_EMAIL: ${PLATFORM_ADMIN_BOOTSTRAP_EMAIL:-}
+  PLATFORM_ADMIN_BOOTSTRAP_ISSUER: ${PLATFORM_ADMIN_BOOTSTRAP_ISSUER:-}
+  PLATFORM_ADMIN_BOOTSTRAP_SUBJECT: ${PLATFORM_ADMIN_BOOTSTRAP_SUBJECT:-}
+  PLATFORM_ADMIN_BOOTSTRAP_TOKEN: ${PLATFORM_ADMIN_BOOTSTRAP_TOKEN:-}
   EMAIL_PROVIDER: ${EMAIL_PROVIDER:-local}
   # Where `EMAIL_PROVIDER=local` writes messages (read through
   # `/api/dev/outbox`). The default path is not writable by the runtime user.
