@@ -255,6 +255,7 @@ function readOidcCookie(
 // --- routes ------------------------------------------------------------------
 
 export function registerOidcRoutes(app: import('express').Express): void {
+  // nosemgrep: sr-authz-route-without-middleware -- public: lists enabled sign-in providers
   app.get('/api/auth/providers', (req, res) => {
     // Unrecognized/missing ?surface defaults to 'public' — the general page
     // must never accidentally see the SSO-restricted entry (an unvalidated
@@ -267,6 +268,7 @@ export function registerOidcRoutes(app: import('express').Express): void {
     res.json({ providers })
   })
 
+  // nosemgrep: sr-authz-route-without-middleware -- public: starts OIDC sign-in
   app.get('/api/auth/login/:provider', async (req, res) => {
     const def = findProviderDef(req.params.provider)
     if (!def) {
@@ -311,6 +313,7 @@ export function registerOidcRoutes(app: import('express').Express): void {
     }
   })
 
+  // nosemgrep: sr-authz-route-without-middleware -- public: OIDC callback, checked by state/nonce/PKCE
   app.get('/api/auth/callback/:provider', async (req, res) => {
     const def = findProviderDef(req.params.provider)
     if (!def) {

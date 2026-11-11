@@ -13,6 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import type { Express, Request, Response } from 'express'
+import { requireSessionAuth } from './sessionGuard.js'
 import { pool } from '../db.js'
 import { findOrCreateUser, bootstrapPlatformAdmin, redeemPlatformAdminBootstrapToken } from './users.js'
 import {
@@ -52,6 +53,7 @@ function isValidEmail(v: unknown): v is string {
  * would.
  */
 export function registerAuthRoutes(app: Express): void {
+  // nosemgrep: sr-authz-route-without-middleware -- public: the sign-in itself, 404 unless AUTH_DEV_LOGIN=on
   app.post('/api/auth/dev-login', async (req: Request, res: Response) => {
     if (process.env.AUTH_DEV_LOGIN !== 'on') {
       res.status(404).json({ error: 'Not found' })
@@ -112,6 +114,7 @@ export function registerAuthRoutes(app: Express): void {
     }
   })
 
+  // nosemgrep: sr-authz-route-without-middleware -- public: only clears the caller's own session cookie
   app.post('/api/auth/logout', (_req: Request, res: Response) => {
     clearSessionCookie(res)
     // A deliberate sign-out is not "your session ended": drop the marker too.
@@ -124,11 +127,8 @@ export function registerAuthRoutes(app: Express): void {
   // operator's PLATFORM_ADMIN_BOOTSTRAP_TOKEN. Grants once, and only while no
   // platform admin exists; the session is re-minted so the flag is live.
   app.post('/api/auth/bootstrap-platform-admin', async (req: Request, res: Response) => {
-    const auth = req.auth
-    if (!auth) {
-      res.status(401).json({ error: 'Authentication required' })
-      return
-    }
+    const auth = requireSessionAuth(req, res)
+    if (!auth) return
     if (auth.imp) {
       res.status(403).json({ error: 'forbidden_while_impersonating' })
       return
@@ -158,6 +158,7 @@ export function registerAuthRoutes(app: Express): void {
     }
   })
 
+  // nosemgrep: sr-authz-route-without-middleware -- verifies the session cookie itself (401 without one)
   app.get('/api/auth/me', async (req: Request, res: Response) => {
     const token = readSessionCookie(req)
     if (!token) {
@@ -219,6 +220,7 @@ export function registerAuthRoutes(app: Express): void {
   // findOrCreateUser only fills them when NULL, so an IdP refresh can never
   // undo this. A field is updated only when present in the body; an empty
   // string (or null) clears it back to NULL.
+  // nosemgrep: sr-authz-route-without-middleware -- verifies the session cookie itself (401 without one)
   app.patch('/api/me', async (req: Request, res: Response) => {
     const token = readSessionCookie(req)
     if (!token) {

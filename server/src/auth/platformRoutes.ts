@@ -639,6 +639,7 @@ export function registerPlatformRoutes(app: Express): void {
   // POST /api/auth/impersonate/exit — restore the stashed admin
   // session. Requires an active imp session + the stash cookie.
   // -------------------------------------------------------------------
+  // nosemgrep: sr-authz-route-without-middleware -- checks req.auth itself: only a session that is impersonating can exit
   app.post('/api/auth/impersonate/exit', async (req, res) => {
     const auth = req.auth
     if (!auth || !auth.imp) {
