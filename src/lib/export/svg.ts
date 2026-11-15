@@ -32,6 +32,7 @@ import { legendSize, legendSvgFragment, type LegendModel } from './legend'
 import { objectTypeBadgeLabel } from '../objectTypeBadge'
 import { objectShortDescription } from '../objectDescription'
 import { resolveTechnologyIconPath } from '../technologies/iconPath'
+import { loadIconCatalog, shapeIconArtwork } from '../technologies/shapeIconArtwork'
 
 /**
  * Serialise a diagram to a standalone, product-styled SVG. Pure — geometry
@@ -120,12 +121,16 @@ function cylinderPathD(x: number, y: number, w: number, h: number, capRy: number
 /**
  * The catalog asset a node paints, chosen exactly as CanvasEngine.renderObject +
  * renderTechnologyIcon choose it: only a shape with an `icon` shows technology
- * artwork, and the image comes from its `iconAssignment` for the theme. A bare
- * `icon` with no assignment has no artwork (the canvas draws a letter badge).
+ * artwork, and the artwork is `shapeIconArtwork`'s — the `iconAssignment`, else
+ * the catalog entry the bare `icon` name points at — for the theme. A name that
+ * is not in the catalog has no artwork (the canvas draws a letter badge). The
+ * catalog is a lazy chunk: callers that may hold bare names load it first
+ * (`loadIconCatalog`), or those nodes see no artwork here.
  */
 export function exportIconPath(o: C4Object, theme: 'light' | 'dark'): string | undefined {
   if (!o.icon) return undefined
-  return resolveTechnologyIconPath(theme, o.iconAssignment?.iconLightPath, o.iconAssignment?.iconDarkPath)
+  const artwork = shapeIconArtwork(o)
+  return resolveTechnologyIconPath(theme, artwork?.iconLightPath, artwork?.iconDarkPath)
 }
 
 /** Fetch the asset behind each path and return it as a `data:` URI. Inlined
@@ -158,6 +163,25 @@ export async function inlineExportIcons(
     }),
   )
   return out
+}
+
+/**
+ * The embeddable artwork for every node of a diagram, ready for
+ * `renderExportSvg({ icons })`. A shape with a bare catalog `icon` name (imports,
+ * older shapes) gets its logo from the lazy icon catalog exactly as on the
+ * canvas, so the catalog is loaded before the synchronous path lookup; if it
+ * cannot be loaded those nodes keep their glyph.
+ */
+export async function exportIconHrefs(
+  objects: readonly C4Object[],
+  theme: 'light' | 'dark',
+  fetchFn: typeof fetch = fetch,
+): Promise<Map<string, string>> {
+  if (objects.some((o) => o.icon && !o.iconAssignment)) await loadIconCatalog().catch(() => undefined)
+  return inlineExportIcons(
+    objects.map((o) => exportIconPath(o, theme)).filter((p): p is string => !!p),
+    fetchFn,
+  )
 }
 
 function guessImageType(path: string): string {
