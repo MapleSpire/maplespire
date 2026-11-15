@@ -16,7 +16,14 @@ import { beforeAll, describe, expect, it } from 'vitest'
 import type { C4Object } from '../../types'
 import { defaultSkin } from '../../skins/defaultSkin'
 import i18n from '../i18n'
-import { exportIconPath, inlineExportIcons, renderExportSvg, type SvgScene } from './svg'
+import { exportIconHrefs, exportIconPath, inlineExportIcons, renderExportSvg, type SvgScene } from './svg'
+import {
+  catalogIconArtwork,
+  isIconCatalogLoading,
+  loadIconCatalog,
+  resetIconCatalogForTests,
+} from '../technologies/shapeIconArtwork'
+import { getIconByName } from '../techIcons'
 
 // Regression: the SVG export drew a type glyph for every object while the canvas
 // and the PNG/PDF exports (which rasterise through CanvasEngine) drew the logo.
@@ -74,9 +81,60 @@ describe('exportIconPath', () => {
     expect(exportIconPath(lightOnly, 'dark')).toBe('/icons/light/pg.png')
   })
 
-  it('has no artwork without an icon or without an assignment', () => {
+  it('has no artwork without an icon', () => {
     expect(exportIconPath({ ...withLogo('a', 0), icon: undefined }, 'light')).toBeUndefined()
-    expect(exportIconPath({ ...withLogo('a', 0), iconAssignment: undefined }, 'light')).toBeUndefined()
+  })
+
+  // Regression: imports and older shapes carry a catalog `icon` NAME with no
+  // assignment; the canvas, 3D and the PNG/PDF exports draw the catalog logo
+  // for them, and the SVG export drew only the type glyph.
+  it('resolves a bare catalog icon name through the catalog, as the canvas does', async () => {
+    await loadIconCatalog()
+    const react = getIconByName('React')!
+    const bare = { ...withLogo('a', 0), icon: 'React', iconAssignment: undefined }
+    expect(react.iconLight).toMatch(/^\/icons\//)
+    expect(exportIconPath(bare, 'light')).toBe(react.iconLight)
+    expect(exportIconPath(bare, 'dark')).toBe(react.iconDark ?? react.iconLight)
+    // The assignment still wins over the catalog.
+    expect(exportIconPath({ ...bare, iconAssignment: withLogo('b', 0).iconAssignment }, 'light')).toBe('/icons/light/pg.png')
+  })
+
+  it('keeps the glyph for a name that is not in the catalog', async () => {
+    await loadIconCatalog()
+    expect(exportIconPath({ ...withLogo('a', 0), icon: 'NotARealIconXYZ', iconAssignment: undefined }, 'light')).toBeUndefined()
+  })
+
+  it('draws the catalog logo for a bare name in the SVG itself', async () => {
+    await loadIconCatalog()
+    const react = getIconByName('React')!
+    const bare = { ...withLogo('a', 0), icon: 'React', iconAssignment: undefined }
+    const svg = renderExportSvg(scene([bare]), { measure, theme: 'light', icons: new Map([[react.iconLight!, PNG_URI]]) })
+    expect(svg).toContain(`href="${PNG_URI}"`)
+  })
+})
+
+describe('exportIconHrefs', () => {
+  // The path the export takes in image.ts: the catalog chunk is NOT loaded yet,
+  // and a bare name must still end up as an embedded logo.
+  it('loads the catalog itself, then inlines the logo of a bare-name shape', async () => {
+    resetIconCatalogForTests()
+    const react = getIconByName('React')!
+    const seen: string[] = []
+    const fetchFn = (async (url: string) => {
+      seen.push(url)
+      return new Response(PNG, { headers: { 'content-type': 'image/png' } })
+    }) as unknown as typeof fetch
+    const bare = { ...withLogo('a', 0), icon: 'React', iconAssignment: undefined }
+    const hrefs = await exportIconHrefs([bare, withLogo('b', 200)], 'light', fetchFn)
+    expect(seen.sort()).toEqual([react.iconLight, '/icons/light/pg.png'].sort())
+    expect(hrefs.get(react.iconLight!)).toBe(PNG_URI)
+  })
+
+  it('does not load the catalog when every icon already carries its assignment', async () => {
+    resetIconCatalogForTests()
+    await exportIconHrefs([withLogo('a', 0)], 'light', (async () => new Response(PNG, { headers: { 'content-type': 'image/png' } })) as unknown as typeof fetch)
+    expect(isIconCatalogLoading()).toBe(false)
+    expect(catalogIconArtwork('React')).toBeUndefined()
   })
 })
 

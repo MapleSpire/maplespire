@@ -17,7 +17,7 @@ import { useSkinStore } from '../../stores/skinStore'
 import type { C4Object, Connection, Diagram, Flow, Group, Tag } from '../../types'
 import type { SkinConfig } from '../../skins/types'
 import type { ExportBundle, ImageTheme } from './types'
-import { exportIconPath, inlineExportIcons, renderExportSvg, type SvgScene } from './svg'
+import { exportIconHrefs, renderExportSvg, type SvgScene } from './svg'
 import { buildLegendModel, drawLegendCanvas, legendSize, renderLegendSvg, type LegendModel } from './legend'
 import type { PdfImage } from './pdf'
 import { getActiveScene3D } from '../../canvas3d/activeScene'
@@ -153,9 +153,7 @@ export async function renderDiagramSvgText(
   const scene = sceneFromBundle(bundle, diagramId)
   if (!scene) throw new Error(i18n.t('exportEngine.errors.noDiagramToExport'))
   const skin = resolveExportSkin(scene, theme)
-  const icons = await inlineExportIcons(
-    scene.objects.map((o) => exportIconPath(o, theme)).filter((p): p is string => !!p),
-  )
+  const icons = await exportIconHrefs(scene.objects, theme)
   return withExportEngine(scene, skin, theme, async (engine) => {
     const svgScene: SvgScene = {
       diagramName: scene.diagram.name,
