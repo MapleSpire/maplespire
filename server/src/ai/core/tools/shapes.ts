@@ -51,9 +51,22 @@ export interface OwnerAssignmentView {
 
 export type LinkView = string | { url: string; label?: string }
 
+/** Mirrors the client's ShapeIconAssignment (src/types/index.ts). */
+export interface IconAssignmentView {
+  source: 'technology' | 'generic'
+  mode: 'automatic' | 'explicit'
+  displayName: string
+  iconLightPath?: string
+  iconDarkPath?: string
+  technologyUsageId?: string
+  catalogRevision?: number
+}
+
 export interface TechnologyBearingView {
   technologyUsages?: Record<string, TechnologyUsageView>
   technologyUsageOrder?: string[]
+  icon?: string
+  iconAssignment?: IconAssignmentView
 }
 
 export interface TagAssignableView {

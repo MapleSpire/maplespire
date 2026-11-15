@@ -32,6 +32,7 @@ import {
   type TechnologyBearingView,
   type TechnologyUsageView,
 } from './shapes.js'
+import { iconAfterAssign, iconAfterRemove, withIconState, type IconState } from './technologyIcons.js'
 
 /**
  * Governed catalog tools deliberately expose no create operation. The model
@@ -320,11 +321,10 @@ export const catalogTools: AiToolDef[] = [
       usages[usageId] = usage
       const order = orderedIds(usages, current.technologyUsageOrder)
       if (!order.includes(usageId)) order.push(usageId)
-      await persistTarget(ctx, input.targetKind, input.targetId, {
-        ...current,
-        technologyUsages: usages,
-        technologyUsageOrder: order,
-      })
+      // Connections carry no icon; shapes follow the editor's automatic-icon rule.
+      const updated = { ...current, technologyUsages: usages, technologyUsageOrder: order }
+      await persistTarget(ctx, input.targetKind, input.targetId,
+        input.targetKind === 'connection' ? updated : withIconState(updated, iconAfterAssign(current, usage)))
       ctx.session.invalidate()
       return {
         target: { kind: input.targetKind, id: input.targetId },
@@ -351,11 +351,14 @@ export const catalogTools: AiToolDef[] = [
         .filter((usage) => usage.technologyId === input.technologyId)
         .map((usage) => usage.id)
       for (const id of removed) delete usages[id]
-      await persistTarget(ctx, input.targetKind, input.targetId, {
-        ...current,
-        technologyUsages: usages,
-        technologyUsageOrder: orderedIds(usages, current.technologyUsageOrder?.filter((id) => !removed.includes(id))),
-      })
+      const order = orderedIds(usages, current.technologyUsageOrder?.filter((id) => !removed.includes(id)))
+      const updated = { ...current, technologyUsages: usages, technologyUsageOrder: order }
+      const icon = removed.reduce<IconState>(
+        (state, id) => iconAfterRemove(state, id, usages, order),
+        { icon: current.icon, iconAssignment: current.iconAssignment },
+      )
+      await persistTarget(ctx, input.targetKind, input.targetId,
+        input.targetKind === 'connection' ? updated : withIconState(updated, icon))
       ctx.session.invalidate()
       return { target: { kind: input.targetKind, id: input.targetId }, removedUsageIds: removed }
     },
