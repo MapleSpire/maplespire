@@ -43,4 +43,20 @@ describe('application indexing deployment', () => {
     expect(nginx).toContain('default_type text/plain')
     expect(nginx).toContain('add_header X-Robots-Tag "noindex, nofollow, noarchive" always')
   })
+
+  it('makes browsers revalidate the SPA shell while hashed bundles stay immutable', () => {
+    // 2026-11-26: with no Cache-Control on index.html, a browser reused the old
+    // shell (and through it the old bundles) for hours after a deployment.
+    const block = (prefix: string) => {
+      const start = nginx.indexOf(`    location ${prefix} {`)
+      expect(start, `missing location ${prefix}`).toBeGreaterThanOrEqual(0)
+      return nginx.slice(start, nginx.indexOf('\n    }', start))
+    }
+    const shell = block('/')
+    expect(shell).toContain('try_files $uri $uri/ /index.html')
+    expect(shell).toContain('add_header Cache-Control "no-cache" always')
+    // An add_header in a location discards the server-level ones.
+    expect(shell).toContain('add_header X-Robots-Tag "noindex, nofollow, noarchive" always')
+    expect(block('/assets/')).toContain('add_header Cache-Control "public, immutable"')
+  })
 })
