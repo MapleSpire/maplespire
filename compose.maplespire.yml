@@ -153,6 +153,37 @@ services:
       timeout: 3s
       retries: 20
 
+  # Gives the technology-asset volume to `node` (uid 1000) before any service
+  # mounts it, then exits.
+  #
+  # Docker seeds a fresh named volume from the image (contents and owner) only
+  # when the first container mounts it read-write. `backup-drill` mounts it
+  # `:ro` and waits for postgres alone, so on a fresh volume it can be the
+  # first mounter: the directory is then created empty and root-owned, and the
+  # api, which runs as uid 1000, refuses it ("technology asset directory is not
+  # writable by uid 1000") and restarts in a loop. This service repairs the
+  # owner idempotently on every `up`, including a volume an earlier deployment
+  # already left root-owned. `scripts/maplespire-compose.test.mjs` asserts
+  # every mounter waits for it.
+  technology-assets-init:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+      # The api's own image, so `node` resolves to the same uid it runs as.
+      target: runtime
+    logging: *default-logging
+    # One-shot: `restart: always` would rerun it forever.
+    restart: "no"
+    user: root
+    entrypoint:
+      - sh
+      - -c
+      - chown node:node /var/lib/maplespire/assets/technologies && chmod 0755 /var/lib/maplespire/assets/technologies
+    volumes:
+      - technology_assets:/var/lib/maplespire/assets/technologies
+    healthcheck:
+      disable: true
+
   # First sync cell. nginx sends REST traffic here.
   api:
     build:
@@ -174,6 +205,8 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
+      technology-assets-init:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       redis:
@@ -204,6 +237,8 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
+      technology-assets-init:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       redis:
@@ -279,6 +314,8 @@ services:
     ports:
       - "127.0.0.1:${MAPLESPIRE_WEB_PORT:-8088}:80"
     depends_on:
+      technology-assets-init:
+        condition: service_completed_successfully
       api:
         condition: service_healthy
       sync-ws-router:
@@ -328,6 +365,8 @@ services:
       BACKUP_DRILL_HISTORY_MAX_BYTES: ${MAPLESPIRE_DRILL_HISTORY_MAX_BYTES:-64MB}
       BACKUP_BUNDLE_MAX_BYTES: ${MAPLESPIRE_BACKUP_BUNDLE_MAX_BYTES:-20GB}
     depends_on:
+      technology-assets-init:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
     volumes:
