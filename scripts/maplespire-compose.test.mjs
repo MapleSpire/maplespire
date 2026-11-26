@@ -88,11 +88,16 @@ function serviceNames(source) {
 
 /**
  * Services the per-service assertions below deliberately do NOT cover, each with
- * the reason. Empty today, and that is the point of it existing: adding a
- * service to `compose.maplespire.yml` now either satisfies the assertions or
- * requires writing down why it does not.
+ * the reason. Adding a service to `compose.maplespire.yml` either satisfies
+ * the assertions or requires writing down why it does not.
  */
-const productionServiceExemptions = new Map([])
+const productionServiceExemptions = new Map([
+  [
+    'technology-assets-init',
+    'one-shot ownership repair that exits; `restart: always` would rerun it forever. ' +
+      'Its own contract is asserted by the technology-assets-init test below.',
+  ],
+])
 
 /**
  * DERIVED from the manifest, not transcribed from it. With a hand-written list,
@@ -200,6 +205,44 @@ test('metrics retention is budgeted in bytes, and its volume is declared', () =>
   for (const volume of ['prometheus_data:', 'backups:']) {
     assert.ok(composeSource.includes(`
   ${volume}`), `missing ${volume} volume declaration`)
+  }
+})
+
+test('technology-assets-init owns the icon volume before any service mounts it', () => {
+  // 2026-11-26, home demo: Docker seeds a fresh named volume from the image only
+  // on a READ-WRITE first mount. `backup-drill` (`:ro`, waits for postgres only)
+  // mounted it first, the directory came up empty and root-owned, and the api
+  // (uid 1000) crash-looped with "technology asset directory is not writable",
+  // taking app.maplespire.ca down until the volume was chowned by hand.
+  const init = serviceBlock('technology-assets-init')
+  assert.match(init, /^    user: root$/m, 'the repair needs root to chown')
+  assert.match(init, /^    restart: "no"$/m, 'a one-shot must not be restarted')
+  assert.match(init, /^      target: runtime$/m, 'the api image, so `node` is the uid the api runs as')
+  assert.match(
+    init,
+    /chown node:node \/var\/lib\/maplespire\/assets\/technologies/,
+    'the init must chown the mounted asset directory to node',
+  )
+  assert.match(
+    init,
+    /^      - technology_assets:\/var\/lib\/maplespire\/assets\/technologies$/m,
+    'the init must mount the volume read-write, or it cannot repair it',
+  )
+
+  // DERIVED: every other service mounting the volume, read-only or not, must
+  // wait for the repair. A new mounter that forgets is exactly the drill's race.
+  const mounters = productionServices.filter(
+    (name) => name !== 'technology-assets-init' && /- technology_assets:/.test(serviceBlock(name)),
+  )
+  for (const name of ['api', 'api-b', 'web', 'backup-drill']) {
+    assert.ok(mounters.includes(name), `mounter derivation is missing ${name}`)
+  }
+  for (const name of mounters) {
+    assert.match(
+      serviceBlock(name),
+      /^      technology-assets-init:\n        condition: service_completed_successfully$/m,
+      `${name} mounts technology_assets but does not wait for technology-assets-init`,
+    )
   }
 })
 
