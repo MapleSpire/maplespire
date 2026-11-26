@@ -1,0 +1,86 @@
+{
+  "epochs": {
+    "hop": {
+      "updating": "Updating the model…"
+    },
+    "retired": {
+      "message_one": "This tab held an archived version of the model: {{count}} unsynced edit could not be carried over.",
+      "message_other": "This tab held an archived version of the model: {{count}} unsynced edits could not be carried over.",
+      "export": "Export them",
+      "dismiss": "Dismiss",
+      "confirmDismiss_one": "Dismiss without exporting? This unsynced edit is kept nowhere else.",
+      "confirmDismiss_other": "Dismiss without exporting? These {{count}} unsynced edits are kept nowhere else.",
+      "keep": "Keep them",
+      "confirmDiscard": "Dismiss anyway"
+    },
+    "overrides": {
+      "notice_one": "{{count}} of your offline edits was overridden by a newer change.",
+      "notice_other": "{{count}} of your offline edits were overridden by newer changes.",
+      "pill_one": "{{count}} overridden edit",
+      "pill_other": "{{count}} overridden edits",
+      "review": "Review",
+      "later": "Later",
+      "title": "Your overridden offline edits",
+      "explain": "While you were offline, someone else changed the same fields. Their version is kept. Re-apply the edits you want to keep — you can undo.",
+      "all": "All",
+      "none": "None",
+      "close": "Close",
+      "showInDiagram": "Show in diagram",
+      "yours": "Yours",
+      "current": "Now (newer)",
+      "when": "Overridden {{date}}",
+      "recreate": {
+        "objects": "Re-create deleted object",
+        "connections": "Re-create deleted connection",
+        "groups": "Re-create deleted group"
+      },
+      "wholeEntity": {
+        "objects": "Whole object",
+        "connections": "Whole connection",
+        "groups": "Whole group"
+      },
+      "changedSince": "Changed since: now {{value}}",
+      "endpointDeleted": "Endpoint deleted",
+      "needs": "Needs {{object}}",
+      "unsupported": "Edit it on its own page",
+      "dismissAll": "Discard my edits",
+      "discardConfirm_one": "Discard your {{count}} overridden edit? The newer version stays.",
+      "discardConfirm_other": "Discard your {{count}} overridden edits? The newer version stays.",
+      "discardConfirmYes": "Confirm discard",
+      "discardConfirmNo": "Keep them",
+      "discarded": "Your overridden edits were discarded.",
+      "undo": "Undo",
+      "reapply_one": "Re-apply {{count}} edit",
+      "reapply_other": "Re-apply {{count}} edits",
+      "reviewing_one": "Reviewing {{count}} overridden edit",
+      "reviewing_other": "Reviewing {{count}} overridden edits",
+      "backToReview": "Back to review",
+      "refusal": {
+        "needsDiagram": "Open a diagram to re-apply: the edit joins its undo history.",
+        "hop": "The model is updating. Try again in a moment.",
+        "notRecorded": "Your edits were not re-applied: the change could not be added to the undo history. Nothing was changed. Try again."
+      },
+      "openDiagram": "Open diagram",
+      "marker": "Your offline edit was overridden",
+      "markerShort": "Overridden",
+      "kind": {
+        "objects": "Object",
+        "connections": "Connection",
+        "groups": "Group",
+        "other": "Model"
+      },
+      "field": {
+        "name": "Name",
+        "description": "Description",
+        "status": "Status",
+        "technology": "Technology",
+        "label": "Label",
+        "type": "Type",
+        "scope": "Scope",
+        "owners": "Owners",
+        "tags": "Tags",
+        "properties": "Properties"
+      }
+    }
+  }
+}

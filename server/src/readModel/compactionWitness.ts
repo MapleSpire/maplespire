@@ -59,6 +59,21 @@ export interface ContentWitness {
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value)
 
+/** A ModelMeta base-shard list as the document RULES it (G4-16f): under
+ * `metaUrlFormat: 2` the `…Refs` list of `ImmutableString`s (`.val`). Read
+ * from the document's shape, not through `modelMetaUrls.ts`, for the reason
+ * the header gives: a witness must not share the code under test. */
+function ruledShardList(meta: Record<string, unknown>, field: 'objectShardUrls' | 'connectionShardUrls'): unknown {
+  const scalar = meta.metaUrlFormat === 2
+  const raw = meta[scalar ? (field === 'objectShardUrls' ? 'objectShardRefs' : 'connectionShardRefs') : field]
+  if (!Array.isArray(raw)) return raw
+  return raw.map((entry: unknown) => {
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) return entry
+    const val = (entry as { val?: unknown }).val
+    return typeof val === 'string' ? val : entry
+  })
+}
+
 const stringArray = (value: unknown): string[] =>
   Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === 'string') : []
 
@@ -125,10 +140,10 @@ export async function collectContentWitness(
   const meta = await readDoc(resolve, modelMetaUrl, 'ModelMeta')
   return {
     objects: await walkCollection(
-      resolve, stringArray(meta.objectShardUrls), 'objects', stringArray(meta.deletedObjectIds),
+      resolve, stringArray(ruledShardList(meta, 'objectShardUrls')), 'objects', stringArray(meta.deletedObjectIds),
     ),
     connections: await walkCollection(
-      resolve, stringArray(meta.connectionShardUrls), 'connections', stringArray(meta.deletedConnectionIds),
+      resolve, stringArray(ruledShardList(meta, 'connectionShardUrls')), 'connections', stringArray(meta.deletedConnectionIds),
     ),
   }
 }

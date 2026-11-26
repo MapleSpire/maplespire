@@ -14,12 +14,18 @@
 
 import type { Repo, DocHandle } from '@automerge/automerge-repo'
 import { isValidAutomergeUrl } from '@automerge/automerge-repo'
-import { getHeads } from '@automerge/automerge'
+import { Float64, getHeads, isCounter, isImmutableString } from '@automerge/automerge'
 import type { WorkspaceKey } from './projector.js'
 import type { Queryable } from './types.js'
 import { findReadyDocument } from '../automergeRepoCompat.js'
+import { appendMetaUrl, readMetaUrl, readMetaUrls, writeMetaUrl, writeMetaUrls } from '../modelMetaUrls.js'
 import { createClaimedDocument } from '../rbac/docScope.js'
 import { OVERLAY_WRITE_HEAD_VERSION } from '../modelMeta.js'
+import { BoundedResolveDeadlineError, SERVER_SHARD_RESOLVE_BATCH_SIZE, resolveWithBoundedConcurrency } from './batchedResolve.js'
+import {
+  OVERLAY_REMATERIALIZE_MESSAGE, clearedEntryEditsYielding, rematerializedEntity, sameDocumentValue, valueAtPath,
+  type ClearScanRow, type ClearScanSave, type ClearedEntryEdit, type DeclinedWrite, type ScanStats,
+} from './overlayClearRematerialize.js'
 
 /**
  * Overlay compaction (the daily background job).
@@ -56,6 +62,27 @@ import { OVERLAY_WRITE_HEAD_VERSION } from '../modelMeta.js'
  * The Automerge docs are the source of truth and are always left correct. The Postgres
  * read model is reconciled by the caller (it restarts the projector, whose cold build
  * re-derives overlay-last-wins from the compacted shards).
+ *
+ * ON A ROTATED, FOLDED ORDINARY WORKSPACE (G4-16i). The clear REWRITES every listed
+ * segment, and two kinds of segment have a server-side row that says what the
+ * segment holds (`ordinaryHeadForwarding.ts`):
+ *  - a fold PRODUCT has a `retired` row whose H_r is its heads at creation, and
+ *    nothing forwards a product (`ordinaryChainFold.ts`). Cleared and left so, it
+ *    reads as unsettled for ever: the fold never takes it again and every later
+ *    compaction refused `retired_head_forward_pending` on it (measured on the
+ *    G4-16f aged bench, `compactionOrdinaryFold.integration.test.ts` W1);
+ *  - the head this pass REPLACES (the current one) had no row, so it was projected
+ *    directly and split every fold run that crossed it; nothing bounded the chain.
+ * So, between the clear and the ModelMeta change, every segment's heads are
+ * captured in the SAME synchronous turn as the clear, the segments are flushed
+ * (a row must never name heads the stored document lacks), and
+ * `settleRewrittenSegments` records them (`workspaceCompaction.ts`,
+ * `settleCompactedOrdinarySegments`) — BEFORE ModelMeta moves, the contract of
+ * `ordinaryHeadForwarding.ts` on order. A throw from it propagates and ModelMeta
+ * is not repointed: the overlay is cleared and the read model reads the base
+ * last-wins, which is what the next pass finds. A write that reaches a segment
+ * after the capture is after its H_r / `forwarded_heads`, and the forwarder
+ * carries it into the fresh head once the projector re-attaches.
  */
 
 interface RootLike {
@@ -75,9 +102,166 @@ interface MetaLike {
 /** A model shard read/written structurally: collectionKey → (id → entity). */
 type ShardDoc = Record<string, Record<string, unknown>>
 
+/**
+ * The compaction's segment-list write: `url` appended, the list deduplicated
+ * (first kept) — what it always wrote — IN PLACE, not assigned whole: one
+ * compaction a day would otherwise re-create every segment url in
+ * ModelMeta's history (G4-16f), through `modelMetaUrls.ts` (text or scalar by
+ * the document's marker). Synchronous; inside the ModelMeta `change`.
+ * Exported for its test.
+ */
+export function appendCompactionSegmentInPlace(
+  meta: MetaLike,
+  field: 'editsObjectShardUrls' | 'editsConnectionShardUrls',
+  url: string,
+): void {
+  writeMetaUrls(meta, field, [...new Set([...(readMetaUrls(meta, field) ?? []), url])])
+}
+
+/**
+ * The fold's base-shard write: make `target[key]` hold `next` — the state a
+ * whole assignment (`target[key] = next`) would leave — while writing only what
+ * differs. Synchronous; inside the base shard's `change`. `target` is a map
+ * proxy of that change, `next` a value materialized from an overlay segment
+ * (`handle.doc()`). Exported for its test.
+ *
+ * WHY (G4-16f): a whole assignment makes a NEW map in Automerge 3, so every
+ * field is written again, and every string field is a text object, one
+ * operation per character. Measured on one base shard of 500 aged-bench
+ * entities, 40 of them folded per pass: re-folding them UNCHANGED cost 16 730
+ * operations and 34.8 KB of history per pass; with this helper 0. With one
+ * short field changed per entity: 16 410 operations and 34.4 KB, against 400
+ * and 2.3 KB.
+ *
+ * What it writes:
+ *  - equal values (by {@link sameFoldValue}) are left as they are;
+ *  - two maps are merged key by key, and a key `next` lacks is DELETED — the
+ *    overlay entry is the entity's whole value, as the assignment made it;
+ *  - anything else (a list that differs, a changed string or number, a kind
+ *    change such as text ↔ ImmutableString or map ↔ list) is assigned whole,
+ *    exactly as before. A changed string is therefore a new text object, not
+ *    an `updateText` splice: the field keeps the assignment's last-writer-wins
+ *    behaviour, and a splice of a rewritten string cost MORE history (probe:
+ *    59–69 KB per pass against 41 KB).
+ *
+ * PARITY with the whole assignment is SEQUENTIAL, and it has three limits
+ * (all pinned in `compactionFieldFold.test.ts`):
+ *  - DATATYPE. Automerge 3.2.6 encodes a number differently in a nested value
+ *    (what the whole assignment writes) and in a scalar put (what a merged
+ *    field write is): nested, a positive integer is `int` and every other
+ *    number — `0`, `-0`, a negative integer, a fraction — is `f64`; a scalar
+ *    put makes every integer `int`, `-0` included (measured with
+ *    `getBackend(doc).getWithType`). So a changed number below the entity is
+ *    written as `Float64` where the nested encoding gives `f64`, and a change
+ *    to or from `-0` re-assigns its enclosing map whole (`Float64` turns `-0`
+ *    into `0`, and a put of `Float64(0)` over a stored `-0` is dropped as a
+ *    no-op, while a plain `0` put stores `int 0`).
+ *    An EQUAL value is not rewritten and
+ *    keeps whatever datatype it already had, which the whole assignment
+ *    would have re-encoded;
+ *  - CONFLICTS. A field holding concurrent values whose winner equals the
+ *    overlay is left as it is; the whole assignment overwrote it and so
+ *    resolved the conflict;
+ *  - CONCURRENT WRITERS (a full-model client writes base shards, `bridge.ts`
+ *    `writeModelShards`). A peer's put of a field the fold does not write
+ *    SURVIVES the merge (the whole assignment made a new map, and the peer's
+ *    put landed on the abandoned one), and a peer's DELETE of the entity
+ *    WINS (the fold writes inside the existing map and never puts the
+ *    entity's key, where the whole assignment's put resurrected it).
+ *
+ * Not preserved, because it is not state: the IDENTITY of a map object that is
+ * merged rather than re-created.
+ */
+export function foldValueInPlace(target: Record<string, unknown>, key: string, next: unknown): void {
+  foldInto(target, key, next, false)
+}
+
+function foldInto(target: Record<string, unknown>, key: string, next: unknown, nested: boolean): void {
+  const current = target[key]
+  if (sameFoldValue(current, next)) return
+  if (isFoldMap(current) && isFoldMap(next)) {
+    // `-0` has no scalar spelling that keeps its sign, and a put of
+    // `Float64(0)` over `-0` is dropped as a no-op (measured: the stored `-0`
+    // stays; a plain `0` put would store `int 0`, the wrong datatype). Either
+    // change re-assigns the map whole, which is what the whole assignment
+    // wrote anyway.
+    if (Object.keys(next).some((k) => !sameFoldValue(current[k], next[k])
+      && (Object.is(next[k], -0) || (Object.is(current[k], -0) && next[k] === 0)))) {
+      target[key] = next
+      return
+    }
+    for (const k of Object.keys(current)) if (!Object.hasOwn(next, k)) delete current[k]
+    for (const k of Object.keys(next)) foldInto(current, k, next[k], true)
+    return
+  }
+  target[key] = nested && typeof next === 'number' ? nestedNumber(next) : next
+}
+
+/** A number spelled so that a scalar put stores the datatype the NESTED
+ * encoding gives it (see {@link foldValueInPlace}): positive integers `int`,
+ * every other number `f64`. `NaN` is not an integer, so a plain put already
+ * stores it as `f64` (and `Float64` would turn it into `0`). */
+function nestedNumber(value: number): number | Float64 {
+  if (Number.isNaN(value) || (Number.isInteger(value) && value > 0)) return value
+  return new Float64(value)
+}
+
+/** A plain map, read through a change proxy or materialized. ARRAY FIRST:
+ * Automerge 3.2.6's list proxy answers `true` to `isImmutableString` and
+ * `isCounter` (measured; `has` reports every symbol), so those tests are only
+ * meaningful once a list has been ruled out. */
+function isFoldMap(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    && !isImmutableString(value) && !isCounter(value)
+    && !(value instanceof Date) && !(value instanceof Uint8Array)
+}
+
+/** Equality of a value read through a change proxy and a materialized one,
+ * KIND included: text reads back as a `string` from both, a scalar string as an
+ * `ImmutableString`, so `'a'` and `ImmutableString('a')` differ and the
+ * assignment that would change the kind still happens. */
+export function sameFoldValue(a: unknown, b: unknown): boolean {
+  // `Object.is`: `0` and `-0` differ, as their stored values do.
+  if (Object.is(a, b)) return true
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false
+    for (let i = 0; i < a.length; i += 1) if (!sameFoldValue(a[i], b[i])) return false
+    return true
+  }
+  if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return false
+  if (isImmutableString(a) || isImmutableString(b)) {
+    return isImmutableString(a) && isImmutableString(b) && a.val === b.val
+  }
+  if (isCounter(a) || isCounter(b)) return isCounter(a) && isCounter(b) && a.value === b.value
+  if (a instanceof Date || b instanceof Date) {
+    return a instanceof Date && b instanceof Date && a.getTime() === b.getTime()
+  }
+  if (a instanceof Uint8Array || b instanceof Uint8Array) {
+    return a instanceof Uint8Array && b instanceof Uint8Array
+      && a.length === b.length && a.every((byte, i) => byte === b[i])
+  }
+  const ka = Object.keys(a)
+  const kb = Object.keys(b)
+  if (ka.length !== kb.length) return false
+  for (const k of ka) {
+    if (!Object.hasOwn(b, k)) return false
+    if (!sameFoldValue((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k])) return false
+  }
+  return true
+}
+
 /** Max objects/connections per base shard when compaction has to place a newly-created
  * id that has no base shard yet. Mirrors the client's VITE_MODEL_SHARD_SIZE default. */
 const DEFAULT_SHARD_SIZE = Number(process.env.AM_MODEL_SHARD_SIZE ?? 512)
+
+/**
+ * The CLEAR's change message. A browser rescues an offline edit inside an entry
+ * only when the delete that erased it is this one (`overlayClearRescue.ts`,
+ * which names the same string): a colleague's explicit delete, or the tombstone
+ * deletes above, carry none and are never undone. Changing it breaks the rescue
+ * of browsers built against the old string.
+ */
+export const OVERLAY_COMPACTION_CLEAR_MESSAGE = 'maplespire:overlay-compaction-clear'
 
 export interface CompactionResult {
   objectsFolded: number
@@ -88,10 +272,30 @@ export interface CompactionResult {
   /** Tombstoned ids removed from the base shards + overlay this run. */
   objectsDeleted: number
   connectionsDeleted: number
+  /** G4-16k: entities whose offline edits an earlier clear erased, written
+   * again this pass (`rematerializeClearedEdits`). Absent: none. */
+  objectsRematerialized?: number
+  connectionsRematerialized?: number
+  /** G4-16k: the step failed (per collection, its error); the fold went on
+   * and the next pass reads the same changes again. Absent: no failure. */
+  rematerializeFailed?: string[]
   /** `projection_not_acknowledged` is deliberately ABSENT: `compactOverlay`
    *  never sets it; it lives on `WorkspaceCompactionSkip`, where the caller
    *  that decides it does. */
-  skippedReason?: 'static_baseline' | 'ownership_lost_mid_fold' | 'retired_head_forward_pending'
+  skippedReason?: 'static_baseline' | 'ownership_lost_mid_fold' | 'rematerialize_cursor_unsaved' | CompactionSegmentRefusal
+}
+
+/** Why `lateWritesPending` refuses a pass: a retired head holds a late write not
+ * forwarded yet, or a listed segment is a source of a fold RECORDED and not
+ * published (`workspaceCompaction.ts`). */
+export type CompactionSegmentRefusal = 'retired_head_forward_pending' | 'ordinary_fold_unpublished'
+
+/** A listed overlay segment as a pass sampled it (heads read in the same
+ * synchronous turn as its content). */
+export interface CompactionSegment {
+  documentId: string
+  heads: readonly string[]
+  current: boolean
 }
 
 /**
@@ -107,6 +311,54 @@ export type CompactionMode = 'preview' | 'apply'
 export interface CompactionOptions {
   /** REQUIRED. See `CompactionMode` — there is deliberately no default. */
   mode: CompactionMode
+  /**
+   * G4-16k: where each overlay segment's last rematerialization scan stopped
+   * (its heads then), and how to record a new one — after the writes it led
+   * to are flushed. A segment with no row starts at its heads when first
+   * seen, so without a store nothing is ever read and nothing rewritten.
+   */
+  /**
+   * G4-16k: how long ago a pass must have FIRST SEEN every late change of an
+   * entry before the server writes it back — by the server's clock, recorded
+   * in the scan row (the author's `change.time` would let a clock set in the
+   * past skip the grace, and one set in the future park the segment for
+   * ever). Younger, it waits — the
+   * segment's scan is not recorded past it — and the browser's own rescue,
+   * the fast path, has that long to apply it. Measured without it, on one
+   * stack: the server wrote back, ten
+   * minutes after her reconnection, 67 edits her browser had rescued into the
+   * retired epoch's export, while she edited the same fields offline again;
+   * 14 of her new values lost the concurrent conflict. Default 0 (the
+   * DB-free suites); the production caller passes a day
+   * (`workspaceCompaction.ts`).
+   */
+  rematerializeGraceMs?: number
+  /** The writes the authors unchecked in the batch re-apply, per
+   * entity id — never written back — and the ones still pending their
+   * decision, held back until it is made (`declinedOverrideWrites`). Absent: none. */
+  declinedEdits?: (collection: 'object' | 'connection', ids: readonly string[]) => Promise<ReadonlyMap<string, ReadonlyArray<DeclinedWrite>>>
+  clearScans?: {
+    /** Every recorded scan of the workspace's segments of `collection`, by
+     * document id, the least recently saved first. */
+    load: (collection: 'object' | 'connection') => Promise<ReadonlyMap<string, ClearScanRow>>
+    /** `onlyNew`: a row that exists already is left as it is (a first sighting). */
+    save: (collection: 'object' | 'connection', scans: ReadonlyArray<ClearScanSave>, options?: { onlyNew?: boolean }) => Promise<void>
+    /** The rows of segments the repo answered are gone. Absent: kept. */
+    purge?: (collection: 'object' | 'connection', documentIds: readonly string[]) => Promise<void>
+  }
+  /** TEST SEAM: the server clock of the grace period. Default `Date.now`. */
+  now?: () => number
+  /** TEST SEAM: how the scan gives the event loop back between its steps.
+   * Default `setImmediate`. */
+  yieldToEventLoop?: () => Promise<void>
+  /** The segments known ONLY by their scan row (no list names them) resolved
+   * per pass, the least recently scanned first. Default
+   * {@link REMATERIALIZE_UNNAMED_SEGMENTS_PER_PASS}. */
+  rematerializeUnnamedPerPass?: number
+  /** The changes the scan decodes per pass and collection; the segment that
+   * crosses it is the last one read (the first is always read). Default
+   * {@link REMATERIALIZE_DECODE_BUDGET}. */
+  rematerializeDecodeBudget?: number
   /** Objects/connections per shard when placing created ids (tests inject a small one). */
   shardSize?: number
   /** Immutable performance baselines must never be destructively rewritten. */
@@ -165,11 +417,43 @@ export interface CompactionOptions {
    *
    * The production caller (`workspaceCompaction.ts`) always passes it; the
    * DB-free unit suites do not, and have no rows to consult.
+   *
+   * A bare list refuses with `retired_head_forward_pending`; `{ reason,
+   * segments }` names the reason (`ordinary_fold_unpublished`: a listed
+   * segment is the source of a fold recorded and not published, whose
+   * recovery would publish a product built from the content this pass is
+   * about to clear — `workspaceCompaction.ts`).
    */
   lateWritesPending?: (
     collection: 'object' | 'connection',
-    segments: ReadonlyArray<{ documentId: string; heads: readonly string[]; current: boolean }>,
-  ) => Promise<readonly string[]>
+    segments: ReadonlyArray<CompactionSegment>,
+  ) => Promise<readonly string[] | { reason: CompactionSegmentRefusal; segments: readonly string[] }>
+  /**
+   * Called once per collection that wrote, in `apply` mode only, AFTER the clear
+   * and BEFORE the ModelMeta change that repoints the write head, with EVERY
+   * listed segment's heads captured in the same synchronous turn as the clear
+   * (and the segments flushed first). The production caller records them
+   * (`settleCompactedOrdinarySegments`): the replaced head's `retired` row, a
+   * rewritten fold product's `forwarded_heads`. A throw propagates and
+   * ModelMeta is NOT repointed.
+   */
+  settleRewrittenSegments?: (
+    collection: 'object' | 'connection',
+    segments: ReadonlyArray<CompactionSegment>,
+  ) => Promise<void>
+  /**
+   * G4-16f diagnosis F1: called once, in `apply` mode, after BOTH collections
+   * applied without refusal (the clear and the ModelMeta change done), with
+   * every base shard the pass resolved, so their storage can be compacted to
+   * one snapshot each before the caller re-attaches
+   * (`workspaceCompaction.ts`, `PostgresStorageAdapter.compactToSnapshot`).
+   * Its outcome never changes the pass's: the caller catches and reports.
+   * Absent (the DB-free suites): nothing.
+   */
+  compactBaseShardStorage?: (handles: ReadonlyArray<DocHandle<unknown>>) => Promise<void>
+  /** TEST SEAM: the pass's single resolution ceiling, default
+   * {@link COMPACTION_RESOLVE_DEADLINE_MS}. */
+  resolveDeadlineMs?: number
 }
 
 export async function compactOverlay(repo: Repo, rootUrl: string, opts: CompactionOptions): Promise<CompactionResult> {
@@ -191,6 +475,40 @@ export async function compactOverlay(repo: Repo, rootUrl: string, opts: Compacti
   if (!metaHandle.doc()) return empty
 
   const claim = opts.workspace ? { workspace: opts.workspace, rootUrl } : undefined
+  // G4-16k, BEFORE the fold reads its snapshot: an offline edit an earlier
+  // pass's clear erased is written back where its entity lives now, so this
+  // pass folds it like any other value. Apply mode only (a preview writes
+  // nothing). Its own resolution ceiling, taken before the fold's: a failure
+  // or a ceiling here is reported and the fold goes on unchanged.
+  // A quarter of the pass's ceiling: the step can add at most
+  // that to a pass's wait.
+  const rematerializeDeadlineAt = Date.now() + Math.min(opts.resolveDeadlineMs ?? COMPACTION_RESOLVE_DEADLINE_MS, COMPACTION_RESOLVE_DEADLINE_MS / 4)
+  const notRun: RematerializeOutcome = { written: 0 }
+  const remObjects = opts.mode === 'apply'
+    ? await rematerializeClearedEdits(repo, resolve, metaHandle, 'objects', 'objectShardUrls', 'editsObjectShardUrl', 'editsObjectShardUrls', 'deletedObjectIds', opts, rematerializeDeadlineAt)
+    : notRun
+  const remConnections = opts.mode === 'apply' && !remObjects.ownershipLost
+    ? await rematerializeClearedEdits(repo, resolve, metaHandle, 'connections', 'connectionShardUrls', 'editsConnectionShardUrl', 'editsConnectionShardUrls', 'deletedConnectionIds', opts, rematerializeDeadlineAt)
+    : notRun
+  const rematerializeFailed = [remObjects.failed, remConnections.failed].filter((f): f is string => !!f)
+  const rematerializedCounts = {
+    ...(remObjects.written ? { objectsRematerialized: remObjects.written } : {}),
+    ...(remConnections.written ? { connectionsRematerialized: remConnections.written } : {}),
+    ...(rematerializeFailed.length ? { rematerializeFailed } : {}),
+  }
+  // The ownership guard said no inside the step: the pass stops there, as
+  // the fold's own guard would have stopped it.
+  if (remObjects.ownershipLost || remConnections.ownershipLost) {
+    return { ...empty, ...rematerializedCounts, skippedReason: 'ownership_lost_mid_fold' }
+  }
+  // A segment seen for the first time whose scan row was not saved
+  // would start, next pass, AFTER this pass's clear — the edits that clear
+  // erases would never be repaired. Nothing is folded or cleared.
+  if (remObjects.firstRowsUnsaved || remConnections.firstRowsUnsaved) {
+    return { ...empty, ...rematerializedCounts, skippedReason: 'rematerialize_cursor_unsaved' }
+  }
+  // ONE resolution ceiling for the whole pass (its four lists), not one each.
+  const resolveDeadlineAt = Date.now() + (opts.resolveDeadlineMs ?? COMPACTION_RESOLVE_DEADLINE_MS)
   // BOTH collections are READ — snapshot, heads, and the `lateWritesPending`
   // answer — before EITHER writes. Asked per collection inside its own pass,
   // an objects pass that folded and flushed was followed by a connections
@@ -198,7 +516,7 @@ export async function compactOverlay(repo: Repo, rootUrl: string, opts: Compacti
   // written base shard (phase-3 review). The connections snapshot is then
   // older than the objects writes; that is the conditional clear's ordinary
   // case (an entry that changed after its snapshot is kept).
-  const objPrepared = await prepareFold(repo, resolve, metaHandle, 'objects', 'objectShardUrls', 'editsObjectShardUrl', 'editsObjectShardUrls', 'deletedObjectIds', shardSize, opts.mode, claim, opts.stillSafeToWrite, opts.lateWritesPending)
+  const objPrepared = await prepareFold(repo, resolve, metaHandle, 'objects', 'objectShardUrls', 'editsObjectShardUrl', 'editsObjectShardUrls', 'deletedObjectIds', shardSize, opts.mode, claim, opts.stillSafeToWrite, opts.lateWritesPending, opts.settleRewrittenSegments, resolveDeadlineAt)
   // The connections pass is SKIPPED once the objects pass has refused: the
   // predicate said this process may no longer write, and starting a second
   // collection would be writing anyway. Its own guard would catch it, but
@@ -207,7 +525,7 @@ export async function compactOverlay(repo: Repo, rootUrl: string, opts: Compacti
   const refusedEarly = !('apply' in objPrepared) && objPrepared.aborted
   const connPrepared = refusedEarly
     ? { folded: 0, kept: 0, deleted: 0, aborted: true as const }
-    : await prepareFold(repo, resolve, metaHandle, 'connections', 'connectionShardUrls', 'editsConnectionShardUrl', 'editsConnectionShardUrls', 'deletedConnectionIds', shardSize, opts.mode, claim, opts.stillSafeToWrite, opts.lateWritesPending)
+    : await prepareFold(repo, resolve, metaHandle, 'connections', 'connectionShardUrls', 'editsConnectionShardUrl', 'editsConnectionShardUrls', 'deletedConnectionIds', shardSize, opts.mode, claim, opts.stillSafeToWrite, opts.lateWritesPending, opts.settleRewrittenSegments, resolveDeadlineAt)
   // A connections refusal found while reading: the objects pass never writes.
   const connRefused = !('apply' in connPrepared) && connPrepared.aborted
   const none = { folded: 0, kept: 0, deleted: 0 }
@@ -222,7 +540,25 @@ export async function compactOverlay(repo: Repo, rootUrl: string, opts: Compacti
       objectsFolded: obj.folded, connectionsFolded: conn.folded,
       objectsKept: obj.kept, connectionsKept: conn.kept,
       objectsDeleted: obj.deleted, connectionsDeleted: conn.deleted,
+      ...rematerializedCounts,
       skippedReason: obj.abortReason ?? conn.abortReason ?? 'ownership_lost_mid_fold',
+    }
+  }
+  // F1, after the pass's own writes and before the caller re-attaches: the
+  // base shards the fold wrote this pass (and any left with accumulated
+  // incrementals) back to one stored snapshot each.
+  const appliedBase = [objPrepared, connPrepared].flatMap((prepared) => 'apply' in prepared ? prepared.baseHandles : [])
+  if (opts.mode === 'apply' && opts.compactBaseShardStorage && appliedBase.length) {
+    // The fold stands whatever the hook does: its caller catches
+    // per shard, and this catches anything else, so the counts below are
+    // always what the pass did.
+    try {
+      await opts.compactBaseShardStorage(appliedBase as ReadonlyArray<DocHandle<unknown>>)
+    } catch (error) {
+      console.warn(JSON.stringify({
+        event: 'compaction.base_storage_failed',
+        error: error instanceof Error ? error.message : String(error),
+      }))
     }
   }
   return {
@@ -232,7 +568,352 @@ export async function compactOverlay(repo: Repo, rootUrl: string, opts: Compacti
     connectionsKept: conn.kept,
     objectsDeleted: obj.deleted,
     connectionsDeleted: conn.deleted,
+    ...rematerializedCounts,
   }
+}
+
+/**
+ * G4-16k: write back, where each
+ * entity lives NOW, the offline edits an earlier pass's clear erased
+ * (`overlayClearRematerialize.ts`). The server holds both her late change and
+ * the clear once she synced, so this covers the browser that never comes
+ * back, closes before its own rescue runs, or rescued nothing.
+ *
+ *  - Read: every listed overlay segment's changes since its last scan
+ *    (`opts.clearScans`; nothing at all without it), the entries whose
+ *    late edits a clear erased — yielding the event loop between its steps,
+ *    within a per-pass decode budget.
+ *  - Never resurrect: an id in the meta's tombstones, or held by no listed
+ *    shard (deleted since), is left as it is.
+ *  - Owed fields only (`rematerializedEntity`): where her value differs
+ *    from what the clear saw and the documents still hold what it saw — a
+ *    later write (her browser's rescue, a colleague's) wins.
+ *  - Written in place (`foldValueInPlace`, change message
+ *    `maplespire:overlay-clear-rematerialize`) into the LAST listed shard
+ *    holding the id — the copy the read model and the browsers project.
+ *  - Under the pass's ownership guard, flushed, and only then is the scan
+ *    recorded. A failure is reported and costs nothing: the fold goes on, and
+ *    the next pass reads the same changes again.
+ *
+ * Returns how many entities it wrote.
+ */
+async function rematerializeClearedEdits(
+  repo: Repo,
+  resolve: <T>(url: string) => Promise<DocHandle<T>>,
+  metaHandle: DocHandle<MetaLike>,
+  collKey: 'objects' | 'connections',
+  urlsField: 'objectShardUrls' | 'connectionShardUrls',
+  overlayField: 'editsObjectShardUrl' | 'editsConnectionShardUrl',
+  overlayUrlsField: 'editsObjectShardUrls' | 'editsConnectionShardUrls',
+  tombstoneField: 'deletedObjectIds' | 'deletedConnectionIds',
+  opts: CompactionOptions,
+  resolveDeadlineAt: number,
+): Promise<RematerializeOutcome> {
+  const collection = collKey === 'objects' ? 'object' : 'connection'
+  let written = 0
+  // From the deployment on: a segment with no row starts its scan at its heads
+  // when a pass first sees it, read nothing — only what an edit loses after
+  // that is repaired, never the history before the deployment. This first
+  // sighting is BEFORE the segment's first clear: only a pass clears, and this
+  // step runs at the start of the pass, before its fold; a segment created
+  // after the deployment (a pass's fresh head, a rotation's) is therefore first
+  // seen, and recorded, before any clear of it. That holds only if the row is
+  // SAVED. So the named segments with no row are counted BEFORE anything is
+  // resolved, and unless every one of them got its row saved — whatever stopped
+  // the step: a scan table that could not be read, a resolution that failed or
+  // missed the step's ceiling, a failed save — the pass neither folds nor
+  // clears (`firstRowsUnsaved`).
+  const firstIds = new Set<string>()
+  const savedFirstIds = new Set<string>()
+  const outcome = (r: { written: number; failed?: string }): RematerializeOutcome =>
+    [...firstIds].some((id) => !savedFirstIds.has(id)) ? { ...r, firstRowsUnsaved: true } : r
+  // Without a store nothing is ever read: no starting point can be kept.
+  if (!opts.clearScans) return { written: 0 }
+  const scanStore = opts.clearScans
+  try {
+    const meta = metaHandle.doc()
+    const overlayUrl = readMetaUrl(meta, overlayField)
+    const listed = (readMetaUrls(meta, urlsField) ?? []).filter((url) => isValidAutomergeUrl(url))
+    // The overlay segments the meta names now.
+    const named = [...new Set([...(readMetaUrls(meta, overlayUrlsField) ?? []), ...(overlayUrl ? [overlayUrl] : [])]
+      .filter((url): url is string => typeof url === 'string' && isValidAutomergeUrl(url)))]
+    // Until the rows are read, every named segment may be a first sighting:
+    // a scan table that cannot be read refuses the fold too.
+    for (const url of named) firstIds.add(url.slice('automerge:'.length))
+    const since = await scanStore.load(collection)
+    for (const documentId of [...firstIds]) if (since.has(documentId)) firstIds.delete(documentId)
+    if (named.length === 0 && since.size === 0) return { written: 0 }
+    const namedSegments = await resolveCompactionShards(resolve, named, `rematerialize ${collKey} overlay segments`, resolveDeadlineAt)
+    let firstSaveFailed: string | undefined
+    if (firstIds.size > 0) {
+      // Recorded at once, before any scan, and only where no row exists yet
+      // (`onlyNew`). Not behind the ownership guard, and safe without it: a
+      // pass that clears a segment saved its row first, so a pass that lost
+      // the workspace finds that row and moves nothing.
+      const firsts = namedSegments.filter((handle) => firstIds.has(String(handle.documentId)))
+        .map((handle) => ({ documentId: String(handle.documentId), heads: handle.doc() ? getHeads(handle.doc() as never) : [] }))
+      try {
+        await scanStore.save(collection, firsts, { onlyNew: true })
+        for (const first of firsts) if (first.heads.length > 0) savedFirstIds.add(first.documentId)
+      } catch (error) {
+        // Reported, and the fold refused (`outcome`); the scan and its writes
+        // still run, so what is owed elsewhere is not held back by it.
+        firstSaveFailed = error instanceof Error ? error.message : String(error)
+        console.warn(JSON.stringify({ event: 'compaction.overlay_clear_rematerialize_failed', collection: collKey, error: firstSaveFailed }))
+      }
+    }
+    // And the documents an earlier pass scanned as a segment that no list names
+    // any more: a meta with the singular pointer alone forgets a segment once
+    // its head rotates, and a chain fold delists the segments it folds — while
+    // a late edit can still reach one. Bounded per pass, the least recently
+    // scanned first; a row whose document the repo answers is gone is purged,
+    // never retried for ever.
+    const namedIds = new Set(namedSegments.map((handle) => String(handle.documentId)))
+    const listedIds = new Set(listed.map((url) => url.slice('automerge:'.length)))
+    const unnamed = [...since.keys()].filter((id) => !namedIds.has(id))
+      .slice(0, opts.rematerializeUnnamedPerPass ?? REMATERIALIZE_UNNAMED_SEGMENTS_PER_PASS)
+    const unnamedSegments: DocHandle<ShardDoc>[] = []
+    const gone: string[] = []
+    for (const documentId of unnamed) {
+      if (Date.now() >= resolveDeadlineAt) break
+      try {
+        unnamedSegments.push(await resolve<ShardDoc>(`automerge:${documentId}`))
+      } catch (error) {
+        if (!listedIds.has(documentId) && documentGone(error)) gone.push(documentId)
+      }
+    }
+    if (gone.length > 0 && scanStore.purge) {
+      await scanStore.purge(collection, gone)
+      console.warn(JSON.stringify({ event: 'compaction.overlay_clear_scan_purged', collection: collKey, documents: gone.length }))
+    }
+    // Read in the rows' order: the least recently scanned first.
+    const byId = new Map([...namedSegments, ...unnamedSegments].map((handle) => [String(handle.documentId), handle]))
+    const toScan = [...since.keys()].filter((id) => byId.has(id))
+    const graceMs = opts.rematerializeGraceMs ?? 0
+    const now = opts.now?.() ?? Date.now()
+    const yieldNow = opts.yieldToEventLoop ?? (() => new Promise<void>((resolveYield) => setImmediate(resolveYield)))
+    const budget = opts.rematerializeDecodeBudget ?? REMATERIALIZE_DECODE_BUDGET
+    const stats: ScanStats = { decoded: 0 }
+    // `done`: the late changes of a PARKED segment this server already dealt
+    // with — written, owing nothing, or tombstoned. A segment parks for the
+    // entry that keeps it (a grace period, a pending row) and not for the
+    // others: an edit whose changes are all done is not looked at again, so a
+    // colleague's revert of a field the server already wrote back is not
+    // overwritten on every pass while the segment waits.
+    // `seen`: the entry/change keys this scan read — `done` is saved pruned to
+    // them, so it never outgrows the late changes still after the parked
+    // cursor.
+    type Scanned = { documentId: string; heads: readonly string[]; row: ClearScanRow; parked: boolean; lateSeen: Record<string, number>; done: Set<string>; seen: Set<string> }
+    const scanned: Scanned[] = []
+    const found: Array<{ edit: ClearedEntryEdit; segment: Scanned }> = []
+    for (const documentId of toScan) {
+      // The cap: the segment that crossed it was the last read; the rest keep
+      // their rows (and their place at the front of the next pass).
+      if (scanned.length > 0 && stats.decoded >= budget) break
+      const segment = byId.get(documentId)!
+      await yieldNow()
+      const doc = segment.doc()
+      if (!doc) continue
+      const row = since.get(documentId)!
+      // The heads and the read from the same immutable revision: the scan
+      // recorded is the revision read, whatever lands while it yields.
+      const heads = getHeads(doc as never)
+      await yieldNow()
+      const edits = await clearedEntryEditsYielding(doc as never, [...row.heads], [collKey], yieldNow, stats)
+      const entry: Scanned = { documentId, heads, row, parked: false, lateSeen: {}, done: new Set(row.done ?? []), seen: new Set() }
+      scanned.push(entry)
+      for (const edit of edits) {
+        for (const hash of edit.changes) entry.seen.add(`${edit.id}/${hash}`)
+        // By entry AND change: one change can write several entries, only some of them held.
+        if (edit.changes.length > 0 && edit.changes.every((hash) => entry.done.has(`${edit.id}/${hash}`))) continue
+        // The grace period, by the server's clock: from the first pass that
+        // saw each late change (its row's `lateSeen`; this pass for a new one).
+        const firstSeen = (hash: string) => row.lateSeen?.[hash] ?? now
+        if (edit.changes.every((hash) => now - firstSeen(hash) >= graceMs)) { found.push({ edit, segment: entry }); continue }
+        // Still in its grace period: this segment is read again from the
+        // same place next pass, and remembers when each change was first seen.
+        entry.parked = true
+        for (const hash of edit.changes) entry.lateSeen[hash] = firstSeen(hash)
+      }
+    }
+    const touched: DocHandle<ShardDoc>[] = []
+    if (found.length > 0) {
+      const tombstones = new Set((meta?.[tombstoneField] ?? []).filter((id): id is string => typeof id === 'string'))
+      const bySegmentUrl = new Map([...byId.values()].map((handle) => [handle.url as string, handle]))
+      const others = listed.filter((url) => !bySegmentUrl.has(url))
+      const resolved = await resolveCompactionShards(resolve, others, `rematerialize ${collKey} shards`, resolveDeadlineAt)
+      const byUrl = new Map<string, DocHandle<ShardDoc>>([...bySegmentUrl, ...others.map((url, i) => [url, resolved[i]] as const)])
+      // Every segment, named or known by its scan row.
+      const overlaySet = new Set<string>([...byId.values()].map((handle) => handle.url))
+      const head = overlayUrl ? byUrl.get(overlayUrl) : undefined
+      // The unchecked box is honoured: a WRITE she unchecked in the batch
+      // re-apply (an override row `dismissed`) is never written back here.
+      // Scoped to that write — its path AND its value — never to the field for
+      // ever: if she edits the field again and a later clear erases THAT edit,
+      // it is repaired like any other. A row still `pending` holds the field
+      // back whatever the value, and parks the segment, until she decides.
+      const declined = opts.declinedEdits
+        ? await opts.declinedEdits(collection, [...new Set(found.map(({ edit }) => edit.id))])
+        : new Map<string, ReadonlyArray<DeclinedWrite>>()
+      if (opts.stillSafeToWrite && !(await opts.stillSafeToWrite())) return { ...outcome({ written: 0 }), ownershipLost: true }
+      for (const { edit, segment } of found) {
+        const handled = () => { for (const hash of edit.changes) segment.done.add(`${edit.id}/${hash}`) }
+        if (tombstones.has(edit.id)) { handled(); continue }
+        const declinedPaths = declined.get(edit.id) ?? []
+        let heldByPending = false
+        // A field is declined when a declined write's path overlaps it (the
+        // field itself, a key below it, or the map above it) AND her value
+        // there is the value she declined — or the row is still pending.
+        const overlaps = (write: DeclinedWrite, field: readonly string[]) => {
+          const n = Math.min(write.path.length, field.length)
+          for (let i = 0; i < n; i++) if (String(write.path[i]) !== field[i]) return false
+          return true
+        }
+        const isDeclined = (field: readonly string[]) => {
+          if (declinedPaths.some((write) => write.pending && overlaps(write, field))) { heldByPending = true; return true }
+          return declinedPaths.some((write) => !write.pending && overlaps(write, field)
+            && sameDocumentValue(valueAtPath(edit.mine, write.path), write.value))
+        }
+        // Where it lives now: the LAST listed shard holding it (list order is precedence).
+        let home: DocHandle<ShardDoc> | undefined
+        for (const url of listed) {
+          const handle = byUrl.get(url)
+          if (handle?.doc()?.[collKey]?.[edit.id] !== undefined) home = handle
+        }
+        const current = home?.doc()?.[collKey]?.[edit.id] as Record<string, unknown> | undefined
+        if (!home || !current) { handled(); continue }
+        const next = rematerializedEntity(edit.mine as Record<string, unknown>, edit.seen as Record<string, unknown>, current,
+          edit.previous as Record<string, unknown> | undefined, declinedPaths.length ? isDeclined : undefined)
+        // Her decision is still owed: the scan does not move past this edit
+        // (and only this one is looked at again, `done`), and NOTHING of it is
+        // written until she decides: a neighbouring field written now would be
+        // judged "untouched" again on every pass while the row is pending, and
+        // a colleague's revert of it overwritten each time. At the decision the
+        // whole edit is written once, by the field rule (a later write wins). A
+        // held edit keeps the FIRST sighting of each change while it is held —
+        // else her decision would wait one more grace (a day in production)
+        // before it is written.
+        if (heldByPending) {
+          segment.parked = true
+          for (const hash of edit.changes) segment.lateSeen[hash] = segment.row.lateSeen?.[hash] ?? now
+          continue
+        }
+        handled()
+        if (!next) continue
+        // Never into an overlay segment that is no longer the write head: a
+        // retired head written past its recorded heads makes the pass refuse.
+        // Into the current head instead, the whole entity — what a browser's
+        // edit writes; it outranks the older copy, and this pass folds it.
+        const target = home !== head && overlaySet.has(home.url) && head ? head : home
+        target.change((s) => {
+          if (!s[collKey]) s[collKey] = {}
+          const coll = s[collKey]
+          if (target === home && coll[edit.id] === undefined) return
+          foldValueInPlace(coll, edit.id, next)
+        }, { message: OVERLAY_REMATERIALIZE_MESSAGE })
+        if (!touched.includes(target)) touched.push(target)
+        written += 1
+        console.warn(JSON.stringify({
+          event: 'compaction.overlay_clear_rematerialized',
+          collection: collKey, id: edit.id, home: String(target.documentId), changes: edit.changes.length,
+        }))
+      }
+    }
+    // What was written is durable BEFORE the scan moves past it: a crash
+    // between the two would otherwise leave her values in memory only, the
+    // cursor already beyond them.
+    if (touched.length) await repo.flush(touched.map((handle) => handle.documentId))
+    // Re-asked right before the save: a pass that lost
+    // the workspace meanwhile records nothing.
+    if (scanned.length > 0 && opts.stillSafeToWrite && !(await opts.stillSafeToWrite())) return { ...outcome({ written }), ownershipLost: true }
+    const scans: ClearScanSave[] = scanned.map((segment) => segment.parked
+      ? { documentId: segment.documentId, heads: segment.row.heads, lateSeen: segment.lateSeen, done: [...segment.done].filter((key) => segment.seen.has(key)) }
+      : { documentId: segment.documentId, heads: segment.heads })
+    if (scans.length) await scanStore.save(collection, scans)
+    if (firstSaveFailed) return outcome({ written, failed: `${collKey}: ${firstSaveFailed}` })
+    return outcome({ written })
+  } catch (error) {
+    // Reported on the pass's result too, never silent; the
+    // fold goes on, and the next pass reads the same changes again (the scan
+    // is not recorded). Writes already made stand: the fold flushes them.
+    // Except a FIRST sighting not recorded: its starting point would be
+    // a later pass's heads, after this pass's clear — the fold is refused.
+    const message = error instanceof Error ? error.message : String(error)
+    console.warn(JSON.stringify({ event: 'compaction.overlay_clear_rematerialize_failed', collection: collKey, error: message }))
+    return outcome({ written, failed: `${collKey}: ${message}` })
+  }
+}
+
+/** What the G4-16k step did: entities written, a failure, a first sighting
+ * whose row is not saved (the fold is refused), an ownership guard that said
+ * no (the pass stops). */
+type RematerializeOutcome = { written: number; failed?: string; firstRowsUnsaved?: true; ownershipLost?: true }
+
+/** Segments known only by their scan row, resolved per pass and collection
+ * The rest wait, the least recently scanned first. */
+export const REMATERIALIZE_UNNAMED_SEGMENTS_PER_PASS = 16
+/** Changes the scan decodes per pass and collection: past it, the segments
+ * not read yet keep their rows for the next pass. A year of daily clears of
+ * 50 entries (365 x 50) is well inside one pass. */
+export const REMATERIALIZE_DECODE_BUDGET = 200_000
+
+/** The repo's answer that a document is gone (collected), as opposed to slow:
+ * only then is its scan row purged. A timeout or an abort is not. */
+function documentGone(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+  return /unavailable|resolved in state "deleted"/i.test(message) && !/abort|timeout|timed out/i.test(message)
+}
+
+/** Documents resolved at once by a pass (see {@link resolveCompactionShards}). */
+export const COMPACTION_RESOLVE_CONCURRENCY = SERVER_SHARD_RESOLVE_BATCH_SIZE
+/** ONE ceiling for every resolution of a pass (not one per list: a
+ * pass resolves four lists — overlay segments and base shards of both
+ * collections — with the projector detached, so 4 x 120 s). Taken once at
+ * the start of `compactOverlay` (`deadlineAt`); each list gets what is left.
+ * It is a WALL-CLOCK deadline: the work between the lists (the objects
+ * fold's preparation, the `lateWritesPending` query) consumes it too, not
+ * only the finds. Each find keeps its own 10 s from its own start. */
+export const COMPACTION_RESOLVE_DEADLINE_MS = 120_000
+
+/** The pass's resolution ceiling ran out before a list could start. */
+function passCeilingPassed(label: string, total: number): BoundedResolveDeadlineError {
+  return new BoundedResolveDeadlineError(`${label} (the pass's single resolution ceiling)`, 0, 0, total)
+}
+
+/**
+ * Resolve a pass's shard list with a bounded number of finds in flight
+ * (`resolveWithBoundedConcurrency`), so `findReadyDocument`'s 10 s deadline
+ * starts when THAT find starts. Before (G4-16f diagnosis q1), `Promise.all`
+ * started every base shard's find, and so its clock, at once; the projector's
+ * detach had evicted them all, their `A.load` calls ran back to back, and the
+ * last shards timed out on the sum of every load (day 16 on the bench machine, a
+ * reproduction at 4 s on the Mac). A failure names the document and its place.
+ */
+async function resolveCompactionShards(
+  resolve: <T>(url: string) => Promise<DocHandle<T>>,
+  urls: readonly string[],
+  label: string,
+  /** The pass's single resolution deadline (epoch ms), see {@link COMPACTION_RESOLVE_DEADLINE_MS}. */
+  deadlineAt: number,
+): Promise<DocHandle<ShardDoc>[]> {
+  const remaining = deadlineAt - Date.now()
+  if (urls.length && remaining <= 0) throw passCeilingPassed(label, urls.length)
+  return resolveWithBoundedConcurrency(urls, async (url, index) => {
+    const startedAt = Date.now()
+    try {
+      return await resolve<ShardDoc>(url)
+    } catch (error) {
+      throw new Error(
+        `${label}: ${url} (${index + 1} of ${urls.length}) not ready ${Date.now() - startedAt} ms after its own find started `
+        + `(${COMPACTION_RESOLVE_CONCURRENCY} in flight at most): ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error },
+      )
+    }
+  }, {
+    concurrency: COMPACTION_RESOLVE_CONCURRENCY,
+    deadlineMs: Math.max(1, remaining),
+    label: `${label} (what was left of the pass's single resolution ceiling)`,
+  })
 }
 
 /** Fold one overlay collection (objects OR connections) into its base shards, apply delete
@@ -246,7 +927,7 @@ export async function compactOverlay(repo: Repo, rootUrl: string, opts: Compacti
  * either. */
 type FoldOutcome = {
   folded: number; kept: number; deleted: number; aborted?: true
-  abortReason?: 'ownership_lost_mid_fold' | 'retired_head_forward_pending'
+  abortReason?: 'ownership_lost_mid_fold' | CompactionSegmentRefusal
 }
 async function prepareFold(
   repo: Repo,
@@ -262,7 +943,9 @@ async function prepareFold(
   claim?: { workspace: WorkspaceKey; rootUrl: string },
   stillSafeToWrite?: () => Promise<boolean>,
   lateWritesPending?: CompactionOptions['lateWritesPending'],
-): Promise<FoldOutcome | { apply: () => Promise<FoldOutcome> }> {
+  settleRewrittenSegments?: CompactionOptions['settleRewrittenSegments'],
+  resolveDeadlineAt: number = Date.now() + COMPACTION_RESOLVE_DEADLINE_MS,
+): Promise<FoldOutcome | { apply: () => Promise<FoldOutcome>; baseHandles: DocHandle<ShardDoc>[] }> {
   const none = { folded: 0, kept: 0, deleted: 0 }
   const meta = metaHandle.doc()
 
@@ -274,9 +957,9 @@ async function prepareFold(
 
   // Resolve every bounded overlay segment oldest → newest. Legacy workspaces
   // expose only the singular current pointer and remain fully compatible.
-  const overlayUrl = meta?.[overlayField]
+  const overlayUrl = readMetaUrl(meta, overlayField)
   const overlayUrls = [...new Set([
-    ...(meta?.[overlayUrlsField] ?? []),
+    ...(readMetaUrls(meta, overlayUrlsField) ?? []),
     ...(overlayUrl ? [overlayUrl] : []),
   ].filter((url): url is string => typeof url === 'string' && isValidAutomergeUrl(url)))]
   // The singular pointer is the current writer and must be overlaid last.
@@ -284,7 +967,7 @@ async function prepareFold(
     overlayUrls.splice(overlayUrls.indexOf(overlayUrl), 1)
     overlayUrls.push(overlayUrl)
   }
-  const overlayHandles = await Promise.all(overlayUrls.map((url) => resolve<ShardDoc>(url)))
+  const overlayHandles = await resolveCompactionShards(resolve, overlayUrls, `compaction ${collKey} overlay segments`, resolveDeadlineAt)
   const segmentSnapshots = overlayHandles.map((handle) => ({ ...(handle.doc()?.[collKey] ?? {}) }))
   // Same synchronous turn as the snapshot: the heads `lateWritesPending` is
   // asked about must be the revision that was folded.
@@ -300,8 +983,8 @@ async function prepareFold(
   // Load the base shards (every model shard EXCEPT all overlay segments) — needed for both
   // folding and applying tombstone deletes.
   const overlaySet = new Set(overlayUrls)
-  const baseUrls = (meta?.[urlsField] ?? []).filter((u) => !overlaySet.has(u) && isValidAutomergeUrl(u))
-  const baseHandles = await Promise.all(baseUrls.map((u) => resolve<ShardDoc>(u)))
+  const baseUrls = (readMetaUrls(meta, urlsField) ?? []).filter((u) => !overlaySet.has(u) && isValidAutomergeUrl(u))
+  const baseHandles = await resolveCompactionShards(resolve, baseUrls, `compaction ${collKey} base shards`, resolveDeadlineAt)
 
   // id → base-shard index (an existing object lives in exactly one base shard).
   const idToShard = new Map<string, number>()
@@ -349,22 +1032,27 @@ async function prepareFold(
         current: overlayUrls[index] === overlayUrl,
       }),
     ))
-    if (pending.length) {
+    const refusal = Array.isArray(pending)
+      ? { reason: 'retired_head_forward_pending' as const, segments: pending as readonly string[] }
+      : pending as { reason: CompactionSegmentRefusal; segments: readonly string[] }
+    if (refusal.segments.length) {
       console.warn(JSON.stringify({
         event: 'compaction.refused',
-        reason: 'retired_head_forward_pending',
+        reason: refusal.reason,
         collection: collKey,
-        segments: pending,
+        segments: refusal.segments,
       }))
-      return { folded: 0, kept: 0, deleted: 0, aborted: true, abortReason: 'retired_head_forward_pending' }
+      return { folded: 0, kept: 0, deleted: 0, aborted: true, abortReason: refusal.reason }
     }
   }
 
+  const currentIndex = overlayUrl ? overlayUrls.indexOf(overlayUrl) : -1
   return {
+    baseHandles,
     apply: () => applyFold({
       repo, metaHandle, collKey, urlsField, overlayField, overlayUrlsField, tombstoneField, shardSize, claim,
       stillSafeToWrite, tombstones, tombSet, overlayHandles, segmentSnapshots, snapshot, ids, overlaySet,
-      baseHandles, idToShard, existingByShard, created,
+      baseHandles, idToShard, existingByShard, created, currentIndex, settleRewrittenSegments,
     }),
   }
 }
@@ -394,11 +1082,14 @@ async function applyFold(prepared: {
   idToShard: Map<string, number>
   existingByShard: Map<number, string[]>
   created: string[]
+  /** Index in `overlayHandles` of the current write head, or -1. */
+  currentIndex: number
+  settleRewrittenSegments?: CompactionOptions['settleRewrittenSegments']
 }): Promise<FoldOutcome> {
   const {
     repo, metaHandle, collKey, urlsField, overlayField, overlayUrlsField, tombstoneField, shardSize, claim,
     stillSafeToWrite, tombstones, tombSet, overlayHandles, segmentSnapshots, snapshot, ids, overlaySet,
-    baseHandles, idToShard, existingByShard, created,
+    baseHandles, idToShard, existingByShard, created, currentIndex, settleRewrittenSegments,
   } = prepared
   // OWNERSHIP GUARD, first consultation — the last instant before this function writes
   // anything. Everything above was reads, and resolving the base shards is an
@@ -408,8 +1099,8 @@ async function applyFold(prepared: {
     return { folded: 0, kept: 0, deleted: 0, aborted: true }
   }
 
-  // Fold edits in place — the overlay entry is the authoritative current value, so a
-  // full replace is correct (and structurally merges into the CRDT shard).
+  // Fold edits in place — the overlay entry is the authoritative current value, so
+  // the result is a full replace, written field by field (`foldValueInPlace`).
   for (const [idx, shardIds] of existingByShard) {
     baseHandles[idx].change((s) => {
       // Assign, then RE-READ: `s[k] ?? (s[k] = {})` yields the plain `{}`, not
@@ -417,7 +1108,7 @@ async function applyFold(prepared: {
       // before the overlay copy is cleared below.
       if (!s[collKey]) s[collKey] = {}
       const coll = s[collKey]
-      for (const id of shardIds) coll[id] = snapshot[id] as Record<string, unknown>
+      for (const id of shardIds) foldValueInPlace(coll, id, snapshot[id])
     })
   }
 
@@ -433,7 +1124,11 @@ async function applyFold(prepared: {
       baseHandles[i].change((s) => {
         if (!s[collKey]) s[collKey] = {}
         const coll = s[collKey]
-        for (const id of take) coll[id] = snapshot[id] as Record<string, unknown>
+        // A created id is absent from every base shard (`idToShard`), so the
+        // helper assigns it whole here. The third path, the overflow into NEW
+        // shards below, writes whole without the helper, which is correct:
+        // those documents are new and there is nothing to diff against.
+        for (const id of take) foldValueInPlace(coll, id, snapshot[id])
       })
       ci += take.length
     }
@@ -458,11 +1153,13 @@ async function applyFold(prepared: {
             return handle
           })()
       metaHandle.change((m) => {
-        if (!m[urlsField]) m[urlsField] = []
-        const urls = m[urlsField] as string[]
+        const urls = [...(readMetaUrls(m, urlsField) ?? [])]
         const oIdx = urls.findIndex((url) => overlaySet.has(url))
         if (oIdx >= 0) urls.splice(oIdx, 0, newHandle.url)
         else urls.push(newHandle.url)
+        // A middle insertion: `writeMetaUrls` inserts it at its position and
+        // re-creates nothing after it.
+        writeMetaUrls(m, urlsField, urls)
       })
       ci += take.length
     }
@@ -552,8 +1249,17 @@ async function applyFold(prepared: {
         if (JSON.stringify(cur) === JSON.stringify(captured)) delete coll[id]
         else keptIds.add(id)
       }
-    }))
+    }, { message: OVERLAY_COMPACTION_CLEAR_MESSAGE }))
   }
+  // EVERY segment's heads, in the SAME synchronous turn as the clear above (and
+  // after the tombstone deletes, so a tombstone-only pass is covered too): the
+  // revision `settleRewrittenSegments` records is the one this pass wrote, and
+  // a write arriving after it is after its H_r, for the forwarder.
+  const rewritten = overlayHandles.map((handle, index) => ({
+    documentId: String(handle.documentId),
+    heads: (() => { try { return getHeads(handle.doc() as never) } catch { return [] as string[] } })(),
+    current: index === currentIndex,
+  }))
   // Never leave the singular pointer on a cleared document with a large CRDT
   // history. New clients resolve only this fresh bounded head; historical URLs
   // remain referenced so stale/offline clients can finish syncing safely.
@@ -568,13 +1274,18 @@ async function applyFold(prepared: {
         await repo.flush([handle.documentId])
         return handle
       })()
+  // BEFORE ModelMeta moves (G4-16i, the header): the rows are committed first,
+  // over heads already in storage — a row naming heads the stored document
+  // lacks refuses every forward of it for ever (`unknown-heads`). A throw ends
+  // the pass here, with the pointer unmoved.
+  if (settleRewrittenSegments) {
+    await repo.flush(overlayHandles.map((handle) => handle.documentId))
+    await settleRewrittenSegments(collKey === 'objects' ? 'object' : 'connection', rewritten)
+  }
   metaHandle.change((m) => {
-    const segments = [...new Set([...(m[overlayUrlsField] ?? []), nextHead.url])]
-    m[overlayUrlsField] = segments
-    m[overlayField] = nextHead.url
-    if (!m[urlsField]) m[urlsField] = []
-    const shardUrls = m[urlsField] as string[]
-    if (!shardUrls.includes(nextHead.url)) shardUrls.push(nextHead.url)
+    appendCompactionSegmentInPlace(m, overlayUrlsField, nextHead.url)
+    writeMetaUrl(m, overlayField, nextHead.url)
+    appendMetaUrl(m, urlsField, nextHead.url)
     // NOT the same number as `nextHeadValue`'s `writeHeadVersion` above,
     // despite both reading `1`: that one is a per-document lifecycle marker,
     // this one is the meta's protocol version the client compares against.

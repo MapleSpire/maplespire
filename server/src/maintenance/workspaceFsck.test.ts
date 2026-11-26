@@ -14,6 +14,11 @@
 
 import { describe, expect, it, vi } from 'vitest'
 import { generateAutomergeUrl, isValidAutomergeUrl } from '@automerge/automerge-repo'
+import { MODEL_EPOCH_FSCK_CHECKS } from './modelEpochFsck.js'
+/** The skips of the STRUCTURE checks: the epoch checks are pinned in
+ * `modelEpochFsck.test.ts` (here they skip as "no model epochs"). */
+const structural = <T extends { check: string }>(skipped: readonly T[]): T[] =>
+  skipped.filter((entry) => !(entry.check in MODEL_EPOCH_FSCK_CHECKS))
 import { FSCK_CHECKS, REGISTRY_HEAD_PROJECTION_GRACE_MS, checkWorkspaceStructure, collectReferencedUrls, documentIdOf, fsckStatusOf, registryDiagramEntries, groupSharedRoots, OVERLAY_CHAIN_CEILING, OVERLAY_HEAD_CEILING, OVERLAY_HEAD_ROTATION_GRACE_MS, measureOverlayWriteHeads, overlayWriteHeadBytesTotal, OVERLAY_SEGMENT_BYTE_CEILING, type OverlayWriteHeadSize, type OverlaySegmentSize } from './workspaceFsck.js'
 import { OVERLAY_WRITE_HEAD_VERSION, buildModelMeta } from '../modelMeta.js'
 import { OVERLAY_SEGMENT_SIZE } from '../overlaySegments.js'
@@ -176,7 +181,7 @@ describe('workspace fsck — the document-graph invariants', () => {
     // checked". The positive coverage is the static fixture next door.
     expect([...result.checksRun, ...result.checksSkipped.map((entry) => entry.check)].sort())
       .toEqual(Object.keys(FSCK_CHECKS).sort())
-    expect(result.checksSkipped).toEqual([
+    expect(structural(result.checksSkipped)).toEqual([
       { check: 'overlay-head-bounded', reason: 'ordinary workspace: overlay rotation is a static-plane mechanism' },
       // ORDINARY head rotation is off unless `AM_ORDINARY_HEAD_ROTATION=on`
       // names the workspace; the fixture next door turns it on.
@@ -200,9 +205,9 @@ describe('workspace fsck — the document-graph invariants', () => {
     // the ORDINARY projector refuses, and this plane reads those maps `?? {}`.
     // `ordinary-head-actors-bounded` too: the static plane's heads are bounded
     // by `overlay-head-bounded`, which RUNS here.
-    expect(result.checksSkipped.map((entry) => entry.check)).toEqual(['model-containers-present', 'ordinary-head-actors-bounded'])
-    for (const skipped of result.checksSkipped) expect(skipped.reason).toMatch(/^static workspace/)
-    expect([...result.checksRun, 'model-containers-present', 'ordinary-head-actors-bounded'].sort())
+    expect(structural(result.checksSkipped).map((entry) => entry.check)).toEqual(['model-containers-present', 'ordinary-head-actors-bounded'])
+    for (const skipped of structural(result.checksSkipped)) expect(skipped.reason).toMatch(/^static workspace/)
+    expect([...result.checksRun, 'model-containers-present', 'ordinary-head-actors-bounded', ...Object.keys(MODEL_EPOCH_FSCK_CHECKS)].sort())
       .toEqual(Object.keys(FSCK_CHECKS).sort())
     expect(fsckStatusOf(result.findings, result.checksSkipped)).toBe('clean')
   })
@@ -222,7 +227,7 @@ describe('workspace fsck — the document-graph invariants', () => {
       expect(result.checksRun).toContain('ordinary-head-actors-bounded')
       // `overlay-head-bounded` still does not apply, and says why in terms of
       // what this rotator bounds.
-      expect(result.checksSkipped).toEqual([{
+      expect(structural(result.checksSkipped)).toEqual([{
         check: 'overlay-head-bounded',
         reason: 'ordinary workspace: its rotation bounds actors and changes, not entities (ordinary-head-actors-bounded)',
       }])
@@ -338,7 +343,7 @@ describe('workspace fsck — the document-graph invariants', () => {
     })
     expect(result.findings).toEqual([])
     expect(result.checksRun).toContain('diagram-doc-url')
-    expect(result.checksSkipped.map((s) => s.check)).toEqual([
+    expect(structural(result.checksSkipped).map((s) => s.check)).toEqual([
       'write-head-writable',
       'model-write-head', 'write-head-version', 'model-containers-present', 'container-conflict', 'overlay-chain-bounded',
       // A monolith has no overlay WRITE HEAD either, for the same reason

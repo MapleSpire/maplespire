@@ -82,6 +82,15 @@ services:
     # (firewall or NAT eviction) after ~2 minutes instead of the OS default of
     # 2 hours. Set all three: idle alone leaves detection at ~12 minutes.
     # Check them over TCP (`psql -h 127.0.0.1`); a Unix-socket session reads 0.
+    #
+    # max_wal_size: 8 GB, not the 1 GB default. A read-model cold build writes
+    # its whole workspace in ONE transaction: at 119 000 objects, 2.8 GB of WAL
+    # for a first build, 3.9 GB for a rebuild, 4.6-4.7 GB beside other
+    # workspaces. A checkpoint is requested at about max_wal_size / 1.9, and
+    # each one mid-build turns the next page writes into full-page images again
+    # (a 153 s attach on a slow disk). At 8 GB a lone build triggers none
+    # (measured). It is a ceiling, not an allocation: provision ~10 GB for
+    # pg_wal.
     command:
       - postgres
       - -c
@@ -90,6 +99,8 @@ services:
       - tcp_keepalives_interval=10
       - -c
       - tcp_keepalives_count=6
+      - -c
+      - max_wal_size=8GB
     environment:
       POSTGRES_USER: maplespire
       POSTGRES_PASSWORD: ${MAPLESPIRE_POSTGRES_PASSWORD:?Run node scripts/init-env.mjs first - see docs/getting-started.md}

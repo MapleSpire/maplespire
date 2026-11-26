@@ -13,12 +13,19 @@
 // GNU Affero General Public License for more details.
 
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest'
-import { EventEmitter } from 'node:events'
+import { EventEmitter, getEventListeners } from 'node:events'
 import { setImmediate as turn } from 'node:timers/promises'
 import { Worker } from 'node:worker_threads'
 import * as A from '@automerge/automerge'
-import { DurableHeadsDecoder, durableHeadsDecoder } from './durableHeadsDecoder.js'
-import { prepareDocumentWatermarkProofs } from './arrivalWatermark.js'
+import {
+  DurableDecodeError,
+  DurableDecodeTransientError,
+  DurableHeadsDecoder,
+  MAX_TIMER_MS,
+  durableHeadsDecoder,
+} from './durableHeadsDecoder.js'
+import { decodeFailureKind, decodeFailureResponse } from './durableDecodeFailure.mjs'
+import { TRANSIENT_DECODE_LIMIT, prepareDocumentWatermarkProofs, resetTransientDecodesForTest } from './arrivalWatermark.js'
 import type { Queryable } from './types.js'
 
 function deferred<T = void>() {
@@ -278,6 +285,7 @@ describe('DurableHeadsDecoder ownership and transport', () => {
     ['absent heads', request => ({ id: request.id, documentId: request.documentId })],
     ['heads plus error', request => ({ ...request, heads: [], error: 'bad' })],
     ['invalid error type', request => ({ ...request, heads: [], error: true })],
+    ['unknown error kind', request => ({ id: request.id, documentId: request.documentId, error: 'bad', errorKind: 'other' })],
     ['null response', () => null],
   ]
   it.each(invalidResponses)('retires %s and waits for termination before replacement', async (_label, makeResponse) => {
@@ -415,6 +423,285 @@ describe('DurableHeadsDecoder ownership and transport', () => {
   })
 })
 
+describe('DurableHeadsDecoder priorities and error kinds (G4-16f)', () => {
+  it('serves a waiting FOREGROUND decode before an earlier BACKGROUND one, never interrupting the decode in flight', async () => {
+    const worker = fake()
+    const value = decoder(() => asWorker(worker))
+    const order: string[] = []
+    const inFlight = value.decodeField('in-flight', [], 'objects', 'background').then(() => order.push('in-flight'))
+    await turn()
+    const background = value.decodeField('background', [], 'objects', 'background').then(() => order.push('background'))
+    const foreground = value.decode('foreground', []).then(() => order.push('foreground'))
+    await turn()
+    expect(value.queued).toEqual({ foreground: 1, background: 1 })
+    expect(worker.requests.map(({ request }) => request.documentId)).toEqual(['in-flight'])
+    const answerField = () => {
+      const { id, documentId } = worker.requests.at(-1)!.request
+      worker.emit('message', { id, documentId, heads: [], json: '{}' })
+    }
+    answerField()
+    await inFlight
+    await turn()
+    expect(worker.requests.map(({ request }) => request.documentId)).toEqual(['in-flight', 'foreground'])
+    worker.answer()
+    await foreground
+    await turn()
+    expect(worker.requests.at(-1)!.request.documentId).toBe('background')
+    answerField()
+    await background
+    expect(order).toEqual(['in-flight', 'foreground', 'background'])
+    expect(value.queued).toEqual({ foreground: 0, background: 0 })
+  })
+
+  it('tags an ANSWERED failure with its kind (refused / serialize); a crashed worker is a plain error', async () => {
+    const worker = fake()
+    const value = decoder(() => asWorker(worker))
+    const reply = async (message: Record<string, unknown>) => {
+      const result = observe(value.decodeField('a', [], 'objects'))
+      await turn()
+      const { id, documentId } = worker.requests.at(-1)!.request
+      worker.emit('message', { id, documentId, ...message })
+      return (await result.result) as { ok: false; error: Error }
+    }
+    const refused = await reply({ error: 'bad bytes', errorKind: 'refused' })
+    expect(refused.error).toBeInstanceOf(DurableDecodeError)
+    expect((refused.error as DurableDecodeError).kind).toBe('refused')
+    // No kind (an older worker): a refusal.
+    expect(((await reply({ error: 'bad bytes' })).error as DurableDecodeError).kind).toBe('refused')
+    expect(((await reply({ error: 'BigInt', errorKind: 'serialize' })).error as DurableDecodeError).kind).toBe('serialize')
+    const crashed = observe(value.decode('b', []))
+    await turn()
+    worker.emit('exit', 1)
+    worker.termination.resolve(1)
+    const outcome = await crashed.result as { ok: false; error: Error }
+    expect(outcome.ok).toBe(false)
+    expect(outcome.error).not.toBeInstanceOf(DurableDecodeError)
+  })
+
+  it('a TRANSIENT answer (out of memory) is a plain error, never a refusal, and the isolate is replaced', async () => {
+    const old = fake()
+    const fresh = fake()
+    let spawned = 0
+    const value = decoder(() => asWorker(++spawned === 1 ? old : fresh))
+    const first = observe(value.decodeField('a', [], 'objects', 'background'))
+    await turn()
+    const { id, documentId } = old.requests[0]!.request
+    old.emit('message', { id, documentId, error: 'out of memory', errorKind: 'transient' })
+    await turn()
+    expect(old.terminations).toBe(1)
+    old.termination.resolve(1)
+    const outcome = await first.result as { ok: false; error: Error }
+    expect(outcome.ok).toBe(false)
+    expect(outcome.error).not.toBeInstanceOf(DurableDecodeError)
+    expect(outcome.error).toBeInstanceOf(DurableDecodeTransientError)
+    expect(outcome.error.message).toMatch(/transiently: out of memory/)
+    // The next decode runs on a NEW isolate.
+    const second = observe(value.decode('b', []))
+    await turn()
+    expect(spawned).toBe(2)
+    fresh.answer(['fresh'])
+    expect(await second.result).toEqual({ ok: true, value: ['fresh'] })
+  })
+
+  it('a TRAPPED refusal (a wasm panic on these bytes) is a DurableDecodeError refusal, AND the isolate that trapped is replaced', async () => {
+    const old = fake()
+    const fresh = fake()
+    let spawned = 0
+    const value = decoder(() => asWorker(++spawned === 1 ? old : fresh))
+    const first = observe(value.decodeField('a', [], 'objects', 'background'))
+    await turn()
+    const { id, documentId } = old.requests[0]!.request
+    old.emit('message', { id, documentId, error: 'unreachable', errorKind: 'refused', trapped: true })
+    expect(await first.result).toMatchObject({ ok: false, error: { name: 'DurableDecodeError', kind: 'refused' } })
+    await turn()
+    expect(old.terminations).toBe(1)
+    old.termination.resolve(1)
+    const second = observe(value.decode('b', []))
+    await turn()
+    expect(spawned).toBe(2)
+    fresh.answer(['fresh'])
+    expect(await second.result).toEqual({ ok: true, value: ['fresh'] })
+    // Control: an untrapped refusal keeps its isolate.
+    const third = observe(value.decode('c', []))
+    await turn()
+    const last = fresh.requests.at(-1)!.request
+    fresh.emit('message', { id: last.id, documentId: last.documentId, error: 'bad checksum', errorKind: 'refused', trapped: false })
+    expect(await third.result).toMatchObject({ ok: false, error: { name: 'DurableDecodeError', kind: 'refused' } })
+    await turn()
+    expect(fresh.terminations).toBe(0)
+    // A `trapped` that is not a boolean is an invalid response.
+    const fourth = observe(value.decode('d', []))
+    await turn()
+    const bad = fresh.requests.at(-1)!.request
+    fresh.emit('message', { id: bad.id, documentId: bad.documentId, error: 'x', errorKind: 'refused', trapped: 'yes' })
+    await turn()
+    fresh.termination.resolve(1)
+    expect(await fourth.result).toMatchObject({ ok: false, error: { message: 'invalid durable heads worker response' } })
+  })
+
+  it('decodeFailureKind: a malformed document, a wasm panic and the stack limit are REFUSED (properties of the bytes); memory exhaustion, whatever its class, is TRANSIENT', () => {
+    const real = (() => { try { A.load(new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8])); return null } catch (error) { return error } })()
+    expect(real).toBeInstanceOf(RangeError) // the premise: a refusal IS a RangeError
+    expect(decodeFailureKind(real)).toBe('refused')
+    expect(decodeFailureKind(new RangeError('bad checksum'))).toBe('refused')
+    expect(decodeFailureKind(new Error('incomplete durable document dependencies: x'))).toBe('refused')
+    expect(decodeFailureKind(new WebAssembly.RuntimeError('unreachable'))).toBe('refused')
+    expect(decodeFailureKind(new WebAssembly.RuntimeError('memory access out of bounds'))).toBe('refused')
+    expect(decodeFailureKind(new RangeError('Maximum call stack size exceeded'))).toBe('refused')
+    expect(decodeFailureKind(new WebAssembly.RuntimeError('WebAssembly.Memory.grow(): Maximum memory size exceeded'))).toBe('transient')
+    expect(decodeFailureKind(new RangeError('Array buffer allocation failed'))).toBe('transient')
+    expect(decodeFailureKind(new RangeError('WebAssembly.Memory.grow(): Maximum memory size exceeded'))).toBe('transient')
+    expect(decodeFailureKind(Object.assign(new Error('BigInt'), { errorKind: 'serialize' }))).toBe('serialize')
+  })
+
+  it('the worker answers a failure with decodeFailureResponse: a wasm trap is flagged `trapped` (the isolate is retired), a plain refusal is not — and the REAL worker sends that field', async () => {
+    const request = { id: 7, documentId: 'd' }
+    expect(decodeFailureResponse(request, new WebAssembly.RuntimeError('unreachable')))
+      .toEqual({ id: 7, documentId: 'd', error: 'unreachable', errorKind: 'refused', trapped: true })
+    expect(decodeFailureResponse(request, new WebAssembly.RuntimeError('WebAssembly.Memory.grow(): Maximum memory size exceeded')))
+      .toMatchObject({ errorKind: 'transient', trapped: true })
+    expect(decodeFailureResponse(request, new RangeError('bad checksum'))).toMatchObject({ errorKind: 'refused', trapped: false })
+    expect(decodeFailureResponse(request, 'a string')).toEqual({ id: 7, documentId: 'd', error: 'a string', errorKind: 'refused', trapped: false })
+    // The wire: what the real worker posts for garbage bytes carries the field.
+    const answers: unknown[] = []
+    const value = decoder(() => {
+      const worker = new Worker(new URL('./durableHeadsWorker.mjs', import.meta.url))
+      worker.on('message', (message) => answers.push(message))
+      return worker
+    })
+    await expect(value.decode('garbage', [new Uint8Array([0, 1, 2, 3, 4])])).rejects.toMatchObject({ name: 'DurableDecodeError', kind: 'refused' })
+    expect(answers).toEqual([expect.objectContaining({ documentId: 'garbage', errorKind: 'refused', trapped: false })])
+  })
+
+  it('decodeFailureKind, message by message: each memory phrase alone is transient, and phrases that merely MENTION memory stay refusals', () => {
+    for (const message of ['out of memory', 'Out of memory', 'allocation failed', 'could not allocate memory', 'cannot allocate memory',
+      'failed to grow memory', 'Maximum memory size exceeded']) {
+      expect(decodeFailureKind(new RangeError(message)), message).toBe('transient')
+    }
+    for (const message of ['unable to parse chunk: bad checksum', 'bad checksum', 'Invalid array length', 'Invalid string length',
+      'Invalid typed array length: 99', 'incomplete durable document dependencies: x', 'memory layout unsupported chunk type',
+      'unexpected end of input', 'invalid UTF-8', 'Maximum call stack size exceeded', 'unreachable']) {
+      expect(decodeFailureKind(new RangeError(message)), message).toBe('refused')
+    }
+    expect(decodeFailureKind('a string')).toBe('refused')
+    expect(decodeFailureKind(undefined)).toBe('refused')
+    expect(decodeFailureKind(null)).toBe('refused')
+  })
+
+  it('a waiter GRANTED the reservation, and one ABANDONED at its deadline, both leave no abort listener on the shared signal (a writer-lifetime signal would accumulate one per wait)', async () => {
+    const worker = fake()
+    const value = decoder(() => asWorker(worker))
+    const inFlight = observe(value.decode('in-flight', []))
+    await turn()
+    const controller = new AbortController()
+    const granted = Array.from({ length: 5 }, (_, at) =>
+      observe(value.decodeField(`w${at}`, [], 'objects', 'background', { signal: controller.signal, maxWaitMs: 60_000 })))
+    const late = observe(value.decodeField('late', [], 'objects', 'background', { signal: controller.signal, maxWaitMs: 20 }))
+    await turn()
+    expect(getEventListeners(controller.signal, 'abort')).toHaveLength(6)
+    expect(await late.result).toMatchObject({ ok: false, error: { name: 'DecodeWaitAbandoned', reason: 'timeout' } })
+    expect(getEventListeners(controller.signal, 'abort'), 'the abandoned waiter removed its listener').toHaveLength(5)
+    worker.answer()
+    await inFlight.result
+    for (const waiter of granted) {
+      await turn()
+      const { id, documentId } = worker.requests.at(-1)!.request
+      worker.emit('message', { id, documentId, heads: [], json: '{}' })
+      expect(await waiter.result).toMatchObject({ ok: true })
+    }
+    expect(getEventListeners(controller.signal, 'abort'), 'granted waiters removed theirs').toHaveLength(0)
+    // The timed-out waiter never received the reservation: its bytes were never sent.
+    expect(worker.requests.map(({ request }) => request.documentId)).not.toContain('late')
+  })
+
+  it('a maxWaitMs beyond a Node timer\'s 2^31-1 ms is clamped to it, not turned into 1 ms', async () => {
+    const worker = fake()
+    const value = decoder(() => asWorker(worker))
+    const inFlight = observe(value.decode('in-flight', []))
+    await turn()
+    const huge = observe(value.decodeField('huge', [], 'objects', 'background', { maxWaitMs: 2 ** 31 + 10 }))
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    expect(huge.settled(), 'still waiting after 100 ms').toBe(false)
+    expect(value.queued).toEqual({ foreground: 0, background: 1 })
+    worker.answer()
+    await inFlight.result
+    await turn()
+    const { id, documentId } = worker.requests.at(-1)!.request
+    worker.emit('message', { id, documentId, heads: [], json: '{}' })
+    expect(await huge.result).toMatchObject({ ok: true })
+    expect(MAX_TIMER_MS).toBe(2_147_483_647)
+  })
+
+  it('a NaN or infinite maxWaitMs is REFUSED (RangeError) before anything is reserved — never a 1 ms timer that gives up at once', async () => {
+    const worker = fake()
+    const value = decoder(() => asWorker(worker))
+    const inFlight = observe(value.decode('in-flight', []))
+    await turn()
+    for (const maxWaitMs of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+      await expect(value.decodeField('bad', [], 'objects', 'background', { maxWaitMs }), String(maxWaitMs))
+        .rejects.toThrow(RangeError)
+      expect(value.queued, `${maxWaitMs} never queued`).toEqual({ foreground: 0, background: 0 })
+    }
+    // Refused while FREE too: never handed the reservation.
+    worker.answer()
+    await inFlight.result
+    await expect(value.decodeField('bad-free', [], 'objects', 'background', { maxWaitMs: Number.NaN })).rejects.toThrow(RangeError)
+    expect(worker.requests.map(({ request }) => request.documentId)).not.toContain('bad-free')
+    expect(worker.requests.map(({ request }) => request.documentId)).not.toContain('bad')
+    // And the decoder is still usable: the refusal took nothing.
+    const after = observe(value.decode('after', []))
+    await turn()
+    const { id, documentId } = worker.requests.at(-1)!.request
+    expect(documentId).toBe('after')
+    worker.emit('message', { id, documentId, heads: [] })
+    expect(await after.result).toMatchObject({ ok: true })
+  })
+
+  it('a WAIT for the decoder is ended by its signal or its deadline: removed from the queue, never handed the reservation', async () => {
+    const worker = fake()
+    const value = decoder(() => asWorker(worker))
+    const inFlight = observe(value.decode('in-flight', []))
+    await turn()
+    const controller = new AbortController()
+    const aborted = observe(value.decodeField('aborted', [], 'objects', 'background', { signal: controller.signal }))
+    const timedOut = observe(value.decodeField('timed-out', [], 'objects', 'background', { maxWaitMs: 30 }))
+    const next = observe(value.decodeField('next', [], 'objects', 'background'))
+    await turn()
+    expect(value.queued).toEqual({ foreground: 0, background: 3 })
+    controller.abort()
+    expect(await aborted.result).toMatchObject({ ok: false, error: { name: 'DecodeWaitAbandoned', reason: 'aborted' } })
+    expect(await timedOut.result).toMatchObject({ ok: false, error: { name: 'DecodeWaitAbandoned', reason: 'timeout' } })
+    expect(value.queued).toEqual({ foreground: 0, background: 1 })
+    expect(next.settled()).toBe(false)
+    worker.answer()
+    await inFlight.result
+    await turn()
+    // The reservation went to the one waiter left; the abandoned ones sent nothing.
+    expect(worker.requests.map(({ request }) => request.documentId)).toEqual(['in-flight', 'next'])
+    const { id, documentId } = worker.requests.at(-1)!.request
+    worker.emit('message', { id, documentId, heads: [], json: '{}' })
+    expect(await next.result).toMatchObject({ ok: true })
+    // An already-aborted signal is refused before any wait.
+    await expect(value.decodeField('late', [], 'objects', 'background', { signal: controller.signal }))
+      .rejects.toMatchObject({ name: 'DecodeWaitAbandoned', reason: 'aborted' })
+  })
+
+  it('the real worker: an integer beyond 2^53 decodes but has no JSON form (serialize), garbage bytes are refused', async () => {
+    const doc = A.from<{ objects: Record<string, unknown> }>({ objects: { x: { id: 'x', value: 1152921504606846976 } } })
+    const bytes = A.save(doc)
+    A.free(doc)
+    const value = decoder()
+    await expect(value.decodeField('big', [bytes], 'objects')).rejects.toMatchObject({ name: 'DurableDecodeError', kind: 'serialize' })
+    await expect(value.decodeField('garbage', [new Uint8Array([0, 1, 2, 3, 4])], 'objects'))
+      .rejects.toMatchObject({ name: 'DurableDecodeError', kind: 'refused' })
+    // The same worker still answers.
+    const plain = A.from<{ objects: Record<string, unknown> }>({ objects: { y: { id: 'y' } } })
+    const plainBytes = A.save(plain)
+    A.free(plain)
+    expect((await value.decodeField('plain', [plainBytes], 'objects')).json).toBe('{"y":{"id":"y"}}')
+  })
+})
+
 describe('prepareDocumentWatermarkProofs uses the real decoder', () => {
   function database(rows: { document_id: string; data: unknown }[], onRead: () => Promise<void> = async () => {}) {
     const statements: string[] = []
@@ -451,6 +738,61 @@ describe('prepareDocumentWatermarkProofs uses the real decoder', () => {
     await expect(prepareDocumentWatermarkProofs(db, [target('a')])).rejects.toThrow('incomplete durable document dependencies')
     rows.splice(1, 0, { document_id: 'a', data: f.increment1 })
     expect((await prepareDocumentWatermarkProofs(db, [target('a')])).durableHeadsById.get('a')).toEqual(f.heads2)
+  })
+
+  it('a TRANSIENT decode failure recurring on the SAME row versions fails the proof twice, then SKIPS the document (no heads, no further decode) until a row changes; a success clears the count', async () => {
+    resetTransientDecodesForTest()
+    try {
+      expect(TRANSIENT_DECODE_LIMIT).toBe(3)
+      const f = revisions()
+      const rows: Array<{ document_id: string; key: string; arrival_seq: string; data: Uint8Array }> = [
+        { document_id: 'a', key: 'a/snapshot/s', arrival_seq: '1', data: f.snapshot },
+        { document_id: 'b', key: 'b/snapshot/s', arrival_seq: '2', data: f.snapshot },
+      ]
+      const { db } = database(rows)
+      const real = durableHeadsDecoder.decode.bind(durableHeadsDecoder)
+      const decode = vi.spyOn(durableHeadsDecoder, 'decode').mockImplementation(async (documentId, chunks) => {
+        if (documentId === 'a') throw new DurableDecodeTransientError('out of memory')
+        return real(documentId, chunks)
+      })
+      const decodesOf = (id: string) => decode.mock.calls.filter(([documentId]) => documentId === id).length
+      await expect(prepareDocumentWatermarkProofs(db, [target('a'), target('b')])).rejects.toBeInstanceOf(DurableDecodeTransientError)
+      await expect(prepareDocumentWatermarkProofs(db, [target('a'), target('b')])).rejects.toBeInstanceOf(DurableDecodeTransientError)
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      const third = await prepareDocumentWatermarkProofs(db, [target('a'), target('b')])
+      expect([...third.durableHeadsById.keys()]).toEqual(['b'])
+      // Logged ONCE, as a warning naming the document.
+      expect(warn.mock.calls.map(([line]) => JSON.parse(String(line))))
+        .toEqual([expect.objectContaining({ event: 'read_model.durable_proof_transient_skipped', documentId: 'a', failures: 3 })])
+      expect(decodesOf('a')).toBe(3)
+      // Skipped without decoding while the rows are the same, and silently.
+      expect([...(await prepareDocumentWatermarkProofs(db, [target('a')])).durableHeadsById.keys()]).toEqual([])
+      expect([...(await prepareDocumentWatermarkProofs(db, [target('a')])).durableHeadsById.keys()]).toEqual([])
+      expect(decodesOf('a')).toBe(3)
+      expect(warn).toHaveBeenCalledTimes(1)
+      // A changed row is a new set: decoded again (and refused again, transiently).
+      rows[0] = { ...rows[0]!, arrival_seq: '3' }
+      await expect(prepareDocumentWatermarkProofs(db, [target('a')])).rejects.toBeInstanceOf(DurableDecodeTransientError)
+      expect(decodesOf('a')).toBe(4)
+      // A success clears the count: the next transient run starts from one
+      // again, so TWO more failures still throw (one failure was counted on
+      // this set before the success; without the clear the second would skip).
+      decode.mockImplementation(real)
+      expect((await prepareDocumentWatermarkProofs(db, [target('a')])).durableHeadsById.get('a')).toEqual(f.heads0)
+      decode.mockImplementation(async (documentId, chunks) => {
+        if (documentId === 'a') throw new DurableDecodeTransientError('out of memory')
+        return real(documentId, chunks)
+      })
+      await expect(prepareDocumentWatermarkProofs(db, [target('a')])).rejects.toBeInstanceOf(DurableDecodeTransientError)
+      await expect(prepareDocumentWatermarkProofs(db, [target('a')])).rejects.toBeInstanceOf(DurableDecodeTransientError)
+      // A REFUSAL is not counted: it throws every time, as before.
+      decode.mockImplementation(async () => { throw new DurableDecodeError('bad checksum', 'refused') })
+      for (let at = 0; at < 4; at += 1) {
+        await expect(prepareDocumentWatermarkProofs(db, [target('b')])).rejects.toBeInstanceOf(DurableDecodeError)
+      }
+    } finally {
+      resetTransientDecodesForTest()
+    }
   })
 
   it('refuses a non-byte SQL chunk before it can become a successful proof', async () => {

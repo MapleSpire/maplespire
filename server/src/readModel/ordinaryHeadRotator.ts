@@ -27,6 +27,7 @@ import type { OverlayCollection } from './overlayHistoryProtocol.js'
 import type { WorkspaceKey } from './projector.js'
 import type { ReleasableQueryable } from './queryableShape.js'
 import type { Queryable } from './types.js'
+import { readMetaUrl } from '../modelMetaUrls.js'
 
 /**
  * Ordinary-workspace writer-head rotation — PHASE 3, THE ROTATOR.
@@ -88,8 +89,8 @@ import type { Queryable } from './types.js'
  * `edits*ShardUrls` entry).
  *
  * KNOWN LIMITS, each gating any allow-list beyond the bench (the full text,
- * with the code each one lives in, is in `docs/read-model-projector-health.md`,
- * "Known limits"):
+ * with the code each one lives in, is in
+ * https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/read-model-projector-health.md#known-limits):
  *  (a) the first write of an entity into the fresh head is a whole-entity put
  *      (`src/lib/automerge/bridge.ts`), so two ONLINE clients editing
  *      different fields of X right after a repoint produce a `$` conflict —
@@ -148,6 +149,26 @@ export type RotateOrdinaryHeadOutcome =
 const metaField = (collection: OverlayCollection) =>
   collection === 'object' ? 'editsObjectShardUrl' : 'editsConnectionShardUrl'
 
+const UNPUBLISHED_CHILD = Symbol('ordinaryHeadRotator.unpublishedChild')
+
+/** Carried by an error a rotation threw after its child existed and before
+ * ModelMeta named it (the retired head's flush, BEGIN, the row, COMMIT): that
+ * child's document id, so the caller gives its residency lease back — the
+ * same contract as the fold's `unrecordedFoldProductOf` (G4-16f). */
+function markUnpublishedRotationChild(error: unknown, documentId: DocumentId): void {
+  if (!error || typeof error !== 'object') return
+  try {
+    Object.defineProperty(error, UNPUBLISHED_CHILD, { value: documentId, enumerable: false, configurable: true })
+  } catch { /* a frozen error: the lease waits for the projector's stop */ }
+}
+
+/** The child a failed rotation built and never published, or null. */
+export function unpublishedRotationChildOf(error: unknown): DocumentId | null {
+  if (!error || typeof error !== 'object') return null
+  const value = (error as Record<symbol, unknown>)[UNPUBLISHED_CHILD]
+  return typeof value === 'string' ? value as DocumentId : null
+}
+
 /**
  * Record the retirement of the CURRENT head: an upsert, because a row may
  * already name it — the crash at step 7 above. Overwriting is sound only
@@ -187,10 +208,56 @@ export async function commitOrdinaryHeadRetirement(
   }
 }
 
+/**
+ * {@link commitOrdinaryHeadRetirement} for several heads of one collection,
+ * in ONE statement (the compaction settle's, `workspaceCompaction.ts`): the
+ * same upsert, the same refusal over a `folded` row, so the protocol tables'
+ * statement trigger re-stamps the adopt digests once for all of them, not
+ * once per head. A document id given twice keeps its LAST heads, as two
+ * calls in that order would (one statement cannot upsert a row twice).
+ * Throws, naming the first refused head, when any is folded; the caller's
+ * transaction then rolls back whole.
+ */
+export async function commitOrdinaryHeadRetirements(
+  tx: Queryable,
+  key: WorkspaceKey,
+  collection: OverlayCollection,
+  heads: ReadonlyArray<{ documentId: string; retirementHeads: readonly string[] }>,
+): Promise<void> {
+  const byId = new Map<string, string[]>()
+  for (const head of heads) byId.set(head.documentId, [...head.retirementHeads].sort())
+  if (!byId.size) return
+  const result = await tx.query<{ document_id: string }>(
+    `INSERT INTO read_model_ordinary_head_retirements (
+       landscape_id, version_id, collection, document_id, retirement_heads, status, origin
+     )
+     SELECT $1, $2, $3, head.id,
+            ARRAY(SELECT h FROM jsonb_array_elements_text(head.heads) WITH ORDINALITY AS e(h, at) ORDER BY at),
+            'retired', 'rotation'
+       FROM jsonb_to_recordset($4::jsonb) AS head(id text, heads jsonb)
+     ON CONFLICT (landscape_id, version_id, collection, document_id) DO UPDATE
+     SET retirement_heads = EXCLUDED.retirement_heads,
+         forwarded_heads = NULL,
+         status = 'retired',
+         origin = 'rotation',
+         updated_at = now()
+     WHERE read_model_ordinary_head_retirements.status <> 'folded'
+     RETURNING document_id`,
+    [key.landscapeId, key.versionId, collection,
+      JSON.stringify([...byId].map(([id, retirementHeads]) => ({ id, heads: retirementHeads })))],
+  )
+  const written = new Set(result.rows.map((row) => row.document_id))
+  const refused = [...byId.keys()].find((id) => !written.has(id))
+  if (refused !== undefined) {
+    throw new Error(`ordinary head ${collection} ${refused} of ${key.landscapeId}/${key.versionId} `
+      + 'is folded; it cannot be retired again')
+  }
+}
+
 export async function rotateOrdinaryHead(args: RotateOrdinaryHeadArgs): Promise<RotateOrdinaryHeadOutcome> {
   const log = args.log ?? ((line: string) => console.warn(line))
   const field = metaField(args.collection)
-  const stillCurrent = () => args.meta.doc()?.[field] === args.retired.url
+  const stillCurrent = () => readMetaUrl(args.meta.doc(), field) === args.retired.url
   if (!args.mayWrite()) return { outcome: 'not-owner' }
   // BEFORE the client: a projector that lost its fence or its plane costs one
   // read, no connection and no lock.
@@ -201,6 +268,9 @@ export async function rotateOrdinaryHead(args: RotateOrdinaryHeadArgs): Promise<
   // leaves exactly that gap, and its hand-back DESTROYS the session.
   let lock: OverlayRotationLockState = 'unknown'
   let inTransaction = false
+  /** The child this rotation built, and whether ModelMeta names it yet. */
+  let builtChild: DocumentId | null = null
+  let published = false
   try {
     lock = await acquireOverlayRotationLock(client as unknown as PoolClient, lockKey)
     // `!== 'acquired'`, NOT `=== 'refused'`: three states, one licence.
@@ -219,6 +289,7 @@ export async function rotateOrdinaryHead(args: RotateOrdinaryHeadArgs): Promise<
     if (!precheck?.length) return { outcome: 'nothing-published' }
 
     const child = await args.createChild()
+    builtChild = child.documentId
 
     // H_r read AFTER the child exists: the retired head kept being projected
     // meanwhile, and a later H_r leaves less to forward.
@@ -275,6 +346,7 @@ export async function rotateOrdinaryHead(args: RotateOrdinaryHeadArgs): Promise<
       return { outcome: 'superseded', childUrl: child.url, stage: 'after-row' }
     }
     args.publish(child.url)
+    published = true
     await args.flush([args.meta.documentId])
     log(JSON.stringify({
       event: 'read_model.ordinary_head_rotated',
@@ -287,6 +359,11 @@ export async function rotateOrdinaryHead(args: RotateOrdinaryHeadArgs): Promise<
     return { outcome: 'rotated', childUrl: child.url, retirementHeads: [...retirementHeads].sort() }
   } catch (error) {
     if (inTransaction) await client.query('ROLLBACK').catch(() => undefined)
+    // A child built and not published is a claimed orphan nothing names (GC
+    // sweeps it): the caller gives its lease back. Not marked once published:
+    // it is the current head then, attached and leased for good — a failed
+    // meta flush after the change does not unpublish it.
+    if (builtChild && !published) markUnpublishedRotationChild(error, builtChild)
     throw error
   } finally {
     await releaseOverlayRotationLock(client as unknown as PoolClient, lockKey, lock)

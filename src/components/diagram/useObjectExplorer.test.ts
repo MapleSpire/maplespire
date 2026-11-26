@@ -52,6 +52,44 @@ describe('object explorer disclosure reconciliation', () => {
 describe('useObjectExplorer concurrent refresh', () => {
   afterEach(() => __setModelQueryForTest(null))
 
+  it('a new revision never starts a refresh inside the commit\'s passive effects — one macrotask later, ONE refresh for a burst of revisions', async () => {
+    let calls = 0
+    __setModelQueryForTest({
+      ...residentModelQuery,
+      objectTreePage: async () => { calls += 1; return { projectionGeneration: 1, items: [], nextCursor: null, total: 0 } },
+    })
+    const { result, rerender } = renderHook(
+      ({ refreshKey }) => useObjectExplorer({ query: '', filters: {}, diagramId: null, refreshKey }),
+      { initialProps: { refreshKey: 0 } },
+    )
+    await waitFor(() => expect(result.current.rows).toBeDefined())
+    await waitFor(() => expect(calls).toBe(1))
+    // A burst of store revisions, one commit each (thousands of objects created offline).
+    for (let revision = 1; revision <= 3; revision += 1) rerender({ refreshKey: revision })
+    expect(calls).toBe(1)
+    await waitFor(() => expect(calls).toBe(2))
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    expect(calls).toBe(2)
+  })
+
+  it('a refresh armed just before the explorer unmounts never runs', async () => {
+    let calls = 0
+    __setModelQueryForTest({
+      ...residentModelQuery,
+      objectTreePage: async () => { calls += 1; return { projectionGeneration: 1, items: [], nextCursor: null, total: 0 } },
+    })
+    const { result, rerender, unmount } = renderHook(
+      ({ refreshKey }) => useObjectExplorer({ query: '', filters: {}, diagramId: null, refreshKey }),
+      { initialProps: { refreshKey: 0 } },
+    )
+    await waitFor(() => expect(result.current.rows).toBeDefined())
+    await waitFor(() => expect(calls).toBe(1))
+    rerender({ refreshKey: 1 })
+    unmount()
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    expect(calls).toBe(1)
+  })
+
   it('keeps a deep search window visible and revalidates all loaded pages', async () => {
     let revision = 1
     let releaseRevisionTwo!: () => void

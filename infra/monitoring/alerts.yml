@@ -732,7 +732,7 @@ groups:
             has no live projector.
           runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/read-model-projector-health.md
 
-      # A retired head owed the handover re-check (G4-16d) was given up after
+      # A retired head owed the handover re-check was given up after
       # repeated failures: a previous owner's late write in it may never be
       # carried. Per cell: a process-local counter.
       - alert: ReadModelHandoverRecheckAbandoned
@@ -752,9 +752,9 @@ groups:
             read_model.ordinary_fold_arrival_failed / ..._handover_recheck_failed
             for why; a late write of the previous owner in it is not carried
             until the head is written again.
-          runbook: docs/read-model-projector-health.md
+          runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/read-model-projector-health.md#the-handover-re-check
 
-      # A handover re-check (G4-16d) ran after the barrier's maximum wait:
+      # A handover re-check ran after the barrier's maximum wait:
       # an old owner's storage write was still open after five minutes,
       # which the write pool's own ceilings should make impossible. Per cell,
       # not max(): a process-local counter.
@@ -775,7 +775,7 @@ groups:
             for ms-storage:* backends with an old xact_start (a commit stuck on
             synchronous replication, a cell of an older version, a ceiling set
             to 0), and at read_model.ordinary_handover_recheck_barrier_timeout.
-          runbook: docs/read-model-projector-health.md
+          runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/read-model-projector-health.md#the-handover-re-check
 
       # `catching_up` is healthy in small doses — it is what a projector doing
       # its job looks like. Sustained, it means it cannot keep pace.
@@ -791,9 +791,9 @@ groups:
             continuously. Expected briefly after a large import; not otherwise.
           runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/read-model-projector-health.md
 
-      # G4-16e. With ordinary head rotation on and the chain fold off, every
-      # rotation appends a segment that nothing removes, and an attach costs
-      # ~24 ms per listed segment (mesures/G4-16e-rotation-rate.json). The
+      # With ordinary head rotation on and the chain fold off, every rotation
+      # appends a segment that nothing removes, and an attach costs ~24 ms per
+      # listed segment (measured). The
       # gauge counts, per CELL, the rotating workspace/collection pairs whose
       # overlay chain passed AM_ORDINARY_CHAIN_ALERT_LENGTH — not a fleet fact
       # like the rules above, but `max()` for a reason of its own: a cell that
@@ -814,12 +814,252 @@ groups:
             the read_model.ordinary_chain_length_alert log line or the
             ordinaryHeadRotation block of /api/automerge/stats for which, then
             follow "Runbook: ReadModelOrdinaryChainUnbounded".
-          runbook: docs/read-model-projector-health.md
+          runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/read-model-projector-health.md#runbook-readmodelordinarychainunbounded
+
+      # A current static overlay write head whose projection stops at
+      # `!ready`: a segment of its chain has no snapshot and could not be read
+      # from its document. Before this rule that state was silent for ever
+      # (measured: every object rename of a summary workspace lost, badge
+      # "Synced"). A head blocked only by a PENDING segment clears once that
+      # segment's own pass acknowledges it, on a reload tick (10 s); ten
+      # minutes is far past that. Per cell (`max by (instance)`): the gauge is
+      # the oldest block of the cell's own projector. NaN when nothing is
+      # blocked, which compares false.
+      - alert: ReadModelStaticOverlayHeadNotReady
+        expr: max by (instance) (maplespire_read_model_static_overlay_heads_not_ready_oldest_seconds{job="maplespire-api"}) > 600
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }}: a static overlay write head has been blocked at !ready for {{ $value }} s"
+          description: >-
+            Writes to that head (object or connection edits of a summary
+            workspace) reach no ro_* row while clients show "Synced". Read the
+            read_model.static_overlay_not_ready log line on
+            {{ $labels.instance }}: it names the head and the segments it
+            waits for. A segment that does not resolve keeps it blocked.
+          runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/read-model-projector-health.md#runbook-readmodelstaticoverlayheadnotready
+
+      # A static projection pass in flight past its ceiling
+      # (5 min): typically one evicted under it that never ends. Every later
+      # pass of its document waits for it — the durable recovery, the
+      # orphan-zero sweep and the change-event passes alike — so the document's
+      # ro_* rows stay as they were while clients show "Synced". The gauge
+      # counts only the pass in front (not those queued behind it), so it is
+      # already 5 minutes old when it reads 1; five more before the ticket.
+      - alert: ReadModelStaticPassOverdue
+        expr: max by (instance) (maplespire_read_model_static_pass_watches_overdue{job="maplespire-api"}) > 0
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }}: {{ $value }} static projection pass(es) in flight past their ceiling"
+          description: >-
+            A static document is not projected while that pass lives. Read the
+            read_model.static_pass_watch_overdue log line on
+            {{ $labels.instance }}: it names the document, its age and whether
+            it was evicted under it (withdrawn). The pass ending, or a restart
+            of the instance, ends it.
+          runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/read-model-projector-health.md#runbook-readmodelstaticpassoverdue
+
+      # The same pass still in flight half
+      # an hour on. A PAGE, not a ticket: such a pass no longer ends on its own
+      # (none measured past a first ModelMeta build, 26-35 s), its document's
+      # live edits reach no ro_* row while clients show "Synced", and the only
+      # remedy is a person restarting the instance — the timing of
+      # ReadModelCompactionReattachOutage (ticket at 5 minutes, page at 30).
+      # Unlike that age gauge, this one reads 0 or 1, so a `for: 30m` on the
+      # bare gauge would restart from zero at one missed scrape of a loaded
+      # instance; max_over_time over 10 minutes rides over such gaps (the page
+      # may linger up to 10 minutes after the pass ends).
+      - alert: ReadModelStaticPassOverdueOutage
+        expr: max by (instance) (max_over_time(maplespire_read_model_static_pass_watches_overdue{job="maplespire-api"}[10m])) > 0
+        for: 30m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.instance }}: a static projection pass has been stuck for over 35 minutes"
+          description: >-
+            Its document's edits are not projected. Restart {{ $labels.instance }}
+            (see the runbook link: Runbook: ReadModelStaticPassOverdue).
+          runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/read-model-projector-health.md#runbook-readmodelstaticpassoverdue
+
+      # A compaction pass detached a workspace's projector, folded, and its
+      # re-attach FAILED (measured on a 3-year bench: a storage permit refused
+      # on slow storage). The cell retries it on its own (1, 2,
+      # 5, 10, 30 s, then 60, 120, 300 s, never sooner than 3x the last
+      # attempt of any workspace), so a workspace still detached after 5
+      # minutes has failed several retries: its reads answer 503 and its
+      # writes are not projected. A TICKET at 5 minutes (the retry usually
+      # ends it once the storage catches up), a PAGE at 30. On the AGE since
+      # the FIRST detachment, not on the count: a lease that
+      # flaps between owned and not owned drops the workspace out of the
+      # gauges while dormant, and a `for:` on the count would start again at
+      # every wake; the age does not, so one minute active again is enough.
+      # Per CELL (a process-local gauge): `max by (instance)`, so the alert
+      # names the cell whose logs to read.
+      - alert: ReadModelCompactionReattachPending
+        expr: max by (instance) (maplespire_read_model_compaction_detached_oldest_seconds{job="maplespire-api"}) > 300
+        for: 1m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }}: a compaction left a workspace with the read plane detached for {{ $value }} s"
+          description: >-
+            The compaction's re-attach failed and its retries have not
+            succeeded yet: the workspace answers 503 on its read routes and its
+            writes are not projected. Read read_model.compaction_reattach_failed
+            on {{ $labels.instance }} for the workspace and the error of each
+            retry, then follow "Runbook: ReadModelCompactionReattachPending".
+          runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/read-model-projector-health.md#runbook-readmodelcompactionreattachpending
+
+      # The same outage, half an hour on: the retry is not winning.
+      - alert: ReadModelCompactionReattachOutage
+        expr: max by (instance) (maplespire_read_model_compaction_detached_oldest_seconds{job="maplespire-api"}) > 1800
+        for: 1m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.instance }}: a workspace detached by a compaction for {{ $value }} s"
+          description: >-
+            The read plane of these workspaces has been down for 30 minutes
+            and the cell's retries keep failing. Follow "Runbook:
+            ReadModelCompactionReattachPending".
+          runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/read-model-projector-health.md#runbook-readmodelcompactionreattachpending
+
+      # A workspace whose root did not resolve at several retries in a row:
+      # no retry can fix it (a deleted or broken workspace), so it is out of
+      # the paging gauge and retried every 15 minutes. Someone has to look.
+      - alert: ReadModelCompactionReattachNoRoot
+        expr: max by (instance) (maplespire_read_model_compaction_reattach_dormant{job="maplespire-api", reason="no_root"}) > 0
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }}: {{ $value }} workspace(s) detached by a compaction whose root does not resolve"
+          description: >-
+            A compaction detached the workspace and its root no longer
+            resolves, so no projector can be started. Read
+            read_model.compaction_reattach_dormant (reason no_root) for the
+            workspace, then follow "Runbook: ReadModelCompactionReattachPending",
+            step 3.
+          runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/read-model-projector-health.md#runbook-readmodelcompactionreattachpending
+
+      # Each retry holds the compaction slot for a whole cold
+      # build, and that slot is what the epoch sweep, the meta-only job and
+      # the hop latches (forwardBusy) wait for. The rest is SHARED by every
+      # workspace's retries (no build before the last one's release plus 3x
+      # its hold), so all of a cell's retries together hold it at most 25 %
+      # of the time. 10 minutes in an hour (17 %) is a sweep starved by
+      # retries, which no single-hold rule can see. One workspace alone on
+      # its 300 s period reaches it only with builds over ~100 s (H / (H +
+      # 300 s) > 17 %) or with the rest binding: a 45 s build every 345 s is
+      # 13 %, under the threshold, by design.
+      - alert: ReadModelCompactionReattachSlotStarving
+        expr: max by (instance) (increase(maplespire_read_model_compaction_reattach_slot_held_seconds_total{job="maplespire-api"}[1h])) > 600
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }}: compaction re-attach retries held the compaction slot {{ $value }} s in the last hour"
+          description: >-
+            Failed re-attach retries keep holding the slot the epoch sweep and
+            the hop latches wait for, so epoch forwarding on this cell is
+            delayed (forwardBusy answers, sweeps skipped). The cause is the
+            retries' own failure: follow "Runbook:
+            ReadModelCompactionReattachPending".
+          runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/read-model-projector-health.md#runbook-readmodelcompactionreattachpending
+
+      # A re-attach (the pass's or a retry's) whose cold build waits
+      # on a lock neither fails nor can be cancelled; it shows here only.
+      - alert: ReadModelCompactionReattachStuck
+        expr: max by (instance) (maplespire_read_model_compaction_reattach_running_seconds{job="maplespire-api"}) > 600
+        for: 1m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }}: a compaction re-attach has been running for {{ $value }} s"
+          description: >-
+            A cold build of a compaction re-attach has been in flight for more
+            than 10 minutes (a cold build at three years takes about a minute):
+            it is waiting on something. Read read_model.compaction_reattach_slow
+            for the workspace, then pg_stat_activity for a transaction holding
+            locks on ro_* rows or read_model_projection_state.
+          runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/read-model-projector-health.md#runbook-readmodelcompactionreattachpending
+
+      # The epoch hop runs in the browser; the server sees its latch
+      # asks. The gauge counts the old ModelMetas whose latch asks came in at
+      # least 3 hop cycles (runs of latches 5 min or more apart) inside the
+      # last hour without any answer proving their S7: a roll stopped between
+      # S6b and S7, and tabs that keep blocking input up to 2 s per latch for
+      # nothing. Three cycles need two gaps of 5 min or more, so the gauge is
+      # already integrated over at least 10 minutes: a short for:.
+      - alert: EpochHopStalled
+        expr: max by (instance) (maplespire_model_epoch_hop_stalled_metas{job="maplespire-api"}) > 0
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }}: {{ $value }} ModelMeta(s) whose epoch hop keeps latching without the S7 proof"
+          description: >-
+            Tabs of these workspaces latch (input blocked up to 2 s each) in
+            hop after hop and the old meta is never answered superseded: the
+            roll is stuck between S6b and S7. Follow "Runbook:
+            EpochHopStalled": find the workspace (log line
+            model_epoch.hop_stalled, or its repointing epoch row), let the
+            epoch step's recovery roll it forward; the operator door
+            npm --prefix server run epoch:resolve-repointing (read-only
+            first) only when the root names neither meta.
+          runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/read-model-projector-health.md#runbook-epochhopstalled
+
+      # The ROOT CAUSE of EpochHopStalled, read
+      # from the database rather than from tabs. A roll row still
+      # `repointing` more than 10 minutes after S6b (the gauge's own
+      # threshold, EPOCH_STUCK_REPOINTING_AFTER_MS) strands every tab of its
+      # workspace, one tab or many, and it stays up for as long as the row
+      # does. A FLEET fact: every cell reads the same table, so max(), never
+      # sum(), and no instance label. EpochHopStalled stays: it says tabs keep
+      # paying latches; this one says a roll is stuck, whether or not any.
+      - alert: EpochRollStuckBeforeS7
+        expr: max(maplespire_model_epoch_rows_stuck_repointing{job="maplespire-api"}) > 0
+        for: 2m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $value }} model epoch roll(s) stuck between S6b and S7 for more than 10 minutes"
+          description: >-
+            The root names the new ModelMeta but S7 never published it: every
+            tab of the workspace hops, latches ten times (input blocked up to
+            2 s each) and gives up. Read model_epoch.roll_stuck_repointing for
+            the workspace, then follow "Runbook: EpochHopStalled" from step 2.
+          runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/read-model-projector-health.md#runbook-epochhopstalled
+
+      # max() skips NaN, so EpochRollStuckBeforeS7 only goes
+      # blind when EVERY cell's sample fails (a permission, a renamed
+      # column, its 5 s statement timeout under a lock). That is this rule:
+      # the gauge is reported, and no cell has a number in it.
+      - alert: EpochStuckRowsSamplerBlind
+        expr: >-
+          absent(maplespire_model_epoch_rows_stuck_repointing{job="maplespire-api"} >= 0)
+          and on() (count(maplespire_model_epoch_rows_stuck_repointing{job="maplespire-api"}) > 0)
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "No cell can read the stuck epoch rows: EpochRollStuckBeforeS7 is blind"
+          description: >-
+            Every cell's stuck-repointing sample has failed for fifteen minutes
+            (the gauge reads NaN everywhere). Read the
+            "[model-epoch] the stuck-repointing sample failed" warning for the
+            error and maplespire_model_epoch_stuck_rows_sample_failures_total;
+            until it is fixed, run step 1's query of "Runbook: EpochHopStalled"
+            by hand.
+          runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/read-model-projector-health.md#runbook-epochhopstalled
 
   - name: maplespire-automerge
     rules:
       # Evictions refused because a document's last content save failed and
-      # its delta is still only in memory (G4-16d). A few are a save that is
+      # its delta is still only in memory. A few are a save that is
       # being retried or flushed; a sustained stream is a cell that cannot make
       # its documents durable, and keeps them resident meanwhile.
       - alert: AutomergeUnsavedEvictionsSustained
@@ -837,7 +1077,7 @@ groups:
             for documents whose last content save failed. Each refusal asks for
             a flush; look at automerge.storage_write_ceiling,
             automerge.unsaved_document_flush_failed and the storage pool.
-          runbook: docs/read-model-projector-health.md
+          runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/read-model-projector-health.md#storage-write-pool-and-handover-barrier
 
       # A storage write stopped by a ceiling of the storage write pool
       # (statement_timeout 57014, lock_timeout 55P03, idle in transaction
@@ -861,8 +1101,8 @@ groups:
             minutes. Read the automerge.storage_write_ceiling log lines for the
             documents and codes, and automerge.storage_write_ceiling_retry_exhausted
             for any that never became durable. See the storage write pool in
-            docs/read-model-projector-health.md.
-          runbook: docs/read-model-projector-health.md
+            the runbook link.
+          runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/read-model-projector-health.md#storage-write-pool-and-handover-barrier
 
       # Should be flat at zero forever. Any increase means a document was
       # evicted while something was still listening to it.
@@ -1175,8 +1415,8 @@ groups:
             row proves somebody persisted it, not that they are still running.
             FIRST STEP is therefore to check whether the cell named in the
             `sync.cell.fence_foreign_cell` log line is alive; the runbook has the
-            two branches. That the gate ignores cell_id is decision D45, not an
-            oversight.
+            two branches. That the gate ignores cell_id is a deliberate design
+            choice, not an oversight.
           runbook: https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/sync-cell-ownership.md
 
       # THE DETECTOR'S OWN BLINDNESS, and it is the rule the two above cannot do

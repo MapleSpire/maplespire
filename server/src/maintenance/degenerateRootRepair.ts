@@ -24,6 +24,7 @@ import type { WorkspaceKey } from '../readModel/projector.js'
 import { findReadyDocument } from '../automergeRepoCompat.js'
 import { copyRootShape } from '../rootShape.js'
 import { emptyMonolithModel, MONOLITH_MODEL_COLLECTIONS } from '../modelCollections.js'
+import { readMetaUrlsUnion } from '../modelMetaUrls.js'
 
 type PlainDocument = Record<string, unknown>
 
@@ -284,18 +285,15 @@ export function buildDegenerateRootRepairPlan(
 
   const meta = modelMetaUrl ? documents.find(({ url }) => url === modelMetaUrl)?.value : undefined
   const referenced = new Set<AutomergeUrl>([
-    ...urls(meta?.objectShardUrls),
-    ...urls(meta?.connectionShardUrls),
+    // A reference census — what either copy of a URL field names.
+    ...urls(readMetaUrlsUnion(meta, 'objectShardUrls')),
+    ...urls(readMetaUrlsUnion(meta, 'connectionShardUrls')),
     ...urls(meta?.decisionRecordShardUrls),
-    ...urls(meta?.editsObjectShardUrls),
-    ...urls(meta?.editsConnectionShardUrls),
+    ...urls(readMetaUrlsUnion(meta, 'editsObjectShardUrls')),
+    ...urls(readMetaUrlsUnion(meta, 'editsConnectionShardUrls')),
+    ...urls(readMetaUrlsUnion(meta, 'editsObjectShardUrl')),
+    ...urls(readMetaUrlsUnion(meta, 'editsConnectionShardUrl')),
   ])
-  if (typeof meta?.editsObjectShardUrl === 'string' && isValidAutomergeUrl(meta.editsObjectShardUrl)) {
-    referenced.add(meta.editsObjectShardUrl)
-  }
-  if (typeof meta?.editsConnectionShardUrl === 'string' && isValidAutomergeUrl(meta.editsConnectionShardUrl)) {
-    referenced.add(meta.editsConnectionShardUrl)
-  }
   for (const registryUrl of registryCandidates) {
     const registry = documents.find(({ url }) => url === registryUrl)?.value
     for (const entry of Object.values((registry?.diagrams ?? {}) as Record<string, { docUrl?: unknown }>)) {

@@ -110,8 +110,10 @@ export function registerMcpOAuthRoutes(app: Express): void {
 
   // ── Dynamic client registration (public clients + PKCE) ─────────────────
   // nosemgrep: sr-authz-route-without-middleware -- public: OAuth dynamic client registration (RFC 7591) runs before any sign-in
+  // Each handler RETURNS its promise: the app
+  // holds a mutating handler until it settles (`holdMutatingRoutes`).
   app.post('/api/auth/mcp/register', (req, res) => {
-    void (async () => {
+    return (async () => {
       const body = (req.body ?? {}) as { redirect_uris?: unknown; client_name?: unknown }
       const uris = Array.isArray(body.redirect_uris) ? body.redirect_uris.filter((u): u is string => typeof u === 'string') : []
       if (uris.length === 0 || !uris.every(isHttpUrl)) {
@@ -141,7 +143,7 @@ export function registerMcpOAuthRoutes(app: Express): void {
 
   // ── Authorize: consent page (GET) + decision (POST) ─────────────────────
   const handleAuthorize = (req: Request, res: Response) => {
-    void (async () => {
+    return (async () => {
       const src = req.method === 'POST' ? (req.body as Record<string, unknown>) : (req.query as Record<string, unknown>)
       const clientId = param(src.client_id)
       const redirectUri = param(src.redirect_uri)
@@ -265,7 +267,7 @@ export function registerMcpOAuthRoutes(app: Express): void {
 
   // ── Token endpoint: authorization_code + refresh_token (rotating) ───────
   app.post('/api/auth/mcp/token', form, (req, res) => {
-    void (async () => {
+    return (async () => {
       const body = (req.body ?? {}) as Record<string, unknown>
       const grantType = param(body.grant_type)
 

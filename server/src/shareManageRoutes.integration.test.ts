@@ -162,7 +162,7 @@ describe.skipIf(!TEST_DATABASE_URL)('share links: deleted landscape + PATCH vali
         return (await gate.canonicalWorkspaceKey(pool, raw)) ?? raw
       },
     }))
-    const server: Server = await new Promise((resolve) => { const s = app.listen(0, () => resolve(s)) })
+    const server: Server = await new Promise((resolve) => { const s = app.listen(0, '127.0.0.1', () => resolve(s)) })
     try {
       const port = (server.address() as AddressInfo).port
       const res = await fetch(`http://127.0.0.1:${port}/api/shares/${encodeURIComponent(token)}`, {

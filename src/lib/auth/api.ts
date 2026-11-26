@@ -218,21 +218,136 @@ export interface WorkspaceAccess {
   enforced: boolean
 }
 
+/** How long a READER of the access probe waits for its answer
+ * (T-DIAGDEF-2). The probe is a single small read a live server answers in
+ * milliseconds; a workspace switch runs it BESIDE its outgoing drain
+ * (`switchWorkspace.ts`), whose own bound is the same 3 s, so on that path
+ * it costs nothing more when the server is gone. Without a bound, a server
+ * that accepts and never answers held a switch (and a boot, and the route
+ * guard) on it for good. Past it the reader goes on without the answer; the
+ * request itself goes on to `WORKSPACE_ACCESS_LATE_MS`, and a late answer
+ * still reaches a caller that asked for it (`onLateAnswer`). */
+export const WORKSPACE_ACCESS_TIMEOUT_MS = 3_000
+
+/** The probe REQUEST's own bound: a server slow to answer (a restart's cold
+ * build) still gets to lock a viewer's editor, late (failing open at 3 s for
+ * good unlocked it for the whole session). */
+export const WORKSPACE_ACCESS_LATE_MS = 30_000
+
+/** How long a SETTLED probe answers for its workspace again (T-DIAGDEF-2).
+ * A store-led switch asks twice within seconds: `switchWorkspace` before the
+ * bridge starts, then the route guard once the URL names the workspace — at
+ * the END of the switch, up to the root request's 10 s bound later. Asked
+ * afresh, the guard waited a second bound behind a server that does not
+ * answer. 15 s covers that gap; permissions are UX here (the server
+ * enforces), so an answer that old is as good as a new one. Only an answer
+ * that DECIDES is reused — a 2xx with its access, a 403, a 404:
+ * a network failure, a timeout, a 5xx or a 401 (a session that ended) asked
+ * again would have answered open for 15 s, with no late answer to correct it.
+ * The whole memo is forgotten when the signed-in identity changes
+ * (`forgetWorkspaceAccessProbes`, from the auth store). */
+export const WORKSPACE_ACCESS_REUSE_MS = 15_000
+
+type AccessProbe = { answered: true; status: number; access: WorkspaceAccess | null } | { answered: false }
+
+interface AccessProbeEntry {
+  settledAt: number | null
+  /** A reader already waited its full patience on this request: the next
+   * reader of the same request does not wait a second one. */
+  patienceSpent: boolean
+  /** Settled with an answer that decides (2xx with an access, 403, 404):
+   * the only kind reused. */
+  authoritative: boolean
+  answer: Promise<AccessProbe>
+}
+
+/** The last probe of each workspace, in flight or settled. */
+const accessProbes = new Map<string, AccessProbeEntry>()
+
+/** Forget every probe: the signed-in identity changed (and tests). */
+export function forgetWorkspaceAccessProbes(): void {
+  accessProbes.clear()
+}
+
+const NO_ANSWER: AccessProbe = { answered: false }
+const FAIL_OPEN: WorkspaceAccess = { canRead: true, canWrite: true, enforced: false }
+
+/** One GET of the access endpoint, shared by both readers below (an
+ * identical request: same endpoint, same workspace). `now` settles within the
+ * reader's patience; `answer` is the request itself. Neither rejects. */
+function probeWorkspaceAccess(landscapeId: string, versionId: string, patienceMs: number): {
+  now: Promise<AccessProbe>
+  answer: Promise<AccessProbe>
+} {
+  const key = `${landscapeId}\u0000${versionId}`
+  let entry = accessProbes.get(key)
+  const reusable = entry !== undefined && (entry.settledAt === null
+    || (entry.authoritative && Date.now() - entry.settledAt < WORKSPACE_ACCESS_REUSE_MS))
+  if (!entry || !reusable) {
+    const fresh: AccessProbeEntry = { settledAt: null, patienceSpent: false, authoritative: false, answer: Promise.resolve(NO_ANSWER) }
+    fresh.answer = (async (): Promise<AccessProbe> => {
+      try {
+        const qs = `?landscapeId=${encodeURIComponent(landscapeId)}&versionId=${encodeURIComponent(versionId)}`
+        const res = await fetch(`${API_BASE}/api/me/workspace-access${qs}`, {
+          credentials: 'include',
+          signal: AbortSignal.timeout(WORKSPACE_ACCESS_LATE_MS),
+        })
+        if (!res.ok) {
+          fresh.authoritative = res.status === 403 || res.status === 404
+          return { answered: true, status: res.status, access: null }
+        }
+        const access = ((await res.json()) as { access?: WorkspaceAccess }).access ?? null
+        fresh.authoritative = access !== null
+        return { answered: true, status: res.status, access }
+      } catch {
+        return NO_ANSWER
+      } finally {
+        fresh.settledAt = Date.now()
+      }
+    })()
+    accessProbes.set(key, fresh)
+    entry = fresh
+  }
+  const current = entry
+  if (current.settledAt !== null) return { now: current.answer, answer: current.answer }
+  if (current.patienceSpent) return { now: Promise.resolve(NO_ANSWER), answer: current.answer }
+  const now = new Promise<AccessProbe>((resolve) => {
+    const timer = setTimeout(() => {
+      current.patienceSpent = true
+      resolve(NO_ANSWER)
+    }, patienceMs)
+    void current.answer.then((probe) => {
+      clearTimeout(timer)
+      resolve(probe)
+    })
+  })
+  return { now, answer: current.answer }
+}
+
 /**
  * The session's effective access to one workspace (RBAC team grants /
- * org-admin). FAILS OPEN to full access on any error: this call powers UX
- * lock-down only — enforcement lives server-side (sync write gate + REST write
- * gates), so a fetch hiccup must not brick an editor the server would accept.
+ * org-admin). FAILS OPEN to full access on any error — no answer within
+ * `WORKSPACE_ACCESS_TIMEOUT_MS` included: this call powers UX lock-down only —
+ * enforcement lives server-side (sync write gate + REST write gates), so a
+ * fetch hiccup must not brick an editor the server would accept. When it
+ * failed open for want of an answer, `onLateAnswer` receives the answer that
+ * comes after (within `WORKSPACE_ACCESS_LATE_MS`), for the caller to apply.
  */
-export async function workspaceAccess(landscapeId: string, versionId: string): Promise<WorkspaceAccess> {
-  try {
-    const qs = `?landscapeId=${encodeURIComponent(landscapeId)}&versionId=${encodeURIComponent(versionId)}`
-    const res = await fetch(`${API_BASE}/api/me/workspace-access${qs}`, { credentials: 'include' })
-    if (!res.ok) return { canRead: true, canWrite: true, enforced: false }
-    return ((await res.json()) as { access: WorkspaceAccess }).access
-  } catch {
-    return { canRead: true, canWrite: true, enforced: false }
+export async function workspaceAccess(
+  landscapeId: string,
+  versionId: string,
+  options: { timeoutMs?: number; onLateAnswer?: (access: WorkspaceAccess) => void } = {},
+): Promise<WorkspaceAccess> {
+  const { now, answer } = probeWorkspaceAccess(landscapeId, versionId, options.timeoutMs ?? WORKSPACE_ACCESS_TIMEOUT_MS)
+  const probe = await now
+  if (probe.answered) return probe.access ?? FAIL_OPEN
+  const onLateAnswer = options.onLateAnswer
+  if (onLateAnswer) {
+    void answer.then((late) => {
+      if (late.answered && late.access) onLateAnswer(late.access)
+    })
   }
+  return FAIL_OPEN
 }
 
 export type WorkspaceReadAccess = 'granted' | 'forbidden' | 'unknown'
@@ -244,19 +359,24 @@ export type WorkspaceReadAccess = 'granted' | 'forbidden' | 'unknown'
  *   - a foreign/absent workspace, or an explicit `canRead:false` → 'forbidden'
  *   - a network error → 'unknown' (the caller treats unknown as allow, so an
  *     offline deep-link still opens from local cache — offline-first).
+ *   - no answer within `WORKSPACE_ACCESS_TIMEOUT_MS` → 'unknown' as well
+ *     (T-DIAGDEF-2 B): the route guard shows a spinner until this settles,
+ *     so a server that accepts and never answers held every switched-to
+ *     workspace behind it, the bridge's own error screen included. A probe
+ *     of the same workspace settled within `WORKSPACE_ACCESS_REUSE_MS`
+ *     answers instead of a new request.
  * Only meaningful at AUTH stage 'on'; callers skip it below that (always granted).
  */
-export async function checkWorkspaceReadAccess(landscapeId: string, versionId: string): Promise<WorkspaceReadAccess> {
-  try {
-    const qs = `?landscapeId=${encodeURIComponent(landscapeId)}&versionId=${encodeURIComponent(versionId)}`
-    const res = await fetch(`${API_BASE}/api/me/workspace-access${qs}`, { credentials: 'include' })
-    if (res.status === 404 || res.status === 401 || res.status === 403) return 'forbidden'
-    if (!res.ok) return 'unknown'
-    const { access } = (await res.json()) as { access: WorkspaceAccess }
-    return access.canRead ? 'granted' : 'forbidden'
-  } catch {
-    return 'unknown'
-  }
+export async function checkWorkspaceReadAccess(
+  landscapeId: string,
+  versionId: string,
+  options: { timeoutMs?: number } = {},
+): Promise<WorkspaceReadAccess> {
+  const probe = await probeWorkspaceAccess(landscapeId, versionId, options.timeoutMs ?? WORKSPACE_ACCESS_TIMEOUT_MS).now
+  if (!probe.answered) return 'unknown'
+  if (probe.status === 404 || probe.status === 401 || probe.status === 403) return 'forbidden'
+  if (!probe.access) return 'unknown'
+  return probe.access.canRead ? 'granted' : 'forbidden'
 }
 
 export interface OrgMembership {

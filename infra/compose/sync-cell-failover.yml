@@ -149,7 +149,7 @@ x-sync-environment: &sync-environment
   # single event-loop turn. Lease renewals keep their separate concurrency.
   SYNC_CELL_ADMISSION_CONCURRENCY: "${SYNC_FAILOVER_ADMISSION_CONCURRENCY:-8}"
   SYNC_CELL_OWNERSHIP_CONCURRENCY: "${SYNC_FAILOVER_OWNERSHIP_CONCURRENCY:-8}"
-  # THE G4-16b A/B ARM, BENCH ONLY. Unset is `off`, the shipped default
+  # THE ORDINARY HEAD ROTATION A/B ARM, BENCH ONLY. Unset is `off`, the shipped default
   # (`compose.maplespire.yml` does not name it). Set by
   # `sync-cell-bench.mjs --ordinary-head-rotation=…`, which also writes the
   # allow-list from the two hot workspaces it preselected and recreates the
@@ -160,11 +160,11 @@ x-sync-environment: &sync-environment
   AM_ORDINARY_HEAD_ROTATION_WORKSPACE_ALLOWLIST: "${SYNC_FAILOVER_ORDINARY_HEAD_ROTATION_ALLOWLIST:-}"
   AM_ORDINARY_HEAD_ROTATION_MAX_ACTORS: "${SYNC_FAILOVER_ORDINARY_HEAD_ROTATION_MAX_ACTORS:-}"
   AM_ORDINARY_HEAD_ROTATION_MAX_CHANGES: "${SYNC_FAILOVER_ORDINARY_HEAD_ROTATION_MAX_CHANGES:-}"
-  # G4-16b phase 4, same rules: set by `--ordinary-chain-fold=…` on an armed
+  # The ordinary chain fold, same rules: set by `--ordinary-chain-fold=…` on an armed
   # run only; unset is `off`, and the server refuses `on` without rotation on.
   AM_ORDINARY_CHAIN_FOLD: "${SYNC_FAILOVER_ORDINARY_CHAIN_FOLD:-off}"
   AM_ORDINARY_CHAIN_FOLD_RETAIN_HOURS: "${SYNC_FAILOVER_ORDINARY_CHAIN_FOLD_RETAIN_HOURS:-}"
-  # G4 STALL DIAGNOSIS, BENCH ONLY. Unset is off: no inspector session, worker
+  # STALL DIAGNOSIS, BENCH ONLY. Unset is off: no inspector session, worker
   # or observer (`server/src/diagnostics/cpuProfileCapture.ts`). Set by
   # `sync-cell-bench.mjs --cpu-profile=on`, which also bind-mounts a host
   # directory at the DIR below (`SYNC_FAILOVER_DIAG_HOST_DIR`, see the cell
@@ -220,6 +220,9 @@ services:
   postgres:
     image: postgres:16-alpine
     restart: "no"
+    # As compose.maplespire.yml: 8 GB, so a cold build's single transaction
+    # mostly stays below the checkpoint trigger (~max_wal_size / 1.9).
+    command: ["postgres", "-c", "max_wal_size=8GB"]
     environment:
       POSTGRES_USER: maplespire
       POSTGRES_PASSWORD: maplespire

@@ -12,8 +12,57 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU Affero General Public License for more details.
 
-import { describe, expect, it } from 'vitest'
-import { staleGraceMs } from './health.js'
+import { beforeEach, describe, expect, it } from 'vitest'
+import { ABSENCE_STUCK_AFTER_MS, absenceProofMetricSamples, noteAbsenceProof, resetAbsenceProofForTest, staleGraceMs } from './health.js'
+
+describe('noteAbsenceProof (T-SUM-2c: a refused proof says what it waits on)', () => {
+  const key = { landscapeId: 'l', versionId: 'v' }
+  const refused = (fallback: number, sample: string[]) => ({
+    caughtUp: true, absenceProvable: false, arrivalRefusals: { zero: 0, exact: 0, fallback, sample },
+  })
+  const counter = (name: string, branch?: string) => absenceProofMetricSamples()
+    .find((metric) => metric.name === name)!.values
+    .find((value) => branch === undefined || value.labels?.branch === branch)!.value
+  beforeEach(() => resetAbsenceProofForTest())
+
+  it('counts a caught-up refusal by branch, and nothing for a provable or a not-caught-up answer', () => {
+    noteAbsenceProof(key, refused(1, ['m:fallback:9']), 0, () => {})
+    noteAbsenceProof(key, { caughtUp: true, absenceProvable: true, arrivalRefusals: { zero: 0, exact: 0, fallback: 0, sample: [] } }, 1, () => {})
+    noteAbsenceProof(key, { caughtUp: false, absenceProvable: false, arrivalRefusals: { zero: 0, exact: 2, fallback: 0, sample: ['s:exact:3'] } }, 2, () => {})
+    expect(counter('maplespire_read_model_absence_unprovable_total', 'fallback')).toBe(1)
+    expect(counter('maplespire_read_model_absence_unprovable_total', 'exact')).toBe(0)
+    expect(counter('maplespire_read_model_absence_unprovable_total', 'zero')).toBe(0)
+  })
+
+  it('logs ONCE, naming the documents, when the same refusal is still answered after the threshold', () => {
+    const lines: string[] = []
+    const log = (line: string) => lines.push(line)
+    noteAbsenceProof(key, refused(1, ['m:fallback:9']), 1_000, log)
+    noteAbsenceProof(key, refused(1, ['m:fallback:9']), 1_000 + ABSENCE_STUCK_AFTER_MS - 1, log)
+    expect(lines).toEqual([])
+    noteAbsenceProof(key, refused(1, ['m:fallback:9']), 1_000 + ABSENCE_STUCK_AFTER_MS, log)
+    noteAbsenceProof(key, refused(1, ['m:fallback:9']), 1_000 + 2 * ABSENCE_STUCK_AFTER_MS, log)
+    expect(lines).toHaveLength(1)
+    expect(JSON.parse(lines[0])).toEqual({
+      event: 'read_model.absence_unprovable_stuck', workspace: 'l/v', sinceMs: ABSENCE_STUCK_AFTER_MS,
+      refused: { zero: 0, exact: 0, fallback: 1 }, documents: ['m:fallback:9'],
+    })
+    expect(counter('maplespire_read_model_absence_unprovable_stuck_total')).toBe(1)
+  })
+
+  it('a refusal that CHANGES (a new arrival) or a provable answer starts the clock again', () => {
+    const lines: string[] = []
+    const log = (line: string) => lines.push(line)
+    noteAbsenceProof(key, refused(1, ['m:fallback:9']), 0, log)
+    noteAbsenceProof(key, refused(1, ['m:fallback:10']), ABSENCE_STUCK_AFTER_MS, log)
+    expect(lines).toEqual([])
+    noteAbsenceProof(key, { caughtUp: true, absenceProvable: true }, ABSENCE_STUCK_AFTER_MS + 1, log)
+    noteAbsenceProof(key, refused(1, ['m:fallback:10']), 2 * ABSENCE_STUCK_AFTER_MS, log)
+    expect(lines).toEqual([])
+    noteAbsenceProof(key, refused(1, ['m:fallback:10']), 3 * ABSENCE_STUCK_AFTER_MS, log)
+    expect(lines).toHaveLength(1)
+  })
+})
 
 describe('staleGraceMs', () => {
   it('defaults when unset', () => {

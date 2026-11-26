@@ -414,6 +414,8 @@ async function timedPass(
   const decorated: WorkspaceCompactionDeps['fleet'] = {
     isResident: (k) => fleet.isResident(k),
     residentProjectorInstanceId: (k) => fleet.residentProjectorInstanceId(k),
+    // T-VANISH: closes the window the fold's `release` opened.
+    endCompactionWindow: (k) => fleet.endCompactionWindow(k),
     release: (k, reason) => {
       if (reason === 'compaction-instance-refresh') refreshReleases += 1
       const t0 = performance.now()
@@ -424,9 +426,11 @@ async function timedPass(
         detachEnd = performance.now()
       }
     },
-    ensure: async (k) => {
+    // The options pass through: the pass re-attaches `{ adopt: false }`, the
+    // only start a compaction window admits (T-VANISH).
+    ensure: async (k, options) => {
       const startedAt = performance.now()
-      const value = await fleet.ensure(k as WorkspaceKey)
+      const value = await fleet.ensure(k as WorkspaceKey, options)
       ensures.push({ startedAt, ms: performance.now() - startedAt })
       return value
     },
@@ -436,6 +440,7 @@ async function timedPass(
     repo,
     rootUrl,
     db,
+    connect: () => db.connect(),
     fleet: decorated,
     ownership: { owns: () => true },
     isShuttingDown: () => false,

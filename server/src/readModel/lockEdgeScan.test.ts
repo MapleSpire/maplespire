@@ -13,7 +13,11 @@
 // GNU Affero General Public License for more details.
 
 import { describe, expect, it } from 'vitest'
+import { LIFECYCLE_LOCK_CLASS } from '../maintenance/lifecycleApplyLock.js'
 import {
+  LIFECYCLE_LOCK_CLASS_ON_THE_WIRE,
+  lifecycleRotationEdges,
+  modelEpochRotationEdges,
   projectionInboundEdges,
   unknownAdvisoryKeys,
   type LockEdgeCall,
@@ -165,5 +169,72 @@ describe('G5 — the inbound edge into the projection mutex', () => {
       commit,
     ]).length).toBeGreaterThan(0)
     expect(unknownAdvisoryKeys([take('anything-at-all:x')]).length).toBeGreaterThan(0)
+  })
+})
+
+describe('G4-16f — the overlay-rotation ↔ lifecycle edge', () => {
+  const rotation = 'overlay-rotation:l:v:objects'
+  const takeRotation = (scope: 'session' | 'xact'): LockEdgeCall => ({
+    sql: scope === 'xact'
+      ? 'SELECT pg_advisory_xact_lock(hashtextextended($1, 0))'
+      : 'SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked',
+    params: [rotation],
+  })
+  const releaseRotation: LockEdgeCall = { sql: 'SELECT pg_advisory_unlock(hashtextextended($1, 0)) AS released', params: [rotation] }
+  // The spelling of `lifecycleApplyLock.ts`.
+  const takeLifecycle = (form: 'try' | 'blocking'): LockEdgeCall => ({
+    sql: form === 'try'
+      ? 'SELECT pg_try_advisory_lock($1, $2) AS locked, pg_backend_pid() AS pid'
+      : 'SELECT pg_advisory_lock($1, $2)',
+    params: [LIFECYCLE_LOCK_CLASS, 12345],
+  })
+  const releaseLifecycle: LockEdgeCall = { sql: 'SELECT pg_advisory_unlock($1, $2) AS unlocked, pg_backend_pid() AS pid', params: [LIFECYCLE_LOCK_CLASS, 12345] }
+
+  it('the wire class is the lifecycle lock\'s own', () => {
+    expect(LIFECYCLE_LOCK_CLASS_ON_THE_WIRE).toBe(LIFECYCLE_LOCK_CLASS)
+  })
+
+  it('compaction (rotation keys, then a TRY on the lifecycle lock) against a promotion (lifecycle, then the rotation key): both edges, no cycle', () => {
+    const compaction = [takeRotation('session'), takeLifecycle('try'), releaseLifecycle, releaseRotation]
+    const promotion = [takeLifecycle('try'), { sql: 'BEGIN' }, { sql: "SET LOCAL lock_timeout = '5000ms'" }, takeRotation('xact'), { sql: 'COMMIT' }, releaseLifecycle]
+    const a = lifecycleRotationEdges(compaction)
+    const b = lifecycleRotationEdges(promotion)
+    expect(a.edges).toEqual([{ direction: 'rotation→lifecycle', form: 'try' }])
+    expect(b.edges).toEqual([{ direction: 'lifecycle→rotation', form: 'blocking' }])
+    expect([...a.violations, ...b.violations]).toEqual([])
+  })
+
+  it('CAN FAIL — a BLOCKING lifecycle acquisition under a rotation key (session or xact) is the cycle', () => {
+    expect(lifecycleRotationEdges([takeRotation('session'), takeLifecycle('blocking')]).violations).toHaveLength(1)
+    expect(lifecycleRotationEdges([{ sql: 'BEGIN' }, takeRotation('xact'), takeLifecycle('blocking')]).violations).toHaveLength(1)
+    // …and none once the key is given back or the transaction ended.
+    expect(lifecycleRotationEdges([takeRotation('session'), releaseRotation, takeLifecycle('blocking')]).violations).toEqual([])
+    expect(lifecycleRotationEdges([{ sql: 'BEGIN' }, takeRotation('xact'), { sql: 'COMMIT' }, takeLifecycle('blocking')]).violations).toEqual([])
+  })
+})
+
+describe('G4-16f — the overlay-rotation → model-epoch edge', () => {
+  const take = (key: string, form: 'try' | 'blocking' = 'try'): LockEdgeCall => ({
+    sql: form === 'try' ? 'SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked' : 'SELECT pg_advisory_lock(hashtextextended($1, 0))',
+    params: [key],
+  })
+  const give = (key: string): LockEdgeCall => ({ sql: 'SELECT pg_advisory_unlock(hashtextextended($1, 0)) AS released', params: [key] })
+  const obj = 'overlay-rotation:l:v:object'
+  const conn = 'overlay-rotation:l:v:connection'
+  const epoch = 'model-epoch:l:v'
+
+  it('the sweep\'s and compaction\'s order — rotation keys, then a TRY on model-epoch — is the one registered edge, no violation', () => {
+    const r = modelEpochRotationEdges([take(obj), take(conn), take(epoch), give(epoch), give(conn), give(obj)])
+    expect(r.edges).toEqual([{ direction: 'rotation→model-epoch', form: 'try' }])
+    expect(r.violations).toEqual([])
+    // The repair doors and the retirement pass take model-epoch alone: no edge.
+    expect(modelEpochRotationEdges([take(epoch), give(epoch)])).toEqual({ edges: [], violations: [] })
+  })
+
+  it('CAN FAIL — the inverted order, and a blocking model-epoch under a rotation key', () => {
+    expect(modelEpochRotationEdges([take(epoch), take(obj)]).violations).toHaveLength(1)
+    expect(modelEpochRotationEdges([take(obj), take(epoch, 'blocking')]).violations).toHaveLength(1)
+    // …and none once the key is given back.
+    expect(modelEpochRotationEdges([take(epoch), give(epoch), take(obj)]).violations).toEqual([])
   })
 })

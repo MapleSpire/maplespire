@@ -82,7 +82,7 @@ async function makeServer(
     // where the browser alone carries the bytes.
     shareConfig: { announce: async () => false, access },
   })
-  await new Promise<void>((res) => http.listen(0, res))
+  await new Promise<void>((res) => http.listen(0, '127.0.0.1', res))
   return {
     repo,
     port: (http.address() as { port: number }).port,
@@ -95,7 +95,7 @@ async function makeServer(
 }
 
 function makeClient(port: number): { repo: Repo; close: () => void } {
-  const adapter = new BrowserWebSocketClientAdapter(`ws://localhost:${port}`)
+  const adapter = new BrowserWebSocketClientAdapter(`ws://127.0.0.1:${port}`)
   const repo = new Repo({ network: [adapter], sharePolicy: async () => true })
   return {
     repo,

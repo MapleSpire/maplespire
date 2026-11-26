@@ -71,6 +71,8 @@ describe.skipIf(!TEST_DATABASE_URL)('minted-orphan reaper (live Postgres + real 
     // Postgres container does not carry, and the reaper's DELETE needs
     // nothing of it but the column.
     await db.pool.query(`CREATE TABLE IF NOT EXISTS read_model_document_watermarks (document_id TEXT PRIMARY KEY)`)
+    await db.pool.query(`CREATE TABLE IF NOT EXISTS read_model_adopt_watermarks (document_id TEXT PRIMARY KEY)`)
+    await db.pool.query(`CREATE TABLE IF NOT EXISTS read_model_sealed_product_extracts (product_document_id TEXT PRIMARY KEY)`)
     // The snapshots table, mirroring db.ts: the reaper reads it as a liveness
     // root and REFUSES to run without it.
     await db.pool.query(`
@@ -255,6 +257,28 @@ describe.skipIf(!TEST_DATABASE_URL)('minted-orphan reaper (live Postgres + real 
     expect(mintedOrphanReaperMetricSamples().find((s) => s.name.endsWith('_stranded_documents_total'))!.values[0]!.value).toBe(1)
   })
 
+  it('removes the watermark rows and cached extracts of a reaped document, and keeps a neighbour\'s (the statements DELETE, not only appear)', async () => {
+    const orphanId = mintedId(fresh('gone'))
+    await seedChunk(orphanId, 3 * HOUR)
+    const youngId = mintedId(fresh('gone'))
+    await seedChunk(youngId, 10 * 60 * 1_000)
+    for (const id of [orphanId, youngId]) {
+      await db.pool.query('INSERT INTO read_model_document_watermarks (document_id) VALUES ($1)', [id])
+      await db.pool.query('INSERT INTO read_model_adopt_watermarks (document_id) VALUES ($1)', [id])
+      await db.pool.query('INSERT INTO read_model_sealed_product_extracts (product_document_id) VALUES ($1)', [id])
+    }
+    const outcome = await reapMintedOrphans(repo, { db: db.pool, minimumAgeMs: HOUR })
+    expect(outcome.reapedDocumentIds).toContain(orphanId)
+    expect(outcome.reapedDocumentIds).not.toContain(youngId)
+    const rows = async (table: string, column: string, id: string) =>
+      (await db.pool.query(`SELECT 1 FROM ${table} WHERE ${column} = $1`, [id])).rowCount
+    for (const [table, column] of [['read_model_document_watermarks', 'document_id'], ['read_model_adopt_watermarks', 'document_id'],
+      ['read_model_sealed_product_extracts', 'product_document_id']] as const) {
+      expect(await rows(table, column, orphanId), `${table}: reaped document`).toBe(0)
+      expect(await rows(table, column, youngId), `${table}: neighbour kept`).toBe(1)
+    }
+  })
+
   it('REFUSES to run without a mint key — with no key every id reads unminted and the verdict would be vacuous', async () => {
     const orphanId = mintedId(fresh('gone'))
     await seedChunk(orphanId, 3 * HOUR)
@@ -349,8 +373,9 @@ describe('the reaper deletes exactly what gcOrphanedDocs deletes — a parity ga
   const gc = readFileSync(new URL('./gc.ts', import.meta.url), 'utf8')
   const deletedTables = (source: string): string[] => [...source.matchAll(/DELETE FROM (\w+)/g)].map((m) => m[1]!).sort()
 
-  it('both modules delete from the same three tables, in a transaction under the fence', () => {
-    expect(deletedTables(reaper)).toEqual(['automerge_document_workspace', 'automerge_storage', 'read_model_document_watermarks'])
+  it('both modules delete from the same five tables, in a transaction under the fence', () => {
+    expect(deletedTables(reaper)).toEqual(['automerge_document_workspace', 'automerge_storage', 'read_model_adopt_watermarks',
+      'read_model_document_watermarks', 'read_model_sealed_product_extracts'])
     expect(deletedTables(gc)).toEqual(deletedTables(reaper))
     expect(reaper).toMatch(/if \(options\.fence\) await assertMaintenanceFence\(client, options\.fence\)/)
   })

@@ -2,6 +2,11 @@ services:
   postgres:
     image: postgres:16-alpine
     container_name: maplespire-postgres
+    # 8 GB, not the 1 GB default: a read-model cold build writes its workspace
+    # in one transaction (2.8-4.7 GB of WAL at 119 000 objects); a checkpoint
+    # is requested at ~max_wal_size / 1.9, so at 8 GB only a rebuild beside
+    # other workspaces takes one mid-build (compose.maplespire.yml says more).
+    command: ["postgres", "-c", "max_wal_size=8GB"]
     environment:
       POSTGRES_USER: maplespire
       POSTGRES_PASSWORD: maplespire

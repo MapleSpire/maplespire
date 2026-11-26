@@ -19,6 +19,7 @@ import { patchDocumentObservedDiffSource, patchFanoutHeadsSource, patchRegistryC
 import { patchDocumentSaveBarrierSource, patchDocumentSaveBarrierTypesSource, patchStorageSourceCurrentDocumentSource } from './patch-automerge-document-saves.mjs'
 import { patchCooperativeEventsSource } from './patch-automerge-cooperative-events.mjs'
 import { patchStorageSubsystemCompactionLatchSource } from './patch-automerge-compaction-latch.mjs'
+import { patchStorageSubsystemStrictDecodeSource } from './patch-automerge-strict-decode.mjs'
 import { patchInFlightFanoutSource, verifyInFlightSdkVersion } from './patch-automerge-inflight-fanout.mjs'
 import { prepareSyncStateLifetimePatch, applySyncStateLifetimePatch } from './patch-automerge-sync-state-lifetime.mjs'
 
@@ -2083,7 +2084,8 @@ function patchInstalledStorageSubsystemSource(source) {
   const existing = patchStorageSubsystemSource(source)
   const barrier = patchDocumentSaveBarrierSource(existing.source)
   const latch = patchStorageSubsystemCompactionLatchSource(barrier.source)
-  return { source: latch.source, changed: existing.changed || barrier.changed || latch.changed }
+  const strict = patchStorageSubsystemStrictDecodeSource(latch.source)
+  return { source: strict.source, changed: existing.changed || barrier.changed || latch.changed || strict.changed }
 }
 
 function patchInstalledStorageSource(source) {

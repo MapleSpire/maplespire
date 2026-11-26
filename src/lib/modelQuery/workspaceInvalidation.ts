@@ -48,7 +48,40 @@ function eventUrl(): string {
   return `${API_BASE}/api/model/cache/events?${workspaceSearchParams().toString()}`
 }
 
+/**
+ * REOPENING A STREAM THE BROWSER GAVE UP ON (T-DIAGDEF).
+ *
+ * An EventSource reconnects by itself only after a stream that OPENED; a
+ * request that fails — a 503 while a cell shuts down, a 502 from the proxy in
+ * front of it — moves it to `CLOSED` for good. Left there, `openSource` kept
+ * the dead source (`source && sourceUrl === url`) and the tab lost every
+ * invalidation until a workspace change or a reload. So on `CLOSED` the source
+ * is dropped and reopened after a delay that doubles from
+ * {@link REOPEN_FIRST_MS} to {@link REOPEN_MAX_MS} (no tight loop against a
+ * server that keeps refusing), reset by the first event of a stream that works.
+ */
+export const REOPEN_FIRST_MS = 2_000
+export const REOPEN_MAX_MS = 60_000
+let reopenTimer: ReturnType<typeof setTimeout> | null = null
+let reopenDelayMs = REOPEN_FIRST_MS
+
+function cancelReopen(): void {
+  if (reopenTimer) clearTimeout(reopenTimer)
+  reopenTimer = null
+}
+
+function scheduleReopen(): void {
+  if (reopenTimer) return
+  const delay = reopenDelayMs
+  reopenDelayMs = Math.min(REOPEN_MAX_MS, reopenDelayMs * 2)
+  reopenTimer = setTimeout(() => {
+    reopenTimer = null
+    openSource()
+  }, delay)
+}
+
 function closeSource(): void {
+  cancelReopen()
   source?.close()
   source = null
   sourceUrl = null
@@ -108,13 +141,26 @@ function openSource(): void {
   sourceUrl = url
   next.addEventListener('ready', (event) => {
     const generation = parseGeneration(event)
-    if (source === next && generation !== null) enqueue('ready', workspace, generation)
+    if (source !== next) return
+    reopenDelayMs = REOPEN_FIRST_MS
+    if (generation !== null) enqueue('ready', workspace, generation)
   })
   next.addEventListener('invalidate', (event) => {
     const generation = parseGeneration(event)
     if (source === next && generation !== null) enqueue('invalidate', workspace, generation)
   })
+  next.addEventListener('error', () => {
+    // CONNECTING: the browser retries on its own (`retry:`), nothing to do.
+    if (source !== next || next.readyState !== CLOSED_STATE) return
+    source = null
+    sourceUrl = null
+    scheduleReopen()
+  })
 }
+
+/** `EventSource.CLOSED`, without relying on the constructor's static (a test
+ * double, or an environment without it). */
+const CLOSED_STATE = 2
 
 function onVisibility(): void {
   if (document.visibilityState === 'visible') openSource()
@@ -164,4 +210,6 @@ export function __resetWorkspaceInvalidationForTests(): void {
   uninstallLifecycle()
   pending = null
   flushScheduled = false
+  cancelReopen()
+  reopenDelayMs = REOPEN_FIRST_MS
 }

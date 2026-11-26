@@ -19,6 +19,7 @@ import { PostgresStorageAdapter } from '../automergeStorage.js'
 import { AutomergeResidencyLeases } from '../automergeResidency.js'
 import { cachedHandles } from '../automergeRepoCompat.js'
 import { createIsolatedSchemaDb, type IsolatedSchemaDb } from '../testing/isolatedSchema.js'
+import { protocolFixtureQuery } from '../testing/protocolFixture.js'
 import { setWorkspaceDocumentsRegistrationForTest } from '../rbac/docScope.js'
 import { ensureReadModelSchema } from './schema.js'
 import { startReadModelProjector } from './projectorService.js'
@@ -313,7 +314,7 @@ suite('ordinary head residency (G4-16b-defer2h memory) — real leases, real Rep
         WHERE landscape_id = $1 AND version_id = $2 AND collection = 'object' AND document_id = $3`,
       [WS.landscapeId, WS.versionId, id],
     )
-    const setForwardedHeads = (id: string, heads: string[] | null) => db.pool.query(
+    const setForwardedHeads = (id: string, heads: string[] | null) => protocolFixtureQuery(db.pool,
       `UPDATE read_model_ordinary_head_retirements SET forwarded_heads = $4::text[]
         WHERE landscape_id = $1 AND version_id = $2 AND collection = 'object' AND document_id = $3`,
       [WS.landscapeId, WS.versionId, id, heads],
@@ -1006,7 +1007,7 @@ suite('ordinary head residency (G4-16b-defer2h memory) — real leases, real Rep
           injected = true
         }
         if (mode === 'cas-refused') {
-          await db.pool.query(
+          await protocolFixtureQuery(db.pool,
             `UPDATE read_model_ordinary_head_retirements SET arrival_watermark = 1
               WHERE landscape_id = $1 AND version_id = $2 AND document_id = $3`, [WS.landscapeId, WS.versionId, hit])
           injected = true
@@ -1180,6 +1181,125 @@ suite('ordinary head residency (G4-16b-defer2h memory) — real leases, real Rep
       },
     }) as IsolatedSchemaDb['pool']
   }
+
+  // ---- G4-16f: the rotation child a failed or superseded rotation leaves ----
+
+  /** Every document `repo.create` makes from here on, in order. */
+  function recordCreates(repo: Repo) {
+    const ids: string[] = []
+    const original = repo.create.bind(repo) as (...args: unknown[]) => DocHandle<unknown>
+    const spy = vi.spyOn(repo, 'create').mockImplementation(((...args: unknown[]) => {
+      const handle = original(...args)
+      ids.push(String(handle.documentId))
+      return handle
+    }) as unknown as typeof repo.create)
+    return { ids, restore: () => spy.mockRestore() }
+  }
+
+  it('G4-16f: a rotation that throws after its child exists (BEGIN, N times) gives each child\'s lease back — the cache does not grow with N', async () => {
+    process.env.AM_ORDINARY_FOLD_ARRIVAL_POLL_MS = '200'
+    const ws = await workspace(storageRepo())
+    const residency = new AutomergeResidencyLeases(ws.repo)
+    const log = logLines()
+    // Fold OFF: the rotator is then the only writer of this BEGIN form.
+    const FAILURES = 2
+    let failed = 0
+    const pool = poolBeforeQuery((text) => {
+      if (failed < FAILURES && text.startsWith('BEGIN; SET LOCAL lock_timeout')) {
+        failed += 1
+        throw new Error('injected BEGIN failure after createChild')
+      }
+    })
+    const creates = recordCreates(ws.repo)
+    const stop = await startReadModelProjector(
+      ws.repo, ws.rootUrl, pool, WS, residency, 0, undefined,
+      undefined, undefined, undefined, config(false),
+    )
+    try {
+      const cachedBefore = new Set(Object.keys(cachedHandles(ws.repo)))
+      // Backoff 1 s then 5 s, then the third attempt rotates.
+      await fillAndRotate(ws, 'h0')
+      expect(failed).toBe(FAILURES)
+      expect(log.events('read_model.ordinary_head_rotation_failed')).toHaveLength(FAILURES)
+      const child = docId(currentHead(ws))
+      const orphans = creates.ids.filter((id) => id !== child)
+      expect(creates.ids).toContain(child)
+      expect(orphans).toHaveLength(FAILURES)
+      for (const id of orphans) {
+        expect(await until(async () => {
+          await residency.drain()
+          return !residency.isLeased(id) && !resident(ws.repo, id)
+        }, (gone) => gone, 15_000)).toBe(true)
+      }
+      // No growth with N: the published child is the ONE new resident document.
+      await residency.drain()
+      expect(Object.keys(cachedHandles(ws.repo)).filter((id) => !cachedBefore.has(id))).toEqual([child])
+      expect(residency.isLeased(child)).toBe(true)
+    } finally {
+      stop()
+      creates.restore()
+      log.restore()
+      delete process.env.AM_ORDINARY_FOLD_ARRIVAL_POLL_MS
+    }
+  }, 120_000)
+
+  it('G4-16f: a SUPERSEDED rotation (ownership lost while its child is built) gives the child\'s lease back, and the next rotation still lands', async () => {
+    process.env.AM_ORDINARY_FOLD_ARRIVAL_POLL_MS = '200'
+    const ws = await workspace(storageRepo())
+    const residency = new AutomergeResidencyLeases(ws.repo)
+    const log = logLines()
+    let owned = true
+    let child: string | null = null
+    const original = ws.repo.create.bind(ws.repo) as (...args: unknown[]) => DocHandle<unknown>
+    const createSpy = vi.spyOn(ws.repo, 'create').mockImplementation(((...args: unknown[]) => {
+      const handle = original(...args)
+      // Fold off: the only document created here is a rotation's child. The
+      // first one loses the workspace while it is built.
+      if (!child) { child = String(handle.documentId); owned = false }
+      return handle
+    }) as unknown as typeof ws.repo.create)
+    // Ownership comes back once the child's lease went (on the base, never:
+    // the test then times out on the wait below).
+    const originalRelease = residency.release.bind(residency)
+    const releaseSpy = vi.spyOn(residency, 'release').mockImplementation((documentId, owner) => {
+      if (documentId === child) owned = true
+      return originalRelease(documentId, owner)
+    })
+    const stop = await startReadModelProjector(
+      ws.repo, ws.rootUrl, db.pool, WS, residency, 0, undefined,
+      () => owned, undefined, undefined, config(false),
+    )
+    try {
+      const url = currentHead(ws)
+      const head = await ws.repo.find<ObjHead>(url as AutomergeUrl)
+      let index = 0
+      while (A.stats(head.doc() as A.Doc<unknown>).numChanges < THRESHOLD) {
+        head.change((d) => { d.objects[`s${index}`] = { id: `s${index}`, name: `s${index}`, type: 'system' } })
+        index += 1
+      }
+      expect(await until(() => child !== null && owned, (back) => back, 30_000)).toBe(true)
+      // Superseded: ModelMeta never named it, and its lease went.
+      expect(currentHead(ws)).toBe(url)
+      expect(await until(async () => {
+        await residency.drain()
+        return !residency.isLeased(child!) && !resident(ws.repo, child!)
+      }, (gone) => gone, 15_000)).toBe(true)
+      // Control: the next due pass rotates for real.
+      head.change((d) => { d.objects.again = { id: 'again', name: 'again', type: 'system' } })
+      const next = await until(() => currentHead(ws), (now) => now !== url, 45_000)
+      expect(next).not.toBe(url)
+      expect(docId(next)).not.toBe(child)
+      // Logged after the meta flush, which follows the repoint just seen.
+      expect((await until(() => log.events('read_model.ordinary_head_rotated'), (lines) => lines.length >= 1, 15_000)).length)
+        .toBeGreaterThanOrEqual(1)
+    } finally {
+      stop()
+      createSpy.mockRestore()
+      releaseSpy.mockRestore()
+      log.restore()
+      delete process.env.AM_ORDINARY_FOLD_ARRIVAL_POLL_MS
+    }
+  }, 120_000)
 
   it('G4-16 M3 review: a pass IN FLIGHT on an earlier source when the detach batch throws is awaited before its lease goes, and the unsaved write it carries is not lost', async () => {
     process.env.AM_ORDINARY_FOLD_ARRIVAL_POLL_MS = '200'

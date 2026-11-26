@@ -24,6 +24,17 @@ import { bootstrapPlacementFor, bootstrapPlacementSnapshot, resetServerCreationP
 import { StaleSyncCellWriteError } from './automergeStorageErrors.js'
 
 describe('remapModelMeta', () => {
+  it('the fork carries NO epoch hint — no predecessor of the source version for B3 to resume into', () => {
+    const meta = {
+      objectShardUrls: ['o1'], connectionShardUrls: ['c1'],
+      modelEpoch: 4, epochPredecessorRef: { val: 'automerge:2j9Fq5ZQfRrR1CbGCJm5qUxZHfVh' }, epochSlots: [1], epochSuccessorRef: 'automerge:x',
+      groups: { g: { id: 'g' } },
+    }
+    const out = remapModelMeta(meta, ['N1'], ['M1'])
+    for (const field of ['modelEpoch', 'epochPredecessorRef', 'epochSlots', 'epochSuccessorRef']) expect(out).not.toHaveProperty(field)
+    expect(out.groups).toEqual({ g: { id: 'g' } }) // the model itself is carried
+  })
+
   it('replaces the shard url arrays with the forked ones', () => {
     const meta = { objectShardUrls: ['o1', 'o2'], connectionShardUrls: ['c1'], decisionRecordShardUrls: ['d1'] }
     const out = remapModelMeta(meta, ['N1', 'N2'], ['M1'], ['D1'])

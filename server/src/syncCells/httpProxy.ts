@@ -14,6 +14,7 @@
 
 import http, { type IncomingMessage, type ServerResponse } from 'node:http'
 import https from 'node:https'
+import { endEventStreamForShutdown, type InFlightHandlers, type LongLivedResponses } from '../httpShutdown.js'
 import {
   DRAFT_CREATE_PATH,
   expressMatchablePath,
@@ -326,6 +327,19 @@ export function proxyWorkspaceHttpRequest(options: {
    *  two bounds apart — with both at their defaults, a test cannot prove the
    *  connect timer is cleared on connect rather than merely outlived. */
   connectTimeoutMs?: number
+  /** The landing cell's long-lived responses: a
+   * relayed `text/event-stream` registers there for as long as it is open, so
+   * the landing cell's shutdown ends it instead of waiting out its grace cut;
+   * and once that shutdown has begun, a stream reaching its headers is not
+   * relayed at all. */
+  longLived?: LongLivedResponses
+  /** The landing cell's handler census: the request is
+   * HELD until the exchange with the owner is really over (the upstream
+   * request's `close`: response consumed, or the exchange destroyed), so a
+   * relayed write in flight counts while the owner has not answered — and a
+   * relay the client abandoned (the proxy destroys the upstream) is released,
+   * never leaked. */
+  inFlight?: InFlightHandlers
 }): Promise<boolean> {
   const { request, response, advertiseUrl, sourceCellId } = options
   const timeoutMs = options.timeoutMs ?? 5_000
@@ -372,6 +386,12 @@ export function proxyWorkspaceHttpRequest(options: {
       headers,
       agent: false,
     })
+    // Held until the upstream exchange closes: `close` fires once the
+    // response is consumed, on an error, and when the proxy destroys it.
+    if (options.inFlight) {
+      void options.inFlight.hold(request, new Promise<void>((relayOver) => upstream.once('close', () => relayOver())))
+        .catch(() => undefined)
+    }
 
     let settled = false
     // TWO BOUNDS, AND A DISARM THAT EVERY TERMINAL PATH REACHES.
@@ -430,6 +450,18 @@ export function proxyWorkspaceHttpRequest(options: {
       clearTimeout(connectTimer)
       clearTimeout(headerTimer)
       upstream.setTimeout(0)
+      const eventStream = String(upstreamResponse.headers['content-type'] ?? '').includes('text/event-stream')
+      if (eventStream && options.longLived?.closing) {
+        // The landing cell is shutting down: no new relayed stream. Answered
+        // as the cell's own route answers (`endEventStreamForShutdown`): a
+        // stream that ends at once with a `retry:`, which an EventSource
+        // reconnects — to another cell — where a 503 would close it for good.
+        upstreamResponse.destroy()
+        upstream.destroy()
+        endEventStreamForShutdown(response)
+        settle(false)
+        return
+      }
       response.statusCode = upstreamResponse.statusCode ?? 502
       if (upstreamResponse.statusMessage) response.statusMessage = upstreamResponse.statusMessage
       for (const [name, value] of Object.entries(upstreamResponse.headers)) {
@@ -440,6 +472,17 @@ export function proxyWorkspaceHttpRequest(options: {
       // operations and the active/active conformance gate.
       response.setHeader(SYNC_HTTP_ROUTE_HEADER, 'proxied')
       upstreamResponse.once('error', (error) => response.destroy(error))
+      if (eventStream && options.longLived) {
+        // Ended by the shutdown's `http` step: the pipe and the upstream go
+        // first (`onEnd`), then the response — nothing is relayed after the
+        // end. Unregistered when the response closes, whoever closes it.
+        const untrack = options.longLived.track(response, () => {
+          upstreamResponse.unpipe(response)
+          upstreamResponse.destroy()
+          upstream.destroy()
+        })
+        response.once('close', untrack)
+      }
       upstreamResponse.pipe(response)
       settle(true)
     })

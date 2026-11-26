@@ -17,7 +17,7 @@ import pg from 'pg'
 import { guardIdleClientErrors } from '../db/poolErrorGuard.js'
 import {
   upsertObjects, upsertConnections, deleteObjects,
-  applyObjectShardDelta, coldBuildReadModel, deleteGroups, upsertGroups, type WorkspaceKey,
+  applyObjectShardDelta, applyConnectionShardDelta, coldBuildReadModel, coldBuildReadModelByDeltas, deleteGroups, upsertGroups, type WorkspaceKey,
 } from './projector.js'
 
 /**
@@ -210,6 +210,46 @@ suite('read-model projector (Postgres integration, txn-isolated)', () => {
     expect((await getObject('o3'))?.name).toBe('C')
   })
 
+  /** `ro_workspace_stats.<column>` of the suite's workspace, 0 without a row. */
+  const workspaceCount = async (column: 'object_count' | 'connection_count') =>
+    Number((await client.query(
+      `SELECT ${column}::int AS n FROM ro_workspace_stats WHERE landscape_id = $1 AND version_id = $2`,
+      [WS.landscapeId, WS.versionId],
+    )).rows[0]?.n ?? 0)
+
+  it('a shard delta with an IN-SHARD duplicate id (two map keys, one inner id) succeeds, the last copy wins, in a chunk and across chunks', async () => {
+    // Raw, two copies in one 1 000-row `bulkUpsert` chunk fail the statement
+    // (21000) on every delta of the shard; across chunks the upsert succeeds
+    // but counts the id twice.
+    for (const { label, size, twinAt } of [
+      { label: 'in one chunk', size: 10, twinAt: 7 },
+      { label: 'across chunks', size: 1_500, twinAt: 1_200 },
+    ]) {
+      await client.query('SAVEPOINT shard_duplicates')
+      await client.query('DELETE FROM ro_workspace_stats WHERE landscape_id = $1 AND version_id = $2', [WS.landscapeId, WS.versionId])
+      const objects = Array.from({ length: size }, (_, i) => ({ id: `o${i}`, name: `n${i}` }))
+      objects.splice(twinAt, 0, { id: 'o0', name: 'LAST' })
+      const dropped = await applyObjectShardDelta(client, WS, null, [], objects)
+      expect(dropped.map((drop) => [drop.kind, drop.id, drop.index, drop.keptIndex]), label).toEqual([['object', 'o0', 0, twinAt]])
+      expect(await countObjects(), label).toBe(size)
+      expect((await getObject('o0'))?.name, label).toBe('LAST')
+      expect(await workspaceCount('object_count'), label).toBe(size)
+
+      const connections = Array.from({ length: size }, (_, i) => ({ id: `c${i}`, fromId: 'o1', toId: 'o2', label: `l${i}` }))
+      connections.splice(twinAt, 0, { id: 'c0', fromId: 'o1', toId: 'o2', label: 'LAST' })
+      const droppedConnections = await applyConnectionShardDelta(client, WS, null, [], connections)
+      expect(droppedConnections.map((drop) => [drop.kind, drop.id]), label).toEqual([['connection', 'c0']])
+      const connectionRows = await client.query<{ id: string; label: string }>(
+        `SELECT id, data->>'label' AS label FROM ro_connections WHERE landscape_id = $1 AND version_id = $2`,
+        [WS.landscapeId, WS.versionId],
+      )
+      expect(connectionRows.rows, label).toHaveLength(size)
+      expect(connectionRows.rows.find((row) => row.id === 'c0')?.label, label).toBe('LAST')
+      expect(await workspaceCount('connection_count'), label).toBe(size)
+      await client.query('ROLLBACK TO SAVEPOINT shard_duplicates')
+    }
+  }, 60_000)
+
   it('deleteObjects removes by id', async () => {
     await upsertObjects(client, WS, null, [{ id: 'o1' }, { id: 'o2' }])
     await deleteObjects(client, WS, ['o1'])
@@ -229,7 +269,11 @@ suite('read-model projector (Postgres integration, txn-isolated)', () => {
     expect(await getObject('o2')).toBeUndefined()
   })
 
-  it('the COLD BUILD analyzes ro_objects before reparenting, and the delta path does NOT', async () => {
+  /** A real PostgreSQL error carrying `lock_not_available` (what an expired
+   * `lock_timeout` raises), for the degrade arms below. */
+  const RAISE_LOCK_TIMEOUT = `DO $$ BEGIN RAISE EXCEPTION USING ERRCODE = '55P03', MESSAGE = 'test: lock timeout'; END $$`
+
+  it('the BY-DELTAS cold build analyzes ro_objects before reparenting, and the delta path does NOT', async () => {
     // Both halves, because each alone is satisfied by the wrong thing.
     //
     // The cold build DELETEs every `ro_objects` row for the workspace and
@@ -253,12 +297,12 @@ suite('read-model projector (Postgres integration, txn-isolated)', () => {
         }
         return (text: string, params?: unknown[]) => {
           if (typeof text === 'string') recorded.push(text.trim().split('\n')[0].trim())
-          // A statement Postgres really rejects, so the catch is entered by the
-          // database rather than by a stub — and the transaction is genuinely in
-          // the aborted state the SAVEPOINT has to rescue it from.
-          const sql = failAnalyze && text === 'ANALYZE ro_objects'
-            ? 'ANALYZE ro_objects_no_such_table'
-            : text
+          // A statement Postgres really rejects WITH THE CEILING'S CODE (55P03,
+          // the only failure the bounded ANALYZE absorbs — any other is
+          // rethrown, `analyzeWithinCeiling`), so the catch is entered by the
+          // database rather than by a stub — and the transaction is genuinely
+          // in the aborted state the SAVEPOINT has to rescue it from.
+          const sql = failAnalyze && text === 'ANALYZE ro_objects' ? RAISE_LOCK_TIMEOUT : text
           return (target.query as (t: string, p?: unknown[]) => Promise<never>)(sql, params)
         }
       },
@@ -270,7 +314,10 @@ suite('read-model projector (Postgres integration, txn-isolated)', () => {
     const ANALYZE = 'ANALYZE ro_objects'
     const analyzeCount = () => recorded.filter((sql) => sql === ANALYZE).length
 
-    await coldBuildReadModel(recordingClient, WS, null, [{ id: 'o1', name: 'A' }, { id: 'o2', parentId: 'o1' }], [])
+    // The by-deltas cold build (the reference the bulk path is tested
+    // against) keeps this ANALYZE; the bulk path has no reparent — the test
+    // below.
+    await coldBuildReadModelByDeltas(recordingClient, WS, null, [{ id: 'o1', name: 'A' }, { id: 'o2', parentId: 'o1' }], [])
     expect(analyzeCount()).toBe(1)
     // BETWEEN the insert and the reparent — BOTH bounds, because either alone
     // is satisfied by a placement that does nothing. An ANALYZE at the TOP of
@@ -288,7 +335,7 @@ suite('read-model projector (Postgres integration, txn-isolated)', () => {
     // projection mutex on a CROSS-WORKSPACE table lock; leaving the ceiling
     // armed afterwards would re-time every later lock in the projection.
     expect(recorded).toContain("SET LOCAL lock_timeout = '15000ms'")
-    expect(recorded.lastIndexOf('SET LOCAL lock_timeout = 0')).toBeGreaterThan(analyzeAt)
+    expect(recorded.lastIndexOf(`SELECT set_config('lock_timeout', $1, true)`)).toBeGreaterThan(analyzeAt)
     // And it is allowed to fail without taking the build with it.
     expect(recorded).toContain('SAVEPOINT read_model_analyze')
 
@@ -309,7 +356,7 @@ suite('read-model projector (Postgres integration, txn-isolated)', () => {
     console.warn = (...args: unknown[]) => { warnings.push(args) }
     try {
       failAnalyze = true
-      await coldBuildReadModel(recordingClient, WS, null, [{ id: 'o4', name: 'D' }], [])
+      await coldBuildReadModelByDeltas(recordingClient, WS, null, [{ id: 'o4', name: 'D' }], [])
     } finally {
       failAnalyze = false
       console.warn = warn
@@ -328,6 +375,57 @@ suite('read-model projector (Postgres integration, txn-isolated)', () => {
     // ANALYZE being absent and not about the driver never entering the path.
     expect(recorded.some((sql) => sql.startsWith('UPDATE ro_objects'))).toBe(true)
     expect(await getObject('o3')).toBeDefined()
+  })
+
+  it('the BULK cold build never reparents by UPDATE, and its one ANALYZE is bounded and allowed to fail', async () => {
+    // G4-16f C7: the derived parents are computed before the insert, so no
+    // `UPDATE ro_objects` and no ANALYZE before one; the derived-stats
+    // ANALYZE (eight tables, every workspace's rows: a cross-workspace lock
+    // inside the projection mutex) is bounded like the reparent's was.
+    const recorded: string[] = []
+    let failAnalyze = false
+    const recording = {
+      query: (text: string, params?: unknown[]) => {
+        recorded.push(text.trim().split('\n')[0].trim())
+        const sql = failAnalyze && text.startsWith('ANALYZE ro_objects,') ? RAISE_LOCK_TIMEOUT : text
+        return client.query(sql, params)
+      },
+    }
+    await client.query(`SET LOCAL lock_timeout = '7s'`)
+    await coldBuildReadModel(recording, WS, null, [{ id: 'o1', name: 'A' }, { id: 'o2', parentId: 'o1' }], [])
+    expect(recorded.some((sql) => sql.startsWith('UPDATE ro_objects'))).toBe(false)
+    expect(recorded).not.toContain('ANALYZE ro_objects')
+    const analyzeAt = recorded.findIndex((sql) => sql.startsWith('ANALYZE ro_objects, ro_connections'))
+    expect(analyzeAt).toBeGreaterThan(-1)
+    expect(recorded[analyzeAt - 1]).toBe("SET LOCAL lock_timeout = '15000ms'")
+    expect(recorded[analyzeAt - 2]).toBe('SAVEPOINT read_model_analyze')
+    // The caller's own ceiling comes back afterwards.
+    expect((await client.query('SHOW lock_timeout')).rows[0].lock_timeout).toBe('7s')
+    expect(await getObject('o2')).toMatchObject({ parentId: 'o1' })
+    const levels = await client.query(
+      `SELECT id, effective_parent_id, c4_parent_id FROM ro_objects WHERE landscape_id = $1 AND version_id = $2 ORDER BY id`,
+      [WS.landscapeId, WS.versionId],
+    )
+    expect(levels.rows).toEqual([
+      { id: 'o1', effective_parent_id: null, c4_parent_id: null },
+      { id: 'o2', effective_parent_id: 'o1', c4_parent_id: 'o1' },
+    ])
+
+    // DRIVEN degrade: the ANALYZE really fails, the build still completes.
+    const warn = console.warn
+    const warnings: unknown[][] = []
+    console.warn = (...args: unknown[]) => { warnings.push(args) }
+    try {
+      failAnalyze = true
+      await coldBuildReadModel(recording, WS, null, [{ id: 'o5', name: 'E' }], [])
+    } finally {
+      failAnalyze = false
+      console.warn = warn
+    }
+    expect(await getObject('o5')).toBeDefined()
+    expect(recorded).toContain('ROLLBACK TO SAVEPOINT read_model_analyze')
+    expect(warnings.some((args) => String(args[0]).includes('could not ANALYZE ro_objects, ro_connections'))).toBe(true)
+    expect((await client.query('SHOW lock_timeout')).rows[0].lock_timeout).toBe('7s')
   })
 
   it('degree via from_id/to_id counts a self-loop once (matches client connectionCount)', async () => {

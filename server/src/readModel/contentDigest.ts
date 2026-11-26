@@ -28,6 +28,10 @@
 // resolution, no fight with the residency evictor, no second pass and no race:
 // both operands carry the same generation.
 //
+// (Since G4-16f C6a the object and connection seals are also MAINTAINED
+// through delta writes, and a maintained seal certifies less than the list
+// below: see `projectionIntegrity.ts`, WHAT A MAINTAINED SEAL CERTIFIES.)
+//
 // WHAT THIS COVERS (narrowly): the PRIMARY KEYS of four tables —
 // ro_objects, ro_connections, ro_groups, ro_diagrams — between the extractor's
 // output and the bytes on disk. Within that: a partial commit, an `ON CONFLICT`
@@ -135,6 +139,119 @@ export function digestOfIds(ids: Iterable<string>): ContentDigest {
 
 export function digestsEqual(a: ContentDigest, b: ContentDigest): boolean {
   return a.n === b.n && a.x === b.x
+}
+
+// ── G4-16f C6a: maintaining a digest through delta writes ──────────────────
+//
+// The digest is over `id` ALONE (see the header: row content is hole 1), so
+// an `ON CONFLICT … DO UPDATE` of a row that was already there changes
+// nothing, and the only facts a delta write must report are the ids that
+// ENTERED the table and the ids that LEFT it. XOR is its own inverse, so
+// "XOR out" a left id is the same operation as "XOR in" an entered one; only
+// the count distinguishes them.
+
+/** A signed change to a `ContentDigest`: `n` may be negative. */
+export interface DigestDelta {
+  n: number
+  x: string
+}
+
+export const ZERO_DIGEST_DELTA: DigestDelta = Object.freeze({ n: 0, x: '0000000000000000' })
+
+const hex64 = (value: bigint): string => (value & MASK64).toString(16).padStart(16, '0')
+
+/**
+ * The delta of an id set from which `left` was removed and to which
+ * `entered` was added. The caller passes SETS — an id that entered must not
+ * already have been present, an id that left must have been present — which
+ * is why the writers compute them from the table (`projector.ts`), never from
+ * their input lists. Ids are coerced with `String()` like `digestOfIds`.
+ */
+export function xorDelta(entered: Iterable<string>, left: Iterable<string>): DigestDelta {
+  const into = digestOfIds(entered)
+  const out = digestOfIds(left)
+  return { n: into.n - out.n, x: hex64(BigInt(`0x${into.x}`) ^ BigInt(`0x${out.x}`)) }
+}
+
+/** `a` then `b`: counts add, XORs XOR. Associative and commutative. */
+export function composeDigestDeltas(a: DigestDelta, b: DigestDelta): DigestDelta {
+  return { n: a.n + b.n, x: hex64(BigInt(`0x${a.x}`) ^ BigInt(`0x${b.x}`)) }
+}
+
+/** `base ⊕ delta`. The JS twin of the SQL in `stampProjectionIntegrity`,
+ * unit-tested against `digestOfIds` of the resulting set. */
+export function applyDigestDelta(base: ContentDigest, delta: DigestDelta): ContentDigest {
+  return { n: base.n + delta.n, x: hex64(BigInt(`0x${base.x}`) ^ BigInt(`0x${delta.x}`)) }
+}
+
+/** The kinds whose id-set changes the delta writers record. Groups and
+ * diagrams are not here: every pass that writes them is a FULL sync and
+ * re-seals them (`syncGroups`, `syncDiagrams`). */
+export type MaintainedDigestKind = 'object' | 'connection'
+
+/**
+ * The id-set changes ONE projection transaction made to `ro_objects` and
+ * `ro_connections`, recorded by the writers themselves (`upsertObjects`,
+ * `deleteObjects`, `upsertConnections`, `deleteConnections`).
+ *
+ * WHY AMBIENT (bound to the transaction's client) and not a parameter: a
+ * parameter is a wire every call site must remember, and the one it forgets
+ * — the metadata pass's tombstone `deleteObjects` is a writer nobody would
+ * think of as "the object delta" — corrupts the digest. Bound to the client
+ * for the length of the projection's action, every writer that runs in that
+ * transaction records, whichever call path reached it. A writer called with
+ * any OTHER Queryable (the pool, another client) is outside this transaction
+ * and records nothing, which is right: its write is not this projection's.
+ */
+export class IdSetDeltaRecorder {
+  private readonly deltas = new Map<MaintainedDigestKind, DigestDelta>()
+
+  record(kind: MaintainedDigestKind, entered: Iterable<string>, left: Iterable<string>): void {
+    this.deltas.set(kind, composeDigestDeltas(this.deltas.get(kind) ?? ZERO_DIGEST_DELTA, xorDelta(entered, left)))
+  }
+
+  /** Every kind a writer recorded for, an empty delta included. */
+  touched(): MaintainedDigestKind[] {
+    return [...this.deltas.keys()]
+  }
+
+  deltasByKind(): Partial<Record<MaintainedDigestKind, DigestDelta>> {
+    return Object.fromEntries(this.deltas)
+  }
+}
+
+const recorders = new WeakMap<object, IdSetDeltaRecorder>()
+
+/**
+ * Run `work` with `recorder` bound to `tx`. Unbound in `finally`, so a
+ * pooled client returned after a failed pass carries no recorder into the
+ * next transaction that draws it. A second bind on the same client while one
+ * is live is refused: two projections cannot share one transaction, so it
+ * would be a defect, and silently merging their deltas would hide it.
+ */
+export async function withIdSetDeltaRecorder<T>(
+  tx: object,
+  recorder: IdSetDeltaRecorder,
+  work: () => Promise<T>,
+): Promise<T> {
+  if (recorders.has(tx)) throw new Error('an id-set delta recorder is already bound to this transaction')
+  recorders.set(tx, recorder)
+  try {
+    return await work()
+  } finally {
+    recorders.delete(tx)
+  }
+}
+
+/** Called by the writers after their row statement succeeded. A no-op when
+ * no recorder is bound (the static plane, the seed, scripts). */
+export function recordIdSetDelta(
+  tx: object,
+  kind: MaintainedDigestKind,
+  entered: Iterable<string>,
+  left: Iterable<string>,
+): void {
+  recorders.get(tx)?.record(kind, entered, left)
 }
 
 /** The `ro_` table each kind is verified against. */

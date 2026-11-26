@@ -212,7 +212,7 @@ describe.skipIf(!TEST_DATABASE_URL)('provisioning + multi-org endpoints (live Po
       })
       orgsRoutes.registerOrgRoutes(app)
       const server: Server = await new Promise((resolve) => {
-        const s = app.listen(0, () => resolve(s))
+        const s = app.listen(0, '127.0.0.1', () => resolve(s))
       })
       const port = (server.address() as AddressInfo).port
       return {

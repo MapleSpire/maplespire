@@ -286,6 +286,10 @@ describe('sweepOrphanedRestoreDatabasesAtBoot — it may never prevent a drill',
     }
     const pool = {
       on: () => pool,
+      // What pg-pool keeps its constructor options in: `guardIdleClientErrors`
+      // installs the protocol marker's `onConnect` there and refuses a pool
+      // without it.
+      options: {},
       end: async () => undefined,
       query,
       // An EventEmitter, because the sweep attaches an `error` listener to the

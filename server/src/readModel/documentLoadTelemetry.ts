@@ -36,10 +36,11 @@ import type { MetricSample } from '../runtime/metrics.js'
  * (folded) source the arrival poll forwards, `handover-recheck` a
  * still-watched head re-read for the handover, `parked-arrival`/`park` a
  * parked retired head, `extract` a listed shard read by an extraction,
- * `attach` a shard newly listed in ModelMeta. */
+ * `attach` a shard newly listed in ModelMeta, `sealed-values` a parked
+ * sealed product whose extract no longer gives its values back. */
 export const DOCUMENT_LOAD_CALLERS = [
   'attach', 'extract', 'rotation-current', 'fold-sample', 'fold-settle', 'fold-product',
-  'folded-arrival', 'handover-recheck', 'parked-arrival', 'park', 'other',
+  'folded-arrival', 'handover-recheck', 'parked-arrival', 'park', 'sealed-values', 'other',
 ] as const
 export type DocumentLoadCaller = typeof DOCUMENT_LOAD_CALLERS[number]
 export const DOCUMENT_LOAD_PHASES = ['attach', 'steady'] as const

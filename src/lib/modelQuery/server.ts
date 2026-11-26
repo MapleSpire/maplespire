@@ -403,7 +403,18 @@ export interface DurabilityWitnessResult {
   absenceProvable: boolean
   objects: Map<string, C4Object>
   connections: Map<string, Connection>
+  /** The asked overlay batch ids the server acknowledges having received
+   * (`read_model_overlay_batch_acks`, T-SUM-2b). A POSITIVE fact, usable like
+   * presence whatever `absenceProvable` says: the write that batch carried
+   * reached the server, so the intent it expressed is accomplished even once
+   * the segment carrying the id is out of the client's sight (rotation, fold,
+   * compaction). */
+  landedBatchIds: Set<string>
 }
+
+const NO_WITNESS = (): DurabilityWitnessResult => ({
+  absenceProvable: false, objects: new Map(), connections: new Map(), landedBatchIds: new Set(),
+})
 
 /**
  * Batched durability witness for the entity-intent replay: objects AND
@@ -431,22 +442,25 @@ export async function fetchDurabilityWitness(
   journal: { ref: WorkspaceRef; bootedRootUrl: string | null },
   objectIds: readonly string[],
   connectionIds: readonly string[],
+  batchIds: readonly string[] = [],
 ): Promise<DurabilityWitnessResult> {
   // Never the alias. The server resolves `current` to whatever the default is
   // NOW (`canonicalWorkspaceKey`), which after a repoint is not the version
   // these documents belong to; and its echo is that concrete version, so a
   // `current` request could never be matched against what was asked.
   const asked = documentsWorkspaceFor(journal.ref, journal.bootedRootUrl)
-  if (!asked) return { absenceProvable: false, objects: new Map(), connections: new Map() }
+  if (!asked) return NO_WITNESS()
   const body = await postJson<{
     landscapeId?: string
     versionId?: string
     absenceProvable: boolean
     objects: Record<string, C4Object>
     connections: Record<string, Connection>
+    batches?: Record<string, string>
   }>(`/api/model/durability-witness?${workspaceSearchParamsFor(asked)}`, {
     objects: objectIds,
     connections: connectionIds,
+    batches: batchIds,
   })
   // The server echoes the workspace whose read model answered: for a sparse
   // draft, its BASE version (`staticReadModelQueryWorkspaceIfPresent`). A
@@ -456,14 +470,27 @@ export async function fetchDurabilityWitness(
   // would "prove" absences that never could appear there. Anything but an
   // exact echo discards the WHOLE payload — no proof, no values.
   if (body.landscapeId !== asked.landscapeId || body.versionId !== asked.versionId) {
-    return { absenceProvable: false, objects: new Map(), connections: new Map() }
+    return NO_WITNESS()
   }
   // Both maps or nothing. `durabilityWitnessPayload` always sends both; a
   // payload missing one is malformed, and reading the gap as an empty map
   // would turn `absenceProvable: true` into a proof that every asked id of
   // that family is absent.
   if (!isPlainRecord(body.objects) || !isPlainRecord(body.connections)) {
-    return { absenceProvable: false, objects: new Map(), connections: new Map() }
+    return NO_WITNESS()
+  }
+  // The same rule for the batch answer, once batches were asked: an older
+  // server (no `batches`) or a malformed one would otherwise read as "none of
+  // your writes landed", and under `absenceProvable` the planner would replay
+  // every one of them over a colleague's later deletion — the resurrection
+  // this field exists to stop (T-SUM-2b).
+  if (batchIds.length > 0 && !isPlainRecord(body.batches)) return NO_WITNESS()
+  // Only ids that were ASKED: an answer naming another batch proves nothing
+  // about this journal.
+  const askedBatches = new Set(batchIds)
+  const landedBatchIds = new Set<string>()
+  for (const [batchId, status] of Object.entries(body.batches ?? {})) {
+    if (typeof status === 'string' && askedBatches.has(batchId)) landedBatchIds.add(batchId)
   }
   return {
     // Strict === true: an older server (no field) or a malformed payload must
@@ -471,6 +498,7 @@ export async function fetchDurabilityWitness(
     absenceProvable: body.absenceProvable === true,
     objects: new Map(Object.entries(body.objects)),
     connections: new Map(Object.entries(body.connections)),
+    landedBatchIds,
   }
 }
 

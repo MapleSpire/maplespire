@@ -22,6 +22,7 @@ import { ORDINARY_HEAD_ROTATION_OFF } from './ordinaryHeadRotation.js'
 import { ORDINARY_FOLD_SOURCES_FIELD, recordOrdinaryChainFold } from './ordinaryChainFold.js'
 import type { WorkspaceKey } from './projector.js'
 import { guardIdleClientErrors } from '../db/poolErrorGuard.js'
+import { markProtocolFixture, protocolFixtureDb, protocolFixtureQuery } from '../testing/protocolFixture.js'
 import { AutomergeResidencyLeases } from '../automergeResidency.js'
 
 /**
@@ -138,7 +139,7 @@ async function rotate(
   const child = ws.repo.create({ [fieldOf(kind)]: {}, writeBatchIds: [] }) as unknown as Head
   await child.whenReady()
   await ws.repo.flush([child.documentId])
-  await recordOrdinaryHeadRetirement(pool!, WS, {
+  await recordOrdinaryHeadRetirement(protocolFixtureDb(pool!), WS, {
     collection: kind,
     documentId: old.documentId,
     retirementHeads: retirementHeads ?? A.getHeads(old.doc() as A.Doc<unknown>),
@@ -201,6 +202,7 @@ async function recordFold(
   const client = await pool!.connect()
   try {
     await client.query('BEGIN')
+    await markProtocolFixture(client)
     await recordOrdinaryChainFold(client, WS, {
       collection: kind,
       productDocumentId: product.documentId,
@@ -550,7 +552,7 @@ suite('ordinary chain fold, projector side (G4-16b phase 4 step 1) — projector
       await other.whenReady()
       await recordFold(ws, 'object', other, [retired])
       const product = await substitute(ws, 'object', [retired], { record: false })
-      await pool!.query(
+      await protocolFixtureQuery(pool!,
         `INSERT INTO read_model_ordinary_chain_folds (landscape_id, version_id, collection, product_document_id, source_document_ids)
          VALUES ($1, $2, 'object', $3, $4::text[])`,
         [WS.landscapeId, WS.versionId, product.documentId, [retired.documentId]],
@@ -572,12 +574,12 @@ suite('ordinary chain fold, projector side (G4-16b phase 4 step 1) — projector
   it('recording a fold is a CAS on forwarded_heads: a forward committed since the read conflicts, and the rollback leaves nothing', async () => {
     const ws = await workspace()
     const retired = ws.objHead
-    await recordOrdinaryHeadRetirement(pool!, WS, {
+    await recordOrdinaryHeadRetirement(protocolFixtureDb(pool!), WS, {
       collection: 'object', documentId: retired.documentId,
       retirementHeads: A.getHeads(retired.doc() as A.Doc<unknown>), status: 'retired',
     })
     // A forward commits after the fold read `forwarded_heads` (null).
-    await pool!.query(
+    await protocolFixtureQuery(pool!,
       `UPDATE read_model_ordinary_head_retirements SET forwarded_heads = $3::text[]
        WHERE landscape_id = $1 AND version_id = $2 AND document_id = $4`,
       [WS.landscapeId, WS.versionId, ['f'.repeat(64)], retired.documentId],
@@ -585,6 +587,7 @@ suite('ordinary chain fold, projector side (G4-16b phase 4 step 1) — projector
     const client = await pool!.connect()
     try {
       await client.query('BEGIN')
+      await markProtocolFixture(client)
       await expect(recordOrdinaryChainFold(client, WS, {
         collection: 'object', productDocumentId: 'product-doc', productHeads: ['p'.repeat(64)],
         currentDocumentId: 'current-doc',
@@ -746,7 +749,7 @@ suite('ordinary chain fold, projector side (G4-16b phase 4 step 1) — projector
       await until(() => roRow('object', 's'), (v) => v?.name === 's-old')
       ws.objHead.change((d) => { d.objects.s = { id: 's', name: 's-new' } })
       expect((await until(() => roRow('object', 's'), (v) => v?.name === 's-new'))?.name).toBe('s-new')
-      await recordOrdinaryHeadRetirement(pool!, WS, {
+      await recordOrdinaryHeadRetirement(protocolFixtureDb(pool!), WS, {
         collection: 'object', documentId: side.documentId,
         retirementHeads: A.getHeads(side.doc() as A.Doc<unknown>), status: 'retired',
       })

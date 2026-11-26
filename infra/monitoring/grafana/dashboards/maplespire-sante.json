@@ -19,7 +19,7 @@
       "gridPos": { "h": 6, "w": 24, "x": 0, "y": 0 },
       "options": {
         "mode": "markdown",
-        "content": "### Santé du service et livraison des alertes\n\nLes alertes **page** passent par **SES SMTP** ; les **ticket** restent visibles ici. **Watchdog** alimente un sujet **SNS** sans abonnés : CloudWatch surveille son silence. Un échec SMTP observé emprunte le sujet SNS des notifications.\n\nLes panneaux de transport sont des **observations locales**. Vérifier séparément [le veilleur CloudWatch](https://ca-central-1.console.aws.amazon.com/cloudwatch/home?region=ca-central-1#alarmsV2:alarm/MapleSpireWatchdogMissing) et la réception sur appareil. Un compteur nul, un scrape réussi ou un Watchdog actif ne prouvent pas la livraison. Guides : [SMTP](https://github.com/OlivierAlbertini/dag/blob/codex/refresh-agent-guidance/maplespire-sponsor-kit/docs/operations/alerting-smtp.md) · [SNS et réglages à adapter](https://github.com/OlivierAlbertini/dag/blob/codex/refresh-agent-guidance/maplespire-sponsor-kit/docs/operations/alerting-sns.md)."
+        "content": "### Santé du service et livraison des alertes\n\nLes alertes **page** passent par **SES SMTP** ; les **ticket** restent visibles ici. **Watchdog** alimente un sujet **SNS** sans abonnés : CloudWatch surveille son silence. Un échec SMTP observé emprunte le sujet SNS des notifications.\n\nLes panneaux de transport sont des **observations locales**. Vérifier séparément [le veilleur CloudWatch](https://ca-central-1.console.aws.amazon.com/cloudwatch/home?region=ca-central-1#alarmsV2:alarm/MapleSpireWatchdogMissing) et la réception sur appareil. Un compteur nul, un scrape réussi ou un Watchdog actif ne prouvent pas la livraison."
       }
     },
 
@@ -1185,6 +1185,132 @@
       "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true, "calcs": ["lastNotNull"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "fieldConfig": {
         "defaults": { "unit": "bytes", "min": 0, "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never", "spanNulls": false, "axisPlacement": "auto" }, "mappings": [] },
+        "overrides": []
+      }
+    },
+
+    { "id": 40, "type": "row", "title": "Époques — le passage d'époque (hop) vu par chaque cellule", "collapsed": false, "gridPos": { "h": 1, "w": 24, "x": 0, "y": 81 }, "panels": [] },
+
+    {
+      "id": 41,
+      "type": "stat",
+      "title": "Hops d'époque qui bouclent",
+      "description": "Par cellule : les anciens ModelMeta dont les latches (saisie bloquée jusqu'à 2 s chacun) sont arrivés sur au moins 3 cycles de hop dans l'heure sans qu'aucune réponse ne prouve leur S7. Un roll arrêté entre S6b et S7. Au-dessus de zéro pendant 5 minutes, EpochHopStalled tire. Le serveur ne voit que les onglets qui envoient : un onglet fermé ou hors ligne n'y figure pas, et le chiffre compte des métas, pas des utilisateurs. Mémoire du processus : un redémarrage le remet à zéro.",
+      "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" },
+      "gridPos": { "h": 7, "w": 6, "x": 0, "y": 82 },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" }, "expr": "max by (instance) (maplespire_model_epoch_hop_stalled_metas{job=\"maplespire-api\"})", "instant": true, "legendFormat": "{{instance}}" }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "vertical",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "value_and_name"
+      },
+      "fieldConfig": {
+        "defaults": { "unit": "none", "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 1 } ] } },
+        "overrides": []
+      }
+    },
+
+    {
+      "id": 42,
+      "type": "timeseries",
+      "title": "Latches par issue, par cellule",
+      "description": "Les demandes latch=1 de durable-heads, par seconde. Accordés : granted (une passe de forward était due et a gardé sa priorité). Refusés : demoted (au-delà de la rafale de l'espace ou de la part réservée) et forward_busy (l'onglet attend avant de bloquer la saisie). not_needed : rien n'était dû — c'est aussi l'issue d'un latch sans preuve S7, à lire avec s7_unproven à droite. failed : réponse 503.",
+      "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" },
+      "gridPos": { "h": 7, "w": 9, "x": 6, "y": 82 },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" }, "expr": "sum by (instance, outcome) (rate(maplespire_model_epoch_latch_requests_total{job=\"maplespire-api\"}[5m]))", "legendFormat": "{{instance}} {{outcome}}" }
+      ],
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true, "calcs": ["max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "min": 0, "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 0, "showPoints": "never", "spanNulls": false, "axisPlacement": "auto" }, "mappings": [] },
+        "overrides": []
+      }
+    },
+
+    {
+      "id": 43,
+      "type": "timeseries",
+      "title": "Réponses durable-heads par issue d'époque",
+      "description": "Une par document répondu, par seconde. forwarded, forward_pending et epoch_retired sur toute demande ; s7_unproven sur les latches seulement : un ancien ModelMeta répondu sans le bit qui prouve S7. Un s7_unproven qui revient de cycle en cycle sans forwarded pour ce méta est ce que compte le panneau de gauche.",
+      "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" },
+      "gridPos": { "h": 7, "w": 9, "x": 15, "y": 82 },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" }, "expr": "sum by (instance, outcome) (rate(maplespire_model_epoch_durable_heads_answers_total{job=\"maplespire-api\"}[5m]))", "legendFormat": "{{instance}} {{outcome}}" }
+      ],
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true, "calcs": ["max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "min": 0, "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 0, "showPoints": "never", "spanNulls": false, "axisPlacement": "auto" }, "mappings": [] },
+        "overrides": []
+      }
+    },
+
+    {
+      "id": 44,
+      "type": "timeseries",
+      "title": "Tenue d'un latch par le serveur, p50 et p99",
+      "description": "Combien de temps la cellule a tenu une demande latch=1 : sa part du gel de saisie de l'onglet. Un latch dure au plus 2 s et contient plusieurs demandes, le flush de l'onglet et le réseau, que le serveur ne voit pas. La route attend au plus 1,5 s une passe de forward : un p99 qui s'approche de 2 s est un latch que l'onglet a déjà levé. Les échecs de recherche du méta (la jauge aveugle) sont en pointillé.",
+      "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" },
+      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 89 },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" }, "expr": "histogram_quantile(0.5, sum by (instance, le) (rate(maplespire_model_epoch_latch_hold_seconds_bucket{job=\"maplespire-api\"}[5m])))", "legendFormat": "{{instance}} p50" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" }, "expr": "histogram_quantile(0.99, sum by (instance, le) (rate(maplespire_model_epoch_latch_hold_seconds_bucket{job=\"maplespire-api\"}[5m])))", "legendFormat": "{{instance}} p99" },
+        { "refId": "C", "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" }, "expr": "sum by (instance) (increase(maplespire_model_epoch_hop_meta_lookup_failures_total{job=\"maplespire-api\"}[5m]))", "legendFormat": "{{instance}} recherches du méta en échec (5 min)" }
+      ],
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true, "calcs": ["max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "min": 0, "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 0, "showPoints": "never", "spanNulls": false, "axisPlacement": "auto" }, "mappings": [] },
+        "overrides": [
+          { "matcher": { "id": "byFrameRefID", "options": "C" }, "properties": [ { "id": "unit", "value": "none" }, { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } } ] }
+        ]
+      }
+    },
+
+    {
+      "id": 45,
+      "type": "stat",
+      "title": "Rolls bloqués entre S6b et S7 (base de données)",
+      "description": "Les lignes d'époque encore en repointing plus de 10 minutes après que la racine a été repointée : chaque onglet de l'espace hope, latche dix fois puis abandonne. Lu dans la base toutes les minutes, que des onglets soient ouverts ou non, et tant que la ligne reste bloquée. Un fait de flotte : toutes les cellules lisent la même table, d'où max() et non sum(). EpochRollStuckBeforeS7 tire au-dessus de zéro pendant 2 minutes. Vide (NaN) avant le premier échantillon ou après un échantillon en échec.",
+      "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" },
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 96 },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" }, "expr": "max(maplespire_model_epoch_rows_stuck_repointing{job=\"maplespire-api\"})", "instant": true, "legendFormat": "rolls bloqués" }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "vertical",
+        "reduceOptions": { "calcs": ["last"], "fields": "", "values": false },
+        "textMode": "value_and_name"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "mappings": [ { "type": "special", "options": { "match": "null+nan", "result": { "text": "inconnu", "color": "orange", "index": 0 } } } ],
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] }
+        },
+        "overrides": []
+      }
+    },
+
+    {
+      "id": 46,
+      "type": "timeseries",
+      "title": "Âge du plus vieux roll bloqué avant S7",
+      "description": "Depuis combien de temps la plus vieille ligne d'époque bloquée en repointing l'est (0 quand il n'y en a aucune). Elle ne redescend qu'à la reprise : la publication de S7 par la passe de compaction ou par le job méta, ou la porte de l'opérateur epoch:resolve-repointing. Une courbe qui monte sans fin est un roll que rien ne reprend.",
+      "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" },
+      "gridPos": { "h": 7, "w": 16, "x": 8, "y": 96 },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "maplespire-prometheus" }, "expr": "max(maplespire_model_epoch_rows_stuck_repointing_oldest_seconds{job=\"maplespire-api\"})", "legendFormat": "plus vieux roll bloqué" }
+      ],
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true, "calcs": ["max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "min": 0, "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 0, "showPoints": "never", "spanNulls": false, "axisPlacement": "auto" }, "mappings": [] },
         "overrides": []
       }
     }

@@ -16,6 +16,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ImportResult, ImportSource } from '../../lib/import/types'
+import { useAutomergeStatus } from '../../stores/automergeStatusStore'
 
 /**
  * The VISIBILITY half of the bulk-id pre-provision.
@@ -112,7 +113,7 @@ vi.mock('../../stores/uiStore', () => ({
 
 vi.mock('../../stores/workspaceStore', () => ({
   useWorkspaceStore: Object.assign(
-    (selector: (s: unknown) => unknown) => selector({ landscapes: [], readOnly: false }),
+    (selector: (s: unknown) => unknown) => selector({ landscapes: [], readOnly: false, ref: { landscapeId: 'default', versionId: 'current' } }),
     { getState: () => ({ load: mocks.loadWorkspaces, landscapes: [], error: null }) },
   ),
 }))
@@ -139,8 +140,43 @@ describe('ImportModal — a short minted-id pre-provision is stated, not swallow
     mocks.ensureMintedIdCapacity.mockReset()
     mocks.importModel.mockReset()
     currentResult = RESULT
+    // The bridge has wired this workspace's store to its documents.
+    useAutomergeStatus.setState({ projectedWorkspace: 'default/current' })
   })
   afterEach(cleanup)
+
+  it('no import into the current workspace before its boot has wired the store to its documents', async () => {
+    useAutomergeStatus.setState({ projectedWorkspace: null })
+    mocks.ensureMintedIdCapacity.mockResolvedValue(3)
+    render(<ImportModal open onClose={vi.fn()} />)
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'workspace {}' } })
+    fireEvent.click(screen.getByText(/parseAndPreview/))
+    await waitFor(() => { expect(screen.getByTestId('import-generate')).toBeTruthy() })
+    expect((screen.getByTestId('import-generate') as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.click(screen.getByTestId('import-generate'))
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(mocks.importModel).not.toHaveBeenCalled()
+    // Wired: the same import goes through.
+    useAutomergeStatus.setState({ projectedWorkspace: 'default/current' })
+    await waitFor(() => { expect((screen.getByTestId('import-generate') as HTMLButtonElement).disabled).toBe(false) })
+  })
+
+  it('a source that CHOOSES its target, the target `current` — no import before the boot wired the store either', async () => {
+    const mutable = source as { chooseTarget?: boolean }
+    mutable.chooseTarget = true
+    try {
+      useAutomergeStatus.setState({ projectedWorkspace: null })
+      render(<ImportModal open onClose={vi.fn()} />)
+      fireEvent.change(screen.getByRole('textbox'), { target: { value: 'workspace {}' } })
+      fireEvent.click(screen.getByText(/parseAndPreview/))
+      await waitFor(() => { expect(screen.getByTestId('import-generate')).toBeTruthy() })
+      expect((screen.getByTestId('import-generate') as HTMLButtonElement).disabled).toBe(true)
+      useAutomergeStatus.setState({ projectedWorkspace: 'default/current' })
+      await waitFor(() => { expect((screen.getByTestId('import-generate') as HTMLButtonElement).disabled).toBe(false) })
+    } finally {
+      delete mutable.chooseTarget
+    }
+  })
 
   it('asks for the model and registry shards the import can create, not only its diagrams', async () => {
     // One object and one connection: each can overflow into a new model shard,

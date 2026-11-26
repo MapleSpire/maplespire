@@ -448,7 +448,18 @@ async function main() {
   const fireDrill = await runStreamed('npm', ['run', '--silent', 'qa:eviction-fire-drill'],
     { cwd: path.join(ROOT, 'server'), env, logFile: path.join(RUN_DIR, 'eviction-fire-drill.log') })
 
-  // OPT-IN, and LOCAL-ONLY: `ci.yml` runs no browser suite, so this leg is
+  // T-SUM-0: "Paul's diagram" on a summary workspace, END TO END — the one
+  // browser suite in BOTH runners (`ci.yml`'s test job runs it too), so
+  // it is parity, not a local extra. It creates its OWN database
+  // (`maplespire_summary_e2e`) on this runner's Postgres, never touches
+  // `maplespire_ci`, and boots its own server and client on 3587/5587. It
+  // judges Playwright's JSON report itself: a skip, a retry or a missing test
+  // is RED, never green (`scripts/e2e-summary-visibility.mjs`).
+  console.log('\n=== Summary workspace: a created diagram is visible to a cold user (Playwright, two arms) ===')
+  const summaryVisibility = await runStreamed('npm', ['run', '--silent', 'e2e:summary-visibility'],
+    { env, logFile: path.join(RUN_DIR, 'summary-visibility.log') })
+
+  // OPT-IN, and LOCAL-ONLY: `ci.yml` runs no browser suite but the one above, so this leg is
   // not parity with CI and must never run by default — otherwise this script
   // could print RED for something CI never runs (`ci-local-parity.test.mjs`
   // pins that it stays behind the flag). It owns its stack (Postgres 55439,
@@ -472,6 +483,8 @@ async function main() {
     // 3041 was busy".
     fireDrill.status === 2 && 'eviction gate fire drill (VOID — the drill did not run)',
     fireDrill.status !== 0 && fireDrill.status !== 2 && 'eviction gate fire drill (the gate cannot discriminate)',
+    summaryVisibility.status === 2 && 'summary visibility e2e (VOID — no database to run against)',
+    summaryVisibility.status !== 0 && summaryVisibility.status !== 2 && 'summary visibility e2e (a diagram created on a summary workspace is not visible, or the run skipped)',
     compat && compat.status !== 0 && 'N-1 <-> N compatibility harness (--compat, not in ci.yml)',
   ].filter(Boolean)
   if (failed.length > 0) {

@@ -72,6 +72,36 @@ describe('guardIdleClientErrors', () => {
     expect(String(warn.mock.calls[0]?.[0])).toContain('pg.idle_client_error')
   })
 
+  it('marks every connection as a read-model protocol participant in pg-pool\'s AWAITED onConnect, before the onConnect the pool was built with; a failed mark fails the connect', async () => {
+    const order: string[] = []
+    const built = vi.fn(async () => { order.push('built') })
+    const pool = guardIdleClientErrors(new Pool({ connectionString: DEAD_END, onConnect: built } as never), 'marker')
+    const onConnect = (pool as unknown as { options: { onConnect: (client: unknown) => Promise<void> } }).options.onConnect
+    const client = { query: vi.fn(async (sql: string) => { order.push(sql) }) }
+    await onConnect(client)
+    expect(order).toEqual(["SET maplespire.read_model_protocol = '2'", 'built'])
+    expect(built).toHaveBeenCalledWith(client)
+    const failing = { query: vi.fn(async () => { throw new Error('connection lost') }) }
+    await expect(onConnect(failing)).rejects.toThrow('connection lost')
+    expect(built).toHaveBeenCalledTimes(1)
+    // A pool built without one gets the mark alone.
+    const plain = guardIdleClientErrors(new Pool({ connectionString: DEAD_END }), 'marker-plain')
+    const sql: string[] = []
+    await (plain as unknown as { options: { onConnect: (client: unknown) => Promise<void> } }).options
+      .onConnect({ query: async (text: string) => { sql.push(text) } })
+    expect(sql).toEqual(["SET maplespire.read_model_protocol = '2'"])
+  })
+
+  it('REFUSES, at creation, a pool it cannot install the protocol marker into (no options object: a pg-pool without onConnect), naming why', () => {
+    const optionless = Object.assign(new EventEmitter(), { options: undefined })
+    expect(() => guardIdleClientErrors(optionless as never, 'no-options', vi.fn()))
+      .toThrow(/no-options.*protocol marker.*onConnect/)
+    const badHook = Object.assign(new EventEmitter(), { options: { onConnect: 'not a function' } })
+    expect(() => guardIdleClientErrors(badHook as never, 'bad-hook', vi.fn())).toThrow(/onConnect is not a function/)
+    // The real Pool carries one: the control.
+    expect(() => guardIdleClientErrors(new Pool({ connectionString: DEAD_END }), 'real', vi.fn())).not.toThrow()
+  })
+
   it('returns the SAME pool, so it can wrap a construction expression', () => {
     const pool = new Pool({ connectionString: DEAD_END })
     expect(guardIdleClientErrors(pool, 'identity')).toBe(pool)
@@ -235,6 +265,72 @@ describe('every pg Pool under server/src and server/scripts is guarded', () => {
     }
     return { sites, bare, files }
   }
+
+  /**
+   * A BARE `pg.Client` in production code. It never enters a pool, so
+   * `guardIdleClientErrors` never marks it: it is a non-participant of the
+   * read-model protocol (`readModel/protocolParticipant.ts`) — its protocol
+   * writes unchecked by the lock-order trigger, its fence assertions refused
+   * — and it has no client error listener either. Tests open them on purpose
+   * (a bare client is how they simulate the previous release), so only
+   * non-test modules under `server/src` are scanned. Resolved through the imports of `'pg'`:
+   * a default or namespace import's `.Client`, or the named `Client` under
+   * any alias.
+   */
+  function bareClientConstructions(file: string, text: string): string[] {
+    if (!/\bfrom\s+['"]pg['"]/.test(text)) return []
+    const source = ts.createSourceFile(file, text, ts.ScriptTarget.ESNext, true)
+    const namespaces = new Set<string>()
+    const clients = new Set<string>()
+    for (const statement of source.statements) {
+      if (!ts.isImportDeclaration(statement) || !ts.isStringLiteral(statement.moduleSpecifier)
+        || statement.moduleSpecifier.text !== 'pg' || !statement.importClause) continue
+      const clause = statement.importClause
+      if (clause.name) namespaces.add(clause.name.text)
+      const bindings = clause.namedBindings
+      if (bindings && ts.isNamespaceImport(bindings)) namespaces.add(bindings.name.text)
+      if (bindings && ts.isNamedImports(bindings)) {
+        for (const element of bindings.elements) {
+          if ((element.propertyName ?? element.name).text === 'Client') clients.add(element.name.text)
+        }
+      }
+    }
+    const found: string[] = []
+    const visit = (node: ts.Node): void => {
+      if (ts.isNewExpression(node)) {
+        const callee = node.expression
+        const bare = ts.isIdentifier(callee) ? clients.has(callee.text)
+          : ts.isPropertyAccessExpression(callee) && callee.name.text === 'Client'
+            && ts.isIdentifier(callee.expression) && namespaces.has(callee.expression.text)
+        if (bare) found.push(`${file}:${source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1}`)
+      }
+      ts.forEachChild(node, visit)
+    }
+    ts.forEachChild(source, visit)
+    return found
+  }
+
+  it('finds no bare pg.Client in production code under server/src (a non-participant of the read-model protocol)', async () => {
+    const found: string[] = []
+    let files = 0
+    for await (const file of walk(path.join(SERVER, 'src'))) {
+      if (/\.test\.ts$/.test(file)) continue
+      files += 1
+      found.push(...bareClientConstructions(path.relative(SRC, file).replace(/\\/g, '/'), await readFile(file, 'utf8')))
+    }
+    expect(files).toBeGreaterThan(200)
+    expect(found).toEqual([])
+    // The detector's controls: each spelling is caught, a non-pg Client is not.
+    const caught: Array<[string, string]> = [
+      ['default import', `import pg from 'pg'\nconst c = new pg.Client({})`],
+      ['namespace import', `import * as db from 'pg'\nconst c = new db.Client({})`],
+      ['named import', `import { Client } from 'pg'\nconst c = new Client({})`],
+      ['aliased import', `import { Pool, Client as Raw } from "pg"\nconst c = new Raw()`],
+    ]
+    for (const [shape, text] of caught) expect(bareClientConstructions('x.ts', text), shape).toHaveLength(1)
+    expect(bareClientConstructions('x.ts', `import { Client } from '@modelcontextprotocol/sdk/client/index.js'\nnew Client({})`)).toEqual([])
+    expect(bareClientConstructions('x.ts', `import pg from 'pg'\nconst p = new pg.Pool({})`)).toEqual([])
+  })
 
   it('exempts only itself, and only because its controls are bare ON PURPOSE', async () => {
     const { bare } = await scan()

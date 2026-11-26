@@ -17,6 +17,7 @@ import * as A from '@automerge/automerge'
 import { Repo, type DocHandle } from '@automerge/automerge-repo'
 import { PostgresStorageAdapter } from '../automergeStorage.js'
 import { createIsolatedSchemaDb, type IsolatedSchemaDb } from '../testing/isolatedSchema.js'
+import { protocolFixtureQuery } from '../testing/protocolFixture.js'
 import { setWorkspaceDocumentsRegistrationForTest } from '../rbac/docScope.js'
 import { ensureReadModelSchema } from './schema.js'
 import { getWorkspaceProjectionFreshness } from './health.js'
@@ -706,7 +707,7 @@ suite('ordinary head rotation (phase 3) — real storage, real projector, real P
     const ws = await workspace(repo)
     const log = logLines()
     const staleHeads = A.getHeads(ws.head.doc() as A.Doc<unknown>)
-    await db.pool.query(
+    await protocolFixtureQuery(db.pool,
       `INSERT INTO read_model_ordinary_head_retirements
          (landscape_id, version_id, collection, document_id, retirement_heads, forwarded_heads, status)
        VALUES ($1, $2, 'object', $3, $4::text[], $4::text[], 'retired')`,
@@ -1075,7 +1076,7 @@ suite('ordinary head rotation (phase 3) — real storage, real projector, real P
       a.reconnect()
       expect(await until(degradedSince, (value) => Boolean(value))).toBeTruthy()
       // The row stops asking for forwarding before the 1 s retry runs.
-      await db.pool.query(
+      await protocolFixtureQuery(db.pool,
         `UPDATE read_model_ordinary_head_retirements SET status = 'admitted'
           WHERE landscape_id = $1 AND version_id = $2`, [WS.landscapeId, WS.versionId])
       demoted = true
@@ -1184,7 +1185,7 @@ suite('ordinary head rotation (phase 3) — real storage, real projector, real P
         child: A.getHeads(child.doc() as A.Doc<unknown>),
       }
       const deps = {
-        repo, rootUrl: ws.rootUrl, db: db.pool, fleet,
+        repo, rootUrl: ws.rootUrl, db: db.pool, connect: () => db.pool.connect(), fleet,
         ownership: { owns: () => true }, isShuttingDown: () => false,
         log: () => {}, warn: () => {},
       }
@@ -1692,7 +1693,7 @@ suite('ordinary head rotation (phase 3) — real storage, real projector, real P
     await db.pool.query(
       'INSERT INTO automerge_document_workspace (document_id, landscape_id, version_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
       [String(current.documentId), WS.landscapeId, WS.versionId])
-    await db.pool.query(
+    await protocolFixtureQuery(db.pool,
       `INSERT INTO read_model_ordinary_head_retirements
          (landscape_id, version_id, collection, document_id, retirement_heads, status)
        VALUES ($1, $2, 'object', $3, $4::text[], 'retired')`,

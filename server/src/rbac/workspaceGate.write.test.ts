@@ -12,11 +12,12 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU Affero General Public License for more details.
 
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest'
+import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vitest'
 import pg from 'pg'
 import { randomBytes } from 'node:crypto'
 import type { Request, Response } from 'express'
 import {
+  canWriteVersion,
   requireLandscapeWrite,
   requireVersionWrite,
   requireOrgAdmin,
@@ -312,6 +313,41 @@ describe.skipIf(!TEST_DATABASE_URL)('workspaceGate write gates (live Postgres)',
       expect(await requireVersionWrite(pool, reqFor(viewer), res, f.landscapeId, f.versionId)).toBe(false)
       expect(res.statusCode).toBe(403)
     } finally {
+      await dropOrg(f.orgId)
+    }
+  })
+
+  it('canWriteVersion is requireVersionWrite\'s verdict, answering nothing — a viewer no, a writer yes', async () => {
+    const f = await makeFixture()
+    try {
+      const viewer = await makeMember(f.orgId, 'member')
+      await grant(f.orgId, viewer.userId, f.landscapeScopeId, false)
+      const writer = await makeMember(f.orgId, 'member')
+      await grant(f.orgId, writer.userId, f.landscapeScopeId, true)
+      expect(await canWriteVersion(pool, reqFor(viewer), f.landscapeId, f.versionId)).toBe(false)
+      expect(await canWriteVersion(pool, reqFor(writer), f.landscapeId, f.versionId)).toBe(true)
+    } finally {
+      await dropOrg(f.orgId)
+    }
+  })
+
+  it("at stage 'dual' canWriteVersion is STRICT — a viewer is no writer, and nothing is logged; the mutation gate still allows and warns", async () => {
+    const f = await makeFixture()
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    try {
+      const viewer = await makeMember(f.orgId, 'member')
+      await grant(f.orgId, viewer.userId, f.landscapeScopeId, false)
+      const writer = await makeMember(f.orgId, 'member')
+      await grant(f.orgId, writer.userId, f.landscapeScopeId, true)
+      process.env.AUTH = 'dual'
+      expect(await canWriteVersion(pool, reqFor(viewer), f.landscapeId, f.versionId)).toBe(false)
+      expect(await canWriteVersion(pool, reqFor(writer), f.landscapeId, f.versionId)).toBe(true)
+      expect(warn.mock.calls.some((c) => String(c[0]).includes('[workspace-gate] dual'))).toBe(false)
+      expect(await requireVersionWrite(pool, reqFor(viewer), fakeRes(), f.landscapeId, f.versionId)).toBe(true)
+      expect(warn.mock.calls.some((c) => String(c[0]).includes('[workspace-gate] dual'))).toBe(true)
+    } finally {
+      process.env.AUTH = 'on'
+      warn.mockRestore()
       await dropOrg(f.orgId)
     }
   })

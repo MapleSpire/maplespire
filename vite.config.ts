@@ -135,7 +135,11 @@ export default defineConfig(({ mode }) => {
       // Watched, every build or checkout there full-reloads this page (measured
       // 2026-11-08: dozens of "page reload .claude/worktrees/.../index.html"
       // lines in one session's Vite log, seen as the app reloading on its own).
-      watch: { ignored: ['**/.claude/**'] },
+      // Anchored to THIS checkout's .claude/: an unanchored `**/.claude/**`
+      // also matches every path of a dev server that itself runs inside a
+      // worktree under .claude/worktrees/, and unwatches its own sources
+      // (`src/viteWatch.test.ts` went red run from such a worktree).
+      watch: { ignored: [`${join(import.meta.dirname, '.claude')}/**`] },
       proxy: {
         '/api': {
           target: apiTarget,

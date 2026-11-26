@@ -17,6 +17,11 @@ import 'dotenv/config' // load server/.env (PORT, DATABASE_URL, …) before anyt
 import './diagnostics/cpuProfile.install.js' // bench-only CPU/GC capture; inert unless SYNC_DIAG_CPU_PROFILE=on; before Automerge
 import express from 'express'
 import { durableHeadsDecoder } from './readModel/durableHeadsDecoder.js'
+import { runGracefulShutdown } from './serverShutdown.js'
+import { StaticMembershipHeadIndexBuilder } from './readModel/schema.js'
+import {
+  closeHttpServer, endEventStreamForShutdown, holdHandler, holdMutatingRoutes, InFlightHandlers, LongLivedResponses,
+} from './httpShutdown.js'
 import type { Request, Response } from 'express'
 import cors from 'cors'
 import compression from 'compression'
@@ -64,7 +69,7 @@ import {
   resolveDiagramDocUrlFromReadModel,
   resolveDiagramDocUrlFromRegistry,
 } from './diagramHeads.js'
-import { acknowledgeDurableHeads, parseDurableHeadRequests } from './durableHeads.js'
+import { acknowledgeDurableHeads, lastAcknowledgementTiming, parseDurableHeadRequests } from './durableHeads.js'
 import {
   ProjectorFleet,
   ProjectorOwnershipError,
@@ -80,16 +85,32 @@ import {
 import { classifyWarmupFailure, createWarmupOutcomeLog } from './readModel/warmupOutcome.js'
 import type { WorkspaceKey } from './readModel/projector.js'
 import {
+  runModelEpochMetaJob,
+  compactionHttpBody,
   runWorkspaceCompaction,
   type WorkspaceCompactionOutcome,
 } from './readModel/workspaceCompaction.js'
+import { MODEL_EPOCH_SWEEP_INTERVAL_MS, sweepModelEpochs } from './readModel/modelEpochSweep.js'
+import { createForwardTrigger, type ForwardPassUrgency, type ForwardTrigger } from './readModel/modelEpochForwardTrigger.js'
+import { emptyTimings, timedConnect, timedQueryable, timedRepo } from './readModel/modelEpochTraceDeps.js'
+import { createEpochCapabilityMemo, createEpochTraceSink, e2eCompactionHoldFromEnv, epochRolledOrRecovered, awaitTriggeredForward, forwardPassProgressed, forwardPassRefused, periodicSweepWorkspaces, wireEpochForwardPasses, yieldToRefusedRotation } from './readModel/modelEpochForwardWiring.js'
+import { modelEpochRowsExist } from './readModel/modelEpochStore.js'
+import { registerModelEpochOverrideRoutes } from './readModel/modelEpochOverrideRoutes.js'
 import {
   COMPACTION_ALLOWLIST_ENV,
   admitCompaction,
   parseCompactionAllowlist,
 } from './readModel/compactionAllowlist.js'
 import { compactOverlay } from './readModel/compaction.js'
+import { type CompactionReattachSupervisor, compactionReattachMetricSamples } from './readModel/compactionReattach.js'
+import { RedundantIndexDropRetry, redundantIndexRetryMetricSamples } from './readModel/redundantIndexDropRetry.js'
+import { wireCompactionReattach } from './readModel/compactionReattachWiring.js'
+import { installedPoolConcurrencyGate } from './db/poolConcurrencyGate.js'
 import { ordinaryHeadRotationConfig } from './readModel/ordinaryHeadRotation.js'
+import { readModelAdoptMode } from './readModel/adoptVerify.js'
+import { modelEpochConfig } from './readModel/modelEpochConfig.js'
+import { baseShardStorageCompactionMode } from './readModel/baseShardStorageCompactionConfig.js'
+import { epochResolveAcquisitionGuard } from './readModel/modelEpochResolveGuard.js'
 import { ordinaryChainUnboundedBootWarning, ordinaryRotationMetricSamples } from './readModel/ordinaryRotationTelemetry.js'
 import { automergeStatsBody, type AutomergeStatsBodyInput } from './automergeStatsBody.js'
 import {
@@ -131,6 +152,7 @@ import { roViewerLevel } from './readModel/viewerLevel.js'
 import { staticReadModelQueryWorkspaceIfPresent } from './readModel/staticWorkspace.js'
 import { ensureSparseDraftDiagram } from './draft/sparse.js'
 import { resolveHandleWithRetry } from './readModel/projectorService.js'
+import { compactionFleet, divergenceEligible, ensureServedForReadiness, readRouteServes } from './readModel/fleetServing.js'
 import { ensureDefaultProjectorAtBoot } from './readModel/defaultProjectorBoot.js'
 /**
  * Per-attempt ceiling for a document resolved INSIDE an HTTP request.
@@ -152,10 +174,13 @@ import { objectSearchQueryError } from './readModel/objectSearchContract.js'
 import { scanReferenceIntegrity } from './maintenance/referenceIntegrityScan.js'
 import { repairReferenceIntegrity } from './maintenance/referenceIntegrityRepair.js'
 import { route as routeHandler, sendDependencyOutage } from './routeErrors.js'
-import { LifecycleApplyRefusedError } from './maintenance/lifecycleApplyLock.js'
+import { LifecycleApplyRefusedError, withLifecycleApplyLock } from './maintenance/lifecycleApplyLock.js'
 import { DOCUMENT_CHECKED_KINDS, scanDocumentReferences } from './maintenance/referenceIntegrityDocuments.js'
 import { appendAudit } from './auth/audit.js'
-import { StaticDeltaProjector } from './readModel/staticDeltaProjector.js'
+import {
+  StaticDeltaProjector, staticOverlayDeferralMetricSamples, staticOverlayNotReadyMetricSamples, staticPassWatchMetricSamples,
+  staticRecoveryBackoffMetricSamples,
+} from './readModel/staticDeltaProjector.js'
 import { ServerTimingTrace } from './observability/serverTiming.js'
 import { gzipSerializedBody } from './observability/serializedGzipCache.js'
 import { AsyncSingleFlight } from './performance/asyncSingleFlight.js'
@@ -230,7 +255,9 @@ import { forkRollbackMetricSamples } from './forkRollback.js'
 import { bootstrapMintMetricSamples } from './bootstrapMint.js'
 import { bootstrapScopeMetricSamples, bootstrapScopeSnapshot, installBootstrapOwnership } from './bootstrapScope.js'
 import { mintedOrphanReaperMetricSamples, reapMintedOrphans } from './mintedOrphanReaper.js'
-import { overlayRotationLockMetricSamples } from './readModel/overlayRotationLock.js'
+import { overlayRotationLockMetricSamples, setOverlayRotationContendedListener } from './readModel/overlayRotationLock.js'
+import { epochHopMetricSamples, epochMetaDocumentIds, latchOutcome, recordDurableHeadsTelemetry } from './readModel/epochHopTelemetry.js'
+import { epochStuckRowsMetricSamples, startEpochStuckRowsSampler } from './readModel/epochStuckRows.js'
 import { documentLoadMetricSamples } from './readModel/documentLoadTelemetry.js'
 import { documentGrowthSnapshot, startDocumentGrowthSampler } from './readModel/documentGrowth.js'
 import { lastDivergenceRun } from './readModel/divergenceRunner.js'
@@ -238,10 +265,12 @@ import { collectCrdtInventory } from './readModel/crdtInventory.js'
 import { divergenceSweepState, startDivergenceScheduler } from './readModel/divergenceScheduler.js'
 import {
   fleetDefectSummary,
+  liveDuplicateIdDropCount,
+  readModelDefectMetricSamples,
   refusedProjectionCount,
   verifyWorkspaceIntegrity,
 } from './readModel/projectionIntegrity.js'
-import { getFleetReadModelStatusCounts } from './readModel/health.js'
+import { absenceProofMetricSamples, getFleetReadModelStatusCounts } from './readModel/health.js'
 import { handoverBarrierTimeoutCount, handoverRecheckAbandonedCount } from './readModel/ordinaryFoldedArrivals.js'
 import { storageWriteCeilingCounts } from './automergeStorageCeiling.js'
 import { readDrillHealth, readDrillOverlap } from './backup/drillReport.js'
@@ -276,6 +305,7 @@ import { ensureHealthyWorkspaceRoot } from './maintenance/workspaceRootGuard.js'
 import { cachedHandles, findReadyDocument } from './automergeRepoCompat.js'
 import { assertWorkspaceSetParity } from './maintenance/workspaceSetParity.js'
 import { singleFlight } from './maintenance/singleFlight.js'
+import { createProcessExclusion } from './maintenance/processExclusion.js'
 import { classifyWorkspaceRefusal } from './syncCells/workspaceRefusal.js'
 
 /** Upper bound on one mint request. Small on purpose: the offline reserve this
@@ -287,6 +317,18 @@ assertProductionGuardrails(process.env)
 
 const READ_MODEL_ENABLED = process.env.READ_MODEL === 'on'
 const readModelChangeHub = new ReadModelChangeNotificationHub(pool)
+/** The static write-head index's background build (T-DIAGDEF): started once
+ * the pod is ready, tried again hourly until valid,
+ * stopped — its statement cancelled — by the shutdown. The PRIMARY pool, not
+ * the read-model one: a build holds a connection for its whole duration, and
+ * the read-model pool is the small one. */
+const staticMembershipHeadIndexBuilder = new StaticMembershipHeadIndexBuilder(pool)
+/** The SSE streams (`/api/model/cache/events`): they never end on their own,
+ * so the shutdown's `http` step ends them (`httpShutdown.ts`). */
+const longLivedResponses = new LongLivedResponses()
+/** The HTTP handlers still running: the shutdown's `http` step waits for them
+ * before ownership is released (`httpShutdown.ts`). */
+const inFlightHandlers = new InFlightHandlers()
 const renderCacheConfig = diagramRenderCacheConfig()
 const redisRenderCacheConfig = redisDiagramRenderCacheConfig()
 const diagramRenderCache = new DiagramRenderCache(
@@ -317,6 +359,28 @@ if (ordinaryHeadRotation.mode !== 'off') {
 // nothing bounds the chain — said at boot, and as a gauge on /metrics.
 const ordinaryChainUnboundedWarning = ordinaryChainUnboundedBootWarning(ordinaryHeadRotation)
 if (ordinaryChainUnboundedWarning) console.warn(ordinaryChainUnboundedWarning)
+// G4-16f C6-1/C6-2a: `READ_MODEL_ADOPT`, parsed here for the same reason as
+// the rotation above — an invalid value refuses to boot. `shadow` makes every
+// ordinary attach log a verify-and-adopt verdict before its cold build
+// (`adoptVerify.ts`); nothing is adopted. `on` adopts the kept read model
+// when the verdict allows it (the attach resolves once fully attached, B5);
+// compaction's re-attach never adopts.
+const readModelAdopt = readModelAdoptMode()
+if (readModelAdopt !== 'off') console.log(`[read-model] verify-and-adopt: ${readModelAdopt}`)
+// G4-16f: ModelMeta and base-shard epochs. Parsed at module load for
+// the same reason: a retention below the retention floor of 3 (or any malformed knob)
+// refuses to boot instead of being clamped (`modelEpochConfig.ts`). Nothing
+// rolls an epoch yet; the parse exists so the floor holds from the first
+// commit that can name it.
+const modelEpochs = modelEpochConfig()
+if (modelEpochs.enabled) {
+  console.log(`[read-model] model epochs: on, retain=${modelEpochs.retain}, period=${modelEpochs.periodDays} d`)
+}
+// G4-16f: the kill switch of the base shards' storage
+// compaction after the fold. ON by default; a malformed value refuses to
+// boot (`baseShardStorageCompactionConfig.ts`).
+const baseShardStorageCompaction = baseShardStorageCompactionMode()
+if (baseShardStorageCompaction === 'off') console.log('[read-model] base-shard storage compaction: off')
 let maintenanceCoordinator: MaintenanceCoordinator | null = null
 let syncCellOwnership: SyncCellOwnershipCoordinator | null = null
 let syncCellOwnershipRedis: RedisRuntime | null = null
@@ -346,6 +410,13 @@ let automergeResidency: AutomergeResidencyLeases | null = null
 let readDenyLedgerSnapshot: (() => DenyLedgerSnapshot | null) | null = null
 
 const app = express()
+// FIRST, so every request — whatever middleware answers it — is counted until
+// its handler settles.
+app.use(inFlightHandlers.middleware())
+// …and EVERY mutating registration on this app holds its handler's promise,
+// whichever module registers it. BEFORE any route:
+// `httpShutdown.coverage.test.ts` pins the order.
+holdMutatingRoutes(app, inFlightHandlers)
 const PORT = Number(process.env.PORT ?? 3001)
 const readiness = {
   automerge: false,
@@ -450,6 +521,12 @@ app.use(createWorkspaceHttpRouting({
   db: pool,
   ownership: () => syncCellOwnership,
   ownershipRequired: syncCellOwnershipRequired,
+  // A RELAYED SSE stream (another cell owns the workspace) is as long-lived as
+  // the cell's own: the shutdown ends it too.
+  longLived: longLivedResponses,
+  // A RELAYED request is held until the owner's exchange is really over: a
+  // relayed write in flight stays counted while the owner has not answered.
+  inFlight: inFlightHandlers,
 }))
 
 // Health check
@@ -650,8 +727,27 @@ app.get('/metrics', route(async (req, res) => {
   metrics.push(...mintedOrphanReaperMetricSamples())
   // The overlay rotation key.
   metrics.push(...overlayRotationLockMetricSamples())
+  // G4-16j: the epoch hop as this cell sees it — latch asks, their hold,
+  // durable-heads epoch answers, and the metas whose hop loops.
+  metrics.push(...epochHopMetricSamples())
+  // …and the roll rows stuck `repointing`, read from the database on a timer.
+  metrics.push(...epochStuckRowsMetricSamples())
+  // G4-16f: a compaction re-attach that failed, retried until it attaches.
+  metrics.push(...compactionReattachMetricSamples(compactionReattach))
+  // G4-16f: a deferred or INVALID 0006 trigram index.
+  metrics.push(...redundantIndexRetryMetricSamples(redundantIndexRetry))
   // G4-16 M3: documents the projector had to load from storage, by path.
   metrics.push(...documentLoadMetricSamples())
+  // G4-16f: static overlay passes waiting for their ModelMeta state.
+  metrics.push(...staticOverlayDeferralMetricSamples())
+  // T-SUM-0b: current static overlay heads blocked at `!ready`.
+  metrics.push(...staticOverlayNotReadyMetricSamples())
+  // T-ZEROWM-3: static recoveries retried past their limit (capped backoff).
+  metrics.push(...staticRecoveryBackoffMetricSamples())
+  // T-ZEROWM-4: static passes in flight past their ceiling.
+  metrics.push(...staticPassWatchMetricSamples())
+  // T-SUM-2c: absence proofs refused on a caught-up workspace, and the stuck ones.
+  metrics.push(...absenceProofMetricSamples())
   // G4-16e: the ordinary chain, its fold-off alert and the rotation counter
   // (no workspace label; the stats body says which).
   metrics.push(...ordinaryRotationMetricSamples(ordinaryHeadRotation))
@@ -670,22 +766,12 @@ app.get('/metrics', route(async (req, res) => {
   // Documents the projector could not read. This is the signal the
   // divergence detector could never produce: a document that fails to load is
   // absent from BOTH sides of any comparison, so only the reader can report it.
-  const defects = await fleetDefectSummary(pool, { worstLimit: 0 })
-  metrics.push({
-    name: 'maplespire_read_model_unreadable_documents',
-    help: 'Documents a full extraction resolved but could not read. Each one is data missing from the read model with no error anywhere.',
-    type: 'gauge',
-    values: [
-      { labels: { scope: 'documents' }, value: defects.totalDefects },
-      { labels: { scope: 'workspaces' }, value: defects.workspacesWithDefects },
-    ],
-  })
-  metrics.push({
-    name: 'maplespire_read_model_workspaces_never_examined',
-    help: 'Workspaces with no defect count recorded. NOT the same as zero defects — these have never been fully extracted since T1.3a shipped.',
-    type: 'gauge',
-    values: [{ value: defects.workspacesNeverExamined }],
-  })
+  // Which total goes under which name and scope: `readModelDefectMetricSamples`
+  // (unit-tested in projectionIntegrity.test.ts).
+  metrics.push(...readModelDefectMetricSamples(
+    await fleetDefectSummary(pool, { worstLimit: 0 }),
+    liveDuplicateIdDropCount(),
+  ))
   metrics.push({
     name: 'maplespire_read_model_refused_projections_total',
     help: 'Full-sync projections declined because their source document carried no entity map (a shard delta, or a ModelMeta with no groups). Non-zero means row deletion was refused on evidence that failed to load.',
@@ -1048,7 +1134,11 @@ type Handler = (req: express.Request, res: express.Response) => Promise<void>
 // A `function` declaration and not a `const`: four call sites above this line
 // rely on hoisting, and `const` turns them into TS2448 at build time.
 function route(handler: Handler): express.RequestHandler {
-  return routeHandler<express.Request, express.Response>(handler)
+  // Counted until the handler's PROMISE settles — not its response, not its
+  // socket: a handler can keep writing after either.
+  // And one that begins after the HTTP step sealed the census does not run:
+  // 503, retryable.
+  return routeHandler<express.Request, express.Response>(holdHandler(inFlightHandlers, handler))
 }
 const idsParam = (v: unknown): string[] =>
   typeof v === 'string' && v.length ? v.split(',').filter(Boolean) : []
@@ -1068,6 +1158,13 @@ const boundedIdsParam = (v: unknown, max: number): string[] =>
  * so a client polling /api/model/* during boot can arrive while this is still
  * null — ensureWorkspace answers 503 (retryable) for that window. */
 let readModelFleet: ProjectorFleet | null = null
+/** G4-16f (3-year bench): retries a compaction re-attach that failed
+ * (`readModel/compactionReattach.ts`). Built with the compaction wiring in
+ * main(); null before it, and with READ_MODEL off (its metrics read zero). */
+let compactionReattach: CompactionReattachSupervisor | null = null
+/** G4-16f: the background retry of the 0006 trigram drop
+ * (`readModel/redundantIndexDropRetry.ts`); null before main() starts it. */
+let redundantIndexRetry: RedundantIndexDropRetry | null = null
 /** Residency follows the live workspace: the ownership gate of the
  * sync server tells this of every document frame on a workspace this cell
  * owns, and it makes the fleet's projector resident without waiting for a read.
@@ -1096,6 +1193,43 @@ let automergeRepo: Repo | null = null
  * the summary-migration routes (registered at module scope) can drain a
  * workspace's sockets after a contract change without threading it through. */
 let automergeConnectionRegistry: ConnectionRegistry | null = null
+/** G4-16f: the EVENT-DRIVEN forward pass, set where the epoch
+ * sweep is wired (it runs the same pass), read by the durable-heads route. */
+let modelEpochForwardTrigger: ForwardTrigger | null = null
+/** How long the durable-heads route waits for a pass it triggered before it
+ * answers again (inside a hopping tab's 2 s latch). */
+const FORWARD_TRIGGER_WAIT_MS = 1_500
+/** How long a refused overlay rotation holds the workspace's
+ * event-driven forward back (the rotation retries at 1 s, then 5 s). */
+const FORWARD_ROTATION_YIELD_MS = 5_000
+/** The periodic sweep and the meta-only job wait this long for
+ * the pool-heavy slot, as waiters, before skipping their turn. */
+const PERIODIC_SWEEP_EXCLUSION_WAIT_MS = 30_000
+/** The epoch capability per workspace, memoized for the hot
+ * durable-heads route (no SQL on most acknowledgements). Marked at a roll. */
+const modelEpochCapability = createEpochCapabilityMemo((key) => modelEpochRowsExist(pool, key))
+/** S9: forward right after a roll or a recovered roll — by
+ * the compaction or by the meta-only job; and the capability is known. */
+function afterEpochRoll(key: WorkspaceKey, outcome: unknown): void {
+  if (!epochRolledOrRecovered(outcome)) return
+  modelEpochCapability.markRolled(key)
+  epochTrace?.({ event: 'forward_trigger.s9_requested', workspace: `${key.landscapeId}/${key.versionId}` })
+  // The backoff is cleared and the pass starts as soon as the
+  // running one ends — single flight kept.
+  void modelEpochForwardTrigger?.request(key, { reset: true })
+}
+/** Diagnostics for the event-driven forward: JSON lines
+ * appended, asynchronously and bounded, to MODEL_EPOCH_TRACE_FILE when it is
+ * set (the e2e harness gives each run its own file) and NODE_ENV is not
+ * production; nothing is built otherwise. */
+const epochTraceSink = createEpochTraceSink(process.env.MODEL_EPOCH_TRACE_FILE, {
+  nodeEnv: process.env.NODE_ENV, warn: (message) => console.warn(message),
+})
+const epochTrace = epochTraceSink.enabled ? (event: Record<string, unknown>) => epochTraceSink.write(event) : undefined
+/** The epoch e2e's long compaction — null unless
+ * MODEL_EPOCH_E2E_COMPACTION_HOLD=on outside production
+ * (`e2eCompactionHoldFromEnv`, tested). */
+const e2eCompactionHold = e2eCompactionHoldFromEnv(process.env, (message) => console.warn(message))
 
 /** (landscapeId, versionId) from the query string, defaulting to the default
  * workspace per the shared contract — every /api/model/* endpoint accepts
@@ -1171,7 +1305,11 @@ async function ensureWorkspace(req: express.Request, res: express.Response): Pro
   // baseline must not start an O(500k) cold build merely to attach every shard.
   const staticQueryKey = await staticReadModelQueryWorkspaceIfPresent(pool, key)
   if (staticQueryKey) return staticQueryKey
-  if (!readModelFleet.isResident(key)) {
+  // SERVED, not resident (G4-16f C6-2b, `fleetServing.ts`): an adopting
+  // start serves the kept rows from its claim on, under a status that refuses
+  // freshness (`idle`) until its background attach is done; the durability
+  // witness carries that status. A served read is also the LRU's use (`touch`).
+  if (!readRouteServes(readModelFleet, key)) {
     // Never make an interactive request await an O(workspace) cold build. The
     // fleet memoizes the background start; callers retry the bounded query.
     void readModelFleet.ensure(key).then(
@@ -1216,8 +1354,6 @@ async function ensureWorkspace(req: express.Request, res: express.Response): Pro
     })
     return undefined
   }
-  // A read is a use: without `touch` the fleet's LRU would be FIFO.
-  readModelFleet.touch(key)
   return key
 }
 
@@ -1384,6 +1520,10 @@ if (READ_MODEL_ENABLED) {
       // `alreadyResident` stays flat is a fleet that keeps evicting what the
       // sockets keep re-warming — the cap is too small for the live set.
       liveResidency: liveResidency.snapshot(),
+      // G4-16f: workspaces a compaction left DETACHED (its re-attach failed)
+      // and the retry's attempts — counts and an age, no workspace key (the
+      // read_model.compaction_reattach_* log lines name it).
+      compactionReattach: compactionReattach?.snapshot() ?? null,
     })
   }))
 
@@ -1437,6 +1577,7 @@ if (READ_MODEL_ENABLED) {
     let ready = false
     let closed = false
     let heartbeat: NodeJS.Timeout | null = null
+    let untrackStream: (() => void) | null = null
 
     const writeGeneration = (generation: number): void => {
       if (closed || generation <= lastSentGeneration) return
@@ -1456,6 +1597,8 @@ if (READ_MODEL_ENABLED) {
       if (closed) return
       closed = true
       unsubscribe()
+      untrackStream?.()
+      untrackStream = null
       if (heartbeat) clearInterval(heartbeat)
       heartbeat = null
       res.off('drain', onDrain)
@@ -1484,6 +1627,15 @@ if (READ_MODEL_ENABLED) {
       throw error
     }
     if (closed) return
+    if (longLivedResponses.closing) {
+      // Accepted before the shutdown, reaching its headers after the `http`
+      // step ended the streams: do not open one more. NOT a 503: an
+      // EventSource whose request fails CLOSES for good; a
+      // stream that opens with a `retry:` and ends is reconnected.
+      cleanup()
+      endEventStreamForShutdown(res)
+      return
+    }
 
     res.status(200)
     res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
@@ -1491,6 +1643,11 @@ if (READ_MODEL_ENABLED) {
     res.setHeader('Connection', 'keep-alive')
     res.setHeader('X-Accel-Buffering', 'no')
     res.flushHeaders()
+    // Registered once the stream is OPEN: from here on only the client, or the
+    // shutdown's `http` step, ends it.
+    // `cleanup` runs BEFORE the shutdown's `res.end()`: it stops the
+    // heartbeat and the subscription, so nothing writes after the end.
+    untrackStream = longLivedResponses.track(res, cleanup)
     res.write(`retry: 2000\nevent: ready\ndata: ${JSON.stringify({ generation: currentGeneration })}\n\n`)
     ready = true
     writeGeneration(Math.max(currentGeneration, pendingGeneration ?? 0))
@@ -1695,13 +1852,16 @@ if (READ_MODEL_ENABLED) {
           .map((entry) => entry.slice(0, 256))
         : []
     )
-    const body = (req.body ?? {}) as { objects?: unknown; connections?: unknown }
+    const body = (req.body ?? {}) as { objects?: unknown; connections?: unknown; batches?: unknown }
     const objectIds = boundedIdsBody(body.objects)
     const connectionIds = boundedIdsBody(body.connections)
+    // T-SUM-2b: the overlay batch ids of stamped intents the client cannot
+    // find in its loaded segments; the answer names those the server received.
+    const batchIds = boundedIdsBody(body.batches)
     // The whole contract (freshness-then-entities ordering, resolved-workspace
     // echo, the absenceProvable field) lives in durabilityWitnessPayload —
     // assembled and TESTED there; this route only parses and transmits.
-    res.json(await durabilityWitnessPayload(pool, key, objectIds, connectionIds))
+    res.json(await durabilityWitnessPayload(pool, key, objectIds, connectionIds, batchIds))
   }))
   app.get('/api/model/dependencies', route(async (req, res) => {
     const key = await ensureWorkspace(req, res)
@@ -2736,6 +2896,7 @@ async function main() {
   let stopReadModelOwnershipListener: (() => void) | null = null
   let stopDivergenceScheduler: (() => void) | null = null
   let stopRepoFreshnessListener: (() => void) | null = null
+  let stopEpochResolveAcquisitionGuard: (() => void) | null = null
   let staticDeltaProjector: StaticDeltaProjector | null = null
   await Promise.all([redisRuntime.start(), redisRenderCacheRuntime.start()])
   // Authentication, quotas and route lookups create a command burst when many
@@ -2772,6 +2933,11 @@ async function main() {
   // that are not `active`) is logged on every boot, healthy ones included, so an
   // operator sees the gap rather than inferring it from silence.
   await assertWorkspaceSetParity(pool)
+  // G4-16f: a trigram drop the 0006 migration deferred
+  // (or left INVALID) is retried hourly, not only at the next boot.
+  redundantIndexRetry = new RedundantIndexDropRetry(pool)
+  redundantIndexRetry.start()
+  maintenanceScheduleStops.push(() => { void redundantIndexRetry?.stop() })
   if (READ_MODEL_ENABLED) {
     void readModelChangeHub.start().catch((error) => {
       console.warn('[read-model-events] initial LISTEN failed; reconnecting in background', error)
@@ -2875,6 +3041,7 @@ async function main() {
     transportTelemetry,
     storageFenceSnapshot,
     storageFenceRejectionCount,
+    compactDocumentStorage,
     denyLedgerSnapshot,
     residency,
     setPinnedCoreDocument,
@@ -2888,6 +3055,10 @@ async function main() {
   readStorageFenceSnapshot = storageFenceSnapshot
   readStorageFenceRejectionCount = storageFenceRejectionCount
   readDenyLedgerSnapshot = denyLedgerSnapshot
+  // G4-16f: no cell acquires a workspace while `epoch:resolve-repointing`
+  // holds its fence (its Repo writes the root without a fencing token). FIRST,
+  // so a refused acquisition never reaches the cache refresh below.
+  stopEpochResolveAcquisitionGuard = syncCellOwnership.onOwnershipAcquired(epochResolveAcquisitionGuard(pool))
   stopRepoFreshnessListener = syncCellOwnership.onOwnershipAcquired(async ({
     workspace, fencingToken,
   }) => {
@@ -2994,66 +3165,74 @@ async function main() {
   let shutdownStarted: Promise<void> | null = null
   const shutdown = (signal: string): Promise<void> => {
     if (shutdownStarted) return shutdownStarted
-    shutdownStarted = (async () => {
-      readiness.shuttingDown = true
-      console.log(`[server] ${signal} received; draining HTTP and Automerge connections`)
-      // Reject queued cold starts before closing transport/DB. ProjectorFleet
-      // prevents active builds from registering listeners after this stop.
-      // Closing the proof decoder below rejects unfinished pure decoding;
-      // it does not cancel SQL/drains or join every cold-build continuation.
-      readModelFleet?.stopAll()
-      coldBuildAdmission.stop()
-      stopReadModelOwnershipListener?.()
-      stopDivergenceScheduler?.()
-      stopReadModelOwnershipListener = null
-      stopRepoFreshnessListener?.()
-      stopRepoFreshnessListener = null
-      const stopStaticDeltaProjector = staticDeltaProjector?.stop()
-      staticDeltaProjector = null
-      maintenanceCoordinator?.stopAccepting()
-      for (const stopSchedule of maintenanceScheduleStops) stopSchedule()
-      const forcedExit = setTimeout(() => {
-        console.error('[server] graceful shutdown deadline exceeded')
-        process.exit(1)
-      }, 30_000)
-      forcedExit.unref()
-      const closeHttp = new Promise<void>((resolve) => server.close(() => resolve()))
-      // Maintenance jobs can hold and mutate Automerge documents, so let an
-      // active one finish before closing the repo or its PostgreSQL session.
-      await maintenanceCoordinator?.drain()
-      const drainResults = await Promise.allSettled([
-        durableHeadsDecoder.close(),
-        stopStaticDeltaProjector,
-        drainAutomerge(),
-        readModelChangeHub.stop(),
-        closeHttp,
-      ])
-      const failedDrains = drainResults.filter((result): result is PromiseRejectedResult => result.status === 'rejected')
-      // A rejected drain can mean an unjoined operation or failed persistence.
-      // Keep ownership until forced process exit; never compare-release on an
-      // allSettled result that did not certify transport closure and flush.
-      if (failedDrains.length) throw new AggregateError(failedDrains.map(result => result.reason), 'Server drain incomplete; ownership retained')
-      // Keep the critical Redis connection alive until Automerge has stopped
-      // accepting writes and flushed. Only then compare-release our leases.
-      // Repo.shutdown can take longer than an orchestrator's stop window; it is
-      // safe to finish after ownership is gone because drainAutomerge closed
-      // every transport and persisted all accepted writes first.
-      await syncCellOwnership?.stop()
-      await shutdownAutomerge()
-      await Promise.allSettled([
+    // T-ZEROWM-2 (2): the sequence and its order live in `serverShutdown.ts`
+    // (measured by `serverShutdown.integration.test.ts`); here, its resources.
+    shutdownStarted = runGracefulShutdown(signal, {
+      stopIntake: () => {
+        readiness.shuttingDown = true
+        // Reject queued cold starts before closing transport/DB. ProjectorFleet
+        // prevents active builds from registering listeners after this stop.
+        readModelFleet?.stopAll()
+        coldBuildAdmission.stop()
+        stopReadModelOwnershipListener?.()
+        stopDivergenceScheduler?.()
+        stopReadModelOwnershipListener = null
+        stopRepoFreshnessListener?.()
+        stopRepoFreshnessListener = null
+        stopEpochResolveAcquisitionGuard?.()
+        stopEpochResolveAcquisitionGuard = null
+      },
+      stopStaticProjector: () => {
+        const stopping = staticDeltaProjector?.stop()
+        staticDeltaProjector = null
+        return stopping
+      },
+      stopMaintenanceIntake: () => {
+        maintenanceCoordinator?.stopAccepting()
+        for (const stopSchedule of maintenanceScheduleStops) stopSchedule()
+      },
+      drainMaintenance: async () => { await maintenanceCoordinator?.drain() },
+      closeDurableHeadsDecoder: () => durableHeadsDecoder.close(),
+      drainAutomerge: () => drainAutomerge(),
+      stopChangeHub: () => readModelChangeHub.stop(),
+      // NOT a bare `server.close`: an open SSE stream never ends, so its
+      // callback never fired and every browser left open held the process to
+      // the 30 s forced exit (T-DIAGDEF (4), `httpShutdown.ts`).
+      closeHttp: async (signalAt) => {
+        // Rejects while a handler still runs at its deadline — ABSOLUTE,
+        // signal + 20 s (the budget is written in `httpShutdown.ts`): the
+        // sequence then KEEPS ownership.
+        const outcome = await closeHttpServer(server, {
+          longLived: longLivedResponses, inFlight: inFlightHandlers, handlerDeadlineAt: signalAt + 20_000,
+        })
+        console.log(JSON.stringify({ event: 'server.http_closed', ...outcome }))
+      },
+      // What a handler wrote after the Automerge drain's final flush, durable
+      // BEFORE the lease goes; bounded at 4 s.
+      flushLateWrites: () => repo.flush(),
+      lateWriteFlushMs: 4_000,
+      // Its CREATE INDEX CONCURRENTLY holds a primary-pool connection that
+      // `pool.end()` would wait for, to the forced exit.
+      stopBackgroundBuilds: async () => {
+        const how = await staticMembershipHeadIndexBuilder.stop()
+        console.log(JSON.stringify({ event: 'server.background_builds_stopped', staticMembershipHeadIndex: how }))
+      },
+      stopOwnership: async () => { await syncCellOwnership?.stop() },
+      shutdownAutomerge: () => shutdownAutomerge(),
+      stopRedis: () => Promise.allSettled([
         syncCellOwnershipRedis?.stop(),
         redisRuntime.stop(),
         redisRenderCacheRuntime.stop(),
-      ])
-      await pool.end().catch((error) => console.warn('[server] Postgres pool shutdown failed:', error))
-      await readModelPool.end().catch((error) => console.warn('[server] read-model Postgres pool shutdown failed:', error))
-      await syncCellPool.end().catch((error) => console.warn('[server] sync-cell Postgres pool shutdown failed:', error))
-      await lifecycleApplyPool.end().catch((error) => console.warn('[server] lifecycle-apply Postgres pool shutdown failed:', error))
-      await storageWritePool.end().catch((error) => console.warn('[server] storage-write Postgres pool shutdown failed:', error))
-      clearTimeout(forcedExit)
-      console.log('[server] graceful shutdown complete')
-      process.exit(0)
-    })()
+      ]),
+      endPools: async () => {
+        await pool.end().catch((error) => console.warn('[server] Postgres pool shutdown failed:', error))
+        await readModelPool.end().catch((error) => console.warn('[server] read-model Postgres pool shutdown failed:', error))
+        await syncCellPool.end().catch((error) => console.warn('[server] sync-cell Postgres pool shutdown failed:', error))
+        await lifecycleApplyPool.end().catch((error) => console.warn('[server] lifecycle-apply Postgres pool shutdown failed:', error))
+        await storageWritePool.end().catch((error) => console.warn('[server] storage-write Postgres pool shutdown failed:', error))
+      },
+      exit: (code) => process.exit(code),
+    })
     return shutdownStarted
   }
   const onShutdownSignal = (signal: string): void => {
@@ -3287,6 +3466,10 @@ async function main() {
     }
   })
 
+  // G4-16f: GET /api/model/epoch-overrides and
+  // POST /api/model/epoch-overrides/resolve (`modelEpochOverrideRoutes.ts`).
+  registerModelEpochOverrideRoutes(app, { pool, workspaceOf: workspaceFromReq, route })
+
   // A successful response is the durability boundary behind the client badge:
   // every acknowledged frontier has reached the workspace owner and its
   // PostgreSQL-backed Repo.flush() has completed. Merely receiving WebSocket
@@ -3303,6 +3486,9 @@ async function main() {
       res.status(400).json({ error: 'invalid durable head request' })
       return
     }
+    // G4-16j: a hopping tab's latch ask, counted per cell (`epochHopTelemetry.ts`).
+    const latchAsk = req.query.latch === '1'
+    const askedAt = Date.now()
     try {
       const canonical = await canonicalWorkspaceKey(pool, { landscapeId, versionId })
       if (!canonical) {
@@ -3314,11 +3500,66 @@ async function main() {
         return
       }
       res.setHeader('Cache-Control', 'private, no-store')
-      res.json({ documents: await acknowledgeDurableHeads(repo, pool, canonical, documents) })
+      const routeStartedAt = Date.now()
+      let acknowledged = await acknowledgeDurableHeads(repo, pool, canonical, documents)
+      const firstAckMs = Date.now() - routeStartedAt
+      const firstAck = lastAcknowledgementTiming
+      // G4-16f: a live superseded source durable past its
+      // forward cursor is forwarded NOW (single flight per workspace), and the
+      // answer is computed again once that pass ends — bounded, so a hopping
+      // tab's 2 s latch still holds.
+      // `awaitTriggeredForward` (tested): a LATCH ask (`latch=1`) is a
+      // priority request — the trigger, never the client, bounds it; the
+      // route waits only for a pass
+      // that can START inside its window, and answers again after one ran.
+      const pendingBefore = acknowledged.filter((d) => d.forwardPending).length
+      const waited = await awaitTriggeredForward({
+        trigger: modelEpochForwardTrigger, key: canonical, query: req.query as Record<string, unknown>,
+        acknowledged, reacknowledge: () => acknowledgeDurableHeads(repo, pool, canonical, documents),
+        waitMs: FORWARD_TRIGGER_WAIT_MS,
+      })
+      acknowledged = waited.acknowledged
+      // A latch's ask is traced even when nothing was triggered: how long it
+      // took, and what it answered.
+      if (waited.ended !== 'not-triggered' || waited.priority) {
+        const { ended, waitedMs, startsInMs } = waited
+        if (epochTrace) {
+          epochTrace({
+            event: 'durable_heads.forward_wait', documents: documents.length, pendingBefore, ended, waitedMs,
+            // Where a latch's ask spends its time — the first
+            // acknowledgement, the wait, the whole route.
+            firstAckMs, firstAck, routeMs: Date.now() - routeStartedAt,
+            startsInMs, priority: waited.priority,
+            pendingAfter: acknowledged.filter((d) => d.forwardPending).length,
+            forwardedAfter: acknowledged.filter((d) => d.forwarded === true).length,
+            notDurableAfter: acknowledged.filter((d) => !d.durable).length,
+            targetDocuments: acknowledged.find((d) => d.targetHeads)?.targetHeads?.length ?? 0,
+          })
+        }
+      }
+      // Whether this workspace has epochs — the
+      // tab gates the live hop, the actor journal and the override review on
+      // it. Its epoch rows, memoized (positive sticky, negative ~60 s); on an
+      // error the bit is OMITTED, never answered false.
+      const epochs = await modelEpochCapability.get(canonical)
+      const heldMs = Date.now() - askedAt
+      res.json({ documents: acknowledged, ...(epochs === undefined ? {} : { epochs }) })
+      // G4-16j: after the answer, so the meta lookup never sits in a latch.
+      void recordDurableHeadsTelemetry({
+        acknowledged, workspace: canonical,
+        latch: latchAsk ? { outcome: latchOutcome(waited, acknowledged), heldMs } : null,
+        metaDocumentIds: (ids) => epochMetaDocumentIds(pool, canonical, ids),
+      })
     } catch (err) {
       console.error('durable-heads error:', err)
       res.setHeader('Retry-After', '1')
       res.status(503).json({ error: 'durability acknowledgement unavailable', retryable: true })
+      if (latchAsk) {
+        void recordDurableHeadsTelemetry({
+          acknowledged: [], latch: { outcome: 'failed', heldMs: Date.now() - askedAt },
+          metaDocumentIds: async () => new Set(),
+        })
+      }
     }
   })
 
@@ -3840,6 +4081,13 @@ async function main() {
     process.once('SIGTERM', stopGrowthSampler)
     process.once('SIGINT', stopGrowthSampler)
     console.log(`[metrics] document-growth sampler every ${growthIntervalMs} ms`)
+    // G4-16j: epoch rows stuck `repointing`, on the same
+    // cadence and lifecycle. Whatever AM_MODEL_EPOCHS says: rows an earlier
+    // `on` left behind still strand tabs (`epochStuckRows.ts`).
+    const stopStuckRowsSampler = startEpochStuckRowsSampler(pool, growthIntervalMs,
+      (key) => !syncCellOwnership?.enabled || syncCellOwnership.owns(key))
+    process.once('SIGTERM', stopStuckRowsSampler)
+    process.once('SIGINT', stopStuckRowsSampler)
   }
   app.post('/api/automerge/gc', async (req, res) => {
     if (!requirePlatformAdminAtStageOn(req, res)) return
@@ -3941,6 +4189,7 @@ async function main() {
         residency,
         ownsWorkspace: (key) => !syncCellOwnership?.enabled || syncCellOwnership.owns(key),
         ordinaryHeadRotation,
+        adopt: readModelAdopt,
       })
       readModelFleet.pin(defaultWorkspaceKey)
 
@@ -3959,7 +4208,7 @@ async function main() {
         ? startDivergenceScheduler({
         pool: readModelPool,
         intervalMs: Number(process.env.READ_MODEL_DIVERGENCE_INTERVAL_MS ?? 15 * 60_000),
-        isEligible: (key) => Boolean(readModelFleet?.isResident(key))
+        isEligible: (key) => Boolean(readModelFleet && divergenceEligible(readModelFleet, key))
           && (!syncCellOwnership?.enabled || syncCellOwnership.owns(key)),
         // INDEPENDENT oracle. This deliberately does NOT use
         // extractModelEntities: that is the projector's own extractor, and
@@ -3995,7 +4244,10 @@ async function main() {
       if (syncCellOwnership!.owns(defaultWorkspaceKey)) {
         const fleet = readModelFleet
         const outcome = await ensureDefaultProjectorAtBoot({
-          ensure: () => fleet.ensure(defaultWorkspaceKey),
+          // Until SERVED (G4-16f C6-2b): an adopting start resolves at its
+          // claim, its background attach still running (`fleetServing.ts`),
+          // so `resident` below reads "served" for an adopted start.
+          ensure: () => ensureServedForReadiness(fleet, defaultWorkspaceKey),
           isStaticRefusal: (error) => error instanceof ProjectorStaticWorkspaceError,
           isOwnershipRefusal: (error) => error instanceof ProjectorOwnershipError,
           stopped: () => readiness.shuttingDown,
@@ -4031,11 +4283,22 @@ async function main() {
       // descriptor/control-document hydration is still consuming the same DB,
       // Repo and event loop as user reads. The first post-ready request must see
       // the fully attached read plane, not compete with startup work.
+      //
+      // EXCEPT an ADOPTED default workspace (READ_MODEL_ADOPT=on, G4-16f
+      // C6-2b): the pod is ready right after the verify and the claim,
+      // its background attach (B1-B5) still running and competing — the read
+      // plane served, freshness refused (`idle`) until B5.
       bringUpComplete = true
       if (!defaultProjectorPending) readiness.readModel = true
       console.log(
         'Read-model projector fleet + static delta projector ready (READ_MODEL=on); only locally-owned workspaces may attach listeners'
       )
+      // T-DIAGDEF: the static write-head index, built in the BACKGROUND
+      // once the pod is ready — outside the migration key, one build across
+      // the cluster, never awaited by the boot. Its readers are correct
+      // without it (it is only their cost). Retried until valid, stopped by
+      // the shutdown.
+      staticMembershipHeadIndexBuilder.start()
 
       // Daily overlay compaction: fold the persistent edits overlay back into the base
       // shards + clear it (CRDT-safe under concurrent edits — see compaction.ts), then
@@ -4062,6 +4325,99 @@ async function main() {
       // A's counts — the same confusion of workspaces this route is being fixed
       // to end, moved one layer down. Bounded by the allow-list: only the default
       // workspace and explicitly named ones can ever create an entry.
+      // G4-16f: compaction and the epoch sweep each
+      // hold ~5 primary-pool connections; together they fill DB_POOL_MAX=10
+      // and HTTP routes then 500. ONE of them at a time in this process:
+      // compaction waits for a running sweep (seconds), the sweep and the
+      // meta-only epoch job skip while compaction runs.
+      const poolHeavyPasses = createProcessExclusion()
+      // G4-16f: the epoch sweep's dependencies, shared by the event-driven
+      // pass, its maintenance follow-up and the periodic loop below.
+      // Diagnostics (MODEL_EPOCH_TRACE_FILE only): the event-driven pass's
+      // dependencies timed from outside the forwarder (modelEpochTraceDeps.ts).
+      const epochFleet = compactionFleet(readModelFleet!)
+      let passTimings = emptyTimings()
+      const timings = () => passTimings
+      const traced = epochTrace !== undefined
+      const triggerRepo = traced ? timedRepo(repo, timings) : repo
+      const triggerDb = traced ? timedQueryable(pool, timings) : pool
+      const triggerConnect = traced ? timedConnect(() => pool.connect(), timings) : () => pool.connect()
+      const epochSweepCommon = {
+        residentProjectorInstanceId: (k: WorkspaceKey) => epochFleet.residentProjectorInstanceId(k),
+        owns: (k: WorkspaceKey) => syncCellOwnership!.owns(k),
+        isShuttingDown: () => readiness.shuttingDown,
+        instanceId: currentProcessBootId(),
+        retire: { retain: modelEpochs.retain, periodDays: modelEpochs.periodDays },
+        log: (event: Record<string, unknown>) => console.log(JSON.stringify(event)),
+      }
+      // The epoch passes' wiring — the exclusion for every pass (the
+      // follow-up included), the unyielding holds `slotHeld` asks (the
+      // compaction's and the meta-only job's, queued or held), the follow-up
+      // noted by requested passes and stopped at shutdown, one yield watch
+      // for the periodic loop — decided and tested in
+      // `wireEpochForwardPasses`.
+      const epochPasses = wireEpochForwardPasses({
+        exclusion: poolHeavyPasses,
+        triggeredSweep: (key, options) => sweepModelEpochs(key, {
+          repo: triggerRepo, db: triggerDb, connect: triggerConnect, ...epochSweepCommon, ...options,
+        }),
+        sweep: (key, options) => sweepModelEpochs(key, {
+          repo, db: pool, connect: () => pool.connect(), ...epochSweepCommon, ...options,
+        }),
+        isShuttingDown: () => readiness.shuttingDown,
+        log: (event) => console.warn(JSON.stringify(event)),
+        stops: maintenanceScheduleStops,
+        periodicWaitMs: PERIODIC_SWEEP_EXCLUSION_WAIT_MS,
+      })
+      const unyieldingHolds = epochPasses.holds
+      // G4-16f (3-year bench): a re-attach the pass could not do is retried
+      // under the same slot as every compaction pass — never during one — as
+      // the pass's own `{ adopt: false }` cold build. What each object below
+      // is used for is decided, and tested, in
+      // `readModel/compactionReattachWiring.ts`.
+      const compactionReattachWiring = wireCompactionReattach({
+        fleet: readModelFleet!,
+        ownership: syncCellOwnership,
+        readiness,
+        holds: unyieldingHolds,
+        stops: maintenanceScheduleStops,
+        writeGate: () => installedPoolConcurrencyGate(storageWritePool),
+        trace: epochTrace,
+      })
+      compactionReattach = compactionReattachWiring.supervisor
+      /** The compaction's hold of the pool-heavy slot. Diagnostics only
+       * (MODEL_EPOCH_TRACE_FILE): its wait, acquisition and release traced;
+       * the e2e's long compaction applied here, AROUND the pass —
+       * the pass itself is untouched. Neither set: `run` exactly as before. */
+      const compactionUnderSlot = <T>(key: WorkspaceKey, work: () => Promise<T>): Promise<T> => {
+        if (!epochTrace && !e2eCompactionHold) return unyieldingHolds.run(work)
+        const workspace = `${key.landscapeId}/${key.versionId}`
+        const askedAt = Date.now()
+        epochTrace?.({ event: 'compaction.slot_wait', workspace, waiting: poolHeavyPasses.waiting(), busy: poolHeavyPasses.busy() })
+        return unyieldingHolds.run(async () => {
+          const acquiredAt = Date.now()
+          epochTrace?.({ event: 'compaction.slot_acquired', workspace, waitedMs: acquiredAt - askedAt })
+          try {
+            const value = await work()
+            const { holdMs, afterMs } = e2eCompactionHold?.take() ?? { holdMs: 0, afterMs: 0 }
+            if (holdMs > 0) {
+              epochTrace?.({ event: 'e2e.compaction_hold', workspace, holdMs })
+              await new Promise((resolve) => setTimeout(resolve, holdMs))
+            }
+            if (afterMs > 0) {
+              // Queued NOW, as the next waiter: the slot passes to it at this release.
+              void unyieldingHolds.run(async () => {
+                epochTrace?.({ event: 'e2e.after_hold_acquired', workspace, afterMs })
+                await new Promise((resolve) => setTimeout(resolve, afterMs))
+                epochTrace?.({ event: 'e2e.after_hold_released', workspace, afterMs })
+              })
+            }
+            return value
+          } finally {
+            epochTrace?.({ event: 'compaction.slot_released', workspace, heldMs: Date.now() - acquiredAt, waiting: poolHeavyPasses.waiting() })
+          }
+        })
+      }
       const compactionRunners = new Map<string, () => Promise<CompactionOutcome>>()
       const compactionRunner = (key: WorkspaceKey): (() => Promise<CompactionOutcome>) => {
         const id = `${key.landscapeId}/${key.versionId}`
@@ -4090,19 +4446,42 @@ async function main() {
                 + 'compacting against a fallback root would rewrite another workspace',
               )
             }
-            const outcome = await runWorkspaceCompaction(key, {
+            const outcome = await compactionUnderSlot(key, () => runWorkspaceCompaction(key, {
               repo,
               rootUrl: workspaceRoot,
               db: pool,
-              fleet: {
-                isResident: (key) => readModelFleet!.isResident(key),
-                ensure: (key) => readModelFleet!.ensure(key),
-                release: (key, reason) => readModelFleet!.release(key, reason),
-                residentProjectorInstanceId: (key) => readModelFleet!.residentProjectorInstanceId(key) ?? null,
-              },
+              // Two clients for the write half: the `overlay-rotation:` keys
+              // (G4-16i), session-scoped, and the settle committed on them.
+              connect: () => pool.connect(),
+              // Resident means ATTACHED (`fleetServing.ts`, C6-2b).
+              fleet: compactionFleet(readModelFleet!),
               ownership: { owns: (key) => syncCellOwnership!.owns(key) },
               isShuttingDown: () => readiness.shuttingDown,
-            })
+              // G4-16f: the epoch step, a no-op unless AM_MODEL_EPOCHS=on. The
+              // lifecycle lock is held for the whole roll, so
+              // promote, demote and the repair doors cannot rewrite the root
+              // under it.
+              modelEpochs: {
+                config: modelEpochs,
+                instanceId: currentProcessBootId(),
+                withLifecycleLock: async (critical) => {
+                  const locked = await withLifecycleApplyLock(pool, key, () => critical())
+                  return locked.granted ? { granted: true, value: locked.value } : { granted: false }
+                },
+              },
+              // G4-16f: the base shards' storage back to one
+              // snapshot each after the fold, epochs on or off, unless
+              // AM_BASE_SHARD_STORAGE_COMPACTION=off.
+              compactDocumentStorage,
+              baseShardStorageCompaction,
+              // A failed re-attach is retried, not left for the next pass;
+              // every re-attach in flight is watched.
+              ...compactionReattachWiring.passHooks,
+            }))
+            // S9: the pass released its keys and re-attached;
+            // forward NOW what reached the superseded documents during the
+            // roll, so an open tab's hop does not wait for the next sweep.
+            if (outcome.epoch && 'outcome' in outcome.epoch) afterEpochRoll(key, outcome.epoch)
             return outcome
           },
         ))
@@ -4123,6 +4502,137 @@ async function main() {
         }
       }))
       console.log(`[compaction] scheduled daily at 00:00 ${tz}`)
+
+      // G4-16f: THE EPOCH SWEEP between two compaction passes
+      // (`readModel/modelEpochSweep.ts`): late writes on a superseded epoch
+      // document are forwarded within minutes, not at the next nightly pass,
+      // and retired documents are walked to `retired`. Whatever
+      // AM_MODEL_EPOCHS says; a workspace with no epoch row costs one probe.
+      // The workspaces the compaction runs for: the default one and the
+      // allow-listed ones this cell owns. Exclusion across cells is the
+      // `model-epoch:` key; the write fence is the resident projector's.
+      {
+        let sweeping = false
+        const sweepWorkspaces = (): WorkspaceKey[] => {
+          const keys = [defaultWorkspaceKey]
+          for (const entry of parseCompactionAllowlist()) {
+            const [landscapeId, versionId] = entry.split('/') as [string, string]
+            if (landscapeId !== defaultWorkspaceKey.landscapeId || versionId !== defaultWorkspaceKey.versionId) keys.push({ landscapeId, versionId })
+          }
+          return keys
+        }
+        const fleet = epochFleet
+        // The event-driven pass is the sweep's own pass, run
+        // on demand (durable-heads, and S9 below) with a short budget,
+        // forward only, an URGENT one waiting as a waiter with a grace
+        // (`triggeredSweepOptions`); its budget counts the HOLD of the slot
+        // (`onAcquired`). A rest at least as long as each pass, a backoff
+        // when a pass moves nothing (`modelEpochForwardTrigger.ts`).
+        // A REQUESTED pass that forwarded
+        // leaves its maintenance to one ordinary pass 30 s later
+        // (`wireEpochForwardPasses`, tested).
+        const runRequestedOrS9 = (key: WorkspaceKey, urgency: ForwardPassUrgency, onAcquired: () => void) =>
+          epochPasses.runRequestedOrS9(key, urgency, onAcquired) as ReturnType<typeof sweepModelEpochs>
+        modelEpochForwardTrigger = createForwardTrigger(async (key, urgency, onAcquired) => {
+          if (!traced) return runRequestedOrS9(key, urgency, onAcquired)
+          passTimings = emptyTimings()
+          try {
+            return await runRequestedOrS9(key, urgency, onAcquired)
+          } finally {
+            epochTrace({ event: 'forward_trigger.pass_timings', ...passTimings })
+          }
+        }, {
+          log: (event) => console.warn(JSON.stringify(event)),
+          trace: epochTrace,
+          progressed: forwardPassProgressed,
+          // Refused the pool-heavy slot is not "no progress".
+          busy: forwardPassRefused,
+          // A latch is not "ready" while a compaction (or the meta-only
+          // job) holds the slot — not the periodic sweep, which yields to it.
+          slotHeld: epochPasses.slotHeld,
+          // One QUEUED is served first, whoever holds.
+          slotQueued: epochPasses.slotQueued,
+        })
+        // A refused overlay rotation (or fold) makes the workspace's
+        // event-driven pass YIELD for a while, so the rotation's retry
+        // (1 s, 5 s, …) finds its keys free — only when one of its passes
+        // held them (refused by a compaction, yielding only delayed S9; a
+        // pass HOLDING the slot, not one waiting for it;
+        // `yieldToRefusedRotation`, tested).
+        setOverlayRotationContendedListener((detail) => {
+          yieldToRefusedRotation(modelEpochForwardTrigger, detail, FORWARD_ROTATION_YIELD_MS)
+        })
+        // The ROTATED workspaces the compaction does not admit get
+        // META-ONLY epochs from this loop (`runModelEpochMetaJob`), and a boot
+        // warning says so — their base shards are bounded by nothing.
+        const metaOnlyWorkspaces = (): WorkspaceKey[] => {
+          if (ordinaryHeadRotation.mode === 'off' || ordinaryHeadRotation.allowlist === 'all') return []
+          return [...ordinaryHeadRotation.allowlist].map((entry) => {
+            const [landscapeId, versionId] = entry.split('/') as [string, string]
+            return { landscapeId, versionId }
+          }).filter((key) => !admitCompaction(key, defaultWorkspaceKey, parseCompactionAllowlist()).allowed)
+        }
+        for (const key of metaOnlyWorkspaces()) {
+          console.warn(`[model-epoch] ${key.landscapeId}/${key.versionId} rotates its ordinary heads but is not compaction-admitted: `
+            + 'its ModelMeta is bounded by meta-only epochs, its base shards by nothing (add it to COMPACTION_WORKSPACE_ALLOWLIST)')
+        }
+        if (ordinaryHeadRotation.mode !== 'off' && ordinaryHeadRotation.allowlist === 'all') {
+          console.warn('[model-epoch] ordinary head rotation is on for ALL workspaces: meta-only epochs cannot enumerate them; '
+            + 'only compaction-admitted workspaces roll epochs')
+        }
+        // The META-ONLY workspaces are swept too — their
+        // superseded metas are retired, and a late write that arrived during
+        // a backoff is forwarded — by nothing else since the event-driven
+        // pass became forward-only. One probe each when they have no row.
+        // The periodic sweep waits as a WAITER (an event-driven
+        // pass yields to it) rather than skipping a 10-minute turn. One that
+        // holds the slot but yields every
+        // period is alerted — one watch for the process's life
+        // (`wireEpochForwardPasses`).
+        const timer = setInterval(() => {
+          if (sweeping || readiness.shuttingDown) return
+          sweeping = true
+          void (async () => {
+            for (const key of periodicSweepWorkspaces(sweepWorkspaces(), metaOnlyWorkspaces())) {
+              try {
+                const outcome = await epochPasses.periodicSweep(key) as Awaited<ReturnType<typeof sweepModelEpochs>>
+                if (outcome.outcome === 'swept') console.log(`[model-epoch] sweep ${key.landscapeId}/${key.versionId}: ${JSON.stringify(outcome)}`)
+              } catch (error) {
+                console.warn(`[model-epoch] sweep of ${key.landscapeId}/${key.versionId} failed: ${error instanceof Error ? error.message : String(error)}`)
+              }
+            }
+            for (const key of metaOnlyWorkspaces()) {
+              try {
+                const rootUrl = await resolveRootUrl(key.landscapeId, key.versionId, '')
+                if (!rootUrl) continue
+                const ran = await unyieldingHolds.runWithin(() => runModelEpochMetaJob(key, {
+                  repo, rootUrl, db: pool, connect: () => pool.connect(), fleet,
+                  ownership: { owns: (k) => syncCellOwnership!.owns(k) },
+                  isShuttingDown: () => readiness.shuttingDown,
+                  modelEpochs: {
+                    config: modelEpochs, instanceId: currentProcessBootId(),
+                    withLifecycleLock: async (critical) => {
+                      const locked = await withLifecycleApplyLock(pool, key, () => critical())
+                      return locked.granted ? { granted: true, value: locked.value } : { granted: false }
+                    },
+                  },
+                  log: (event) => console.log(JSON.stringify(event)),
+                }), PERIODIC_SWEEP_EXCLUSION_WAIT_MS)
+                if (!ran.ran) continue // a compaction pass held the pool-heavy slot past the wait
+                const outcome = ran.value
+                if (outcome.outcome === 'rolled' || outcome.outcome === 'recovered') {
+                  console.log(`[model-epoch] meta-only epoch ${key.landscapeId}/${key.versionId}: ${JSON.stringify(outcome)}`)
+                }
+                afterEpochRoll(key, outcome)
+              } catch (error) {
+                console.warn(`[model-epoch] meta-only epoch of ${key.landscapeId}/${key.versionId} failed: ${error instanceof Error ? error.message : String(error)}`)
+              }
+            }
+          })().finally(() => { sweeping = false })
+        }, MODEL_EPOCH_SWEEP_INTERVAL_MS)
+        timer.unref?.()
+        maintenanceScheduleStops.push(() => clearInterval(timer))
+      }
 
       // On-demand trigger (verification / manual maintenance).
       app.post('/api/model/compact', route(async (req, res) => {
@@ -4152,11 +4662,13 @@ async function main() {
           })
           return
         }
+        // The epoch e2e's long compaction (null outside that harness).
+        e2eCompactionHold?.arm(req.query as Record<string, unknown>)
         const outcome = await compactionRunner(requested)()
         if (outcome.status === 'completed') {
-          // `.result`, so this response is unchanged by the runner now carrying
-          // the re-attach outcome too.
-          res.json(outcome.value.result)
+          // The fold's counts AND the re-attach outcome: a manual
+          // compaction that left the read plane detached says so here.
+          res.json(compactionHttpBody(outcome.value))
         } else if (outcome.status === 'skipped_ownership') {
           res.status(outcome.retryable ? 503 : 409).json({
             status: outcome.status,
@@ -4224,7 +4736,7 @@ async function main() {
         // cold-entry path, the larger half of the lock hold, and
         // keeps the `ro_*` count below from being taken on a read model that was
         // never built.
-        isResident: (workspace) => readModelFleet!.isResident(workspace),
+        isResident: (workspace) => compactionFleet(readModelFleet!).isResident(workspace),
         admit: (workspace) => {
           const admission = admitCompaction(workspace, defaultWorkspaceKey, parseCompactionAllowlist())
           return admission.allowed && admission.scope === 'allowlisted'
@@ -4268,10 +4780,12 @@ async function main() {
           // and `skipped_ownership` mean the pass never ran.
           if (outcome.status !== 'completed') return { ran: false, reason: outcome.status }
           // AND `completed` IS NOT ENOUGH. `runWorkspaceCompaction` returns
-          // NORMALLY, with zero counts and a `skippedReason`, for four of its own
+          // NORMALLY, with zero counts and a `skippedReason`, for seven of its own
           // refusals — `summary_workspace`, `projection_not_acknowledged`,
-          // `foreign_projector_instance`, `ownership_lost_mid_fold` — and the
-          // coordinator stamps all four `completed`. Reading only the status
+          // `foreign_projector_instance`, `ownership_lost_mid_fold`,
+          // `retired_head_forward_pending`, `ordinary_fold_unpublished`,
+          // `overlay_rotation_lock_contended` (`WorkspaceCompactionSkip`) — and
+          // the coordinator stamps all seven `completed`. Reading only the status
           // would book them as a compaction of zero and DELETE the due-work row,
           // so a workspace whose projector is one generation behind (normal for
           // a fat overlay) would lose its turn every window, under a green report.

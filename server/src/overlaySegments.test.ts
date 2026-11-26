@@ -28,6 +28,7 @@ import {
 import { OVERLAY_WRITE_HEAD_VERSION } from './modelMeta.js'
 import { WorkspaceDocIndex, setWorkspaceDocumentsRegistrationForTest } from './rbac/docScope.js'
 import { serverCreationPlacementFor } from './rbac/serverCreationPlacement.js'
+import { readMetaUrl, readMetaUrls } from './modelMetaUrls.js'
 
 describe('bounded overlay segments', () => {
   it('splits a large batch, preserves last-wins order and deletes across segments', async () => {
@@ -44,8 +45,8 @@ describe('bounded overlay segments', () => {
 
     const urls = overlaySegmentUrls(meta.doc(), 'objects')
     expect(urls).toHaveLength(3)
-    expect(meta.doc()?.objectShardUrls).toEqual(urls)
-    expect(meta.doc()?.editsObjectShardUrl).toBe(urls.at(-1))
+    expect(readMetaUrls(meta.doc(), 'objectShardUrls')).toEqual(urls)
+    expect(readMetaUrl(meta.doc(), 'editsObjectShardUrl')).toBe(urls.at(-1))
     // Against the constant, not `1`, so a producer that hardcodes the digit
     // after a protocol bump still fails.
     expect(meta.doc()?.editsOverlayWriteHeadVersion).toBe(OVERLAY_WRITE_HEAD_VERSION)
@@ -81,7 +82,7 @@ describe('bounded overlay segments', () => {
     // `createSegment`, after the claim.
     meta.on('change', ({ patchInfo }) => {
       const after = (patchInfo?.after ?? {}) as { objectShardUrls?: string[] }
-      for (const url of after.objectShardUrls ?? []) {
+      for (const url of readMetaUrls(after, 'objectShardUrls') ?? []) {
         const advertise = `advertise:${url.replace(/^automerge:/, '')}`
         if (!events.includes(advertise)) events.push(advertise)
       }
@@ -147,7 +148,7 @@ describe('bounded overlay segments', () => {
 
     const urls = overlaySegmentUrls(meta.doc(), 'objects')
     expect(urls).toHaveLength(1)
-    expect(meta.doc()?.objectShardUrls).toEqual(urls)
+    expect(readMetaUrls(meta.doc(), 'objectShardUrls')).toEqual(urls)
   })
 
   it('a current segment WITHOUT its collection map still receives the write', async () => {

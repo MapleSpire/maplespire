@@ -582,22 +582,34 @@ suite('read-model projector wiring (in-process Automerge → Postgres)', () => {
       expect(objectVerdict?.expected?.n).toBe(2)
       expect(objectVerdict?.actual?.n).toBe(1)
 
-      // And once the projector advances, the sealed digest is honestly reported
-      // as un-comparable rather than as a match or as corruption.
+      // And once the projector advances, the seal is MAINTAINED through the
+      // delta (G4-16f C6a): o9 is XORed into the g=N seal and stamped at
+      // N+1 — so the row removed behind its back is STILL detected, at the new
+      // generation. Before C6a the delta left the seal un-comparable and the
+      // loss went invisible after the first edit; that is precisely the window
+      // a verify-and-adopt takeover must not have.
       os0.change((doc: { objects: Record<string, unknown> }) => {
         doc.objects['o9'] = { id: 'o9', name: 'Z' }
       })
       await until(() => roObject(pool!, WS, 'o9'), (value) => !!value)
+      const generationAtLoss = objectVerdict?.expected?.g
       const moved = await until(
         () => verifyWorkspaceIntegrity(pool!, WS),
-        (report) => report.verdicts.find((verdict) => verdict.kind === 'object')?.outcome === 'not-verifiable',
+        (report) => (report.verdicts.find((verdict) => verdict.kind === 'object')?.expected?.g ?? -1) > (generationAtLoss ?? Infinity),
       )
-      expect(moved.verdicts.find((verdict) => verdict.kind === 'object')?.outcome).toBe('not-verifiable')
-      expect(moved.outcome).not.toBe('mismatch')
-      // The other half of the carry-forward contract, and the half that makes it
-      // honest: an object-shard delta invalidates ONLY `object`. If it also
-      // dragged the kinds it never touched to `not-verifiable`, one edit anywhere
-      // would blind the whole feature.
+      const movedObject = moved.verdicts.find((verdict) => verdict.kind === 'object')
+      expect(movedObject?.outcome).toBe('mismatch')
+      // The shard delta re-upserts o1 too (it is still in the document), and
+      // o1 ENTERS the table again, so the seal gains o1 AND o9: {o0} ⊕ … at
+      // n=2+2 over a table of 3. The discrepancy the stray DELETE introduced
+      // is carried, never healed into a match: the seal is only ever moved by
+      // what the writers did to the table.
+      expect(movedObject?.expected?.n).toBe(4)
+      expect(movedObject?.actual?.n).toBe(3)
+      expect(movedObject?.expected?.g).toBe(moved.projectedGeneration)
+      // The other half of the carry-forward contract: an object-shard delta
+      // moves ONLY `object`. If it dragged the kinds it never touched to
+      // `not-verifiable`, one edit anywhere would blind the whole feature.
       for (const kind of ['connection', 'group', 'diagram'] as const) {
         expect(moved.verdicts.find((verdict) => verdict.kind === kind)?.outcome, kind).toBe('match')
       }
@@ -642,13 +654,19 @@ suite('read-model projector wiring (in-process Automerge → Postgres)', () => {
     // The carry-forward mechanism's trap:
     //
     //   g=N   cold build seals object {n:1}
-    //   g=N+1 an object-shard delta adds an id and correctly declines to re-seal
-    //   g=N+2 an unrelated GROUP edit truthfully reports it touched no objects
+    //   g=N+1 a projection moves objects and leaves the seal stale
+    //   g=N+2 an object delta XORs its ids in (C6a), or a GROUP edit
+    //         truthfully reports it touched no objects
     //
     // Carrying the object seal forward at g=N+2 re-dates the g=N digest onto rows
     // that have since gained an id, and a HEALTHY read model reports corruption.
     // `not-verifiable` is honest; a false `mismatch` reads as data loss and is
     // strictly worse than silence.
+    //
+    // Since C6a no ordinary pass leaves the object seal stale on its own, so
+    // step N+1 is made by hand: an object row inserted and the generation
+    // advanced with the seal left behind — what a stamp whose savepoint rolled
+    // back leaves.
     const repo = new Repo({})
     const os0 = repo.create({ objects: { o0: { id: 'o0', name: 'A' } } })
     const meta = repo.create({
@@ -661,14 +679,29 @@ suite('read-model projector wiring (in-process Automerge → Postgres)', () => {
     try {
       expect((await verifyWorkspaceIntegrity(pool!, WS)).outcome).toBe('verified')
 
+      await pool!.query(
+        `INSERT INTO ro_objects (landscape_id, version_id, id, data) VALUES ($1, $2, 'out-of-band', '{}'::jsonb)`,
+        [WS.landscapeId, WS.versionId],
+      )
+      await pool!.query(
+        `UPDATE read_model_projection_state
+            SET projected_generation = projected_generation + 1, observed_generation = observed_generation + 1
+          WHERE landscape_id = $1 AND version_id = $2`,
+        [WS.landscapeId, WS.versionId],
+      )
+      const stale = await verifyWorkspaceIntegrity(pool!, WS)
+      expect(stale.verdicts.find((v) => v.kind === 'object')?.outcome).toBe('not-verifiable')
+
+      // A maintained delta on a stale seal: XORing o1 into it would date
+      // {o0, o1} at N+2 over {o0, o1, out-of-band}.
       os0.change((doc: { objects: Record<string, unknown> }) => {
         doc.objects['o1'] = { id: 'o1', name: 'B' }
       })
       await until(() => roObject(pool!, WS, 'o1'), (value) => !!value)
-      const afterObjectEdit = await until(
-        () => verifyWorkspaceIntegrity(pool!, WS),
-        (report) => report.verdicts.find((v) => v.kind === 'object')?.outcome === 'not-verifiable',
-      )
+      await new Promise((resolve) => setTimeout(resolve, 300))
+      const afterObjectEdit = await verifyWorkspaceIntegrity(pool!, WS)
+      expect(afterObjectEdit.projectedGeneration).toBeGreaterThan(stale.projectedGeneration!)
+      expect(afterObjectEdit.verdicts.find((v) => v.kind === 'object')?.outcome).toBe('not-verifiable')
       expect(afterObjectEdit.outcome).not.toBe('mismatch')
 
       meta.change((doc: { groups: Record<string, unknown> }) => {
@@ -689,6 +722,101 @@ suite('read-model projector wiring (in-process Automerge → Postgres)', () => {
       stop()
     }
   }, 30_000)
+
+  it('maintains the object and connection seals through shard deltas and tombstones (C6a)', async () => {
+    // The real projector, a real repo and PostgreSQL: after inserts, an
+    // update, a delete, a re-insert, a duplicate id inside a shard, an id
+    // shared by two shards with one copy removed, and a ModelMeta tombstone,
+    // the object and connection seals are dated at the CURRENT generation and
+    // equal `digestSql` over the table — i.e. a takeover could verify them.
+    const repo = new Repo({})
+    const os0 = repo.create({ objects: { o0: { id: 'o0', name: 'A' }, o1: { id: 'o1', name: 'B' } } })
+    const os1 = repo.create({ objects: { s0: { id: 's0', name: 'S' } } })
+    const cs0 = repo.create({ connections: { c0: { id: 'c0', fromId: 'o0', toId: 'o1' } } })
+    const meta = repo.create({
+      objectShardUrls: [os0.url, os1.url], connectionShardUrls: [cs0.url], groups: {},
+    })
+    const root = repo.create({ modelMetaUrl: meta.url, modelUrl: '', shardUrls: [] })
+    await Promise.all([os0, os1, cs0, meta, root].map((h) => h.whenReady()))
+
+    const stop = await startReadModelProjector(repo, root.url, pool!, WS)
+    const current = async (label: string) => {
+      // Settle: the last change's projection must have committed.
+      await new Promise((resolve) => setTimeout(resolve, 300))
+      const report = await verifyWorkspaceIntegrity(pool!, WS)
+      for (const kind of ['object', 'connection'] as const) {
+        const verdict = report.verdicts.find((v) => v.kind === kind)
+        expect(verdict?.outcome, `${label}: ${kind} ${verdict?.reason ?? ''}`).toBe('match')
+        expect(verdict?.expected?.g, `${label}: ${kind} dated`).toBe(report.projectedGeneration)
+      }
+      return report
+    }
+    try {
+      const start = await current('cold build')
+      type Objs = { objects: Record<string, unknown> }
+      type Conns = { connections: Record<string, unknown> }
+      os0.change((doc: Objs) => { doc.objects['o2'] = { id: 'o2', name: 'C' } })
+      await until(() => roObject(pool!, WS, 'o2'), (value) => !!value)
+      await current('insert')
+      os0.change((doc: Objs) => { (doc.objects['o0'] as { name: string }).name = 'A2' })
+      await current('update')
+      os0.change((doc: Objs) => { delete doc.objects['o1'] })
+      await until(() => roObject(pool!, WS, 'o1'), (value) => !value)
+      await current('delete')
+      os0.change((doc: Objs) => { doc.objects['o1'] = { id: 'o1', name: 'B again' } })
+      await until(() => roObject(pool!, WS, 'o1'), (value) => !!value)
+      await current('re-insert')
+      // Two map keys, one inner id: the shard delta keeps one row.
+      os0.change((doc: Objs) => { doc.objects['dupKey'] = { id: 'o2', name: 'C twin' } })
+      await current('duplicate id in a shard')
+      // An id carried by two shards, then removed from one: the row goes
+      // (the delete path is per shard), and the seal must follow the TABLE.
+      os1.change((doc: Objs) => { doc.objects['o0'] = { id: 'o0', name: 'A copy' } })
+      await current('shared id')
+      os1.change((doc: Objs) => { delete doc.objects['o0'] })
+      await until(() => roObject(pool!, WS, 'o0'), (value) => !value)
+      await current('shared id removed from one shard')
+      // Shards appended to ModelMeta AFTER boot: their first projection is the
+      // watcher's initial apply (`applyInitial`), a separate call site.
+      const os2 = repo.create({ objects: { late0: { id: 'late0', name: 'L' } } })
+      const cs1 = repo.create({ connections: { lateC: { id: 'lateC', fromId: 'o2', toId: 'late0' } } })
+      await Promise.all([os2.whenReady(), cs1.whenReady()])
+      meta.change((doc: { objectShardUrls: string[]; connectionShardUrls: string[] }) => {
+        doc.objectShardUrls.push(os2.url)
+        doc.connectionShardUrls.push(cs1.url)
+      })
+      await until(() => roObject(pool!, WS, 'late0'), (value) => !!value)
+      await until(
+        async () => (await pool!.query('SELECT 1 FROM ro_connections WHERE landscape_id = $1 AND version_id = $2 AND id = $3',
+          [WS.landscapeId, WS.versionId, 'lateC'])).rowCount,
+        (count) => count === 1,
+      )
+      await current('shards attached after boot')
+      os2.change((doc: Objs) => { delete doc.objects['late0'] })
+      await until(() => roObject(pool!, WS, 'late0'), (value) => !value)
+      cs1.change((doc: Conns) => { delete doc.connections['lateC'] })
+      await current('late shards emptied')
+      cs0.change((doc: Conns) => { doc.connections['c1'] = { id: 'c1', fromId: 'o1', toId: 'o2' } })
+      await current('connection insert')
+      cs0.change((doc: Conns) => { delete doc.connections['c0'] })
+      await current('connection delete')
+      // ModelMeta tombstones: `deleteObjects` / `deleteConnections` in the
+      // METADATA pass, a writer no shard delta goes through.
+      meta.change((doc: { deletedObjectIds?: string[]; deletedConnectionIds?: string[] }) => {
+        doc.deletedObjectIds = ['s0', 'never-existed']
+        doc.deletedConnectionIds = ['c1']
+      })
+      await until(() => roObject(pool!, WS, 's0'), (value) => !value)
+      const end = await current('tombstones')
+      expect(end.projectedGeneration).toBeGreaterThan(start.projectedGeneration! + 8)
+      const objects = end.verdicts.find((v) => v.kind === 'object')
+      expect(objects?.actual?.n).toBe(2) // o1, o2
+      const connections = end.verdicts.find((v) => v.kind === 'connection')
+      expect(connections?.actual?.n).toBe(0)
+    } finally {
+      stop()
+    }
+  }, 60_000)
 
   it('refuses to wipe a diagram\'s flows when its document resolves with no flows map', async () => {
     // `syncConnectionFlows` DELETEs every row for the diagram before

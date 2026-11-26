@@ -190,6 +190,11 @@ export interface WriteGateOptions {
    * wherever the gate evaluates (stages 'dual' and 'on' with claims); stage
    * 'off', claim-less requests and platform admins return before the lookup. */
   missingLandscape?: 'allow' | 'deny'
+  /** The STRICT verdict, for a caller that
+   * only asks (`canWriteVersion`): at stage 'dual' a non-writer is NO, and no
+   * `[workspace-gate] dual` warning is logged — dual's "allow and warn" is for
+   * the mutation routes it is phasing in, not for a read that records more. */
+  strict?: boolean
 }
 
 /** Shared body of requireLandscapeWrite / requireVersionWrite. */
@@ -248,6 +253,7 @@ async function requireWorkspaceWrite(
     }
 
     if (canWrite) return true
+    if (opts.strict) return false
     if (stage === 'dual') {
       console.warn(
         `[workspace-gate] dual: ${claims.userId} lacks WRITE on landscape ${target.landscapeId}` +
@@ -289,6 +295,18 @@ export async function requireVersionWrite(
   opts: WriteGateOptions = {}
 ): Promise<boolean> {
   return requireWorkspaceWrite(pool, req, res, { landscapeId, versionId }, opts)
+}
+
+/**
+ * `requireVersionWrite`'s verdict WITHOUT answering the request: for a route
+ * open to readers that does one more thing for a writer (the epoch override
+ * actors). The gate's own answer goes to a sink; a gate fault
+ * reads as "no write". STRICT: at stage
+ * 'dual' a reader is no writer here, and nothing is logged for it.
+ */
+export async function canWriteVersion(pool: Pool, req: Request, landscapeId: string, versionId: string): Promise<boolean> {
+  const sink = { status() { return sink }, json() { return sink } } as unknown as Response
+  return requireWorkspaceWrite(pool, req, sink, { landscapeId, versionId }, { strict: true })
 }
 
 /**

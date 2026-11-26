@@ -24,8 +24,9 @@ import { ensureMaintenanceSchema } from './maintenance/schema.js'
 import { setWorkspaceDocumentsRegistrationForTest, WorkspaceDocIndex } from './rbac/docScope.js'
 import { ensureSyncCellOwnershipSchema } from './syncCells/ownership.js'
 import { createIsolatedSchemaDb, type IsolatedSchemaDb } from './testing/isolatedSchema.js'
+import { protocolFixtureQuery } from './testing/protocolFixture.js'
 import { ensureReadModelSchema } from './readModel/schema.js'
-import { startReadModelProjector } from './readModel/projectorService.js'
+import { awaitAdoptStamps, startReadModelProjector } from './readModel/projectorService.js'
 import type { OrdinaryHeadRotationConfig } from './readModel/ordinaryHeadRotation.js'
 import { readOrdinaryHeadRetirement } from './readModel/ordinaryHeadForwarding.js'
 import type { WorkspaceKey } from './readModel/projector.js'
@@ -242,7 +243,7 @@ async function expectSwept(repo: Repo, documentId: string) {
   expect(await gateWorkspace(repo, documentId)).toBeNull()
 }
 /** Move every folded row's `retain_until` to the database's now + `interval`. */
-const setRetain = (interval: string) => db.pool.query(
+const setRetain = (interval: string) => protocolFixtureQuery(db.pool,
   `UPDATE read_model_ordinary_head_retirements SET retain_until = now() + $3::interval
     WHERE landscape_id = $1 AND version_id = $2 AND status = 'folded'`,
   [WS.landscapeId, WS.versionId, interval],
@@ -477,7 +478,8 @@ suite('G4-16c — a retired ordinary head through a real destructive GC pass (Po
         await db.pool.query(`TRUNCATE automerge_storage, automerge_document_workspace, ro_objects, ro_connections, ro_groups,
           read_model_projection_state, read_model_change_events, read_model_overlay_batch_acks,
           read_model_overlay_entity_bases, read_model_ordinary_head_retirements, read_model_document_watermarks,
-          read_model_ordinary_chain_folds, versions, landscapes CASCADE`)
+          read_model_ordinary_chain_folds, read_model_adopt_watermarks, read_model_sealed_product_extracts,
+          versions, landscapes CASCADE`)
         break
       } catch (error) {
         if ((error as { code?: string }).code !== '40P01' || attempt >= 5) throw error
@@ -689,14 +691,14 @@ suite('G4-16c — a retired ordinary head through a real destructive GC pass (Po
   it('a RECORDED fold product not listed yet is kept by its record, and swept without it', async () => {
     const ws = await workspace(res.repo(storageRepo()))
     const product = await orphan(ws.repo)
-    await db.pool.query(
+    await protocolFixtureQuery(db.pool,
       `INSERT INTO read_model_ordinary_chain_folds (landscape_id, version_id, collection, product_document_id, source_document_ids)
        VALUES ($1, $2, 'object', $3, ARRAY['x'])`,
       [WS.landscapeId, WS.versionId, product],
     )
     await witnessedGc(ws.repo)
     await expectKept(ws.repo, product)
-    await db.pool.query('DELETE FROM read_model_ordinary_chain_folds')
+    await protocolFixtureQuery(db.pool, 'DELETE FROM read_model_ordinary_chain_folds')
     await destructiveGc()
     await expectSwept(ws.repo, product)
   }, 60_000)
@@ -712,6 +714,40 @@ suite('G4-16c — a retired ordinary head through a real destructive GC pass (Po
     await destructiveGc()
     expect(await storedChunks(doc)).toBe(0)
     expect((await db.pool.query('SELECT 1 FROM read_model_document_watermarks WHERE document_id = $1', [doc])).rowCount).toBe(0)
+  }, 60_000)
+
+  it('the sweep removes a swept document\'s adopt watermark and cached sealed-product extract (entities by cascade), and keeps a live document\'s (G4-16f)', async () => {
+    const ws = await workspace(res.repo(storageRepo()))
+    const doc = await orphan(ws.repo)
+    // The control: a document the sweep keeps (the workspace's root).
+    const kept = ws.rootUrl.replace(/^automerge:/, '')
+    for (const id of [doc, kept]) {
+      await db.pool.query(
+        'INSERT INTO read_model_adopt_watermarks (landscape_id, version_id, document_id, adopt_watermark) VALUES ($1, $2, $3, 5)',
+        [WS.landscapeId, WS.versionId, id],
+      )
+      await db.pool.query(
+        `INSERT INTO read_model_sealed_product_extracts (landscape_id, version_id, collection, product_document_id,
+           rows_digest, heads, max_arrival_seq, extraction_version, entity_count) VALUES ($1, $2, 'object', $3, 'd', ARRAY['h'], 5, 1, 1)`,
+        [WS.landscapeId, WS.versionId, id],
+      )
+      await db.pool.query(
+        `INSERT INTO read_model_sealed_product_entities (landscape_id, version_id, collection, product_document_id, entity_id, value)
+         VALUES ($1, $2, 'object', $3, 'e', '{}'::jsonb)`,
+        [WS.landscapeId, WS.versionId, id],
+      )
+    }
+    await ws.repo.flush()
+    await destructiveGc()
+    expect(await storedChunks(doc)).toBe(0)
+    const count = async (table: string, column: string, id: string) =>
+      (await db.pool.query(`SELECT 1 FROM ${table} WHERE ${column} = $1`, [id])).rowCount
+    expect(await count('read_model_adopt_watermarks', 'document_id', doc)).toBe(0)
+    expect(await count('read_model_sealed_product_extracts', 'product_document_id', doc)).toBe(0)
+    expect(await count('read_model_sealed_product_entities', 'product_document_id', doc)).toBe(0)
+    expect(await count('read_model_adopt_watermarks', 'document_id', kept)).toBe(1)
+    expect(await count('read_model_sealed_product_extracts', 'product_document_id', kept)).toBe(1)
+    expect(await count('read_model_sealed_product_entities', 'product_document_id', kept)).toBe(1)
   }, 60_000)
 
   // ---- PARKED (fold off) ----
@@ -748,8 +784,30 @@ suite('G4-16c — a retired ordinary head through a real destructive GC pass (Po
     const p = await parkedFixture(res, log)
     // The park's watermark is the head's highest stored arrival.
     const watermark = String(await maxSeqOf(p.retired))
+    // `automerge_arrival_seq` is a clock EVERY session advances — each save
+    // of any document, and each durable proof's `watermarkPost`
+    // (`arrivalWatermark.ts`, `SELECT nextval`), which a projector runs
+    // after its passes (the deferred adopt stamps included). So the setval
+    // goes as close to the late write's own INSERT as the test can put it:
+    // the head loaded and changed first, the clock quiet, then setval, then
+    // the flush that saves it.
+    expect(resident(p.ws.repo, p.retired)).toBe(false)
+    const head = await p.ws.repo.find<ObjHead>(p.retiredUrl as AutomergeUrl)
+    const edited = A.change(A.clone(p.offline), (d) => { d.objects.late = { id: 'late', name: 'adjacent-parked', type: 'system' } })
+    head.update((doc) => A.merge(doc, edited))
+    const clock = async () => (await db.pool.query<{ v: string }>('SELECT last_value::text AS v FROM automerge_arrival_seq')).rows[0]!.v
+    for (let quiet = 0, last = await clock(), at = 0; quiet < 3 && at < 50; at += 1) {
+      await settle(100)
+      const now = await clock()
+      quiet = now === last ? quiet + 1 : 0
+      last = now
+    }
+    // No deferred adopt stamp armed or running (its proof's nextval would
+    // land between the setval and the flush): the one clock-advancer whose
+    // timer this quiet window does not bound.
+    await awaitAdoptStamps(WS)
     await db.pool.query("SELECT setval('automerge_arrival_seq', $1::bigint)", [watermark])
-    await lateWrite(p.ws.repo, p.retiredUrl, p.offline, 'late', 'adjacent-parked')
+    await p.ws.repo.flush([head.documentId])
     expect(await maxSeqOf(p.retired)).toBe(BigInt(watermark) + 1n)
     expect(await roNamed('late', 'adjacent-parked')).toBe('adjacent-parked')
   }, 120_000)

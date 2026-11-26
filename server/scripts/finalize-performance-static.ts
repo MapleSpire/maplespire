@@ -21,6 +21,7 @@ import 'dotenv/config'
 import { isValidAutomergeUrl, Repo, type AutomergeUrl } from '@automerge/automerge-repo'
 import { PostgresStorageAdapter } from '../src/automergeStorage.js'
 import { initSchema, pool } from '../src/db.js'
+import { readMetaUrl } from '../src/modelMetaUrls.js'
 import { ensureAuthSchema } from '../src/auth/schema.js'
 import { ensureRbacSchema } from '../src/rbac/schema.js'
 import { ensureReadModelSchema } from '../src/readModel/schema.js'
@@ -86,8 +87,8 @@ async function main(): Promise<void> {
     editsConnectionShardUrl?: string
   }>(modelMetaUrl as AutomergeUrl)
   await metaHandle.whenReady()
-  const objectOverlayUrl = metaHandle.doc()?.editsObjectShardUrl
-  const connectionOverlayUrl = metaHandle.doc()?.editsConnectionShardUrl
+  const objectOverlayUrl = readMetaUrl(metaHandle.doc(), 'editsObjectShardUrl')
+  const connectionOverlayUrl = readMetaUrl(metaHandle.doc(), 'editsConnectionShardUrl')
   if (!objectOverlayUrl || !isValidAutomergeUrl(objectOverlayUrl)
       || !connectionOverlayUrl || !isValidAutomergeUrl(connectionOverlayUrl)) {
     throw new Error('Performance edit overlays were not found')

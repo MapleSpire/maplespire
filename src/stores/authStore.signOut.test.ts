@@ -26,6 +26,8 @@ const api = {
     kind: 'signed-in',
     result: { user: { id: 'user-b', email: 'b@x.test', isPlatformAdmin: false }, claims: { orgId: 'org-b' } },
   })),
+  // The store forgets the workspace-access probes when the identity changes.
+  forgetWorkspaceAccessProbes: vi.fn(),
 }
 vi.mock('../lib/auth/api', () => api)
 vi.mock('../lib/i18n', () => ({ applyServerLocale: () => {} }))

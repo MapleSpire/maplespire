@@ -38,9 +38,15 @@ vi.mock('../../lib/automerge/bridge', () => ({
   startBridge: vi.fn(async () => {}),
   stopBridge: vi.fn(() => {}),
   preferInitialDiagram: vi.fn(() => {}),
+  // T-DIAGDEF: the stopped session's debt, drained before the
+  // route moves — none here.
+  takeStoppedSessionDurableDebt: vi.fn(() => null),
 }))
 vi.mock('../../lib/automerge/repo', () => ({
   forgetWorkspace: vi.fn(() => {}),
+  // T-DIAGDEF: read by the switch's drain.
+  hasConnectedSyncPeer: vi.fn(() => true),
+  serverKnownHeads: vi.fn(() => new Map()),
 }))
 
 import { ToolCard } from './AIAssistPanel'

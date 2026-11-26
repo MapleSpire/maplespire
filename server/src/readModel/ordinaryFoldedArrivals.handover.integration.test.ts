@@ -22,6 +22,7 @@ import { PostgresStorageAdapter } from '../automergeStorage.js'
 import { AutomergeResidencyLeases } from '../automergeResidency.js'
 import { cachedHandles } from '../automergeRepoCompat.js'
 import { createIsolatedSchemaDb, type IsolatedSchemaDb } from '../testing/isolatedSchema.js'
+import { protocolFixtureQuery } from '../testing/protocolFixture.js'
 import { setWorkspaceDocumentsRegistrationForTest } from '../rbac/docScope.js'
 import { ensureReadModelSchema } from './schema.js'
 import { startReadModelProjector } from './projectorService.js'
@@ -471,7 +472,7 @@ suite('G4-16d late write across an ownership handover — two cells, one storage
   /** Two fold rows the fold-row sweep may take: `fk-s1` (expired) folded
    * into `fk-p`, itself folded long enough ago. No document behind them:
    * the re-check owes them, then forgets them (unknown). */
-  const seedSweepable = () => db.pool.query(
+  const seedSweepable = () => protocolFixtureQuery(db.pool,
     `INSERT INTO read_model_ordinary_head_retirements
        (landscape_id, version_id, collection, document_id, retirement_heads, forwarded_heads, status, folded_into, retain_until, updated_at)
      VALUES ($1, $2, 'object', 'fk-s1', ARRAY['h']::text[], ARRAY['h']::text[], 'folded', 'fk-p', now() - interval '1 hour', now() - interval '1 hour'),
@@ -506,7 +507,7 @@ suite('G4-16d late write across an ownership handover — two cells, one storage
     expect(rechecks()).toBe(byOld) // the gate held it
     // A watermark ABOVE everything the re-check will read: it must stay.
     const raised = String(BigInt((await foldedWatermark(folded))!) + 1_000n)
-    await db.pool.query(
+    await protocolFixtureQuery(db.pool,
       `UPDATE read_model_ordinary_head_retirements SET arrival_watermark = $4::bigint
         WHERE landscape_id = $1 AND version_id = $2 AND document_id = $3`,
       [WS.landscapeId, WS.versionId, folded, raised],
@@ -1132,7 +1133,7 @@ suite('G4-16d late write across an ownership handover — two cells, one storage
       await doc.whenReady()
       await repo.flush([doc.documentId])
       const h = A.getHeads(doc.doc() as A.Doc<unknown>)
-      await db.pool.query(
+      await protocolFixtureQuery(db.pool,
         `INSERT INTO read_model_ordinary_head_retirements
            (landscape_id, version_id, collection, document_id, retirement_heads, forwarded_heads, status, folded_into, retain_until)
          VALUES ($1, $2, 'object', $3, $4::text[], $4::text[], 'folded', 'budget-product', now() + interval '1 day')`,

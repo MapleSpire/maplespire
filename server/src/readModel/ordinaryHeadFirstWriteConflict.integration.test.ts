@@ -31,7 +31,7 @@ import { overlayEntityBases } from './overlayHistoryStore.js'
 
 /**
  * G4-16g, step 1 — the WITNESS for known limit 1 of
- * `docs/read-model-projector-health.md` ("the first write of an entity into a
+ * https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/read-model-projector-health.md#known-limits ("the first write of an entity into a
  * fresh head is a whole-entity put").
  *
  * The claim under test: right after a REAL ordinary rotation, two ONLINE

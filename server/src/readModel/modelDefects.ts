@@ -50,6 +50,14 @@ export type ModelDefectKind =
   | 'field-not-a-map'
   /** The workspace root names neither a sharded model nor a monolithic one. */
   | 'root-no-model-reference'
+  /** Two entities of one kind carry the same `id` (as stored) in the merged
+   * model — under different CRDT map keys, or in two registry shards. The
+   * last in list order is projected, this one is dropped
+   * (`lastOccurrenceById`, projector.ts). Not a document defect: `url` is
+   * null, and the entity kind and id say which. Counted in `defect_count`
+   * AND separately in `duplicate_id_count` (`projectionIntegrity.ts`), so
+   * the unreadable-document gauge can leave it out. */
+  | 'duplicate-id'
 
 export type ModelDefectSource =
   | 'root'
@@ -62,8 +70,15 @@ export type ModelDefectSource =
 export interface ModelDefect {
   kind: ModelDefectKind
   source: ModelDefectSource
-  /** The document url, or null for the root (whose url the extractor is not given). */
+  /** The document url, or null for the root (whose url the extractor is not
+   * given) and for a `duplicate-id` (the merged list no longer says which
+   * shard an entity came from). NULL ON PURPOSE for the latter: a defect's
+   * url makes the cold build leave that shard unstamped
+   * (`projectorService.ts`, `defectedIds`), and the shard WAS read. */
   url: string | null
+  /** `duplicate-id` only: the entity kind and the dropped entity's id. */
+  entity?: 'object' | 'connection' | 'group' | 'diagram'
+  id?: string | null
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -128,9 +143,25 @@ export function isUninformative(defect: ModelDefect | null): boolean {
   return defect !== null && (defect.kind === 'document-unreadable' || defect.kind === 'document-uninitialised')
 }
 
+/** The `duplicate-id` entries of `defects`: ids dropped, not documents
+ * unread. */
+export function duplicateIdDefectCount(defects: readonly ModelDefect[]): number {
+  return defects.filter((defect) => defect.kind === 'duplicate-id').length
+}
+
+/** `duplicate-id` defects for drops a LIVE pass made (the ModelMeta pass, a
+ * shard delta): the same shape the extraction records. */
+export function duplicateIdDefects(
+  source: ModelDefectSource,
+  drops: ReadonlyArray<{ kind: 'object' | 'connection' | 'group' | 'diagram'; id: string | null }>,
+): ModelDefect[] {
+  return drops.map((drop) => ({ kind: 'duplicate-id', source, url: null, entity: drop.kind, id: drop.id }))
+}
+
 /** Compact, bounded, loggable. Urls are Automerge document urls — no customer
- * content — but the string still reaches logs and a database column, so both the
- * url list and the total length are capped. */
+ * content — and a `duplicate-id` names its entity kind and id (an
+ * identifier, not content); the string still reaches logs and a database
+ * column, so both the list and the total length are capped. */
 export function summarizeModelDefects(
   defects: readonly ModelDefect[],
   { maxUrls = 3, maxLength = 500 } = {},
@@ -140,7 +171,9 @@ export function summarizeModelDefects(
   for (const defect of defects) {
     const key = `${defect.source}/${defect.kind}`
     const bucket = byKey.get(key) ?? []
-    bucket.push(defect.url ?? '<root>')
+    bucket.push(defect.url ?? (defect.kind === 'duplicate-id'
+      ? `${defect.entity ?? '?'} ${JSON.stringify(defect.id ?? null).slice(0, 80)}`
+      : '<root>'))
     byKey.set(key, bucket)
   }
   const summary = [...byKey.entries()]

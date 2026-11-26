@@ -198,6 +198,51 @@ describe.skipIf(!TEST_DATABASE_URL)('landscapes.ts: RBAC scope soft-delete on de
     }
   })
 
+  it('a deleted version takes its epoch DISCARD EXPORTS, OVERRIDE rows, forward writes and journals with it; a deleted landscape, all of them', async () => {
+    const { ensureModelEpochSchema } = await import('./readModel/modelEpochStore.js')
+    await ensureModelEpochSchema(realPool)
+    // One row of EACH user-content epoch table per version.
+    const discard = async (journal: string, landscapeId: string, versionId: string) => {
+      await realPool.query(
+        `INSERT INTO read_model_model_epoch_discards (journal_id, landscape_id, version_id, source_document_id, payload)
+         VALUES ($1, $2, $3, 'src', '{}'::jsonb)`, [journal, landscapeId, versionId])
+      await realPool.query(
+        `INSERT INTO read_model_model_epoch_overrides (id, landscape_id, version_id, journal_id, source_doc, target_doc, entity_kind,
+           entity_id, path, reason, late_value, current_value_at_forward, current_heads_at_forward, late_actors)
+         VALUES ($1, $2, $3, $1, 'src', 'tgt', 'object', 'o', '["objects","o","name"]'::jsonb, 'leaf', '"Marie"'::jsonb, '"Paul"'::jsonb, '{}', '{}')`,
+        [journal, landscapeId, versionId])
+      await realPool.query(
+        `INSERT INTO read_model_model_epoch_forward_writes (journal_id, target_document_id, landscape_id, version_id, message, change_hash, heads_before)
+         VALUES ($1, 'tgt', $2, $3, 'm', 'h', '{}')`, [journal, landscapeId, versionId])
+      await realPool.query(
+        `INSERT INTO read_model_model_epoch_forwards (id, landscape_id, version_id, source_document_id, from_heads, to_heads, owner_instance)
+         VALUES ($1, $2, $3, $1, '{}', '{}', 'cell')`, [journal, landscapeId, versionId])
+    }
+    const tables = ['read_model_model_epoch_discards', 'read_model_model_epoch_overrides', 'read_model_model_epoch_forward_writes', 'read_model_model_epoch_forwards']
+    const journals = async (landscapeId: string) => {
+      const out: string[] = []
+      for (const table of tables) {
+        const column = table === 'read_model_model_epoch_overrides' || table === 'read_model_model_epoch_forwards' ? 'id' : 'journal_id'
+        const { rows } = await realPool.query<{ j: string }>(`SELECT ${column} AS j FROM ${table} WHERE landscape_id = $1 ORDER BY 1`, [landscapeId])
+        out.push(...rows.map((r) => `${table.replace('read_model_model_epoch_', '')}:${r.j}`))
+      }
+      return out
+    }
+    const decoyId = rid('decoy-landscape')
+    await realPool.query(`INSERT INTO landscapes (id, name) VALUES ($1, $2)`, [decoyId, 'Decoy'])
+    const { landscapeId, defaultVersionId, extraVersionId } = await makeLandscapeWithTwoVersions()
+    try {
+      await discard(`${landscapeId}-a`, landscapeId, defaultVersionId)
+      await discard(`${landscapeId}-b`, landscapeId, extraVersionId)
+      expect((await deleteVersion(landscapeId, extraVersionId)).ok).toBe(true)
+      expect(await journals(landscapeId)).toEqual(['discards', 'overrides', 'forward_writes', 'forwards'].map((t) => `${t}:${landscapeId}-a`))
+      expect((await deleteLandscape(landscapeId)).ok).toBe(true)
+      expect(await journals(landscapeId)).toEqual([])
+    } finally {
+      await realPool.query('DELETE FROM landscapes WHERE id = ANY($1::text[])', [[decoyId, landscapeId]])
+    }
+  })
+
   it('a delete that fails validation (e.g. deleting the default version) leaves scopes untouched', async () => {
     const { landscapeId, defaultVersionId } = await makeLandscapeWithTwoVersions()
     try {

@@ -90,7 +90,7 @@ async function startResearchRoute(options: {
     ...(options.now ? { researchNow: options.now } : {}),
   })
   const server: Server = await new Promise((resolve) => {
-    const listener = app.listen(0, () => resolve(listener))
+    const listener = app.listen(0, '127.0.0.1', () => resolve(listener))
   })
   const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
   return {
@@ -553,7 +553,7 @@ describe('Admin Technologies AI fresh database authorization', () => {
     })
     registerAdminTechnologyAiRoutes(app, { pool })
     const server: Server = await new Promise((resolve) => {
-      const listener = app.listen(0, () => resolve(listener))
+      const listener = app.listen(0, '127.0.0.1', () => resolve(listener))
     })
     try {
       const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
@@ -575,7 +575,7 @@ describe('Admin Technologies AI fresh database authorization', () => {
     app.use(express.json())
     registerAdminTechnologyAiRoutes(app, { pool: { query } as unknown as Pool })
     const server: Server = await new Promise((resolve) => {
-      const listener = app.listen(0, () => resolve(listener))
+      const listener = app.listen(0, '127.0.0.1', () => resolve(listener))
     })
     try {
       const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`

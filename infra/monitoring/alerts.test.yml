@@ -643,7 +643,7 @@ tests:
         alertname: RedisMemoryNearLimit
         exp_alerts: []
 
-  # G4-16e. One cell with a chain past the threshold is enough (`max()`), a
+  # One cell with a chain past the threshold is enough (`max()`), a
   # second cell at 0 does not dilute it, and it waits its 10 minutes.
   - interval: 1m
     name: an ordinary overlay chain past its alert length tickets after ten minutes
@@ -665,6 +665,340 @@ tests:
         exp_samples:
           - labels: 'ALERTS{alertname="ReadModelOrdinaryChainUnbounded", alertstate="firing", severity="ticket"}'
             value: 1
+
+  # One cell with a head blocked since 0 (the age gauge, +60 s a
+  # minute): over 600 s from 11 min, firing five minutes later at 16 (silent
+  # at 15); the other cell reports NaN (nothing blocked) and stays silent.
+  - interval: 1m
+    name: a static overlay head blocked at !ready past ten minutes tickets five minutes later
+    input_series:
+      - series: 'maplespire_read_model_static_overlay_heads_not_ready_oldest_seconds{job="maplespire-api", instance="api-a:3001"}'
+        values: 'NaN+0x30'
+      - series: 'maplespire_read_model_static_overlay_heads_not_ready_oldest_seconds{job="maplespire-api", instance="api-b:3001"}'
+        values: '0+60x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: ReadModelStaticOverlayHeadNotReady
+        exp_alerts: []
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="ReadModelStaticOverlayHeadNotReady", alertstate="firing"}'
+        eval_time: 16m
+        exp_samples:
+          - labels: 'ALERTS{alertname="ReadModelStaticOverlayHeadNotReady", alertstate="firing", instance="api-b:3001", severity="ticket"}'
+            value: 1
+
+  # One cell with a pass past its ceiling from 3 min (the
+  # gauge 0 then 1): firing five minutes later, at 8 (silent at 7); the other
+  # cell stays at 0 and silent.
+  - interval: 1m
+    name: a static projection pass in flight past its ceiling tickets five minutes later
+    input_series:
+      - series: 'maplespire_read_model_static_pass_watches_overdue{job="maplespire-api", instance="api-a:3001"}'
+        values: '0+0x20'
+      - series: 'maplespire_read_model_static_pass_watches_overdue{job="maplespire-api", instance="api-b:3001"}'
+        values: '0 0 0 1+0x17'
+    alert_rule_test:
+      - eval_time: 7m
+        alertname: ReadModelStaticPassOverdue
+        exp_alerts: []
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="ReadModelStaticPassOverdue", alertstate="firing"}'
+        eval_time: 8m
+        exp_samples:
+          - labels: 'ALERTS{alertname="ReadModelStaticPassOverdue", alertstate="firing", instance="api-b:3001", severity="ticket"}'
+            value: 1
+
+  # The same series: a page thirty
+  # minutes after the gauge rose, at 33 (silent at 32). A scrape missed at
+  # minute 20 (a failed scrape writes a stale marker) does not restart the
+  # thirty minutes.
+  - interval: 1m
+    name: a static projection pass in flight past its ceiling for thirty more minutes pages
+    input_series:
+      - series: 'maplespire_read_model_static_pass_watches_overdue{job="maplespire-api", instance="api-a:3001"}'
+        values: '0+0x40'
+      - series: 'maplespire_read_model_static_pass_watches_overdue{job="maplespire-api", instance="api-b:3001"}'
+        values: '0 0 0 1+0x16 stale 1+0x19'
+    alert_rule_test:
+      - eval_time: 32m
+        alertname: ReadModelStaticPassOverdueOutage
+        exp_alerts: []
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="ReadModelStaticPassOverdueOutage", alertstate="firing"}'
+        eval_time: 33m
+        exp_samples:
+          - labels: 'ALERTS{alertname="ReadModelStaticPassOverdueOutage", alertstate="firing", instance="api-b:3001", severity="page"}'
+            value: 1
+
+  # One cell with a workspace detached since 0 (the age
+  # gauge: 60 s at 2 min, +60 s a minute): over 300 s from 7 min, a ticket
+  # one minute later, at 8 min (silent at 7); over 1800 s from 32 min, a page
+  # at 33 (silent at 32) — threshold and window pinned both ways. A second
+  # cell at 0 does not dilute it, and the alert names the cell.
+  - interval: 1m
+    name: a read plane a compaction left detached tickets past five minutes and pages past thirty
+    input_series:
+      - series: 'maplespire_read_model_compaction_detached_oldest_seconds{job="maplespire-api", instance="api-a:3001"}'
+        values: '0+0x40'
+      - series: 'maplespire_read_model_compaction_detached_oldest_seconds{job="maplespire-api", instance="api-b:3001"}'
+        values: '0 0 60+60x38'
+    alert_rule_test:
+      - eval_time: 7m
+        alertname: ReadModelCompactionReattachPending
+        exp_alerts: []
+      - eval_time: 32m
+        alertname: ReadModelCompactionReattachOutage
+        exp_alerts: []
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="ReadModelCompactionReattachPending", alertstate="firing"}'
+        eval_time: 8m
+        exp_samples:
+          - labels: 'ALERTS{alertname="ReadModelCompactionReattachPending", alertstate="firing", instance="api-b:3001", severity="ticket"}'
+            value: 1
+      - expr: 'ALERTS{alertname="ReadModelCompactionReattachOutage", alertstate="firing"}'
+        eval_time: 33m
+        exp_samples:
+          - labels: 'ALERTS{alertname="ReadModelCompactionReattachOutage", alertstate="firing", instance="api-b:3001", severity="page"}'
+            value: 1
+
+  # A FLAPPING lease. The workspace goes dormant (out of the
+  # gauge) at 4 min and wakes at 6 min with its ORIGINAL age (420 s): the
+  # ticket fires one minute later, at 7 min, instead of five minutes after
+  # each wake.
+  - interval: 1m
+    name: a lease that flaps does not restart the detached window
+    input_series:
+      - series: 'maplespire_read_model_compaction_detached_oldest_seconds{job="maplespire-api", instance="api-a:3001"}'
+        values: '0 0 120 240 0 0 420 480 540 600'
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="ReadModelCompactionReattachPending", alertstate="firing"}'
+        eval_time: 7m
+        exp_samples:
+          - labels: 'ALERTS{alertname="ReadModelCompactionReattachPending", alertstate="firing", instance="api-a:3001", severity="ticket"}'
+            value: 1
+
+  # A workspace another cell served for 10 h comes
+  # back. The age counts this cell's ACTIVE time only (a few seconds, then
+  # the 70 s build that succeeds): no ticket, no page. NOTE: this
+  # fixture only documents the series the server now emits; it cannot see
+  # the server. The real guard is the unit test "A WORKSPACE ANOTHER CELL
+  # SERVED FOR 10 H comes back without a page" (compactionReattach.test.ts),
+  # which fails if the dormant 10 h are counted again.
+  - interval: 1m
+    name: a workspace back after ten hours on another cell does not page
+    input_series:
+      - series: 'maplespire_read_model_compaction_detached_oldest_seconds{job="maplespire-api", instance="api-a:3001"}'
+        values: '3 0x600 63 0x5'
+    alert_rule_test:
+      - eval_time: 601m
+        alertname: ReadModelCompactionReattachPending
+        exp_alerts: []
+      - eval_time: 602m
+        alertname: ReadModelCompactionReattachPending
+        exp_alerts: []
+      - eval_time: 602m
+        alertname: ReadModelCompactionReattachOutage
+        exp_alerts: []
+
+  # ...and a re-attach the retry recovered within five minutes stays silent.
+  - interval: 1m
+    name: a compaction re-attach recovered by its retry within five minutes is silent
+    input_series:
+      - series: 'maplespire_read_model_compaction_detached_oldest_seconds{job="maplespire-api", instance="api-a:3001"}'
+        values: '0 60 120 180 240 0+0x36'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: ReadModelCompactionReattachPending
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: ReadModelCompactionReattachPending
+        exp_alerts: []
+      - eval_time: 35m
+        alertname: ReadModelCompactionReattachOutage
+        exp_alerts: []
+
+  # A no_root dormant workspace tickets after exactly fifteen minutes; a
+  # not_owned one (the normal state of a non-owner) never does.
+  - interval: 1m
+    name: a detached workspace whose root does not resolve tickets after fifteen minutes
+    input_series:
+      - series: 'maplespire_read_model_compaction_reattach_dormant{job="maplespire-api", instance="api-a:3001", reason="no_root"}'
+        values: '0 0 1+0x20'
+      - series: 'maplespire_read_model_compaction_reattach_dormant{job="maplespire-api", instance="api-b:3001", reason="not_owned"}'
+        values: '1+0x22'
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: ReadModelCompactionReattachNoRoot
+        exp_alerts: []
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="ReadModelCompactionReattachNoRoot", alertstate="firing"}'
+        eval_time: 17m
+        exp_samples:
+          - labels: 'ALERTS{alertname="ReadModelCompactionReattachNoRoot", alertstate="firing", instance="api-a:3001", severity="ticket"}'
+            value: 1
+
+  # The threshold and the window, by behaviour. At 71 min
+  # one cell's counter jumps by 700 s of hold (an hour's increase ~712 s,
+  # over 600), the other's by 550 s (~559 s, under): the first tickets at
+  # exactly 76 min (silent at 75), the second never.
+  - interval: 1m
+    name: re-attach retries holding the compaction slot over ten minutes in an hour ticket after five more
+    input_series:
+      - series: 'maplespire_read_model_compaction_reattach_slot_held_seconds_total{job="maplespire-api", instance="api-a:3001"}'
+        values: '0x70 700x30'
+      - series: 'maplespire_read_model_compaction_reattach_slot_held_seconds_total{job="maplespire-api", instance="api-b:3001"}'
+        values: '0x70 550x30'
+    alert_rule_test:
+      - eval_time: 75m
+        alertname: ReadModelCompactionReattachSlotStarving
+        exp_alerts: []
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="ReadModelCompactionReattachSlotStarving", alertstate="firing"}'
+        eval_time: 76m
+        exp_samples:
+          - labels: 'ALERTS{alertname="ReadModelCompactionReattachSlotStarving", alertstate="firing", instance="api-a:3001", severity="ticket"}'
+            value: 1
+
+  # A build in flight 590 s, 600 s, then 610 s (past ten
+  # minutes) at 2 min tickets at 3 min (silent at 2); one that settles at
+  # 600 s exactly never does.
+  - interval: 1m
+    name: a compaction re-attach stuck past ten minutes tickets
+    input_series:
+      - series: 'maplespire_read_model_compaction_reattach_running_seconds{job="maplespire-api", instance="api-a:3001"}'
+        values: '590+10x10'
+      - series: 'maplespire_read_model_compaction_reattach_running_seconds{job="maplespire-api", instance="api-b:3001"}'
+        values: '590 600 0+0x9'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: ReadModelCompactionReattachStuck
+        exp_alerts: []
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="ReadModelCompactionReattachStuck", alertstate="firing"}'
+        eval_time: 3m
+        exp_samples:
+          - labels: 'ALERTS{alertname="ReadModelCompactionReattachStuck", alertstate="firing", instance="api-a:3001", severity="ticket"}'
+            value: 1
+
+  # A cell reporting a stalled hop (one meta, from 2 min) tickets
+  # after five minutes, at 7 min (silent at 6); one whose gauge drops back
+  # after three minutes (S7 proven) never does, nor a cell at zero.
+  - interval: 1m
+    name: a stalled epoch hop tickets after five minutes, one proven meanwhile does not
+    input_series:
+      - series: 'maplespire_model_epoch_hop_stalled_metas{job="maplespire-api", instance="api-a:3001"}'
+        values: '0 0 1+0x20'
+      - series: 'maplespire_model_epoch_hop_stalled_metas{job="maplespire-api", instance="api-b:3001"}'
+        values: '0 1 1 1 0+0x20'
+      - series: 'maplespire_model_epoch_hop_stalled_metas{job="maplespire-api", instance="api-c:3001"}'
+        values: '0+0x22'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: EpochHopStalled
+        exp_alerts: []
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="EpochHopStalled", alertstate="firing"}'
+        eval_time: 7m
+        exp_samples:
+          - labels: 'ALERTS{alertname="EpochHopStalled", alertstate="firing", instance="api-a:3001", severity="ticket"}'
+            value: 1
+      - expr: 'ALERTS{alertname="EpochHopStalled", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="EpochHopStalled", alertstate="firing", instance="api-a:3001", severity="ticket"}'
+            value: 1
+
+  # A stuck row reported by two cells (the same fleet
+  # fact) tickets ONCE after two minutes, at 3 min (silent at 2); a row that
+  # leaves `repointing` after one minute never does, nor NaN (no sample yet).
+  - interval: 1m
+    name: a roll stuck before S7 tickets once for the fleet after two minutes
+    input_series:
+      - series: 'maplespire_model_epoch_rows_stuck_repointing{job="maplespire-api", instance="api-a:3001"}'
+        values: '0 1+0x20'
+      - series: 'maplespire_model_epoch_rows_stuck_repointing{job="maplespire-api", instance="api-b:3001"}'
+        values: '0 1+0x20'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: EpochRollStuckBeforeS7
+        exp_alerts: []
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="EpochRollStuckBeforeS7", alertstate="firing"}'
+        eval_time: 3m
+        exp_samples:
+          - labels: 'ALERTS{alertname="EpochRollStuckBeforeS7", alertstate="firing", severity="ticket"}'
+            value: 1
+
+  - interval: 1m
+    name: a stuck row that clears within the window, or no sample yet, is silent
+    input_series:
+      - series: 'maplespire_model_epoch_rows_stuck_repointing{job="maplespire-api", instance="api-a:3001"}'
+        values: '0 1 0+0x20'
+      - series: 'maplespire_model_epoch_rows_stuck_repointing{job="maplespire-api", instance="api-b:3001"}'
+        values: 'NaN+0x22'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: EpochRollStuckBeforeS7
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: EpochRollStuckBeforeS7
+        exp_alerts: []
+
+  # NaN on EVERY cell for fifteen minutes tickets once; NaN on
+  # one cell while another has a number, or a NaN that lasts less, does not.
+  - interval: 1m
+    name: the stuck-row sampler failing on every cell tickets after fifteen minutes
+    input_series:
+      - series: 'maplespire_model_epoch_rows_stuck_repointing{job="maplespire-api", instance="api-a:3001"}'
+        values: '0 NaN+0x30'
+      - series: 'maplespire_model_epoch_rows_stuck_repointing{job="maplespire-api", instance="api-b:3001"}'
+        values: '0 NaN+0x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: EpochStuckRowsSamplerBlind
+        exp_alerts: []
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="EpochStuckRowsSamplerBlind", alertstate="firing"}'
+        eval_time: 16m
+        exp_samples:
+          - labels: 'ALERTS{alertname="EpochStuckRowsSamplerBlind", alertstate="firing", severity="ticket"}'
+            value: 1
+
+  # No series at all (an image from before model epochs, a job not
+  # scraped) is not a blind sampler — `absent()` alone would fire here.
+  - interval: 1m
+    name: a missing stuck-row series does not fire the sampler alert
+    input_series:
+      - series: 'up{job="maplespire-api", instance="api-a:3001"}'
+        values: '1+0x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: EpochStuckRowsSamplerBlind
+        exp_alerts: []
+
+  - interval: 1m
+    name: one cell still reading the stuck rows, or a short NaN everywhere, keeps the sampler alert silent
+    input_series:
+      - series: 'maplespire_model_epoch_rows_stuck_repointing{job="maplespire-api", instance="api-a:3001"}'
+        values: 'NaN+0x30'
+      - series: 'maplespire_model_epoch_rows_stuck_repointing{job="maplespire-api", instance="api-b:3001"}'
+        values: '0+0x9 NaN+0x10 0+0x10'
+      - series: 'maplespire_model_epoch_rows_stuck_repointing{job="maplespire-api", instance="api-c:3001"}'
+        values: '0+0x9 NaN+0x10 0+0x10'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: EpochStuckRowsSamplerBlind
+        exp_alerts: []
+
+  - interval: 1m
+    name: no stalled epoch hop on any cell is silent
+    input_series:
+      - series: 'maplespire_model_epoch_hop_stalled_metas{job="maplespire-api", instance="api-a:3001"}'
+        values: '0+0x30'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: EpochHopStalled
+        exp_alerts: []
 
   # ...and every cell at 0, or a chain over for less than the window, stays silent.
   - interval: 1m
@@ -1577,7 +1911,7 @@ tests:
         alertname: SyncCellSupersededGeneration
         exp_alerts: []
 
-  # G4-16d: a storage write stopped by a ceiling of the storage write pool
+  # A storage write stopped by a ceiling of the storage write pool
   # fires per instance once it persists five minutes; a flat counter (an
   # old hit, long retried) never does.
   - interval: 1m
@@ -1603,7 +1937,7 @@ tests:
           - labels: 'ALERTS{alertname="AutomergeStorageWriteCeiling", alertstate="firing", job="maplespire-api", instance="api-a:3001", severity="ticket"}'
             value: 1
 
-  # G4-16d: a handover re-check that ran without its barrier clearing.
+  # A handover re-check that ran without its barrier clearing.
   - interval: 1m
     name: a handover barrier timeout fires for its instance only, and a flat counter stays silent
     input_series:
@@ -1625,7 +1959,7 @@ tests:
           - labels: 'ALERTS{alertname="ReadModelHandoverBarrierTimeouts", alertstate="firing", job="maplespire-api", instance="api-a:3001", severity="ticket"}'
             value: 1
 
-  # G4-16d: a re-check given up fires for its instance; a flat counter does not.
+  # A re-check given up fires for its instance; a flat counter does not.
   - interval: 1m
     name: an abandoned handover re-check fires for its instance only, and a flat counter stays silent
     input_series:
@@ -1647,7 +1981,7 @@ tests:
           - labels: 'ALERTS{alertname="ReadModelHandoverRecheckAbandoned", alertstate="firing", job="maplespire-api", instance="api-a:3001", severity="ticket"}'
             value: 1
 
-  # G4-16d: a sustained stream of refused evictions (one a minute) fires; a
+  # A sustained stream of refused evictions (one a minute) fires; a
   # handful does not, nor do the other outcomes.
   - interval: 1m
     name: unsaved-write eviction refusals fire only when sustained above ten per half hour

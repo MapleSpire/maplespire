@@ -39,6 +39,38 @@ import type { WorkspaceKey } from './rbac/docScope.js'
 import { provisionalPlacementFor } from './rbac/provisionalPlacementSource.js'
 import { bootstrapPlacementFor, placementForFence } from './rbac/serverCreationPlacement.js'
 import type { SyncCellOwnership } from './syncCells/ownership.js'
+import { durableHeadsMemo as processDurableHeadsMemo, durableHeadsScopeSql, type DurableHeadsMemo, type ScopedRowVersion } from './readModel/durableHeadsMemo.js'
+import * as A from '@automerge/automerge'
+import {
+  partitionCoveredRows,
+  snapshotStorageKey,
+  type CompactionCandidateRow,
+  type OwnSnapshotRow,
+} from './storageSnapshotCompaction.js'
+
+/** Bound of `PostgresStorageAdapter.ownSnapshots` (one small record per
+ * document compacted by `compactToSnapshot`). */
+const OWN_SNAPSHOT_RECORDS = 50_000
+
+export type SnapshotCompactionSkip =
+  | 'invalid-document' | 'missing-deps' | 'empty-document' | 'no-rows' | 'already-compact'
+  | 'nothing-covered' | 'not-written'
+
+/** What `compactToSnapshot` did to one document's rows. */
+export interface SnapshotCompactionOutcome {
+  outcome: 'compacted' | 'skipped'
+  reason?: SnapshotCompactionSkip
+  /** Content rows read before. */
+  rowsBefore: number
+  /** Rows deleted (covered by the snapshot). */
+  removed: number
+  /** Rows left beside the snapshot (not covered, or rewritten since the check). */
+  kept: number
+  snapshotOctets: number
+  /** The written row was remembered in the durable-heads memo. */
+  remembered: boolean
+  ms: number
+}
 
 /**
  * Postgres-backed Automerge storage adapter.
@@ -248,6 +280,10 @@ interface PostgresStorageAdapterOptions {
    * bound is then taken against THIS pool, which only the adapter borrows.
    */
   writeDb?: Pool
+  /** Where strict document loads are remembered for the read model's durable
+   * proof (`readModel/durableHeadsMemo.ts`). Default: the process-wide memo;
+   * `null` disables it. */
+  durableHeadsMemo?: DurableHeadsMemo | null
   /** Test seam: the retry delays after a ceiling failure of a content save
    * (default `STORAGE_WRITE_CEILING_RETRY_DELAYS_MS`). */
   ceilingRetryDelaysMs?: readonly number[]
@@ -322,6 +358,15 @@ interface StorageMutation {
   sql(firstParameter: number, permissionCte: string | null): string
   params: unknown[]
   enqueueDocumentId?: string
+  /** Data-modifying CTEs the mutation reads, each `name AS (...)` and each
+   * followed by a comma, placed before `mutation AS (...)` in the SAME
+   * statement (a data-modifying CTE must be top-level). Parameters as `sql`;
+   * the permission CTE gates them as it gates `sql`. Only
+   * `compactToSnapshot` uses it. */
+  ctes?(firstParameter: number, permissionCte: string | null): string
+  /** Extra select-list items of the statement's final SELECT (they may read
+   * `ctes`); the statement's row is returned by `withFencedMutation`. */
+  returning?: string
 }
 
 interface DocumentMapping {
@@ -462,9 +507,20 @@ export class PostgresStorageAdapter implements StorageAdapterInterface {
     CoalescedStaleFenceMutation
   >()
   private readonly loadedChunkBytes = new Map<string, Map<string, number>>()
+  /** The row version each chunk `loadRange` returned was read at, keyed by
+   * the returned bytes' identity: what `noteStrictDecode` binds. Weak, so it
+   * lives exactly as long as the caller keeps the chunk. */
+  private readonly loadedRowVersions = new WeakMap<Uint8Array, ScopedRowVersion>()
+  private readonly durableHeadsMemo: DurableHeadsMemo | null
+  /** documentId -> the snapshot row `compactToSnapshot` last wrote for it
+   * (its exact version and heads), so the next compaction need not re-check
+   * its bytes. Least recently written evicted past `OWN_SNAPSHOT_RECORDS`;
+   * a missing record only costs a check. */
+  private readonly ownSnapshots = new Map<string, OwnSnapshotRow>()
 
   constructor(options: PostgresStorageAdapterOptions = {}) {
     this.db = options.db ?? pool
+    this.durableHeadsMemo = options.durableHeadsMemo === undefined ? processDurableHeadsMemo : options.durableHeadsMemo
     // THE BOUND, and where its number comes from.
     //
     // `DB_POOL_MAX` is 10 and THREE of those clients are held for the process's
@@ -1106,8 +1162,14 @@ export class PostgresStorageAdapter implements StorageAdapterInterface {
       // prefix's special chars escaped; storage keys are alphanumeric/base58/hex
       // so the only realistic specials are none, but escape defensively.
       const escaped = prefix.replace(/([%_\\])/g, '\\$1')
-      const { rows } = await client.query<{ key: string; data: Buffer }>(
-        `SELECT key, data FROM automerge_storage
+      // `arrival_seq` comes from the SAME row version as `data` (one
+      // statement), so (key, arrival_seq, byte length) names these bytes —
+      // within the table the row is in, which `durable_scope` names
+      // (`readModel/durableHeadsMemo.ts`, THE SCOPE).
+      const { rows } = await client.query<{ key: string; data: Buffer; arrival_seq: string | null; durable_scope: string | null }>(
+        `SELECT key, data, arrival_seq::text AS arrival_seq,
+           ${durableHeadsScopeSql('automerge_storage')} AS durable_scope
+         FROM automerge_storage
          WHERE key = $1 OR key LIKE $2 || '/%' ESCAPE '\\'`,
         [prefix, escaped]
       )
@@ -1115,9 +1177,212 @@ export class PostgresStorageAdapter implements StorageAdapterInterface {
         const key = textToKey(row.key)
         const data = toUint8Array(row.data)
         this.recordLoadedChunk(key, data.byteLength)
+        this.loadedRowVersions.set(data, {
+          key: row.key, arrivalSeq: row.arrival_seq ?? null, octets: data.byteLength, scope: row.durable_scope ?? null,
+        })
         return { key, data }
       })
     })
+  }
+
+  /**
+   * Called by the patched `StorageSubsystem.loadDoc`
+   * (`patch-automerge-strict-decode.mjs`) ONLY when `A.load` accepted the
+   * merged chunks without the `loadIncremental` fallback and
+   * `getMissingDeps(doc, [])` was empty. Binds those heads to the exact row
+   * versions `loadRange` read; any chunk this adapter did not read, a
+   * non-content key, another document's key or a NULL `arrival_seq` binds
+   * nothing. Synchronous and never throws into the load.
+   */
+  noteStrictDecode(documentId: string, chunks: readonly { key: StorageKey; data?: Uint8Array }[], heads: readonly string[]): void {
+    const memo = this.durableHeadsMemo
+    if (!memo) return
+    // Each version keeps the scope its row was read with; the memo refuses a
+    // set whose rows disagree on it.
+    const rows: ScopedRowVersion[] = []
+    for (const chunk of chunks) {
+      const version = chunk.data ? this.loadedRowVersions.get(chunk.data) : undefined
+      if (!version || version.arrivalSeq === null || chunk.key[0] !== documentId
+        || (chunk.key[1] !== 'snapshot' && chunk.key[1] !== 'incremental')
+        || version.key !== keyToText(chunk.key)) {
+        memo.forget(documentId)
+        return
+      }
+      rows.push(version)
+    }
+    memo.remember(documentId, rows, heads)
+  }
+
+  /**
+   * Replace the stored rows of `documentId` that `doc` covers by ONE snapshot
+   * row, `A.save(doc)`, in ONE fenced statement (G4-16f; the coverage rule
+   * and its argument: `storageSnapshotCompaction.ts`).
+   *
+   * Crash safety: the snapshot's upsert and the deletes are data-modifying
+   * CTEs of the same statement, so they commit together or not at all —
+   * before it, the old rows; after it, the snapshot (plus any row not
+   * covered). There is no instant at which neither is readable. A covered
+   * row is deleted by its exact version (key, arrival_seq, octet length): a
+   * row rewritten since the check is not. The fence is `save`'s (the same
+   * statement shape, `withFencedMutation`).
+   *
+   * The memo entry, and why it is sound: on success the durable-heads memo
+   * is told that the ONE row version this statement wrote — read back from
+   * its own RETURNING,
+   * scope included — decodes to `A.getHeads(doc)`: the heads this process
+   * just made durable itself, never heads read from anywhere else. The
+   * proof's lookup still needs the CURRENT row set to EQUAL that one row.
+   *
+   * Never throws for coverage reasons; a storage error (a fence refusal, a
+   * pool refusal) propagates and changes nothing.
+   */
+  async compactToSnapshot(documentId: string, doc: A.Doc<unknown>): Promise<SnapshotCompactionOutcome> {
+    const started = performance.now()
+    const skipped = (reason: SnapshotCompactionSkip, rowsBefore = 0): SnapshotCompactionOutcome => ({
+      outcome: 'skipped', reason, rowsBefore, removed: 0, kept: rowsBefore, snapshotOctets: 0, remembered: false,
+      ms: Math.round(performance.now() - started),
+    })
+    if (!isValidAutomergeUrl(`automerge:${documentId}`)) return skipped('invalid-document')
+    // PINNED, before any await: `doc` is a
+    // handle's value, and once the handle changes it is an OUTDATED view —
+    // automerge 3.2.6's `getHeads`/`clone` honour its frozen heads while
+    // `save`, `hasHeads` and `getMissingDeps` read the LIVE wasm state
+    // (measured). A clone is a document of its own at exactly `doc`'s heads,
+    // so every question below (missing deps, heads, coverage, the bytes)
+    // is asked of ONE state. Freed in the `finally`.
+    let pinned: A.Doc<unknown>
+    try {
+      pinned = A.clone(doc)
+    } catch {
+      return skipped('invalid-document')
+    }
+    try {
+      return await this.compactPinned(documentId, pinned, skipped, started)
+    } finally {
+      A.free(pinned)
+    }
+  }
+
+  private async compactPinned(
+    documentId: string,
+    doc: A.Doc<unknown>,
+    skipped: (reason: SnapshotCompactionSkip, rowsBefore?: number) => SnapshotCompactionOutcome,
+    started: number,
+  ): Promise<SnapshotCompactionOutcome> {
+    // A document with a queued change (a missing dependency) is not one whose
+    // save we can vouch for: leave its storage alone.
+    if (A.getMissingDeps(doc, []).length) return skipped('missing-deps')
+    const heads = A.getHeads(doc)
+    if (!heads.length) return skipped('empty-document')
+    const own = this.ownSnapshots.get(documentId)
+    const { rows } = await this.withClient('compact-read', (client) => client.query<{
+      key: string; arrival_seq: string | null; octets: number; digest: string; durable_scope: string | null; data: Buffer | null
+    }>(
+      `SELECT key, arrival_seq::text AS arrival_seq, octet_length(data) AS octets, md5(data) AS digest,
+         ${durableHeadsScopeSql('automerge_storage')} AS durable_scope,
+         CASE WHEN key = $2 AND arrival_seq::text = $3 AND md5(data) = $4 THEN NULL ELSE data END AS data
+       FROM automerge_storage
+       WHERE split_part(key, '/', 1) = $1
+         AND split_part(key, '/', 2) IN ('snapshot', 'incremental')`,
+      [documentId, own?.key ?? '', own?.arrivalSeq ?? '', own?.digest ?? ''],
+    ))
+    if (!rows.length) return skipped('no-rows')
+    if (rows.length === 1 && rows[0]!.key.split('/')[1] === 'snapshot') return skipped('already-compact', 1)
+    const candidates: CompactionCandidateRow[] = rows.map((row) => ({
+      key: row.key,
+      arrivalSeq: row.arrival_seq ?? null,
+      octets: Number(row.octets),
+      digest: row.digest,
+      scope: row.durable_scope ?? null,
+      ...(row.data ? { data: toUint8Array(row.data) } : {}),
+    }))
+    const { covered, kept: notCovered } = partitionCoveredRows(doc, heads, candidates, own)
+    if (!covered.length) return skipped('nothing-covered', rows.length)
+    const bytes = A.save(doc)
+    const key = snapshotStorageKey(documentId, heads)
+    const keyText = keyToText(key)
+    // The snapshot's own key is upserted, never deleted.
+    const deletions = covered.filter((row) => row.key !== keyText)
+    const result = await this.withFencedMutation(key, {
+      ctes: (first, permission) => `compaction_insert AS (
+          INSERT INTO automerge_storage (key, data)
+          SELECT $${first}, $${first + 1}${permission ? ` FROM ${permission}` : ''}
+          ON CONFLICT (key) DO UPDATE
+          SET data = EXCLUDED.data, updated_at = NOW(),
+              arrival_seq = nextval('automerge_arrival_seq')
+          RETURNING key, arrival_seq::text AS arrival_seq, octet_length(data) AS octets, md5(data) AS digest,
+            ${durableHeadsScopeSql('automerge_storage')} AS durable_scope
+        ),
+        compaction_delete AS (
+          DELETE FROM automerge_storage AS storage
+          USING unnest($${first + 2}::text[], $${first + 3}::text[], $${first + 4}::int[], $${first + 5}::text[])
+            AS covered(key, arrival_seq, octets, digest)
+          WHERE storage.key = covered.key
+            AND storage.arrival_seq::text IS NOT DISTINCT FROM covered.arrival_seq
+            AND octet_length(storage.data) = covered.octets
+            -- The bytes too: a write that kept the sequence (a NULL
+            -- one, a hand edit, a restore) must not pass for the checked row.
+            AND md5(storage.data) = covered.digest
+            AND storage.key <> $${first}
+            AND EXISTS (SELECT 1 FROM compaction_insert)
+          RETURNING storage.key
+        ),`,
+      sql: () => 'SELECT 1 FROM compaction_insert',
+      params: [
+        keyText,
+        Buffer.from(bytes),
+        deletions.map((row) => row.key),
+        deletions.map((row) => row.arrivalSeq),
+        deletions.map((row) => row.octets),
+        deletions.map((row) => row.digest ?? ''),
+      ],
+      returning: `(SELECT row_to_json(inserted) FROM compaction_insert AS inserted) AS compaction_inserted,
+        (SELECT coalesce(array_agg(deleted.key), '{}') FROM compaction_delete AS deleted) AS compaction_deleted`,
+      enqueueDocumentId: this.trackStaticReadModel ? documentId : undefined,
+    })
+    const inserted = result?.compaction_inserted as
+      { key: string; arrival_seq: string | null; octets: number; digest: string; durable_scope: string | null } | null | undefined
+    const deletedKeys = (result?.compaction_deleted as string[] | undefined) ?? []
+    for (const deleted of deletedKeys) this.removeLoadedChunk(textToKey(deleted))
+    if (!inserted || inserted.key !== keyText || inserted.arrival_seq === null) {
+      // Not written (cannot happen once the statement returned: a refusal
+      // throws). Nothing to remember.
+      this.ownSnapshots.delete(documentId)
+      return { ...skipped('not-written', rows.length), removed: deletedKeys.length, kept: rows.length - deletedKeys.length }
+    }
+    this.recordLoadedChunk(key, bytes.byteLength)
+    const version: ScopedRowVersion = {
+      key: inserted.key, arrivalSeq: inserted.arrival_seq, octets: Number(inserted.octets), scope: inserted.durable_scope ?? null,
+    }
+    this.rememberOwnSnapshot(documentId, { ...version, arrivalSeq: inserted.arrival_seq, digest: inserted.digest, heads })
+    // Rows left beside the snapshot (derived from the partition): not
+    // covered — a row of the snapshot's own key is overwritten by the
+    // upsert, not left — or covered and changed since the check, so not
+    // deleted by the statement.
+    const kept = notCovered.filter((row) => row.key !== keyText).length + (deletions.length - deletedKeys.length)
+    // The memo entry: the heads of the row version THIS statement wrote,
+    // which are the heads of `bytes` — `A.save` of the pinned, dependency-complete `doc`
+    // (checked above) loads strictly to exactly them. Only when nothing is
+    // left beside it: otherwise the current set cannot equal
+    // `{that row}` and the entry could never answer (sound either way).
+    const remembered = kept === 0 ? (this.durableHeadsMemo?.remember(documentId, [version], heads) ?? false) : false
+    return {
+      outcome: 'compacted',
+      rowsBefore: rows.length,
+      removed: deletedKeys.length,
+      kept,
+      snapshotOctets: bytes.byteLength,
+      remembered,
+      ms: Math.round(performance.now() - started),
+    }
+  }
+
+  private rememberOwnSnapshot(documentId: string, row: OwnSnapshotRow): void {
+    this.ownSnapshots.delete(documentId)
+    this.ownSnapshots.set(documentId, row)
+    while (this.ownSnapshots.size > OWN_SNAPSHOT_RECORDS) {
+      this.ownSnapshots.delete(this.ownSnapshots.keys().next().value as string)
+    }
   }
 
   async removeRange(keyPrefix: StorageKey): Promise<void> {
@@ -1141,6 +1406,11 @@ export class PostgresStorageAdapter implements StorageAdapterInterface {
     const documentId = documentIdFromKey(keyPrefix, true)
     if (documentId && (keyPrefix.length === 1 || keyPrefix[1] === 'snapshot' || keyPrefix[1] === 'incremental')) {
       this.forgetUnsaved(documentId)
+      // Memory only: a removed row already changes the set and misses.
+      this.durableHeadsMemo?.forget(documentId)
+      // Hygiene, not soundness: an own-snapshot record only ever matches the
+      // exact row version it wrote.
+      this.ownSnapshots.delete(documentId)
     }
     this.removeLoadedRange(keyPrefix)
   }
@@ -1197,14 +1467,13 @@ export class PostgresStorageAdapter implements StorageAdapterInterface {
     mutation: StorageMutation,
     allowDocumentPrefix = false,
     coalesceOwnershipUnavailable = false,
-  ): Promise<void> {
+  ): Promise<Record<string, unknown> | undefined> {
     const documentId = documentIdFromKey(key, allowDocumentPrefix)
     const ownership = this.ownership
     const mutationKind = storageMutationKind(key, allowDocumentPrefix)
     const mutationIdentity = keyToText(key)
     if (!documentId || !ownership) {
-      await this.executeUnfencedMutation(mutation)
-      return
+      return this.executeUnfencedMutation(mutation)
     }
 
     // The test seam deliberately holds a transaction open to prove lock order
@@ -1217,7 +1486,7 @@ export class PostgresStorageAdapter implements StorageAdapterInterface {
     // statement snapshot, so a concurrent handoff orders the mutation before
     // the new fence or rejects it after the new fence becomes visible.
     if (this.afterFenceLocked) {
-      await this.executeLegacyFencedMutation(
+      return this.executeLegacyFencedMutation(
         documentId,
         mutationIdentity,
         mutation,
@@ -1225,7 +1494,6 @@ export class PostgresStorageAdapter implements StorageAdapterInterface {
         mutationKind,
         coalesceOwnershipUnavailable,
       )
-      return
     }
 
     // ONE PERMIT AND ONE CLIENT FOR THE WHOLE OPERATION, including the resample.
@@ -1234,7 +1502,7 @@ export class PostgresStorageAdapter implements StorageAdapterInterface {
     // cannot be held indefinitely by a spin. The two statements were previously
     // two separate borrows; they are now one, which also removes a window in
     // which the adapter could hold two clients per mutation.
-    await this.withBoundedClient('fenced-mutation', async (client) => {
+    return this.withBoundedClient('fenced-mutation', async (client) => {
       let resampledAdmission = false
       // Carried ACROSS the resample: pass 2 reads the durable row, so its
       // operand is no longer the bootstrap entry — but a refusal there is
@@ -1342,11 +1610,13 @@ export class PostgresStorageAdapter implements StorageAdapterInterface {
         const queueCte = mutation.enqueueDocumentId
           ? this.readModelQueueCte(p('document_id'))
           : ''
+        const extraCtes = mutation.ctes?.(fixed.length + 1, 'mutation_permission') ?? ''
+        const returning = mutation.returning ? `,\n             ${mutation.returning}` : ''
         const { rows } = await client.query<{
           mapped: boolean
           fence_valid: boolean
           permitted: boolean
-        }>(
+        } & Record<string, unknown>>(
            `WITH document_mapping AS MATERIALIZED (
              SELECT landscape_id, version_id
              FROM automerge_document_workspace
@@ -1417,6 +1687,7 @@ export class PostgresStorageAdapter implements StorageAdapterInterface {
                  )
                )
            ),
+           ${extraCtes}
            mutation AS (
              ${mutationSql}
            )
@@ -1424,7 +1695,7 @@ export class PostgresStorageAdapter implements StorageAdapterInterface {
            SELECT
              EXISTS (SELECT 1 FROM document_mapping) AS mapped,
              EXISTS (SELECT 1 FROM valid_fence) AS fence_valid,
-             EXISTS (SELECT 1 FROM mutation_permission) AS permitted`,
+             EXISTS (SELECT 1 FROM mutation_permission) AS permitted${returning}`,
           parameters,
         )
         const result = rows[0]
@@ -1468,13 +1739,13 @@ export class PostgresStorageAdapter implements StorageAdapterInterface {
           if (provisionalWorkspace) this.provisionallyFencedMutationCount += 1
           if (bootstrapWorkspace) this.bootstrapFencedMutationCount += 1
         }
-        return
+        return result
       }
     })
   }
 
-  private async executeUnfencedMutation(mutation: StorageMutation): Promise<void> {
-    await this.withBoundedClient('unfenced-mutation', async (client) => {
+  private async executeUnfencedMutation(mutation: StorageMutation): Promise<Record<string, unknown> | undefined> {
+    return this.withBoundedClient('unfenced-mutation', async (client) => {
       const parameters = [...mutation.params]
       let documentParameter = ''
       if (mutation.enqueueDocumentId) {
@@ -1482,14 +1753,15 @@ export class PostgresStorageAdapter implements StorageAdapterInterface {
         documentParameter = `$${parameters.length}`
       }
       const queueCte = documentParameter ? this.readModelQueueCte(documentParameter) : ''
-      await client.query(
-        `WITH mutation AS (
+      const { rows } = await client.query<Record<string, unknown>>(
+        `WITH ${mutation.ctes?.(1, null) ?? ''} mutation AS (
            ${mutation.sql(1, null)}
          )
          ${queueCte}
-         SELECT EXISTS (SELECT 1 FROM mutation) AS mutated`,
+         SELECT EXISTS (SELECT 1 FROM mutation) AS mutated${mutation.returning ? `, ${mutation.returning}` : ''}`,
         parameters,
       )
+      return rows[0]
     })
   }
 
@@ -1522,13 +1794,14 @@ export class PostgresStorageAdapter implements StorageAdapterInterface {
     ownership: Pick<SyncCellOwnership, 'fencingToken'>,
     mutationKind: StorageMutationKind,
     coalesceOwnershipUnavailable: boolean,
-  ): Promise<void> {
+  ): Promise<Record<string, unknown> | undefined> {
 
     // The borrow, the permit and the release belong to `withBoundedClient`
     // (do not duplicate them here, and never release the client again). What
     // stays here is the only part that is this branch's own: the transaction, and the `error`
     // listener that must be removed before the client goes back to the pool.
-    await this.withBoundedClient('legacy-fenced-mutation', async (client) => {
+    return this.withBoundedClient('legacy-fenced-mutation', async (client) => {
+      let result: Record<string, unknown> | undefined
       let connectionError: Error | undefined
       const rememberConnectionError = (error: Error) => {
         connectionError ??= error
@@ -1612,7 +1885,16 @@ export class PostgresStorageAdapter implements StorageAdapterInterface {
           }
           await this.afterFenceLocked?.()
         }
-        await client.query(mutation.sql(1, null), mutation.params)
+        if (mutation.ctes || mutation.returning) {
+          const { rows } = await client.query<Record<string, unknown>>(
+            `WITH ${mutation.ctes?.(1, null) ?? ''} mutation AS (${mutation.sql(1, null)})
+             SELECT EXISTS (SELECT 1 FROM mutation) AS mutated${mutation.returning ? `, ${mutation.returning}` : ''}`,
+            mutation.params,
+          )
+          result = rows[0]
+        } else {
+          await client.query(mutation.sql(1, null), mutation.params)
+        }
         if (mutation.enqueueDocumentId) {
           await this.enqueueReadModelRevision(client, mutation.enqueueDocumentId)
         }
@@ -1628,6 +1910,7 @@ export class PostgresStorageAdapter implements StorageAdapterInterface {
           if (provisional) this.provisionallyFencedMutationCount += 1
           if (bootstrap) this.bootstrapFencedMutationCount += 1
         }
+        return result
       } catch (error) {
         await client.query('ROLLBACK').catch(() => undefined)
         throw connectionError ?? error

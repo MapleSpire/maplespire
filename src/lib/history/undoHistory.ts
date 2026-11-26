@@ -52,7 +52,14 @@ export interface HistoryEntry {
   diff: ModelDiff
   selectionBefore: readonly SelectedItem[]
   selectionAfter: readonly SelectedItem[]
+  /** A label a feature attached to this entry (`tagLastEntry`): its tagged-step
+   * listeners hear when the entry is undone or redone. */
+  tag?: string
 }
+
+/** Told when a TAGGED entry is undone or redone, after its diff was applied;
+ * a returned string replaces the entry's tag (a redo under a new batch id). */
+export type TaggedStepListener = (tag: string, direction: Direction) => string | void
 
 export interface ApplyOutcome {
   applied: ModelDiff
@@ -89,6 +96,7 @@ export class UndoHistory {
   private suppressed = 0
   private remoteKeys: Set<string> | null = null
   private readonly listeners = new Set<() => void>()
+  private readonly taggedStepListeners = new Set<TaggedStepListener>()
   private snapshot: UndoAvailability = { canUndo: false, canRedo: false }
   /** Set by the canvas while a pointer button is held (a drag in progress). */
   pointerHeld = false
@@ -186,6 +194,35 @@ export class UndoHistory {
     this.open = null
   }
 
+  /** Tag the entry on top of the current scope's undo stack and seal it, so
+   * nothing joins it. False when there is none (nothing was recorded: the
+   * scope was null, say). */
+  tagLastEntry(tag: string): boolean {
+    const scope = this.host?.scope() ?? null
+    const top = scope === null ? undefined : this.stacks.get(scope)?.undo.at(-1)
+    if (!top) return false
+    top.tag = tag
+    this.seal()
+    return true
+  }
+
+  /** The entry on top of the current scope's undo stack (identity only), or
+   * null when there is none or no scope (recording is off). */
+  top(): object | null {
+    const scope = this.host?.scope() ?? null
+    return scope === null ? null : this.stacks.get(scope)?.undo.at(-1) ?? null
+  }
+
+  /** Whether edits are recorded right now (a scope exists). */
+  get recordable(): boolean {
+    return (this.host?.scope() ?? null) !== null
+  }
+
+  onTaggedStep(listener: TaggedStepListener): () => void {
+    this.taggedStepListeners.add(listener)
+    return () => { this.taggedStepListeners.delete(listener) }
+  }
+
   undo(): boolean {
     return this.step('undo')
   }
@@ -211,8 +248,21 @@ export class UndoHistory {
       // Nothing of it left to apply (peers changed all of it): it is dropped
       // and the next entry is tried, so one keypress always does something.
       if (outcome.applied.size === 0) continue
-      target.push({ ...entry, diff: outcome.applied })
+      const moved: HistoryEntry = { ...entry, diff: outcome.applied }
+      target.push(moved)
       if (outcome.skipped > 0) host.onPartial?.(outcome.skipped, direction)
+      if (entry.tag !== undefined) {
+        for (const listener of this.taggedStepListeners) {
+          // A listener that throws must not cut the step short before
+          // `notify()`: the undo itself was applied.
+          try {
+            const retag = listener(entry.tag, direction)
+            if (typeof retag === 'string') moved.tag = retag
+          } catch (error) {
+            console.error('undo history: a tagged-step listener failed', error)
+          }
+        }
+      }
       done = true
     }
     this.notify()

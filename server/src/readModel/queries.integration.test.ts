@@ -53,7 +53,13 @@ const sortedIds = (es: { connection: { id?: unknown } }[]) => es.map((e) => Stri
 // isolation is covered separately by workspaceIsolation.integration.test.ts,
 // which projects two workspaces with COLLIDING entity ids and runs every
 // function imported below against both).
-const WS: WorkspaceKey = { landscapeId: 'ws-test', versionId: 'v1' }
+// Its own key: `projector.integration.test.ts` ran on 'ws-test'/'v1' too, and
+// two test files' transactions inserting the same keys concurrently wait on
+// each other's uncommitted rows. G4-16f C7: a projector test failed once
+// after 1 024 ms (the default `deadlock_timeout` is 1 s) in a parallel run
+// and passed alone — the error text was not captured, so a deadlock is the
+// inference, not the observation.
+const WS: WorkspaceKey = { landscapeId: 'ws-test-queries', versionId: 'v1' }
 
 suite('read-model queries (Postgres integration, txn-isolated)', () => {
   let client: pg.PoolClient

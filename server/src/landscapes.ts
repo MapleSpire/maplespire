@@ -31,6 +31,7 @@ import {
 import { coverWorkspace } from './rbac/claimCoverage.js'
 import { announceDefaultVersionRepoint } from './syncCells/defaultVersionRepoint.js'
 import { ensureShareSchema } from './shares.js'
+import { deleteEpochUserRowsOfWorkspace } from './readModel/modelEpochQuarantine.js'
 
 /**
  * Multi-landscape registry.
@@ -822,6 +823,9 @@ export async function deleteLandscape(id: string): Promise<DeleteResult> {
       return { ok: false, reason: 'Landscape not found.' }
     }
     await client.query('DELETE FROM shared_links WHERE landscape_id = $1', [id])
+    // G4-16f: the epoch rows carrying user content (discard exports, override
+    // rows, forward writes and journals) go with their versions.
+    await deleteEpochUserRowsOfWorkspace(client, id)
     if (orgId) {
       await client.query(
         `UPDATE orgs SET default_landscape_id = (
@@ -861,11 +865,29 @@ export async function deleteVersion(landscapeId: string, versionId: string): Pro
     [landscapeId]
   )
   if ((crows[0]?.n ?? 0) <= 1) return { ok: false, reason: 'Cannot delete the only version.' }
-  const { rowCount } = await pool.query(
-    'DELETE FROM versions WHERE id = $1 AND landscape_id = $2',
-    [versionId, landscapeId]
-  )
-  if ((rowCount ?? 0) === 0) return { ok: false, reason: 'Version not found.' }
+  // One transaction: the version row and its epoch rows carrying user content
+  // (G4-16f — discard exports, override rows, forward writes and journals
+  // must not outlive their version).
+  const client = await pool.connect()
+  let releaseErr: Error | undefined
+  try {
+    await client.query('BEGIN')
+    const { rowCount } = await client.query(
+      'DELETE FROM versions WHERE id = $1 AND landscape_id = $2',
+      [versionId, landscapeId]
+    )
+    if ((rowCount ?? 0) === 0) {
+      await client.query('ROLLBACK')
+      return { ok: false, reason: 'Version not found.' }
+    }
+    await deleteEpochUserRowsOfWorkspace(client, landscapeId, versionId)
+    await client.query('COMMIT')
+  } catch (err) {
+    await client.query('ROLLBACK').catch((rbErr: Error) => { releaseErr = rbErr })
+    throw err
+  } finally {
+    client.release(releaseErr)
+  }
   await softDeleteScopesFor('version', landscapeId, versionId)
   return { ok: true }
 }

@@ -16,7 +16,9 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vites
 import * as A from '@automerge/automerge'
 import { Repo, type AutomergeUrl, type DocHandle } from '@automerge/automerge-repo'
 import { createIsolatedSchemaDb, type IsolatedSchemaDb } from '../testing/isolatedSchema.js'
+import { protocolFixtureDb, protocolFixtureQuery } from '../testing/protocolFixture.js'
 import { ensureReadModelSchema } from './schema.js'
+import { assertReadModelWriteFence } from './health.js'
 import { foldOrdinaryChain, type FoldOrdinaryChainArgs } from './ordinaryChainFoldWriter.js'
 import { ORDINARY_FOLD_SOURCES_FIELD, readOrdinaryChainFold, recordOrdinaryChainFold } from './ordinaryChainFold.js'
 import { readOrdinaryHeadRetirement, recordOrdinaryHeadRetirement } from './ordinaryHeadForwarding.js'
@@ -53,8 +55,15 @@ interface Fixture {
   args: (over?: Partial<FoldOrdinaryChainArgs>) => FoldOrdinaryChainArgs
 }
 
+/** The workspace's write fence (a projection-state row exists, so the
+ * protocol tables' trigger enforces THE LOCK ORDER on every write here). */
+const FENCE = 'driver-fence'
+/** The production authority's fence half (`assertReadModelWriteFence`): a
+ * write the fold makes before calling it is refused by the trigger. */
+const fenced = (tx: { query: PoolClient['query'] }) => assertReadModelWriteFence(tx as never, WS, FENCE)
+
 async function retire(h: DocHandle<Seg>, status: 'retired' | 'admitted' = 'retired') {
-  await recordOrdinaryHeadRetirement(db.pool, WS, {
+  await recordOrdinaryHeadRetirement(protocolFixtureDb(db.pool), WS, {
     collection: 'object', documentId: h.documentId, retirementHeads: A.getHeads(h.doc() as A.Doc<unknown>), status,
   })
 }
@@ -97,7 +106,7 @@ async function fixture(n = 3, opts: { retire?: boolean } = {}): Promise<Fixture>
       foldSessions.add(rows[0]!.pid)
       return client
     },
-    assertTransactionAuthority: async () => undefined,
+    assertTransactionAuthority: fenced,
     segment: async (url) => {
       const h = await repo.find(url as AutomergeUrl)
       return { documentId: h.documentId, doc: () => h.doc() }
@@ -143,7 +152,9 @@ suite('foldOrdinaryChain driven directly — PostgreSQL, in-memory documents', (
   })
   afterAll(async () => { await db?.teardown() })
   beforeEach(async () => {
-    await db.pool.query('TRUNCATE read_model_ordinary_head_retirements, read_model_ordinary_chain_folds')
+    await db.pool.query('TRUNCATE read_model_ordinary_head_retirements, read_model_ordinary_chain_folds, read_model_projection_state')
+    await db.pool.query('INSERT INTO read_model_projection_state (landscape_id, version_id, write_fence) VALUES ($1, $2, $3)',
+      [WS.landscapeId, WS.versionId, FENCE])
   })
 
   it('control: folds the run, records it, substitutes BOTH lists, flushes ModelMeta', async () => {
@@ -174,6 +185,24 @@ suite('foldOrdinaryChain driven directly — PostgreSQL, in-memory documents', (
     } finally {
       await releaseOverlayRotationLock(holder as unknown as PoolClient, key, state)
     }
+  })
+
+  // G4-16f (design R4-a): an OPEN model epoch forward journal holds the fold back.
+  it('an open model epoch forward journal: skipped epoch-forward-pending, nothing created, nothing changed', async () => {
+    const f = await fixture(3)
+    await db.pool.query(
+      `INSERT INTO read_model_model_epoch_forwards (id, landscape_id, version_id, source_document_id, from_heads, to_heads, owner_instance)
+       VALUES ('j-fold', $1, $2, 'src-fold', '{}', '{}', 'elsewhere')`, [WS.landscapeId, WS.versionId])
+    try {
+      const before = JSON.stringify(f.meta.doc())
+      expect(await foldOrdinaryChain(f.args())).toEqual({ outcome: 'skipped', reason: 'epoch-forward-pending' })
+      expect(f.products).toEqual([])
+      expect(JSON.stringify(f.meta.doc())).toBe(before)
+    } finally {
+      await db.pool.query(`DELETE FROM read_model_model_epoch_forwards WHERE id = 'j-fold'`)
+    }
+    // Control: once the journal is gone, the same fold runs.
+    expect(await foldOrdinaryChain(f.args())).toMatchObject({ outcome: 'folded' })
   })
 
   // F2, F3, F5, F4: ownership at each of its four checks, by call index.
@@ -230,7 +259,7 @@ suite('foldOrdinaryChain driven directly — PostgreSQL, in-memory documents', (
     const result = await foldOrdinaryChain(f.args({
       createProduct: async (entities, fields) => {
         // Between the sample and the record: a forward moves h0's row.
-        await db.pool.query(
+        await protocolFixtureQuery(db.pool,
           `UPDATE read_model_ordinary_head_retirements SET forwarded_heads = retirement_heads WHERE document_id = $1`,
           [f.heads[0]!.documentId],
         )
@@ -248,7 +277,8 @@ suite('foldOrdinaryChain driven directly — PostgreSQL, in-memory documents', (
   it.each(['a source', 'the product'])('the current head becoming %s after the record: superseded after-record, ModelMeta untouched', async (which) => {
     const f = await fixture(3)
     const result = await foldOrdinaryChain(f.args({
-      assertTransactionAuthority: async () => {
+      assertTransactionAuthority: async (tx) => {
+        await fenced(tx)
         // The record's transaction, not the sweep's earlier one.
         if (!f.products.length) return
         const next = which === 'a source' ? f.heads[1]!.url : f.products[0]!.url
@@ -272,7 +302,7 @@ suite('foldOrdinaryChain driven directly — PostgreSQL, in-memory documents', (
   it('a head whose late write has been FORWARDED is settled (forwarded_heads, not H_r)', async () => {
     const f = await fixture(2)
     f.heads[1]!.change((d) => { d.objects!.late = { id: 'late' } })
-    await db.pool.query(
+    await protocolFixtureQuery(db.pool,
       'UPDATE read_model_ordinary_head_retirements SET forwarded_heads = $2::text[] WHERE document_id = $1',
       [f.heads[1]!.documentId, [...A.getHeads(f.heads[1]!.doc() as A.Doc<unknown>)].sort()],
     )
@@ -430,7 +460,7 @@ suite('foldOrdinaryChain driven directly — PostgreSQL, in-memory documents', (
     expect(await foldOrdinaryChain(f.args({ budget: 2 }))).toMatchObject({ outcome: 'folded' })
     const first = f.products[0]!
     expect(await foldOrdinaryChain(f.args())).toMatchObject({ outcome: 'folded', sources: [first.url, f.heads[2]!.url] })
-    await db.pool.query(
+    await protocolFixtureQuery(db.pool,
       `UPDATE read_model_ordinary_head_retirements
           SET retain_until = now() - interval '1 second', updated_at = now() - interval '1 hour'
        WHERE status = 'folded'`,
@@ -456,7 +486,7 @@ suite('foldOrdinaryChain driven directly — PostgreSQL, in-memory documents', (
     expect(await foldOrdinaryChain(f.args({ budget: 2 }))).toMatchObject({ outcome: 'folded' })
     const first = f.products[0]!
     expect(await foldOrdinaryChain(f.args())).toMatchObject({ outcome: 'folded', sources: [first.url, f.heads[2]!.url] })
-    await db.pool.query(
+    await protocolFixtureQuery(db.pool,
       `UPDATE read_model_ordinary_head_retirements
           SET retain_until = now() - interval '1 second', updated_at = now() - interval '1 hour'
        WHERE status = 'folded'`,
@@ -532,7 +562,7 @@ suite('foldOrdinaryChain driven directly — PostgreSQL, in-memory documents', (
     const f = await fixture(3)
     await foldOrdinaryChain(f.args({ budget: 2 }))
     await foldOrdinaryChain(f.args())
-    await db.pool.query(`UPDATE read_model_ordinary_head_retirements
+    await protocolFixtureQuery(db.pool, `UPDATE read_model_ordinary_head_retirements
         SET retain_until = now() - interval '1 second', updated_at = now() - interval '1 hour'
       WHERE status = 'folded'`)
     const assertTransactionAuthority = vi.fn(async () => { throw new Error('plane moved') })
@@ -553,9 +583,10 @@ suite('foldOrdinaryChain driven directly — PostgreSQL, in-memory documents', (
   it('assertTransactionAuthority throwing only in the RECORD\'s transaction: no record, nothing published', async () => {
     const f = await fixture(3)
     let calls = 0
-    const assertTransactionAuthority = vi.fn(async () => {
+    const assertTransactionAuthority = vi.fn(async (tx: { query: PoolClient['query'] }) => {
       calls += 1
       if (f.products.length) throw new Error('plane moved')
+      await fenced(tx)
     })
     await expect(foldOrdinaryChain(f.args({ assertTransactionAuthority }))).rejects.toThrow('plane moved')
     expect(calls).toBe(1)
@@ -609,7 +640,7 @@ suite('foldOrdinaryChain driven directly — PostgreSQL, in-memory documents', (
 
 /** Make a record older than the default retainMs, so the writer may abandon it. */
 async function ageRecord(product: DocHandle<Seg>) {
-  await db.pool.query(
+  await protocolFixtureQuery(db.pool,
     `UPDATE read_model_ordinary_chain_folds SET created_at = now() - interval '2 days' WHERE product_document_id = $1`,
     [product.documentId],
   )
@@ -619,6 +650,7 @@ async function recordByHand(product: DocHandle<Seg>, sources: DocHandle<Seg>[], 
   const client = await db.pool.connect()
   try {
     await client.query('BEGIN')
+    await fenced(client)
     await recordOrdinaryChainFold(client, WS, {
       collection: 'object',
       productDocumentId: product.documentId,

@@ -185,6 +185,12 @@ The three below reach the load-soak leg only (they are ignored by the others):
   --ordinary-chain-fold-retain-hours=N
                   AM_ORDINARY_CHAIN_FOLD_RETAIN_HOURS (server default 168), so a
                   short run reaches the abandon and the row sweep
+  --promoted-takeover=on|off
+                  G4-16h: with --posture and --mode=soak, promote a second
+                  12 000-object partition-zero workspace to summary before the
+                  takeover, measure both arms' freshness from the same
+                  completedAt, and stop after the failover episode (no soak;
+                  a measurement, not a qualification)
   --load-remote=listen --bind=<this host's LAN IPv4>
                   REMOTE LOAD (G4-16 M1): run the load clients on ANOTHER
                   machine. Only the client processes move; the cells, the gate,
@@ -304,6 +310,25 @@ export function ordinaryHeadRotationArm(argv, env = process.env) {
     mode, maxActors, maxChanges, chainFold: chainFold === 'on' ? 'on' : 'off', chainFoldRetainHours,
     followWriteHead: follow === 'on',
   }
+}
+
+/**
+ * G4-16h, load-soak leg only: `--promoted-takeover=on|off`. On, the posture
+ * soak rehearsal adds a second 12 000-object workspace on partition zero,
+ * PROMOTES it to summary before the takeover, measures both arms' freshness
+ * from the one takeover and stops after the failover episode (no soak). The
+ * CLI owns it like the arm: the gate's variable is ALWAYS written, blank
+ * unless asked for, so an inherited value cannot turn a qualification into
+ * this measurement. `legArgs` are the gate arguments the run will use.
+ */
+export function promotedTakeoverEnvironment(argv, { legName, posture, legArgs }) {
+  const raw = argv.find((arg) => arg.startsWith('--promoted-takeover='))?.slice('--promoted-takeover='.length)?.trim()
+  if (raw === undefined || raw === 'off') return { SYNC_LOAD_PROMOTED_TAKEOVER: '' }
+  if (raw !== 'on') fail('--promoted-takeover must be on or off')
+  if (legName !== 'load-soak') fail('--promoted-takeover is a measurement of the load-soak leg only')
+  if (!posture) fail('--promoted-takeover needs --posture: it runs inside the posture rehearsal')
+  if (!legArgs?.includes('--mode=soak')) fail('--promoted-takeover needs --mode=soak: the rehearsal that seeds 12 000 objects')
+  return { SYNC_LOAD_PROMOTED_TAKEOVER: 'on' }
 }
 
 /** `--follow-write-head` as the gate's own variable; absent leaves an
@@ -1079,6 +1104,7 @@ async function main() {
     SYNC_BENCH_POSTURE: posture ?? '',
   }
   const legArgs = overrides.args ?? leg.args
+  Object.assign(env, promotedTakeoverEnvironment(argv, { legName, posture, legArgs }))
   const dedicatedCalibration = Boolean(posture && legName === 'load-soak' && legArgs.includes('--mode=soak'))
 
   assertGateInventory()
@@ -1140,7 +1166,9 @@ async function main() {
       // The calibration runs no load: it gets the arm's names blanked, so both
       // arms calibrate with the same environment.
       calibrationStage = await runIsolatedCalibrationStage({ env: { ...process.env, ...env,
-        ...(remoteOptions ? remoteLoadEnvironment(null, legEnv.SYNC_FAILOVER_ROUTER_PORT, env) : {}) }, image, posture,
+        ...(remoteOptions ? remoteLoadEnvironment(null, legEnv.SYNC_FAILOVER_ROUTER_PORT, env) : {}),
+        // G4-16h: the five-object calibration is the same with or without it.
+        SYNC_LOAD_PROMOTED_TAKEOVER: '' }, image, posture,
         services: leg.services, compose,
         inspectPosture: (project, childEnv) => inspectRunningPosture(project, leg.services, postureConfig, childEnv),
       })
@@ -1277,6 +1305,7 @@ async function main() {
       ...(arm ? { ordinaryHeadRotation: { ...arm, preselection: armPreselection } } : {}),
       ...(remoteOptions ? { loadRemote: { mode: remoteOptions.mode, bind: remoteOptions.bind, ...remotePorts } } : {}),
       ...(capture ? { cpuProfile: capture } : {}),
+      ...(env.SYNC_LOAD_PROMOTED_TAKEOVER === 'on' ? { promotedTakeover: 'on' } : {}),
       services: leg.services,
       excluded,
       cellsServing: serving,

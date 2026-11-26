@@ -23,6 +23,17 @@ import { planShardAssignment, partitionByShard, routeFromShardContents } from '.
 const ids = (n: number, prefix = 'o') => Array.from({ length: n }, (_, i) => prefix + i)
 
 describe('planShardAssignment', () => {
+  it('G4-16f: a CLOSED shard keeps the ids routed to it but takes no new one', () => {
+    const prev = new Map<string, number>([['o0', 1]])
+    const plan = planShardAssignment(['o0', 'n1', 'n2'], prev, 2, 4, new Set([0, 1]))
+    expect(plan.route.get('o0')).toBe(1)
+    expect(plan.route.get('n1')).toBe(2)
+    expect(plan.route.get('n2')).toBe(2)
+    expect(plan.shardCount).toBe(3)
+    // Open, the first shard with room takes them.
+    expect(planShardAssignment(['n1'], new Map(), 2, 4).route.get('n1')).toBe(0)
+  })
+
   it('places new ids into one shard until full, then overflows into a new shard', () => {
     const plan = planShardAssignment(ids(5), new Map(), 1, 2)
     // shardSize 2 → shards [o0,o1] [o2,o3] [o4]; count grows 1 → 3.

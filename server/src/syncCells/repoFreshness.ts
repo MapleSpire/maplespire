@@ -21,6 +21,7 @@ import { cachedHandles, findReadyDocument } from '../automergeRepoCompat.js'
 import type { AutomergeResidencyLeases } from '../automergeResidency.js'
 import type { WorkspaceKey } from '../rbac/docScope.js'
 import type { Queryable } from '../readModel/types.js'
+import { readMetaUrl } from '../modelMetaUrls.js'
 
 /** Drop mutable workspace handles retained by a former/standby generation.
  * The root stays resident because it is a transport core document; its child
@@ -185,7 +186,7 @@ export async function prewarmWorkspaceFailoverDocuments(
     if (!meta) throw new Error('workspace ModelMeta was unavailable during failover prewarm')
     loaded.push(documentIdOf(metaUrl))
 
-    const writeHeadUrls = [meta.editsObjectShardUrl, meta.editsConnectionShardUrl]
+    const writeHeadUrls = [readMetaUrl(meta, 'editsObjectShardUrl'), readMetaUrl(meta, 'editsConnectionShardUrl')]
       .filter((url): url is string => typeof url === 'string' && isValidAutomergeUrl(url))
     const mappedHeads = await mappedWorkspaceDocumentIds(db, workspace, writeHeadUrls)
     for (const url of writeHeadUrls) {

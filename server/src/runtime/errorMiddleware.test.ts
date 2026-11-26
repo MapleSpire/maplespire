@@ -41,7 +41,7 @@ describe('terminal error handler', () => {
     // Mounted last, exactly as main() must mount it.
     app.use(terminalErrorHandler({ log: () => {} }))
     const server = await new Promise<ReturnType<typeof app.listen>>((resolve) => {
-      const s = app.listen(0, () => resolve(s))
+      const s = app.listen(0, '127.0.0.1', () => resolve(s))
     })
     servers.push(server)
     const { port } = server.address() as AddressInfo
@@ -123,7 +123,7 @@ describe('terminal error handler', () => {
     app.get('/boom', async () => { throw new StaleSyncCellWriteError('snapshot', 'fence-mismatch') })
     app.use(terminalErrorHandler({ log }))
     const server = await new Promise<ReturnType<typeof app.listen>>((resolve) => {
-      const s = app.listen(0, () => resolve(s))
+      const s = app.listen(0, '127.0.0.1', () => resolve(s))
     })
     servers.push(server)
     const { port } = server.address() as AddressInfo
@@ -176,7 +176,7 @@ describe('terminal error handler', () => {
     app.get('/boom', async () => { throw new Error('kaboom') })
     app.use(terminalErrorHandler({ log }))
     const server = await new Promise<ReturnType<typeof app.listen>>((resolve) => {
-      const s = app.listen(0, () => resolve(s))
+      const s = app.listen(0, '127.0.0.1', () => resolve(s))
     })
     servers.push(server)
     const { port } = server.address() as AddressInfo

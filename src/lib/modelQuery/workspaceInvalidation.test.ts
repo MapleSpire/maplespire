@@ -23,6 +23,8 @@ import {
 } from '../automerge/workspaceBinding'
 import {
   __resetWorkspaceInvalidationForTests,
+  REOPEN_FIRST_MS,
+  REOPEN_MAX_MS,
   subscribeCurrentWorkspaceInvalidations,
 } from './workspaceInvalidation'
 
@@ -32,6 +34,21 @@ class FakeEventSource {
   readonly listeners = new Map<string, Array<(event: Event) => void>>()
   readonly url: string
   readonly options?: EventSourceInit
+  /** 0 CONNECTING, 1 OPEN, 2 CLOSED — as the platform's. */
+  readyState = 0
+
+  /** What a browser does when the REQUEST fails (a 503 while a cell shuts
+   * down): the source moves to CLOSED, fires `error`, and never retries. */
+  failForGood(): void {
+    this.readyState = 2
+    for (const listener of this.listeners.get('error') ?? []) listener(new Event('error'))
+  }
+
+  /** A stream that dropped after opening: the browser retries by itself. */
+  dropAndRetry(): void {
+    this.readyState = 0
+    for (const listener of this.listeners.get('error') ?? []) listener(new Event('error'))
+  }
 
   constructor(url: string, options?: EventSourceInit) {
     this.url = url
@@ -166,5 +183,67 @@ describe('workspace invalidation transport', () => {
     const third = subscribeCurrentWorkspaceInvalidations(vi.fn())
     expect(FakeEventSource.sources).toHaveLength(2)
     early(); bridge(); third()
+  })
+
+  describe('T-DIAGDEF — a stream the browser CLOSED is reopened, with a bounded delay', () => {
+    beforeEach(() => { vi.useFakeTimers() })
+    afterEach(() => { vi.useRealTimers() })
+
+    it('reopens after a refused request, and the new stream delivers', async () => {
+      const listener = vi.fn()
+      const stop = subscribeCurrentWorkspaceInvalidations(listener)
+      FakeEventSource.sources[0].failForGood()
+
+      vi.advanceTimersByTime(REOPEN_FIRST_MS - 1)
+      expect(FakeEventSource.sources).toHaveLength(1)
+      vi.advanceTimersByTime(1)
+      expect(FakeEventSource.sources).toHaveLength(2)
+
+      FakeEventSource.sources[1].emit('ready', 9)
+      await Promise.resolve()
+      expect(listener).toHaveBeenCalledWith(expect.objectContaining({ generation: 9, kind: 'ready' }))
+      stop()
+    })
+
+    it('backs off on repeated refusals (no tight loop), capped, and resets once a stream works', () => {
+      const stop = subscribeCurrentWorkspaceInvalidations(vi.fn())
+      const delays: number[] = []
+      for (let attempt = 0; attempt < 7; attempt += 1) {
+        const before = FakeEventSource.sources.length
+        FakeEventSource.sources[before - 1].failForGood()
+        let waited = 0
+        while (FakeEventSource.sources.length === before && waited < 120_000) {
+          vi.advanceTimersByTime(500)
+          waited += 500
+        }
+        delays.push(waited)
+      }
+      expect(delays).toEqual([2_000, 4_000, 8_000, 16_000, 32_000, 60_000, 60_000])
+
+      // A stream that works resets the ladder.
+      const working = FakeEventSource.sources[FakeEventSource.sources.length - 1]
+      working.emit('ready', 1)
+      working.failForGood()
+      vi.advanceTimersByTime(REOPEN_FIRST_MS)
+      expect(FakeEventSource.sources.at(-1)).not.toBe(working)
+      stop()
+    })
+
+    it('leaves a stream the browser is RETRYING by itself alone', () => {
+      const stop = subscribeCurrentWorkspaceInvalidations(vi.fn())
+      FakeEventSource.sources[0].dropAndRetry()
+      vi.advanceTimersByTime(REOPEN_MAX_MS * 2)
+      expect(FakeEventSource.sources).toHaveLength(1)
+      expect(FakeEventSource.sources[0].close).not.toHaveBeenCalled()
+      stop()
+    })
+
+    it('a last unsubscribe cancels a pending reopen', () => {
+      const stop = subscribeCurrentWorkspaceInvalidations(vi.fn())
+      FakeEventSource.sources[0].failForGood()
+      stop()
+      vi.advanceTimersByTime(REOPEN_MAX_MS * 2)
+      expect(FakeEventSource.sources).toHaveLength(1)
+    })
   })
 })

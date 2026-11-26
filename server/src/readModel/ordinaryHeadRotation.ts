@@ -113,6 +113,14 @@ export interface OrdinaryHeadRotationConfig {
     readonly minChain: number
     readonly budget: number
     readonly retainMs: number
+    /** The seal and the window (`ordinaryChainFoldWriter.ts`); unset is
+     * `OVERLAY_SEGMENT_ENTITY_CEILING` / `OVERLAY_CHAIN_FOLD_WINDOW_ENTITIES`
+     * (their environment knobs). Not read from the environment here: an
+     * injection for tests, so a product seals at a few entities. The
+     * projector parks what seals at THIS ceiling (G4-16f), so the writer and
+     * the parking always agree on it. */
+    readonly segmentCeiling?: number
+    readonly windowEntities?: number
   }
   /** `AM_ORDINARY_CHAIN_ALERT_LENGTH`; unset is the default above. Only
    * consulted with `on` and no `chainFold`. */

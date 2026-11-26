@@ -13,7 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import { ColdBuildAdmissionStoppedError, ColdBuildQueueFullError } from './coldBuildAdmission.js'
-import { ProjectorOwnershipError, ProjectorStaticWorkspaceError } from './projectorService.js'
+import { ProjectorCompactionInProgressError, ProjectorOwnershipError, ProjectorStaticWorkspaceError } from './projectorService.js'
 import type { WorkspaceKey } from './projector.js'
 
 /**
@@ -27,16 +27,18 @@ import type { WorkspaceKey } from './projector.js'
  *  3. `ProjectorOwnershipError`;
  *  4. `ProjectorStaticWorkspaceError`;
  *  5. `ColdBuildQueueFullError`;
- *  6. `ColdBuildAdmissionStoppedError`.
+ *  6. `ColdBuildAdmissionStoppedError`;
+ *  7. `ProjectorCompactionInProgressError` (T-VANISH): a compaction is
+ *     folding the workspace and admits no start but its own re-attach.
  *
- * Cases 3-6 are deliberately not logged with a stack (that would be one warning
+ * Cases 3-7 are deliberately not logged with a stack (that would be one warning
  * per browser retry during a recovery burst), so without this module a consumer
  * polling the 503 — such as the backup drill's cold-API stage — could only
  * report a failure naming no cause.
  *
  * Three properties this module holds:
  *
- * - **The reason vocabulary is DERIVED, never retyped.** The four classes carry
+ * - **The reason vocabulary is DERIVED, never retyped.** The five classes carry
  *   a `code`; `ReadModelWarmupReason` unions `ClassName['code']` rather than
  *   hand-written literals, so renaming a class's code is a compile error rather
  *   than a silent disagreement. (`readonly code = '…'` infers the literal type.)
@@ -66,6 +68,7 @@ export type ReadModelWarmupReason =
   | ProjectorStaticWorkspaceError['code']
   | ColdBuildQueueFullError['code']
   | ColdBuildAdmissionStoppedError['code']
+  | ProjectorCompactionInProgressError['code']
   /** A cold build is in flight, or none has reported back yet. */
   | 'cold_build_in_flight'
   /** `ensure()` resolved false: no root URL for this workspace. */
@@ -110,16 +113,17 @@ export type WarmupFailureClass = {
 /**
  * Classify by CLASS, never by a duck-typed `code`.
  *
- * Every one of the four carries `code`, so reading it off an arbitrary error
+ * Every one of the five carries `code`, so reading it off an arbitrary error
  * would be shorter — and a `pg` error carrying its own `code` would then be
  * reported as expected backpressure. The predicate has to be one a foreign
  * error cannot satisfy. The code is read off the NARROWED instance, so the
  * literal is never retyped here either.
  *
- * KNOWN LIMITATION: a fifth expected refusal added to `ProjectorFleet.ensure()`
+ * KNOWN LIMITATION: a sixth expected refusal added to `ProjectorFleet.ensure()`
  * lands in the fallback below as `{expected: false}`, which restores one
  * `console.error` per request. Making that a compile error would need a shared
- * abstract base on the four classes. `isExpectedRefusal` (wired in `index.ts`)
+ * abstract base on the five classes. (The fifth, the compaction window of
+ * T-VANISH, was added by hand: that is the limitation.) `isExpectedRefusal` (wired in `index.ts`)
  * derives from this function so the list exists once.
  */
 export function classifyWarmupFailure(error: unknown): WarmupFailureClass {
@@ -127,6 +131,7 @@ export function classifyWarmupFailure(error: unknown): WarmupFailureClass {
   if (error instanceof ProjectorStaticWorkspaceError) return { reason: error.code, expected: true }
   if (error instanceof ColdBuildQueueFullError) return { reason: error.code, expected: true }
   if (error instanceof ColdBuildAdmissionStoppedError) return { reason: error.code, expected: true }
+  if (error instanceof ProjectorCompactionInProgressError) return { reason: error.code, expected: true }
   return { reason: 'cold_build_failed', expected: false }
 }
 

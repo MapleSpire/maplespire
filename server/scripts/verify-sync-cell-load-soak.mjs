@@ -22,6 +22,7 @@ import { performance } from 'node:perf_hooks'
 import { promisify } from 'node:util'
 import { stats as automergeStats } from '@automerge/automerge'
 import { Repo, isValidAutomergeUrl } from '@automerge/automerge-repo'
+import { readMetaUrl, readMetaUrls } from '../src/modelMetaUrls.ts'
 import { AuthenticatedWebSocketClientAdapter } from '../qa/authenticatedWebSocketAdapter.mjs'
 import { appendOverlayBatchId, loadObjectIds, objectMap, percentile, resolveLoadHandle } from '../qa/loadUsersCore.mjs'
 import { makeObject } from '../qa/lib.mjs'
@@ -31,6 +32,8 @@ import { RehearsalObservations, RehearsalSampler, closeRehearsalSeeder, freshnes
 import { assertBenchSession, benchRuntime, benchSessionFile, runCompose, runComposeSync } from './sync-bench-runtime.mjs'
 import { readCalibrationReceipt } from './sync-cell-calibration.mjs'
 import { REMOTE_LOAD_ENV, assertLanAddress, readRemoteLoadSecret, startRemoteLoadServer } from './sync-cell-remote-load-core.mjs'
+import { PROMOTED_TAKEOVER_FLAG, assertPromotedTakeoverConfig, expectedStaticWorkspaces, judgePromotedTakeover, parsePromotedTakeover,
+  probePromotedFreshness, promotedEditPlan, promotedFreshnessValidity, promotionVerdict } from './sync-cell-promoted-takeover.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const composeFile = resolve(here, '../../infra/compose/sync-cell-failover.yml')
@@ -977,7 +980,7 @@ export function writeHeadStats(doc) {
  */
 export const OVERLAY_WRITE_HEAD_VERSION = 1
 export function currentObjectWriteHead(meta, isValidUrl = isValidAutomergeUrl) {
-  const url = meta?.editsObjectShardUrl
+  const url = readMetaUrl(meta, 'editsObjectShardUrl')
   if (typeof url !== 'string' || !isValidUrl(url)) return null
   if (meta.editsOverlayWriteHeadVersion !== OVERLAY_WRITE_HEAD_VERSION) {
     throw new Error(`object write head ${url} has legacy write-head version ${JSON.stringify(meta.editsOverlayWriteHeadVersion)}`)
@@ -1135,6 +1138,7 @@ export function parseLoadSoakConfig(env = process.env, argv = process.argv.slice
     throw new Error(`${PRESELECT_ARG} chooses the workspaces; it cannot be given ${PRESELECTED_WORKSPACES_ENV}`)
   }
   const remoteLoad = parseRemoteLoadConfig(env)
+  const promotedTakeover = parsePromotedTakeover(env[PROMOTED_TAKEOVER_FLAG])
   const config = {
     mode,
     profile,
@@ -1171,6 +1175,8 @@ export function parseLoadSoakConfig(env = process.env, argv = process.argv.slice
     // Present only when asked for, like the arm: a local run parses to the
     // object it parsed before remote load existed.
     ...(remoteLoad ? { remoteLoad } : {}),
+    // G4-16h: present only when asked for, like the arm above.
+    ...(promotedTakeover ? { promotedTakeover } : {}),
     workspaceSelectors,
     usersPerWorkspace,
     clientsPerProcess: boundedInteger(
@@ -1244,6 +1250,7 @@ export function parseLoadSoakConfig(env = process.env, argv = process.argv.slice
     'SYNC_LOAD_RUN_DEADLINE_MS',
   )
   if (config.benchPosture !== null) assertPostureQualificationConfig(config)
+  assertPromotedTakeoverConfig(config)
   return config
 }
 
@@ -1558,7 +1565,9 @@ async function seedRehearsalWorkspace(config, selection, targetUrl, cookie, tota
       })
       if (!isFreshWitness(response, selection.workspace, expectedObjects)) return null
       const inventory = await rehearsalInventory(config, selection.workspace)
-      if (inventory.staticWorkspaces !== 0) throw new Error('rehearsal workspace acquired a static read model')
+      // Every seed is ORDINARY when it is seeded, the G4-16h promoted arm
+      // included (it is promoted afterwards): the rule is never relaxed here.
+      if (inventory.staticWorkspaces !== expectedStaticWorkspaces('ordinary', config)) throw new Error('rehearsal workspace acquired a static read model')
       return inventory.objects === totalObjects && inventory.projectorInstanceId ? inventory : null
     }, 120_000)
     if (publication.totalObjects !== totalObjects) throw new Error('seed local object count changed')
@@ -1611,7 +1620,7 @@ async function readRehearsalFreshness(config, cookie, seed, takeover, replacemen
     && before.fleet?.residentProjectors === 0 && before.fleet?.inFlightWorkspaces === 0
     && after.ownership?.ready === true && after.ownership?.partitionIndex === 0
     && after.fleet?.residentProjectors > 0 && after.fleet?.foreignResidentProjectors === 0
-    && inventory.objects === seed.totalObjects && inventory.staticWorkspaces === 0
+    && inventory.objects === seed.totalObjects && inventory.staticWorkspaces === expectedStaticWorkspaces('ordinary', config)
     && inventory.projectorInstanceId && inventory.projectorInstanceId !== seed.inventory.projectorInstanceId
   return { valid: Boolean(valid), seed, origin: 'replacement ready response completedAt', completedAt: takeover.completedAt,
     firstRequestAt, firstFreshResponseAt: fresh.receivedAt, freshAfterTakeoverMs: fresh.freshAfterTakeoverMs,
@@ -1619,6 +1628,255 @@ async function readRehearsalFreshness(config, cookie, seed, takeover, replacemen
     provisionalBudgetMs: 3_000, provisionalBudgetExceeded: fresh.freshAfterTakeoverMs > 3_000,
     remedyIfExceeded: 'operator summary promotion per landscape (D57)',
     scope: 'cold projector; WebSocket reconnects may already have loaded the head; no standby prewarming' }
+}
+
+/**
+ * G4-16h: the promoted arm's workspace. A fresh landscape on PARTITION ZERO
+ * (the partition the takeover moves, where the ordinary 12 000-object arm
+ * already is), seeded to 12 000 objects by the same seeder as the ordinary
+ * arm, then promoted through the operator route — report-only until the
+ * preconditions hold, then ONE apply, whose report is the verdict. Refused:
+ * the pass is VOID (`G4-16h VOID`). Before the takeover the arm must be
+ * served by the owner's STATIC plane (inventory static, a projector instance
+ * other than the ordinary seed's), so the instance comparison after the
+ * takeover has a baseline.
+ */
+async function preparePromotedArm(config, allCells, cookie, createdLandscapeIds, promotedLandscapeIds) {
+  const armConfig = { ...config, runId: `${config.runId}-promoted` }
+  const states = await Promise.all(allCells.map(cell => json(`${cell.baseUrl}/api/platform/sync-cell`, { cookie })))
+  let selection = null
+  const strays = []
+  for (let attempt = 0; attempt < 30 && !selection; attempt += 1) {
+    setPhase(`G4-16h: creating the promoted workspace (attempt ${attempt + 1})`)
+    const created = await json(`${allCells[0].baseUrl}/api/landscapes`, {
+      cookie, method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: `G4-16h promoted ${attempt + 1}` }),
+    })
+    const workspace = workspaceOf(created.landscape)
+    if (!workspace) throw new Error('created landscape has no active workspace')
+    createdLandscapeIds.push(workspace.landscapeId)
+    const root = await waitFor('promoted workspace owner route', () => probeRoot(allCells, workspace, cookie), 90_000)
+    if (states[root.ownerIndex]?.partitionIndex === 0) {
+      selection = { workspace, ...root }
+      // Moved to its own list: the promoted landscape's deletion is best
+      // effort (runLocalRehearsal).
+      createdLandscapeIds.splice(createdLandscapeIds.lastIndexOf(workspace.landscapeId), 1)
+      promotedLandscapeIds.push(workspace.landscapeId)
+    } else strays.push(workspace.landscapeId)
+  }
+  if (!selection) throw new Error('G4-16h VOID: no fresh landscape landed on partition zero')
+  // Partition zero carries the two arms and nothing else this run created.
+  await cleanupFreshLandscapes(config, allCells, cookie, strays)
+  setPhase('G4-16h: seeding the promoted arm to 12 000 objects')
+  const target = await resolveLoadTarget(armConfig, selection, cookie)
+  const seed = await seedRehearsalWorkspace(armConfig, selection, target, cookie, armConfig.seedObjectCount)
+  setPhase('G4-16h: promoting the arm to summary')
+  const endpoint = `${routerHttp(config)}/api/platform/workspace/promote-summary`
+  const post = (apply, timeoutMs) => request(endpoint, { cookie, method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ ...selection.workspace, apply }), timeoutMs })
+  // A REPORT writes nothing; it is retried only until the preconditions hold
+  // (the seeder's socket census, the projection catching up). The apply is
+  // never retried.
+  const dryRuns = []
+  await waitFor('promotion preconditions', async () => {
+    const report = await post(false, 180_000)
+    const blockers = Array.isArray(report.body?.blockers) ? report.body.blockers.map(blocker => blocker?.code) : null
+    dryRuns.push({ at: Date.now(), status: report.status, blockers })
+    return report.status === 200 && blockers?.length === 0 ? true : null
+  }, 120_000).catch(() => null)
+  const applied = await post(true, 300_000)
+  const verdict = promotionVerdict(applied, selection.workspace)
+  const promotion = { ...verdict, dryRuns, appliedAt: Date.now(),
+    report: applied.body && typeof applied.body === 'object'
+      ? { mode: applied.body.mode, workspace: applied.body.workspace, blockers: applied.body.blockers, overridden: applied.body.overridden,
+        applied: applied.body.applied, exclusionProven: applied.body.exclusionProven, witnesses: applied.body.witnesses,
+        allowListSize: applied.body.plan?.allowList?.length ?? null }
+      : applied.body }
+  console.log('G416H_PROMOTION ' + JSON.stringify({ workspace: selection.workspace, ...promotion }))
+  if (!verdict.accepted) throw new Error(`G4-16h VOID: promotion not accepted (${verdict.reasons.join('; ')})`)
+  setPhase('G4-16h: waiting for the owner\'s static plane to attach the promoted arm')
+  const ownerUrl = `${cells(config)[selection.ownerIndex].baseUrl}/api/model/durability-witness?${workspaceQuery(selection.workspace)}`
+  const witnessOnOwner = expected => request(ownerUrl, { cookie, method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ objects: Object.keys(expected) }), timeoutMs: 3_000 })
+  let lastObserved = null
+  const notServed = (stage) => (error) => {
+    console.log('G416H_ARM_NOT_SERVED ' + JSON.stringify({ stage, workspace: selection.workspace,
+      seedProjectorInstanceId: seed.inventory.projectorInstanceId, lastObserved }))
+    throw error
+  }
+  const attached = await waitFor('promoted arm attached by the owner\'s static plane', async () => {
+    const inventory = await rehearsalInventory(config, selection.workspace)
+    lastObserved = { inventory }
+    return inventory.staticWorkspaces === expectedStaticWorkspaces('promoted', config) && inventory.objects === seed.totalObjects
+      && inventory.projectorInstanceId && inventory.projectorInstanceId !== seed.inventory.projectorInstanceId ? inventory : null
+  }, 60_000).catch(notServed('attach'))
+  // The WARM edit (see sync-cell-promoted-takeover.mjs): one edit on the owner,
+  // then the owner must answer fresh with it before the pause.
+  setPhase('G4-16h: warm overlay edit on the owner')
+  const warmPlan = promotedEditPlan(seed, armConfig.runId, 'warm')
+  const warmEditor = promotedOverlayEditor(config, { selection, plan: warmPlan }, cookie)
+  let warm
+  try {
+    const applied = await warmEditor.apply()
+    // NOT a gate: measured on the Mac trials, the owner never answered fresh
+    // after the warm edit. The arm goes on to the takeover either way and the
+    // record says which it was; the takeover measurement then censors.
+    warm = await waitFor('promoted arm fresh on the owner after the warm edit', async () => {
+      const response = await witnessOnOwner(warmPlan.expectedObjects)
+      lastObserved = { status: response.status, route: response.route, freshness: response.body?.status, caughtUp: response.body?.caughtUp,
+        absenceProvable: response.body?.absenceProvable, editVisible: response.body?.objects?.[warmPlan.objectId]?.name === warmPlan.name }
+      return isFreshWitness(response, selection.workspace, warmPlan.expectedObjects)
+        ? { fresh: true, appliedAt: applied.appliedAt, freshAt: Date.now(), editToFreshMs: performance.now() - applied.appliedMonotonicMs,
+          rootSummaryOnly: applied.rootSummaryOnly, headUrl: applied.headUrl } : null
+    }, 60_000).catch(() => ({ fresh: false, appliedAt: applied.appliedAt, waitedMs: performance.now() - applied.appliedMonotonicMs,
+      rootSummaryOnly: applied.rootSummaryOnly, headUrl: applied.headUrl, lastObserved }))
+    warm.overlay = await promotedOverlayDiagnostics(config, selection.workspace).catch(error => ({ error: error.message }))
+    console.log('G416H_WARM ' + JSON.stringify({ workspace: selection.workspace, ...warm }))
+  } finally {
+    await warmEditor.close().catch(error => console.error(`G4-16h: the warm edit repo did not close cleanly: ${error.message}`))
+  }
+  const inventory = await rehearsalInventory(config, selection.workspace)
+  if (inventory.projectorInstanceId !== attached.projectorInstanceId) {
+    throw new Error('G4-16h VOID: the owner\'s static projector instance changed before the pause')
+  }
+  const preTakeover = { observedAt: Date.now(), inventory, attached, warm }
+  // From here the arm's witness is the warm state; the takeover edit changes it again.
+  const armSeed = { ...seed, expectedObjects: warmPlan.expectedObjects }
+  const arm = { selection, seed: armSeed, promotion, preTakeover, warmPlan, plan: promotedEditPlan(armSeed, armConfig.runId) }
+  console.log('G416H_ARM ' + JSON.stringify({ workspace: selection.workspace, ownerIndex: selection.ownerIndex,
+    totalObjects: seed.totalObjects, preTakeover, warmPlan, plan: arm.plan }))
+  return arm
+}
+
+/** The overlay edit, written the way a client writes it: through the router
+ * (so to whichever cell owns the workspace), into ModelMeta's current object
+ * overlay head, with a batch id. The repo stays open until the probe ends, so
+ * the change is not abandoned in flight. */
+function promotedOverlayEditor(config, arm, cookie) {
+  const adapter = new AuthenticatedWebSocketClientAdapter(routerWs(config, arm.selection.workspace), cookie, 500)
+  const repo = new Repo({ network: [adapter] })
+  return {
+    // Bounded: resolveLoadHandle alone may retry for minutes.
+    apply: () => withDeadline(apply(), 60_000, `G4-16h ${arm.plan.phase} overlay edit`),
+    close: () => closeRehearsalSeeder(repo, adapter),
+  }
+  async function apply() {
+    const root = (await resolveLoadHandle(repo, arm.selection.rootUrl)).handle.doc()
+    if (!root?.modelMetaUrl) throw new Error('the promoted root names no ModelMeta')
+    const meta = (await resolveLoadHandle(repo, root.modelMetaUrl)).handle
+    const headUrl = currentObjectWriteHead(meta.doc())
+    if (!headUrl) throw new Error('the promoted ModelMeta names no object overlay write head')
+    const head = (await resolveLoadHandle(repo, headUrl)).handle
+    let appended = false
+    head.change((document) => {
+      const objects = objectMap(document)
+      if (!objects) throw new Error('the promoted overlay head has no object map')
+      objects[arm.plan.objectId] = makeObject(arm.plan.objectId, { name: arm.plan.name })
+      appended = appendOverlayBatchId(document, arm.plan.batchId)
+    })
+    const appliedMonotonicMs = performance.now()
+    if (!appended) throw new Error(`${headUrl} is not an overlay write head`)
+    return { appliedMonotonicMs, appliedAt: Date.now(), headUrl, batchId: arm.plan.batchId,
+      rootSummaryOnly: root.registrySummaryOnly === true }
+  }
+}
+
+/** Read-only: the static plane's overlay bookkeeping for the arm — the
+ * durable queue rows, the overlay segment rows and the rotations — so a
+ * promoted arm that never answers fresh says where its edit stopped. */
+async function promotedOverlayDiagnostics(config, workspace) {
+  for (const id of [workspace.landscapeId, workspace.versionId]) {
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(id)) throw new Error('invalid G4-16h workspace id')
+  }
+  const scope = `landscape_id = '${workspace.landscapeId}' AND version_id = '${workspace.versionId}'`
+  const sql = `BEGIN READ ONLY;
+    SET LOCAL statement_timeout = '5000ms'; SET LOCAL lock_timeout = '1000ms';
+    SET LOCAL application_name = 'maplespire-g416h-overlay';
+    SELECT json_build_object(
+      'overlayDocuments', (SELECT coalesce(json_agg(json_build_object('documentId', document_id, 'kind', kind) ORDER BY kind, document_id), '[]')
+        FROM read_model_static_documents WHERE ${scope} AND kind IN ('object-overlay', 'connection-overlay')),
+      'queue', (SELECT coalesce(json_agg(json_build_object('documentId', document_id, 'revision', revision, 'projectedRevision', projected_revision) ORDER BY document_id), '[]')
+        FROM read_model_static_document_queue WHERE ${scope}),
+      'segments', (SELECT coalesce(json_agg(json_build_object('collection', collection, 'documentId', document_id, 'isCurrent', is_current,
+        'retired', retired_at IS NOT NULL, 'lastProjectedRevision', last_projected_revision) ORDER BY collection, document_id), '[]')
+        FROM read_model_overlay_segments WHERE ${scope}),
+      'rotations', (SELECT coalesce(json_agg(json_build_object('collection', collection, 'old', old_document_id, 'new', new_document_id, 'status', status) ORDER BY created_at), '[]')
+        FROM read_model_overlay_rotations WHERE ${scope})
+    ); COMMIT;`
+  const { stdout } = await composeAsync(config, 'exec', '-T', 'postgres', 'psql', '-X', '-qAt', '-v', 'ON_ERROR_STOP=1',
+    '-U', 'maplespire', '-d', 'maplespire', '-c', sql)
+  return JSON.parse(stdout.trim())
+}
+
+/** Read AFTER the measurement, read-only, so it cannot perturb it: when the
+ * edit became durable and when the projection row last moved, on the
+ * database's clock, with that clock read beside the gate's. Decomposition
+ * only — no verdict reads it. */
+async function promotedTimeline(config, workspace, headUrl) {
+  const documentId = String(headUrl ?? '').replace(/^automerge:/, '').split('?')[0]
+  for (const id of [workspace.landscapeId, workspace.versionId, documentId]) {
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(id)) throw new Error('invalid G4-16h timeline id')
+  }
+  const scope = `landscape_id = '${workspace.landscapeId}' AND version_id = '${workspace.versionId}'`
+  const sql = `BEGIN READ ONLY;
+    SET LOCAL statement_timeout = '5000ms'; SET LOCAL lock_timeout = '1000ms';
+    SET LOCAL application_name = 'maplespire-g416h-timeline';
+    SELECT json_build_object(
+      'dbNow', (SELECT to_char(clock_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')),
+      'headNewestDurableWrite', (SELECT to_char(max(updated_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') FROM automerge_storage
+        WHERE split_part(key, '/', 1) = '${documentId}' AND split_part(key, '/', 2) <> 'sync-state'),
+      'projectionUpdatedAt', (SELECT to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') FROM read_model_projection_state WHERE ${scope}),
+      'lastProjectedAt', (SELECT to_char(last_projected_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') FROM read_model_projection_state WHERE ${scope})
+    ); COMMIT;`
+  const gateBefore = Date.now()
+  const { stdout } = await composeAsync(config, 'exec', '-T', 'postgres', 'psql', '-X', '-qAt', '-v', 'ON_ERROR_STOP=1',
+    '-U', 'maplespire', '-d', 'maplespire', '-c', sql)
+  return { gateBefore, gateAfter: Date.now(), headDocumentId: documentId, ...JSON.parse(stdout.trim()) }
+}
+
+/** G4-16h: the promoted arm's freshness after the takeover, from the same
+ * `completedAt` as the ordinary arm (`readRehearsalFreshness`). */
+async function readPromotedFreshness(config, cookie, arm, takeover, replacement, before) {
+  const workspace = arm.selection.workspace
+  const endpoint = `${replacement.baseUrl}/api/model/durability-witness?${workspaceQuery(workspace)}`
+  const editor = promotedOverlayEditor(config, arm, cookie)
+  let measured
+  try {
+    measured = await probePromotedFreshness({ takeover, workspace, seed: arm.seed, plan: arm.plan, edit: editor,
+      probe: ids => request(endpoint, { cookie, method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ objects: ids }), timeoutMs: 3_000 }) })
+  } catch (error) {
+    // request() returns only status/body/route: no cookie or auth header.
+    console.log(`G416H_PROMOTED_FRESHNESS_FAILURE ${JSON.stringify({ workspace, completedAt: takeover.completedAt,
+      failedAt: Date.now(), reason: error.message, served: error.served ?? null, requests: error.requests ?? [] })}`)
+    throw error
+  } finally {
+    await editor.close().catch(error => console.error(`G4-16h: the edit repo did not close cleanly: ${error.message}`))
+  }
+  const after = await cellSnapshot(replacement, cookie, false)
+  const inventory = await rehearsalInventory(config, workspace)
+  const timeline = await promotedTimeline(config, workspace, measured.edit?.headUrl).catch(error => ({ error: error.message }))
+  const overlay = await promotedOverlayDiagnostics(config, workspace).catch(error => ({ error: error.message }))
+  const validity = promotedFreshnessValidity({ before, after, replacement, expectedTopology: config.topologyBuild?.expectedTopology,
+    inventory, seed: arm.seed, preTakeover: arm.preTakeover, config, measured })
+  return { ...validity, arm: 'promoted', workspace, origin: 'replacement ready response completedAt', completedAt: takeover.completedAt,
+    freshAfterTakeoverMs: measured.freshAfterTakeoverMs, censored: measured.censored, censoredAfterMs: measured.censoredAfterMs ?? null,
+    editVisibleAfterMs: measured.editVisibleAfterMs ?? null,
+    firstFresh: measured.firstFresh, edit: measured.edit,
+    served: measured.served, requests: measured.requests, before, after, inventory, preTakeover: arm.preTakeover, timeline, overlay,
+    scope: 'promoted (summary) workspace; overlay edit issued after completedAt through the router; no standby prewarming' }
+}
+
+/** Both arms from one takeover: started in the same turn, both settled before
+ * anything is judged, so neither arm's failure hides the other's record. */
+async function readBothRehearsalArms(config, cookie, seed, arm, takeover, replacement, before) {
+  const [ordinary, promoted] = await Promise.allSettled([
+    readRehearsalFreshness(config, cookie, seed, takeover, replacement, before),
+    readPromotedFreshness(config, cookie, arm, takeover, replacement, before),
+  ])
+  const errors = [ordinary, promoted].filter(entry => entry.status === 'rejected').map(entry => entry.reason)
+  if (errors.length) throw new AggregateError(errors, `G4-16h: ${errors.map(error => error?.message ?? error).join('; ')}`)
+  return { ordinary: ordinary.value, promoted: promoted.value }
 }
 
 async function calibrationDatabaseInventory(config) {
@@ -1898,7 +2156,7 @@ async function workspaceHasSegmentedOverlay(config, selection, cookie) {
     const metaHandle = (await resolveLoadHandle(repo, root.modelMetaUrl)).handle
     await metaHandle.whenReady()
     const meta = metaHandle.doc()
-    return Boolean(meta?.editsObjectShardUrl || meta?.editsObjectShardUrls?.at(-1))
+    return Boolean(readMetaUrl(meta, 'editsObjectShardUrl') || readMetaUrls(meta, 'editsObjectShardUrls')?.at(-1))
   } finally {
     await shutdownRepo(repo)
   }
@@ -1978,9 +2236,9 @@ async function resolveLoadTarget(config, selection, cookie, previousTargetUrl = 
       await metaHandle.whenReady()
       targetUrl = await waitFor('rotated overlay write head', () => {
         const meta = metaHandle.doc()
-        const candidate = meta?.editsObjectShardUrl
-          || meta?.editsObjectShardUrls?.at(-1)
-          || meta?.objectShardUrls?.at(-1)
+        const candidate = readMetaUrl(meta, 'editsObjectShardUrl')
+          || readMetaUrls(meta, 'editsObjectShardUrls')?.at(-1)
+          || readMetaUrls(meta, 'objectShardUrls')?.at(-1)
         return candidate && candidate !== previousTargetUrl ? candidate : null
       }, config.settleMs)
     }
@@ -2317,8 +2575,8 @@ export async function cleanupSegmentedQualificationObjects(config, selections, t
       const metaHandle = (await resolveLoadHandle(repo, modelMetaUrl)).handle
       await metaHandle.whenReady()
       const readModelIds = await qualificationReadModelObjectIds(config, selection, cookie)
-      const currentTargetUrl = metaHandle.doc()?.editsObjectShardUrl
-        || metaHandle.doc()?.editsObjectShardUrls?.at(-1)
+      const currentTargetUrl = readMetaUrl(metaHandle.doc(), 'editsObjectShardUrl')
+        || readMetaUrls(metaHandle.doc(), 'editsObjectShardUrls')?.at(-1)
         || targetUrl
       const targetHandle = (await resolveLoadHandle(repo, currentTargetUrl)).handle
       await targetHandle.whenReady()
@@ -3766,8 +4024,24 @@ export async function judgeRehearsalRotationArm({ config, rotationEvidence, writ
   return arm
 }
 
-async function runLocalRehearsal(config, allCells, selections, targets, cookie, rotationEvidence = null) {
+/** G4-16h: best effort, logged, never thrown — whether the landscape API
+ * deletes a promoted landscape is not what the arm measures, and a refusal
+ * must not replace the verdict. The bench tears the whole project down with
+ * its volumes (`down -v`) after the gate either way. */
+async function deletePromotedLandscapes(config, cookie, landscapeIds) {
+  for (const landscapeId of landscapeIds) {
+    const result = await request(`${routerHttp(config)}/api/landscapes/${encodeURIComponent(landscapeId)}`,
+      { cookie, method: 'DELETE', timeoutMs: 30_000 }).catch(error => ({ status: null, body: error.message }))
+    console.log('G416H_CLEANUP ' + JSON.stringify({ landscapeId, status: result.status, body: result.body }))
+  }
+}
+
+async function runLocalRehearsal(config, allCells, selections, targets, cookie, rotationEvidence = null, createdLandscapeIds = [],
+  promotedLandscapeIds = []) {
   const seed = await seedRehearsalWorkspace(config, selections.get(0), targets.get(0), cookie, config.seedObjectCount)
+  // G4-16h: the second partition-zero workspace, promoted before the takeover.
+  const promotedArm = config.promotedTakeover === 'on'
+    ? await preparePromotedArm(config, allCells, cookie, createdLandscapeIds, promotedLandscapeIds) : null
   const initial = await Promise.all(allCells.map(cell => cellSnapshot(cell, cookie)))
   const accumulator = new MetricsAccumulator(initial)
   const observations = new RehearsalObservations({ initialSnapshots: initial,
@@ -3854,7 +4128,9 @@ async function runLocalRehearsal(config, allCells, selections, targets, cookie, 
           accumulator.includeEventLoopService(original.service)
         }
       },
-      fresh: (takeover, replacement) => readRehearsalFreshness(config, cookie, selectedSeed, takeover, replacement, before[spare]),
+      fresh: (takeover, replacement) => promotedArm
+        ? readBothRehearsalArms(config, cookie, selectedSeed, promotedArm, takeover, replacement, before[spare])
+        : readRehearsalFreshness(config, cookie, selectedSeed, takeover, replacement, before[spare]),
     })
     await waitFor('former owner standby', async () => {
       const state = await json(`${original.baseUrl}/api/platform/sync-cell`, { cookie })
@@ -3875,6 +4151,22 @@ async function runLocalRehearsal(config, allCells, selections, targets, cookie, 
       observations.emit('freshness', freshness)
     })
     if (!takeover) throw new Error('failover never ran after fleet admission')
+    if (promotedArm) {
+      // G4-16h ends here: the measurement is the takeover, not the soak. The
+      // rotation arm is not judged (it needs soak cycles) and nothing here is
+      // a G4 qualification.
+      const verdict = judgePromotedTakeover({ promotion: promotedArm.promotion, ordinary: freshness.ordinary,
+        promoted: freshness.promoted, takeover })
+      observations.emit('promoted-takeover', verdict)
+      return { ...verdict, posture: config.benchPosture, topologyBuild: config.topologyBuild, takeover, takeoverPreflights, calibration,
+        calibrationFreshAfterTakeoverMs: calibration?.freshAfterTakeoverMs ?? null,
+        ordinary: freshness.ordinary, promoted: freshness.promoted, promotion: promotedArm.promotion,
+        rehearsal: { firstFailure: observations.firstFailure, invalid: observations.invalid,
+          peakActiveConnections: observations.peakActiveConnections,
+          maxEventLoopP99MsByService: observations.maxEventLoopP99MsByService,
+          episodes: observations.episodes.map(entry => ({ phase: entry.phase, cycle: entry.cycle, status: entry.record?.status ?? null })) },
+        note: 'G4-16h: baseline and failover episodes only, no soak and no rotation-arm verdict; a measurement, not a G4 qualification. Local Docker Desktop, capacityCertified=false.' }
+    }
     const soakStartedMono = performance.now()
     do {
       if (writeHeads) {
@@ -3975,7 +4267,13 @@ async function run(config) {
   }
 
   if (config.benchPosture && config.mode === 'soak') {
-    return await runLocalRehearsal(config, allCells, selections, targets, session.cookie, rotationEvidence)
+    const promotedLandscapeIds = []
+    try {
+      return await runLocalRehearsal(config, allCells, selections, targets, session.cookie, rotationEvidence, createdLandscapeIds,
+        promotedLandscapeIds)
+    } finally {
+      await deletePromotedLandscapes(config, session.cookie, promotedLandscapeIds)
+    }
   }
 
   setPhase('baseline diagnostics snapshot')

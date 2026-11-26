@@ -78,6 +78,9 @@ export default defineConfig({
         '**/visual/**',
         // Needs its own stack and two client builds: playwright.compat.config.ts.
         '**/compat-n-1.spec.ts',
+        // Needs AM_MODEL_EPOCHS=on and a SQL helper on its own database:
+        // playwright.epochs.config.ts, through scripts/e2e-epochs.mjs.
+        '**/epochs/**',
         ...SYNC_CELL_FAILOVER_SPECS, ...AUTH_DEV_LOGIN_SPECS,
       ],
       use: { ...devices['Desktop Chrome'], locale: 'en-US' },

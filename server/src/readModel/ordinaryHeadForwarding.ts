@@ -240,6 +240,46 @@ export async function commitForwardedHeads(
 }
 
 /**
+ * {@link commitForwardedHeads} for several heads of one collection, in ONE
+ * statement (the compaction settle's, `workspaceCompaction.ts`): each row
+ * moves by its OWN compare-and-set on the forward state given for it (null
+ * for none, an empty array for an empty one — they differ), so the protocol
+ * tables' statement trigger re-stamps the adopt digests once, not once per
+ * head. Returns the ids that moved; an id absent from it did not (its CAS
+ * failed, or it has no row). Ids must be distinct.
+ */
+export async function commitForwardedHeadsBatch(
+  tx: Queryable,
+  key: WorkspaceKey,
+  collection: OverlayCollection,
+  moves: ReadonlyArray<{ documentId: string; expected: readonly string[] | null; next: readonly string[] }>,
+): Promise<Set<string>> {
+  if (!moves.length) return new Set()
+  if (new Set(moves.map((move) => move.documentId)).size !== moves.length) {
+    throw new Error('commitForwardedHeadsBatch: a document id is given twice')
+  }
+  const result = await tx.query<{ document_id: string }>(
+    `UPDATE read_model_ordinary_head_retirements AS row
+        SET forwarded_heads = ARRAY(SELECT h FROM jsonb_array_elements_text(move.next) WITH ORDINALITY AS e(h, at) ORDER BY at),
+            updated_at = now()
+       FROM jsonb_to_recordset($4::jsonb) AS move(id text, expected jsonb, next jsonb)
+      WHERE row.landscape_id = $1 AND row.version_id = $2 AND row.collection = $3 AND row.document_id = move.id
+        AND row.status IN ('retired', 'folded')
+        AND row.forwarded_heads IS NOT DISTINCT FROM (
+          CASE WHEN move.expected IS NULL OR jsonb_typeof(move.expected) = 'null' THEN NULL
+               ELSE ARRAY(SELECT h FROM jsonb_array_elements_text(move.expected) WITH ORDINALITY AS e(h, at) ORDER BY at)
+          END)
+      RETURNING row.document_id`,
+    [key.landscapeId, key.versionId, collection, JSON.stringify(moves.map((move) => ({
+      id: move.documentId,
+      expected: move.expected ? sortedHeads(move.expected) : null,
+      next: sortedHeads(move.next),
+    })))],
+  )
+  return new Set(result.rows.map((row) => row.document_id))
+}
+
+/**
  * Which of `segments` carry late writes the forwarder has NOT carried into the
  * current head yet? A segment with a `retired` row whose heads, AS THE CALLER
  * SAMPLED THEM, differ from `forwarded_heads ?? H_r`. Read the rows AFTER the
@@ -249,8 +289,12 @@ export async function commitForwardedHeads(
  * The CURRENT head is never pending, whatever its row says: a row naming the
  * current head is a rotation that crashed between recording the row and
  * repointing ModelMeta (`ordinaryHeadRotator.ts`), and that head is projected
- * directly. A segment without a row is never pending either (compaction's own
- * retired heads, projected directly).
+ * directly. A segment without a row is never pending either (a head a
+ * compaction replaced before G4-16i, projected directly; since then a
+ * compaction on a workspace with rows retires the head it replaces,
+ * `workspaceCompaction.ts`). Compaction does not call this bare: its wrapper
+ * (`compactionSegmentRefusal`) also refuses a listed `folded` row and never
+ * counts a fold product.
  */
 export async function ordinaryHeadLateWritesPending(
   db: Queryable,

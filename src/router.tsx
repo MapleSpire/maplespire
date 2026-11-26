@@ -73,6 +73,9 @@ import { stashPostLoginPath } from './lib/auth/postLoginPath'
 import { setTransportCloseObserver } from './lib/automerge/adaptiveWebSocketClientAdapter'
 import { WorkspaceContractBanner } from './components/layout/WorkspaceContractBanner'
 import { WorkspaceRepointBanner } from './components/layout/WorkspaceRepointBanner'
+import { EpochHopOverlay } from './components/layout/EpochHopOverlay'
+import { EpochRetiredBanner } from './components/layout/EpochRetiredBanner'
+import { EpochOverridesPanel } from './components/layout/EpochOverridesPanel'
 import { useUIStore, type AppView } from './stores/uiStore'
 import { useModelStore } from './stores/modelStore'
 import { useAuthStore } from './stores/authStore'
@@ -337,6 +340,9 @@ const rootRoute = createRootRoute({
       <ImpersonationBanner />
       <WorkspaceContractBanner />
       <WorkspaceRepointBanner />
+      <EpochRetiredBanner />
+      <EpochHopOverlay />
+      <EpochOverridesPanel />
       <Outlet />
     </>
   ),

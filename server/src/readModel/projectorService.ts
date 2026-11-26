@@ -14,12 +14,13 @@
 
 import type { Repo, DocHandle, DocumentId } from '@automerge/automerge-repo'
 import { isValidAutomergeUrl, parseAutomergeUrl, stringifyAutomergeUrl, type AutomergeUrl } from '@automerge/automerge-repo'
-import { getHeads, init as initDoc, loadIncremental, merge as mergeDocs, type Doc } from '@automerge/automerge'
+import { getHeads, init as initDoc, loadIncremental, merge as mergeDocs, view as viewDoc, type Doc } from '@automerge/automerge'
 import { randomUUID } from 'node:crypto'
 import {
   headsEqual as watermarkHeadsEqual,
   recordSampledDocumentWatermark,
   recordSampledDocumentWatermarks,
+  withdrawShardCertificate,
   prepareDocumentWatermarkProofs,
   type PreparedDocumentWatermarks,
 } from './arrivalWatermark.js'
@@ -56,23 +57,32 @@ import {
 } from './health.js'
 import {
   coldBuildReadModel, applyObjectShardDelta, applyConnectionShardDelta, syncGroups, syncDiagrams,
-  deleteObjects, deleteConnections, syncConnectionFlows,
+  deleteObjects, deleteConnections, syncConnectionFlows, lastOccurrenceById,
+  type ColdBuildEntityKind,
+  type DroppedDuplicateId,
   type WorkspaceKey,
 } from './projector.js'
 import type { Queryable, ObjectInput, ConnectionInput, GroupInput, DiagramInput, FlowInput } from './types.js'
+import { roundedRowWriteTimings, type RowWriteTimings } from './rowWriteTimings.js'
 import { resolveCooperatively, resolveInBatches } from './batchedResolve.js'
 import {
+  duplicateIdDefects,
   isUninformative,
   readEntityMap,
   readEntityMapOrDefect,
   summarizeModelDefects,
   type ModelDefect,
+  type ModelDefectSource,
 } from './modelDefects.js'
-import { DIGEST_KINDS, digestOfIds } from './contentDigest.js'
+import { DIGEST_KINDS, digestOfIds, IdSetDeltaRecorder, withIdSetDeltaRecorder } from './contentDigest.js'
 import {
   hasIntegrityToStamp,
+  invalidateContentDigests,
+  kindsChangedWithoutStamp,
+  recordLiveDuplicateIdDrops,
   recordRefusedProjection,
   stampProjectionIntegrity,
+  withRecordedDeltas,
   type ProjectionIntegrity,
 } from './projectionIntegrity.js'
 import {
@@ -103,12 +113,59 @@ import {
   isReadModelAuthorityLoss,
 } from './projectionAuthority.js'
 import { isPool } from './queryableShape.js'
-import { rotateOrdinaryHead } from './ordinaryHeadRotator.js'
+import { rotateOrdinaryHead, unpublishedRotationChildOf } from './ordinaryHeadRotator.js'
 import { ordinaryRotationTelemetry } from './ordinaryRotationTelemetry.js'
 import { foldOrdinaryChain, unrecordedFoldProductOf } from './ordinaryChainFoldWriter.js'
+import { OVERLAY_SEGMENT_ENTITY_CEILING } from './overlayChainFold.js'
+import { SealedWinnerIndex, sealedRankIn } from './sealedWinnerIndex.js'
+import {
+  SealedProductCacheWriter,
+  codePointOrder,
+  readSealedProductCacheHits,
+  sealedProductCacheEnabled,
+  sealedProductCacheIntervalMs,
+  type SealedProductCacheHit,
+  type SealedProductCacheTask,
+} from './sealedProductCache.js'
+import {
+  innerIdAnomalies,
+  readSealedValues,
+  readSealedWinners,
+  type SealedValueRequest,
+  type SealedWinners,
+} from './sealedWinners.js'
+import { durableHeadsDecoder } from './durableHeadsDecoder.js'
+import { durableHeadsMemo } from './durableHeadsMemo.js'
+import {
+  adoptTopology,
+  bindAdoptFence,
+  recordAdoptWatermarks,
+  updateAdoptTopology,
+  withAdoptSavepoint,
+  writeAdoptState,
+  refuseAdoptWatermarks,
+  type AdoptPosture,
+  type AdoptSample,
+} from './adoptState.js'
+import {
+  AdoptClaimOutcomeUnknownError,
+  ReadModelAdoptAttachError,
+  adoptSeedContent,
+  adoptSeedMap,
+  claimAdopt,
+  readModelAdoptMode,
+  seedHeadsAgainstBuild,
+  seedHeadsEqual,
+  verifyAdoptShadow,
+  type AdoptAttachStage,
+  type AdoptVerdict,
+  type ReadModelAdoptMode,
+  type ShardSeed,
+} from './adoptVerify.js'
 import { countDocumentLoad, DOCUMENT_LOAD_LOG_MS, type DocumentLoadCaller } from './documentLoadTelemetry.js'
 import {
   advanceFoldedArrivalWatermark,
+  advanceFoldedArrivalWatermarks,
   arrivalAbove,
   databaseNow,
   documentContentArrivals,
@@ -170,6 +227,7 @@ import {
   retirementKey,
   type OrdinaryHeadRetirement,
 } from './ordinaryHeadForwarding.js'
+import { withMetaUrlView } from '../modelMetaUrls.js'
 
 /**
  * The live server-side projector, one per workspace.
@@ -195,6 +253,13 @@ interface RootLike { modelUrl?: string; modelMetaUrl?: string; shardUrls?: strin
 // No `RegistryShardLike` structural type, deliberately: registry shards are
 // read through `readEntityMap`, which takes `unknown` and reports what it found
 // rather than letting an optional `diagrams?:` field quietly be absent.
+/** ModelMeta as its RULING URL values, plain strings (G4-16f: the
+ * text fields, or their scalar copies once the document's marker says so).
+ * Every read of a ModelMeta in this file goes through it; a change callback
+ * writes through `modelMetaUrls.ts` instead. A materialized document only. */
+const metaView = (doc: unknown): MetaLike | undefined =>
+  doc && typeof doc === 'object' ? withMetaUrlView(doc as MetaLike) : undefined
+
 interface MetaLike {
   objectShardUrls?: string[]
   connectionShardUrls?: string[]
@@ -562,7 +627,93 @@ async function readDiagrams(
  * because refusing to project a whole workspace over one unopenable diagram
  * would be worse. The shortfall is reported instead of invisible.
  */
-export async function extractModelEntities(rootDoc: RootLike | undefined, resolve: Resolve): Promise<ExtractedModel> {
+/**
+ * How a STREAMING extraction reads one object or connection shard (G4-16f):
+ * either the document, kept resident and read as today, or — for a sealed
+ * fold product the caller parks — its entity map, already copied out of a
+ * document the caller has given back before this resolves. A shard read
+ * `sealed` is merged into the result in list order like any other, but has
+ * no entry in the per-shard maps (`objectsByShardUrl`, the heads): nothing
+ * watches it, and its content lives in the caller's index.
+ */
+export type ModelShardRead =
+  | { doc: unknown }
+  | { sealed: Record<string, unknown> }
+/** `list` is the shard list THIS extraction merges (the ModelMeta revision
+ * it read), the order a sealed product must be ranked by: ModelMeta's live
+ * list can have moved since (a takeover's concurrent rewrite), and ranking by
+ * it would index a winner the merged rows do not have. */
+export type ModelShardStream = (
+  url: string,
+  kind: 'object' | 'connection',
+  list: readonly string[],
+) => Promise<ModelShardRead>
+
+export async function extractModelEntities(
+  rootDoc: RootLike | undefined,
+  resolve: Resolve,
+  /** Read the object/connection shards through this instead of `resolve`,
+   * ONE AT A TIME (each finished before the next begins), so a caller can
+   * give a sealed product back before the next is loaded. */
+  stream?: ModelShardStream,
+): Promise<ExtractedModel> {
+  return keepLastOccurrences(await readModelEntities(rootDoc, resolve, stream), Boolean(rootDoc?.modelMetaUrl))
+}
+
+/**
+ * The merged lists with every duplicate id dropped, the LAST occurrence in
+ * list order kept (`lastOccurrenceById`, the cold build's own rule, which
+ * says why last: the client's by-id views are last-wins), each
+ * drop recorded as a `duplicate-id` ModelDefect. The lists are NOT unique by
+ * construction: shards merge by CRDT map key while rows are keyed by the
+ * entity's inner `id`, and `readDiagrams` flat-maps the registry shards. A
+ * duplicate used to fail every cold build (and every monolith reproject);
+ * dropping it here means every full reader of the extraction — the cold
+ * build, the monolith reproject, the registry sync — writes the same rows,
+ * and `fullExtractionIntegrity` digests exactly the ids those rows hold.
+ * The per-shard maps (`objectsByShardUrl`, …) stay RAW: they are the delta
+ * baseline, not rows.
+ */
+function keepLastOccurrences(model: ExtractedModel, sharded: boolean): ExtractedModel {
+  const lists = [
+    ['object', 'objects', sharded ? 'object-shard' : 'model'],
+    ['connection', 'connections', sharded ? 'connection-shard' : 'model'],
+    ['group', 'groups', sharded ? 'model-meta' : 'model'],
+    ['diagram', 'diagrams', 'registry-shard'],
+  ] as const satisfies ReadonlyArray<readonly [ColdBuildEntityKind, keyof ExtractedModel, ModelDefectSource]>
+  const out: ExtractedModel = { ...model }
+  for (const [kind, field, source] of lists) {
+    const { kept, dropped } = lastOccurrenceById(kind, model[field] as Array<{ id: unknown }>)
+    if (!dropped.length) continue
+    ;(out as unknown as Record<string, unknown>)[field] = kept
+    out.defects.push(...duplicateIdDefects(source, dropped))
+  }
+  return out
+}
+
+/** A LIVE pass's duplicate-id drops (the ModelMeta pass, a shard delta, the
+ * static projector's overlay delta), after its transaction committed: logged
+ * as `duplicate-id` defects and counted (`recordLiveDuplicateIdDrops`). Not
+ * stamped into `defect_count` — the pass read one document, and only a full
+ * extraction's view is the workspace's (`ProjectionIntegrity.defects`). */
+export function noteLiveDuplicateIds(
+  source: ModelDefectSource,
+  key: WorkspaceKey,
+  url: string | null,
+  dropped: readonly DroppedDuplicateId[],
+): void {
+  if (!dropped.length) return
+  recordLiveDuplicateIdDrops(dropped.length)
+  console.warn(
+    `[read-model] ${source} ${url ?? '<unknown>'} for ${key.landscapeId}/${key.versionId} holds ${dropped.length} ` +
+      `duplicate id(s); the last occurrence was projected: ${summarizeModelDefects(duplicateIdDefects(source, dropped))}`)
+}
+
+async function readModelEntities(
+  rootDoc: RootLike | undefined,
+  resolve: Resolve,
+  stream?: ModelShardStream,
+): Promise<ExtractedModel> {
   const defects: ModelDefect[] = []
   const empty = (): ExtractedModel => ({
     objects: [], connections: [], groups: [], diagrams: [],
@@ -578,7 +729,7 @@ export async function extractModelEntities(rootDoc: RootLike | undefined, resolv
   const { diagrams, registryShardUrls } = await readDiagrams(rootDoc, resolve, defects)
 
   if (rootDoc.modelMetaUrl) {
-    const meta = (await resolve(rootDoc.modelMetaUrl)) as MetaLike | undefined
+    const meta = metaView(await resolve(rootDoc.modelMetaUrl))
     if (!meta) {
       // This branch discards the ENTIRE model — every object, connection and
       // group — on a workspace that still reports a successful projection, so it
@@ -588,32 +739,63 @@ export async function extractModelEntities(rootDoc: RootLike | undefined, resolv
     }
     const objectShardUrls = meta.objectShardUrls ?? []
     const connectionShardUrls = meta.connectionShardUrls ?? []
-    const objShards = await resolveCooperatively(objectShardUrls, resolve)
-    const connShards = await resolveCooperatively(connectionShardUrls, resolve)
     // DEDUP by id, last shard wins. The client "edits" shard (appended LAST) holds
     // overlay copies of EDITED existing objects, so the same id appears in its
     // original shard AND the edits shard — flatMap would emit duplicates and the bulk
     // upsert ("ON CONFLICT … cannot affect row a second time") would crash. Object
     // .assign in shard order resolves the overlay to the edited (last) version.
+    //
+    // Each read is MERGED AS IT ARRIVES (reads come in list order, one at a
+    // time) and then dropped: a sealed product's copied map is garbage once
+    // merged, so the cold build never holds every product's copy at once
+    // (G4-16f). The same result as merging after the last read: a document a
+    // resolver returns is an immutable revision, read here or later alike.
+    const readShards = async (
+      urls: readonly string[],
+      kind: 'object' | 'connection',
+      merge: (read: ModelShardRead, url: string | undefined) => void,
+    ): Promise<void> => {
+      let index = 0
+      await resolveCooperatively(urls, async (url) => {
+        const at = index
+        index += 1
+        // The list being merged, not ModelMeta's live one: what a streamed
+        // product is ranked by (`ModelShardStream`).
+        const read: ModelShardRead = stream ? await stream(url, kind, urls) : { doc: await resolve(url) }
+        merge(read, urls[at])
+      })
+    }
     const objMap: Record<string, ObjectInput> = {}
     const objectsByShardUrl = new Map<string, Record<string, ObjectInput>>()
     const objectShardHeadsByUrl = new Map<string, readonly string[] | null>()
-    objShards.forEach((shard, index) => {
-      const perShard = readEntityMap<ObjectInput>(shard, 'objects', 'object-shard', objectShardUrls[index] ?? null, defects)
-      if (objectShardUrls[index]) {
-        objectsByShardUrl.set(objectShardUrls[index], perShard)
-        objectShardHeadsByUrl.set(objectShardUrls[index], tryGetAutomergeHeads(shard))
+    await readShards(objectShardUrls, 'object', (read, url) => {
+      // A sealed product streamed and given back: merged in its slot, no
+      // per-shard entry (G4-16f).
+      if ('sealed' in read) {
+        Object.assign(objMap, read.sealed as Record<string, ObjectInput>)
+        return
+      }
+      const shard = read.doc
+      const perShard = readEntityMap<ObjectInput>(shard, 'objects', 'object-shard', url ?? null, defects)
+      if (url) {
+        objectsByShardUrl.set(url, perShard)
+        objectShardHeadsByUrl.set(url, tryGetAutomergeHeads(shard))
       }
       Object.assign(objMap, perShard)
     })
     const connMap: Record<string, ConnectionInput> = {}
     const connectionsByShardUrl = new Map<string, Record<string, ConnectionInput>>()
     const connectionShardHeadsByUrl = new Map<string, readonly string[] | null>()
-    connShards.forEach((shard, index) => {
-      const perShard = readEntityMap<ConnectionInput>(shard, 'connections', 'connection-shard', connectionShardUrls[index] ?? null, defects)
-      if (connectionShardUrls[index]) {
-        connectionsByShardUrl.set(connectionShardUrls[index], perShard)
-        connectionShardHeadsByUrl.set(connectionShardUrls[index], tryGetAutomergeHeads(shard))
+    await readShards(connectionShardUrls, 'connection', (read, url) => {
+      if ('sealed' in read) {
+        Object.assign(connMap, read.sealed as Record<string, ConnectionInput>)
+        return
+      }
+      const shard = read.doc
+      const perShard = readEntityMap<ConnectionInput>(shard, 'connections', 'connection-shard', url ?? null, defects)
+      if (url) {
+        connectionsByShardUrl.set(url, perShard)
+        connectionShardHeadsByUrl.set(url, tryGetAutomergeHeads(shard))
       }
       Object.assign(connMap, perShard)
     })
@@ -622,6 +804,14 @@ export async function extractModelEntities(rootDoc: RootLike | undefined, resolv
     // shard still contains them until the daily compaction removes them).
     for (const id of meta.deletedObjectIds ?? []) delete objMap[id]
     for (const id of meta.deletedConnectionIds ?? []) delete connMap[id]
+    // A streamed sealed read may carry `undefined` placeholders (the cold
+    // build's first-insert slots, G4-16f C5), each overwritten later in the
+    // same merge by its winner. One still here is a defect of that contract:
+    // fail the extraction loudly rather than project a hole.
+    for (const [kind, map] of [['object', objMap], ['connection', connMap]] as const) {
+      const hole = Object.keys(map).find((id) => map[id] === undefined)
+      if (hole !== undefined) throw new Error(`extraction: the ${kind} ${hole} has no value after the merge`)
+    }
     return {
       objects: Object.values(objMap),
       connections: Object.values(connMap),
@@ -677,13 +867,13 @@ export async function extractModelEntities(rootDoc: RootLike | undefined, resolv
  * upserts), so the table ends up holding exactly these ids and the digest
  * describes it exactly.
  *
- * Objects, connections and groups come out of merge maps and are already unique.
- * DIAGRAMS ARE NOT: `readDiagrams` flatMaps across registry shards with no
- * dedup, so the same id appearing in two shards reaches here twice.
- * `bulkUpsert` only crashes on that WITHIN one 1000-row chunk; across chunks
- * PostgreSQL silently keeps one row, so on a >1000-diagram landscape the table
- * would hold one and the digest would count two — a permanent mismatch. Hence
- * `uniqueIds`.
+ * The lists are unique by the time they get here — not by construction (map
+ * keys are not the inner ids, and registry shards are flat-mapped) but
+ * because `extractModelEntities` drops every duplicate, last occurrence
+ * kept, by the same rule as the cold build (`keepLastOccurrences`), so the
+ * digest is over exactly the ids the rows hold. `uniqueIds` stays as a
+ * second line for a model built by hand (a digest counting an id twice
+ * would be a permanent mismatch).
  */
 function uniqueIds(entities: ReadonlyArray<{ id: string }>): string[] {
   return [...new Set(entities.map((entity) => entity.id))]
@@ -732,9 +922,71 @@ async function resolveOrgId(db: Queryable, key: WorkspaceKey): Promise<string | 
  */
 const initialDiagramProbes = new Map<string, Promise<void>>()
 
+/** The sealed-product cache writer of each attached workspace (G4-16f), so
+ * a caller (a test, a bench) can wait for the background writes; nothing in
+ * production waits on it. */
+const sealedProductCacheWriters = new Map<string, SealedProductCacheWriter>()
+
+/** The number of sealed-product values each attached workspace's projector
+ * holds in memory (G4-16f C5), for tests and benches; nothing in production
+ * reads it. */
+const sealedValueCounters = new Map<string, (url?: string) => number>()
+
+/** Values of parked sealed products held in memory by the workspace's
+ * projector (`SealedWinnerIndex.pinnedValues`, both kinds; with `url`, that
+ * product's only); null when no projector of this process is attached to it. */
+export function heldSealedValues(key: WorkspaceKey, url?: string): number | null {
+  return sealedValueCounters.get(keyOf(key))?.(url) ?? null
+}
+
+/** Queue a task on the workspace's sealed-product cache writer (tests: a
+ * write at heads the projector did not park with). False without a writer. */
+export function enqueueSealedProductCacheWriteForTest(key: WorkspaceKey, task: SealedProductCacheTask): boolean {
+  const writer = sealedProductCacheWriters.get(keyOf(key))
+  writer?.enqueue(task)
+  return Boolean(writer)
+}
+
+/** Await the sealed-product cache writes queued for a workspace, if any. */
+export async function awaitSealedProductCacheWrites(key: WorkspaceKey): Promise<void> {
+  await sealedProductCacheWriters.get(keyOf(key))?.idle()
+}
+
+/** The deferred adopt stamps of each attached workspace: resolves once no
+ * stamp is armed or running (tests that need the arrival clock quiet). */
+const adoptStampIdlers = new Map<string, (maxMs: number) => Promise<void>>()
+
+/** Await the deferred adopt stamps of a workspace, if any (tests). THROWS
+ * when they are still armed or running after `maxMs` (default 15 s). */
+export async function awaitAdoptStamps(key: WorkspaceKey, maxMs = 15_000): Promise<void> {
+  await adoptStampIdlers.get(keyOf(key))?.(maxMs)
+}
+
+/** Is a sealed-product cache writer registered for the workspace (tests)? */
+export function hasSealedProductCacheWriter(key: WorkspaceKey): boolean {
+  return sealedProductCacheWriters.has(keyOf(key))
+}
+
+/** Is an initial diagram probe registered for the workspace (tests)? */
+export function hasInitialDiagramProbe(key: WorkspaceKey): boolean {
+  return initialDiagramProbes.has(keyOf(key))
+}
+
 /** Await the initial diagram probe for a workspace, if one is in flight. */
 export async function awaitInitialDiagramProbe(key: WorkspaceKey): Promise<void> {
   await initialDiagramProbes.get(keyOf(key))
+}
+
+/** The document id a ModelMeta pointer names, whatever its spelling: a plain
+ * URL, an ImmutableString, a URL with heads (`#…`) or a query. Null for an
+ * absent or empty pointer. Exported for its test. */
+export function metaDocumentIdOf(pointer: unknown): string | null {
+  const text = typeof pointer === 'string'
+    ? pointer
+    : pointer && typeof pointer === 'object' && 'val' in pointer ? String((pointer as { val: unknown }).val) : ''
+  if (!text) return null
+  if (isValidAutomergeUrl(text)) return String(parseAutomergeUrl(text).documentId)
+  return text.replace(/^automerge:/, '').split(/[#?]/)[0] || null
 }
 
 /** Start one workspace's live projector against an already migrated database.
@@ -745,8 +997,69 @@ export async function awaitInitialDiagramProbe(key: WorkspaceKey): Promise<void>
  *
  * Returns a stop() that detaches listeners and retains projected rows.
  * Tests may inject a transaction-scoped client; residency is optional.
+ *
+ * An attach that THROWS returns no stop(), so nothing would ever run the
+ * cleanups it had registered: what must not outlive it — the deferred adopt
+ * stamps' debounce timer, the sealed-product cache writer and its entry in
+ * `sealedProductCacheWriters` — registers an `attachFailed` hook as well,
+ * run here on the way out (`ordinarySealedProductParking.integration.test.ts`,
+ * CACHE-P7).
  */
 export async function startReadModelProjector(
+  ...args: StartReadModelProjectorArgs
+): Promise<() => void> {
+  const attachFailed: Array<() => void> = []
+  try {
+    return await attachReadModelProjector(attachFailed, ...args)
+  } catch (error) {
+    for (const hook of attachFailed.splice(0)) {
+      try { hook() } catch (hookError) { console.error('[read-model] a failed attach\'s cleanup threw', hookError) }
+    }
+    throw error
+  }
+}
+
+type StartReadModelProjectorArgs = Parameters<typeof attachReadModelProjector> extends [unknown, ...infer Rest] ? Rest : never
+
+/** Trailing options of {@link startReadModelProjector}. */
+export interface ReadModelProjectorAttachOptions {
+  /** `READ_MODEL_ADOPT` as parsed at boot (`adoptVerify.ts`); OFF for direct
+   * callers. `shadow` runs the verify-and-adopt checks before the cold
+   * build, logs `read_model.adopt_verdict` and then cold-builds exactly as
+   * `off` does. `on` (C6-2a) claims what the checks accept and attaches to
+   * the kept rows (B1-B5) instead of cold-building; a refusal cold-builds in
+   * the same call. */
+  adopt?: ReadModelAdoptMode
+  /** Aborts an ADOPTING attach (`on`, B1-B5): checked with `stillOwned`
+   * after every await of the background attach, and handed to its document
+   * resolutions. The fleet aborts it on `release` and `stopAll`. A cold
+   * build ignores it (it is not cancellable; `stillOwned` covers it). */
+  signal?: AbortSignal
+  /** EARLY SERVING (G4-16f C6-2b, the owner's decision 1 of 2026-11-07):
+   * fired SYNCHRONOUSLY, once, the moment an adopting claim (S6) has
+   * COMMITTED — the fence is this instance's and the row says not attached,
+   * so `caughtUp` and `absenceProvable` are false until B5. Never fired by a
+   * cold build (a refused claim included): its caller learns it is serving
+   * when the attach resolves. A throw from it is logged and ignored. */
+  onServing?: () => void
+  /** Awaited once, after the claim decided (claimed, refused, or not tried)
+   * and before the first document is resolved: the caller's build
+   * admission (G4-16f C6-2b — the fleet runs the claim outside its cold-build
+   * slots and takes one here, so a takeover's claim never queues behind
+   * another workspace's B1-B5). A throw fails the attach (an adopting one as
+   * `B1`, `aborted` when it was being torn down). */
+  admitBuild?: () => Promise<void>
+  /** G4-16f epochs (design R4-d): fired at most once, when the ROOT's
+   * `modelMetaUrl` no longer names the ModelMeta this projector attached to —
+   * an epoch roll, the slim script, a repair, an operator. This projector
+   * watches the superseded ModelMeta and its shards, so it can never serve
+   * the new epoch; the fleet wires it to a release (the next `ensure`
+   * cold-builds on the new root). A throw from it is logged and ignored. */
+  onModelMetaRepointed?: (from: string, to: string | undefined) => void
+}
+
+async function attachReadModelProjector(
+  attachFailed: Array<() => void>,
   repo: Repo,
   rootUrl: string,
   db: Queryable = pool,
@@ -787,7 +1100,14 @@ export async function startReadModelProjector(
    * due head; `on` also rotates it, `ordinaryHeadRotator.ts`) — see
    * `ordinaryHeadRotation.ts`. */
   ordinaryHeadRotation: OrdinaryHeadRotationConfig = ORDINARY_HEAD_ROTATION_OFF,
+  attachOptions: ReadModelProjectorAttachOptions = {},
 ): Promise<() => void> {
+  const adoptMode = attachOptions.adopt ?? 'off'
+  // Before anything is acquired: a mode this build cannot run (a JavaScript
+  // caller, a cast) refuses the attach instead of silently meaning off.
+  if (adoptMode !== 'off' && adoptMode !== 'shadow' && adoptMode !== 'on') {
+    throw new Error(`unsupported read-model adopt mode: ${String(adoptMode)}`)
+  }
   const orgId = await resolveOrgId(db, key)
   const projectorInstanceId = randomUUID()
   onAttached?.(projectorInstanceId)
@@ -812,6 +1132,16 @@ export async function startReadModelProjector(
   // projection still runs; projection errors are nevertheless re-thrown after
   // a best-effort failure marker so existing logging/retry behavior is kept.
   let projectionTail: Promise<void> = Promise.resolve()
+  /** Bumped by every task chained onto `projectionTail`; `tailSettledAt`
+   * is the last one that settled with nothing chained after it, so the
+   * tail is busy exactly while they differ (`foregroundBusy`). */
+  let tailChained = 0
+  let tailSettledAt = 0
+  const chainProjectionTail = (task: Promise<unknown>): void => {
+    const chained = ++tailChained
+    projectionTail = task.then(() => undefined, () => undefined)
+    void projectionTail.then(() => { if (tailChained === chained) tailSettledAt = chained })
+  }
   // The projection mutex — rationale (a `//` block: it documents no
   // declaration).
   //
@@ -841,13 +1171,28 @@ export async function startReadModelProjector(
    * generation bump that could invalidate the RETRY build mid-flight. */
   let bootComplete = false
   let fenceLostReported = false
-  const reportFenceLost = (kind: ProjectionKind, error: unknown) => {
+  /** An ADOPTING attach's cancellation (G4-16f C6-2a): aborted by the
+   * caller's `signal` (the fleet's `release`/`stopAll`) and by a fence lost
+   * while the attach runs (`reportFenceLost`). The background attach checks
+   * it, with `stopped` and `stillOwned`, after every await
+   * (`assertAdoptLive`); its document resolutions take it. */
+  const adoptAbort = new AbortController()
+  const onCallerAbort = () => adoptAbort.abort()
+  attachOptions.signal?.addEventListener('abort', onCallerAbort, { once: true })
+  if (attachOptions.signal?.aborted) adoptAbort.abort()
+  const dropCallerAbort = () => attachOptions.signal?.removeEventListener('abort', onCallerAbort)
+  attachFailed.push(dropCallerAbort)
+  /** `kind` names what rolled back, in a log line only: a projection kind,
+   * or `adopt_stamp` for the deferred adopt stamps' own transaction. */
+  const reportFenceLost = (kind: ProjectionKind | 'adopt_stamp', error: unknown) => {
     // `unknown` rather than a union of the two authority errors: the union
     // would have to be widened by hand every time a third one appears, which
     // is the drift `isReadModelAuthorityLoss` exists to remove. Nothing here
     // reads anything but the message.
     const message = error instanceof Error ? error.message : String(error)
     console.warn(`[read-model] ${kind} projection rolled back: ${message}`)
+    // During the attach: an adopting attach stops at its next check.
+    if (!bootComplete) adoptAbort.abort()
     if (fenceLostReported || !bootComplete) return
     fenceLostReported = true
     try { onFenceLost?.() } catch (hookError) {
@@ -918,14 +1263,23 @@ export async function startReadModelProjector(
           // still must not land unfenced or un-atomically. Same transaction
           // shape as the tracked path, minus the bookkeeping it cannot have.
           return await withReadModelProjectionTransaction(db, key, 'ordinary', async (tx) => {
-            const result = await action(tx)
+            const recorder = new IdSetDeltaRecorder()
+            const result = await withIdSetDeltaRecorder(tx, recorder, () => action(tx))
+            // No generation moves here, so a seal over the kinds this wrote
+            // would stay comparable over rows it no longer describes (C6a).
+            await invalidateContentDigests(tx, key, kindsChangedWithoutStamp(integrity, recorder.touched()))
             await assertReadModelWriteFence(tx, key, projectorInstanceId)
             return result
           })
         }
         const activeToken = token
         return await withReadModelProjectionTransaction(db, key, 'ordinary', async (tx) => {
-          const result = await action(tx)
+          // Every object/connection id this action adds or removes, through
+          // whichever writer, is recorded here (`IdSetDeltaRecorder`) and
+          // XORed into the carried seals by the stamp below (C6a).
+          const recorder = new IdSetDeltaRecorder()
+          const result = await withIdSetDeltaRecorder(tx, recorder, () => action(tx))
+          const sealed = withRecordedDeltas(integrity, recorder)
           await appendReadModelChange(tx, key, activeToken, typeof change === 'function' ? change(result) : change)
           // BEFORE completeReadModelProjection, deliberately: the row must still
           // carry the generation this projection supersedes, because that is what
@@ -936,10 +1290,10 @@ export async function startReadModelProjector(
           // back the PROJECTION. Without it, a schema drift or a rejected CHECK
           // on `defect_summary` would abort a whole cold build — observability
           // taking down correctness, which is the wrong way round.
-          if (hasIntegrityToStamp(integrity)) {
+          if (hasIntegrityToStamp(sealed)) {
             await tx.query('SAVEPOINT read_model_integrity')
             try {
-              const stamped = await stampProjectionIntegrity(tx, key, activeToken.generation, integrity!)
+              const stamped = await stampProjectionIntegrity(tx, key, activeToken.generation, sealed!)
               if (!stamped) {
                 console.debug(
                   `[read-model] integrity stamp skipped for ${key.landscapeId}/${key.versionId} at generation ` +
@@ -1001,7 +1355,7 @@ export async function startReadModelProjector(
     })
     // All source listeners for one workspace publish in generation order. A
     // failed item does not poison the queue; its snapshot remains retryable.
-    projectionTail = task.then(() => undefined, () => undefined)
+    chainProjectionTail(task)
     return task
   }
 
@@ -1011,6 +1365,10 @@ export async function startReadModelProjector(
     let disposed = false
     /** The run in flight, so `idle()` can wait for it. */
     let active: Promise<void> = Promise.resolve()
+    /** Did the LAST run end on an error (logged here, swallowed)? An
+     * adopting attach's B4 reads it after `idle()`: a boot gap pass that
+     * failed must fail the attach, not be certified by B5 (G4-16f C6-2a). */
+    let lastRunFailed = false
     const kick = () => {
       if (running || disposed) { pending = !disposed; return }
       active = run()
@@ -1022,7 +1380,9 @@ export async function startReadModelProjector(
           pending = false
           await project()
         } while (pending && !disposed)
+        lastRunFailed = false
       } catch (error) {
+        lastRunFailed = true
         console.error(`[read-model] ${label} failed`, error)
       } finally {
         running = false
@@ -1038,6 +1398,7 @@ export async function startReadModelProjector(
         let seen: Promise<void>
         do { seen = active; await seen } while (seen !== active)
       },
+      failed: () => lastRunFailed,
     }
   }
 
@@ -1080,10 +1441,16 @@ export async function startReadModelProjector(
     const documentId = isValidAutomergeUrl(url) ? parseAutomergeUrl(url).documentId : null
     return !documentId || Boolean(syncedHandle(repo, documentId))
   }
-  const resolveHandle = async (url: string, caller: DocumentLoadCaller = 'other'): Promise<DocHandle<unknown>> => {
+  const resolveHandle = async (
+    url: string,
+    caller: DocumentLoadCaller = 'other',
+    /** The adopting attach's (`adoptAbort`); nothing else passes one. */
+    signal?: AbortSignal,
+  ): Promise<DocHandle<unknown>> => {
     const resident = residentNow(url)
     const startedAt = performance.now()
     const handle = await resolveHandleWithRetry(repo, url, {
+      signal,
       deadlineMs: resolveDeadlineMs,
       // THREE, not the default twenty. The twenty was sized for attempts that
       // failed in milliseconds, where the patience actually came from the 1 s
@@ -1117,6 +1484,190 @@ export async function startReadModelProjector(
      * (`documentContentArrivals`). Only the fold, which unlists, bounds them. */
     snapshot: Record<string, unknown>
   }>()
+  /**
+   * PARKED SEALED FOLD PRODUCTS (G4-16f; chain fold ON). A product holding at
+   * least the fold's seal ceiling is never folded again and never projected
+   * (`ordinaryChainFold.ts`): its content is fixed for this projector's life,
+   * a change degrades it (`ORDINARY_FOLD_PRODUCT_CHANGED`, the watcher's
+   * `refuseFoldProductChange`) and only a cold build lifts that. Leased and
+   * watched, every sealed product stayed resident for the projector's life,
+   * and the cold build resolved them all before reading any: wasm after a
+   * cold attach grew with the corpus' age (61 MiB fresh, 175 MiB at six
+   * months mid-rate, the 4 GiB wasm32 ceiling at about two years heavy-rate),
+   * and the JS heap held two copies of each (the extraction's per-shard map
+   * and the watcher's snapshot).
+   *
+   * A parked sealed product is: still listed, and still in
+   * `model.*ShardUrls` (so no attach pass re-attaches it); not watched; not
+   * leased (evicted); the ids it wins in `sealedIndex` — each entity once,
+   * the latest sealed product holding it in ModelMeta order — and their
+   * values either PINNED there (read from its document, until its extract
+   * is committed) or in its extract (G4-16f C5, `parkedSealedValues`).
+   * Readers ask the index (`resolve` here, `servedOutsideCurrentHead`); the fold writer skips
+   * it unresolved (`parked`). Its late writes are found in storage by the
+   * arrival poll, against the arrival read BEFORE its content was
+   * (`parkSealedProduct`, `streamSealedProduct`: the parking argument of
+   * `parkRetiredHead`), and DEGRADE it — never unparked, never forwarded.
+   *
+   * Only with the poll on (without it nothing would find a change) and with
+   * residency (without it nothing is given back; the products stay watched).
+   */
+  const sealedParking = Boolean(headRotation.rotates && ordinaryHeadRotation.chainFold)
+    && Boolean(residency) && ordinaryFoldArrivalPollMs() > 0
+  /** The sealed-product extract cache (G4-16f, `sealedProductCache.ts`):
+   * written in the background after the cold build commits and after each
+   * mid-session park. Only with parking (nothing else reads a product once)
+   * and a pool (it opens its own transactions). Nothing is queued before the
+   * cold build has committed, so a failed build leaves it idle. */
+  // HELD until the attach completes (`start()` at its end): an attach
+  // that throws after this line leaves a writer that never ran. It yields to
+  // this workspace's foreground work (`foregroundBusy`, below) and decodes at
+  // background priority (`durableHeadsDecoder`).
+  const sealedCache = sealedParking && isPool(db) && sealedProductCacheEnabled()
+    ? new SealedProductCacheWriter({
+      db, key, intervalMs: sealedProductCacheIntervalMs(), held: true,
+      foregroundBusy: () => foregroundBusy(),
+      onWritten: (task, rowsDigest) => onSealedExtractWritten(task, rowsDigest),
+    })
+    : null
+  /** The seal, the same number the fold writer is handed (`requestFold`). */
+  const sealedCeiling = ordinaryHeadRotation.chainFold?.segmentCeiling ?? OVERLAY_SEGMENT_ENTITY_CEILING
+  /** What the cold build records as the adopt row's posture AND what the
+   * verifier compares it with (`adoptVerify.ts`, S2): one value, so the two
+   * cannot drift. */
+  const projectorPosture: AdoptPosture = {
+    rotation: headRotation.rotates,
+    fold: Boolean(ordinaryHeadRotation.chainFold),
+    parking: sealedParking,
+    extractCache: sealedCache !== null,
+  }
+  const entityFieldOf = (kind: 'object' | 'connection'): 'objects' | 'connections' =>
+    kind === 'object' ? 'objects' : 'connections'
+  const sealedIndex = {
+    object: new SealedWinnerIndex<unknown>(),
+    connection: new SealedWinnerIndex<unknown>(),
+  }
+  /** Keyed by url: a url names ONE document, listed in ONE kind's list, so
+   * `kind` says which index holds it (a document listed in both lists is
+   * ambiguous — `ambiguousShardDocuments` — and its second read only finds it
+   * parked already). */
+  const parkedSealedProducts = new Map<string, {
+    kind: 'object' | 'connection'
+    documentId: string
+    /** Highest content arrival read BEFORE the content (text BIGINT), or null. */
+    watermark: string | null
+    /** Its heads when its content was read: what the handover re-check
+     * compares storage with. */
+    heads: readonly string[]
+    /** Degraded already: the poll does not report it again. */
+    changed: boolean
+    /** Served from the extract cache by the cold build (G4-16f C4): its
+     * extract exists, nothing to write back. */
+    cached?: boolean
+    /** The rows digest of the extract its values are read from (G4-16f C5):
+     * the hit's, for a product the cold build served from the cache; the
+     * writer's (`onSealedExtractWritten`), once the extract of a product read
+     * from its document is committed at these `heads`. Unset while its
+     * values are PINNED in `sealedIndex` (read from its document, extract
+     * not committed yet, or found missing since). */
+    rowsDigest?: string
+    /** Its values could be read neither from its extract nor from its
+     * document (`reloadSealedValues`): degraded, and every later read of
+     * its values throws at once instead of loading the document again. Only
+     * a cold build lifts it. */
+    valuesLost?: string
+  }>()
+  /** Sealed products the cold build read and did NOT park (heads unreadable,
+   * or no longer sealed when re-read after its arrival read): watched, and
+   * offered to `parkSealedProduct` on later attach passes. */
+  const sealedDeclinedAtColdBuild = new Set<string>()
+  /** url -> mid-session park attempts so far (bounded). */
+  const sealedParkAttempts = new Map<string, number>()
+  const SEALED_PARK_MAX_ATTEMPTS = 5
+  /** Is `doc` a fold product sealed at this projector's ceiling? */
+  const isSealedProductDoc = (kind: 'object' | 'connection', doc: unknown): boolean => {
+    if (!hasOrdinaryFoldMarker(doc)) return false
+    const entities = (doc as Record<string, unknown>)[entityFieldOf(kind)]
+    return Boolean(entities && typeof entities === 'object' && !Array.isArray(entities))
+      && Object.keys(entities as object).length >= sealedCeiling
+  }
+  /** ModelMeta's CURRENT rank of `url` in the kind's list (-1: unlisted), for
+   * a product parked mid-session; the cold build ranks by the list it merges
+   * (`sealedRankIn` over `ModelShardStream`'s `list`). */
+  const listRankOf = (kind: 'object' | 'connection') => {
+    const meta = metaView(metaHandle?.doc())
+    return sealedRankIn((kind === 'object' ? meta?.objectShardUrls : meta?.connectionShardUrls) ?? [])
+  }
+  /** Copy a sealed product's entity map out of its document (plain JS: the
+   * document goes) and index it, its values PINNED (G4-16f C5: held until
+   * its extract is committed, `onSealedExtractWritten`). Synchronous. */
+  const indexSealedProduct = (
+    kind: 'object' | 'connection',
+    url: string,
+    doc: unknown,
+    rankOf: (url: string) => number,
+  ): Record<string, unknown> => {
+    const entities = JSON.parse(JSON.stringify((doc as Record<string, unknown>)[entityFieldOf(kind)])) as Record<string, unknown>
+    sealedIndex[kind].add(url, Object.keys(entities), rankOf, innerIdAnomalies(entities), entities)
+    return entities
+  }
+  /**
+   * PARK THE CACHE HITS a winners statement served (G4-16f C5): each
+   * accepted hit indexed with the ids it wins among the hits (no value; its
+   * values are read from its extract, `parkedSealedValues`), its inner-id
+   * anomalies, its heads remembered against S in the durable-heads memo, and
+   * parked with max(S) as its watermark and the hit's digest. Ranked by
+   * `list`, the list the caller merges or serves. Synchronous; a url parked
+   * already is left as it is. The cold build calls it once per kind; it is
+   * the one place C6's background attach parks cache hits from, and it needs
+   * nothing of the cold build's stream.
+   *
+   * No hit filter here (C6's "header heads = retirement_heads"): a hit
+   * refused AFTER `readSealedWinners` would leave the other hits' wins
+   * computed with it — an id it won would be served by nobody. Such a check
+   * belongs to the candidates handed to `readSealedWinners`.
+   */
+  const parkCachedHits = (
+    kind: 'object' | 'connection',
+    list: readonly string[],
+    hits: ReadonlyMap<string, SealedProductCacheHit>,
+    winners: SealedWinners,
+  ): void => {
+    const rankOf = sealedRankIn(list)
+    for (const [url, won] of winners.wonBy) {
+      const hit = hits.get(url)
+      if (!hit || parkedSealedProducts.has(url)) continue
+      durableHeadsMemo.remember(hit.documentId, hit.rows, hit.heads)
+      const innerIds = new Map<string, string | null>()
+      for (const id of won) if (winners.innerIds.has(id)) innerIds.set(id, winners.innerIds.get(id)!)
+      sealedIndex[kind].add(url, won, rankOf, innerIds)
+      parkedSealedProducts.set(url, {
+        kind, documentId: hit.documentId, watermark: hit.maxArrivalSeq, heads: [...hit.heads], changed: false,
+        cached: true, rowsDigest: hit.rowsDigest,
+      })
+    }
+  }
+  /**
+   * The writer committed `task`'s extract (G4-16f C5, `onWritten`): every
+   * parked product of that document and kind parked at the SAME heads (the
+   * writer wrote it only because the decode of S gave exactly those) now
+   * reads its values from that extract — recorded against the digest the
+   * header carries — and its pinned values leave memory. A product parked at
+   * other heads (a re-park after a fallback of another revision) keeps them.
+   */
+  const onSealedExtractWritten = (task: SealedProductCacheTask, rowsDigest: string): void => {
+    for (const [url, entry] of parkedSealedProducts) {
+      if (entry.kind !== task.kind || entry.documentId !== task.documentId || !watermarkHeadsEqual(entry.heads, task.heads)) continue
+      entry.rowsDigest = rowsDigest
+      entry.cached = true
+      sealedIndex[entry.kind].unpin(url)
+    }
+  }
+  /** Values held in memory, both kinds, or for one product url (tests:
+   * `heldSealedValues`). */
+  const sealedValuesHeld = (url?: string): number => url === undefined
+    ? sealedIndex.object.pinnedValues + sealedIndex.connection.pinnedValues
+    : sealedIndex.object.pinnedValuesOf(url) + sealedIndex.connection.pinnedValuesOf(url)
   /** The plain copy a parked head is read from. A document without the map
    * gives `{}`, so a reader records the same defect the live one would. */
   const parkedSnapshotOf = (kind: 'object' | 'connection', doc: unknown): Record<string, unknown> => {
@@ -1135,9 +1686,23 @@ export async function startReadModelProjector(
   // extraction that runs once a head can be parked (`registryProjectLatest`)
   // keeps the diagrams and the defects, not the heads. The cold build, which
   // does use them, runs before anything is parked.
+  //
+  // A parked SEALED product answers with the ids it wins and no value
+  // (G4-16f C5): `{ id }` stubs carrying each entity's inner id as the
+  // duplicate-id rule reads it (`innerIdOf`). The one extraction that reaches
+  // a parked product through here is the registry pass, which keeps the
+  // diagrams and the defect list; its duplicate-id defects are computed over
+  // the inner ids of exactly the entries a winners-with-values answer had.
+  // A reader that needs a parked product's VALUES asks
+  // `parkedSealedValues` (`servedOutsideCurrentHead`), never this.
   const resolve: Resolve = async (url) => {
     const parked = parkedRetiredHeads.get(url)
     if (parked) return parked.snapshot
+    const sealed = parkedSealedProducts.get(url)
+    if (sealed) {
+      const index = sealedIndex[sealed.kind]
+      return { [entityFieldOf(sealed.kind)]: Object.fromEntries(index.idsWonBy(url).map((id) => [id, { id: index.innerIdOf(id) }])) }
+    }
     return (await resolveHandle(url, 'extract')).doc()
   }
   // Prepare the durable witness before taking projection locks. A drain can
@@ -1148,7 +1713,197 @@ export async function startReadModelProjector(
     return prepareDocumentWatermarkProofs(db, storage
       ? [...new Set(documentIds)].map(documentId => ({ documentId,
         drainPendingSaves: () => storage.drainDocumentSaves(documentId) }))
-      : [])
+      : [], durableHeadsMemo)
+  }
+  /** The live heads of `documentId` for an adopt stamp (`adoptState.ts`):
+   * through `handle` only while it is still the Repo's ready handle for it
+   * (a replaced handle refuses, as the cold build's shard check does), or,
+   * without one, the synchronizer's current handle. Null refuses. */
+  const adoptLiveHeads = (documentId: string, handle?: DocHandle<unknown>) => (): readonly string[] | null => {
+    if (!handle) {
+      const live = syncedHandle(repo, documentId)
+      return live ? tryGetAutomergeHeads(live.doc()) : null
+    }
+    const state = repo.synchronizer.docSynchronizers[documentId as DocumentId]?.query.peek()
+    return state?.state === 'ready' && state.handle === handle ? tryGetAutomergeHeads(handle.doc()) : null
+  }
+  /** The adopt stamps' own proof preparation, NEVER fatal: a 0 only withholds
+   * a lift (the durability witness then falls to the timestamp, T-SUM-2c;
+   * a future adopt refuses), so a preparation that fails (a
+   * durable chunk the strict decoder refuses, a drain that rejects) must not
+   * fail the projection it rides on — it returns an empty preparation, and
+   * every sample is stamped 0 (`recordAdoptWatermarks` with no durable heads). */
+  const prepareAdoptWatermarks = async (documentIds: readonly DocumentId[]): Promise<PreparedDocumentWatermarks> => {
+    try {
+      // Durable first, as every stamp: the sampled revision must be saved
+      // before the durable heads are read.
+      await repo.flush([...documentIds])
+      return await prepareShardWatermarks(documentIds)
+    } catch (error) {
+      console.warn(`[read-model] adopt watermark preparation failed for ${key.landscapeId}/${key.versionId}; stamped 0`, error)
+      return { watermarkPost: '0', durableHeadsById: new Map() }
+    }
+  }
+  /** Heads of each document an extraction read, by url; a url read twice at
+   * two revisions records null (no single revision to certify). */
+  const noteSampledHeads = (into: Map<string, readonly string[] | null>, url: string, doc: unknown): void => {
+    const heads = tryGetAutomergeHeads(doc)
+    if (!into.has(url)) { into.set(url, heads); return }
+    const previous = into.get(url)
+    if (!previous || !heads || !watermarkHeadsEqual(previous, heads)) into.set(url, null)
+  }
+  /**
+   * THE DELTA PASSES' ADOPT STAMPS, OFF THEIR CRITICAL PATH (G4-16f). A
+   * metadata or registry pass used to flush its control documents and run a
+   * strict durable proof of them BEFORE its transaction — +3 ms a pass on a
+   * small workspace (median 9.9 -> 12.8 ms metadata, 12.5 -> 15.5 ms
+   * registry; 10.8 / 13.4 ms with this change), NOT measured on
+   * a large ModelMeta or with many registry shards (all decoded on each
+   * registry pass). That delay was also what reddened the compaction suite's
+   * W1/W2 under CPU contention. Now:
+   *  - IN the pass's transaction, only what must be atomic with its rows:
+   *    every sampled control document whose revision is not the one its
+   *    positive certificate names gets 0 (`refuseAdoptWatermarks`), so no
+   *    positive value outlives the rows it described — when that write's
+   *    savepoint commits. When it fails (`withAdoptSavepoint` logs it and
+   *    keeps the projection), the old positive value stays beside rows of a
+   *    later revision: once that revision is durable its arrival is above
+   *    the certificate and a verifier comparing them refuses (safe); while
+   *    it is not — and for ever if the owner dies before saving it — the
+   *    certificate equals the durable state the rows have moved past. Since
+   *    T-SUM-2c the durability witness reads it (`health.ts`, the adopt
+   *    branch): in that state it lifts the proof for arrivals up to the old
+   *    durable state only, which the timestamp branch lifts too (the rows'
+   *    pass postdates those saves) — no lift the witness did not already
+   *    give. A document whose
+   *    revision is the certified one keeps its value: its rows are the same
+   *    projection of the same heads, and a later write arrives above it;
+   *  - after the pass commits, ONE debounced job (`ADOPT_STAMP_DELAY_MS`)
+   *    flushes and proves every document whose projected revision is not
+   *    certified, and stamps it EXACT or 0 in a fenced transaction on
+   *    `projectionTail` — where no pass interleaves — positive only while
+   *    the revision it proved is still the live one (heads never return to
+   *    an earlier set, so a pass that projected a later revision since has
+   *    moved them, and the stamp is 0).
+   * A takeover inside the window finds 0 and cold-builds: the safe side.
+   */
+  const ADOPT_STAMP_DELAY_MS = 250
+  /** documentId -> sorted-heads key of its POSITIVE certificate. */
+  const adoptCertified = new Map<string, string>()
+  /** documentId -> the revision the last committed pass projected. */
+  const adoptProjected = new Map<string, { heads: readonly string[] | null; readCurrentHeads: () => readonly string[] | null }>()
+  const headsKeyOf = (heads: readonly string[] | null): string | null => heads ? JSON.stringify([...heads].sort()) : null
+  let adoptStampTimer: ReturnType<typeof setTimeout> | null = null
+  let adoptStampRunning: Promise<void> | null = null
+  let adoptStampAgain = false
+  // A failed attach: no stop() will ever run, so nothing is scheduled again
+  // (`stopped`) and an armed debounce is cleared.
+  attachFailed.push(() => {
+    stopped = true
+    if (adoptStampTimer) clearTimeout(adoptStampTimer)
+    adoptStampTimer = null
+  })
+  const adoptStampsIdle = async (maxMs: number): Promise<void> => {
+    const deadline = performance.now() + maxMs
+    while ((adoptStampTimer || adoptStampRunning) && performance.now() < deadline) {
+      let tickTimer: ReturnType<typeof setTimeout> | undefined
+      const tick = new Promise((resolve) => { tickTimer = setTimeout(resolve, 25) })
+      // A running stamp is awaited, but never past the deadline. An ARMED
+      // one (timer set, nothing running yet) waits a real timer turn: a race
+      // against an already-resolved promise settles as a microtask, the
+      // loop never yields to the timer phase, the armed debounce can never
+      // fire, and the wait spins the event loop to its deadline. The tick is
+      // cleared once the wait is over: when the running stamp wins the race,
+      // it would otherwise stay pending for its 25 ms.
+      try {
+        await (adoptStampRunning ? Promise.race([adoptStampRunning, tick]) : tick)
+      } finally {
+        clearTimeout(tickTimer)
+      }
+    }
+    // Given up, not idle: say so, so the test waiting on it fails with the
+    // cause instead of racing a stamp it believes has run.
+    if (adoptStampTimer || adoptStampRunning) {
+      throw new Error(`awaitAdoptStamps(${key.landscapeId}/${key.versionId}): the deferred adopt stamps were still `
+        + `${adoptStampRunning ? 'running' : 'armed'} after ${maxMs} ms (a stamp re-armed by every pass, or one that never settles)`)
+    }
+  }
+  adoptStampIdlers.set(keyOf(key), adoptStampsIdle)
+  const dropStampIdler = () => { if (adoptStampIdlers.get(keyOf(key)) === adoptStampsIdle) adoptStampIdlers.delete(keyOf(key)) }
+  attachFailed.push(dropStampIdler)
+  /** The control documents of `samples` whose sampled revision is not the
+   * certified one (their 0 goes in the pass's transaction). */
+  const adoptRefusalsOf = (samples: readonly AdoptSample[]): string[] => [...new Set(samples
+    .filter((sample) => {
+      const sampled = headsKeyOf(sample.sampledHeads)
+      return sampled === null || adoptCertified.get(sample.documentId) !== sampled
+    })
+    .map((sample) => sample.documentId))]
+  /** After the pass COMMITTED: what it projected, and the job. */
+  const noteAdoptProjected = (
+    samples: readonly AdoptSample[],
+    refused: readonly string[],
+    certified?: ReadonlySet<string>,
+    schedule = true,
+  ) => {
+    for (const id of refused) adoptCertified.delete(id)
+    const byId = new Map<string, { heads: readonly string[] | null; readCurrentHeads: () => readonly string[] | null }>()
+    for (const sample of samples) {
+      const seen = byId.get(sample.documentId)
+      byId.set(sample.documentId, {
+        heads: seen && headsKeyOf(seen.heads) !== headsKeyOf(sample.sampledHeads) ? null : sample.sampledHeads,
+        readCurrentHeads: sample.readCurrentHeads,
+      })
+    }
+    for (const [id, projected] of byId) {
+      adoptProjected.set(id, projected)
+      if (certified?.has(id)) adoptCertified.set(id, headsKeyOf(projected.heads)!)
+    }
+    if (schedule) scheduleAdoptStamps()
+  }
+  const scheduleAdoptStamps = () => {
+    if (stopped || adoptStampTimer) return
+    if (adoptStampRunning) { adoptStampAgain = true; return }
+    adoptStampTimer = setTimeout(() => {
+      adoptStampTimer = null
+      adoptStampRunning = runAdoptStamps()
+        .catch((error) => {
+          if (isReadModelAuthorityLoss(error)) reportFenceLost('adopt_stamp', error)
+          else console.warn(`[read-model] deferred adopt stamps failed for ${key.landscapeId}/${key.versionId}; left 0`, error)
+        })
+        .finally(() => {
+          adoptStampRunning = null
+          if (adoptStampAgain) { adoptStampAgain = false; scheduleAdoptStamps() }
+        })
+    }, ADOPT_STAMP_DELAY_MS)
+    adoptStampTimer.unref?.()
+  }
+  const runAdoptStamps = async (): Promise<void> => {
+    if (stopped || !stillOwned()) return
+    // Due: projected, not certified, and still the live revision (one that
+    // moved has a pass coming, which schedules this again).
+    const due = [...adoptProjected].filter(([id, projected]) => {
+      const sampled = headsKeyOf(projected.heads)
+      return sampled !== null && adoptCertified.get(id) !== sampled
+        && headsKeyOf(projected.readCurrentHeads()) === sampled
+    })
+    if (!due.length) return
+    const prepared = await prepareAdoptWatermarks(due.map(([id]) => id as DocumentId))
+    // On the tail, so no pass interleaves; exact or 0 against the LIVE heads
+    // at the stamp (`recordAdoptWatermarks`): a pass that projected a later
+    // revision since the proof has moved those heads, and gets 0 here.
+    const task = projectionTail.then(() => withReadModelProjectionTransaction(db, key, 'ordinary', async (tx) => {
+      if (stopped || !stillOwned()) return new Set<string>()
+      await assertReadModelWriteFence(tx, key, projectorInstanceId)
+      const samples: AdoptSample[] = due.map(([id, projected]) =>
+        ({ documentId: id, sampledHeads: projected.heads, readCurrentHeads: projected.readCurrentHeads }))
+      let certified = new Set<string>()
+      await withAdoptSavepoint(tx, key, async () => { certified = await recordAdoptWatermarks(tx, key, samples, prepared) })
+      return certified
+    }))
+    chainProjectionTail(task)
+    const certified = await task
+    for (const [id, projected] of due) if (certified.has(id)) adoptCertified.set(id, headsKeyOf(projected.heads)!)
   }
 
   // A shard a client CREATED mid-session may not have synced to us yet when we
@@ -1164,10 +1919,16 @@ export async function startReadModelProjector(
   // only on the next meta or root change. A workspace that appends one shard and
   // then goes quiet would be left degraded with nothing scheduled. Waiting is the
   // whole point of this call, so it keeps a budget sized for waiting.
-  const resolveHandleRetry = async (url: string, caller: DocumentLoadCaller = 'attach'): Promise<DocHandle<unknown>> => {
+  const resolveHandleRetry = async (
+    url: string,
+    caller: DocumentLoadCaller = 'attach',
+    /** The adopting attach's (`adoptWatchSignal`); nothing else passes one. */
+    signal?: AbortSignal,
+  ): Promise<DocHandle<unknown>> => {
     const resident = residentNow(url)
     const startedAt = performance.now()
     const handle = await resolveHandleWithRetry(repo, url, {
+      signal,
       deadlineMs: resolveDeadlineMs,
       tries: SHARD_ARRIVAL_TRIES,
     })
@@ -1193,6 +1954,18 @@ export async function startReadModelProjector(
   let rootDoc!: RootLike
   let metaHandle!: DocHandle<unknown> | null
   let model!: Awaited<ReturnType<typeof extractModelEntities>>
+  /**
+   * T-DIAGDEF-2 (A): the heads the COLD BUILD's extraction read of each
+   * CONTROL document — the root, and by url ModelMeta (or a monolith model)
+   * and every registry shard. Their watchers are plain `change` listeners
+   * attached long after that read, so a change that lands in between fires
+   * nothing and is never projected (a diagram delete was lost that way: the
+   * client's socket synced the registry shard while the restarted server
+   * cold-built the workspace). Each watcher compares, once attached, and runs
+   * its pass when the document moved (`controlGapSince`). Null when adopting:
+   * B4 runs those passes after the watchers, so it has no such gap.
+   */
+  let coldBuildControlHeads: { root: readonly string[] | null; byUrl: Map<string, readonly string[] | null> } | null = null
   // A delta writes only one collection/baseline. It cannot certify a document
   // that was sampled through several references. Retain that refusal until a
   // new cold build: removing a duplicate URL does not remove phantom rows left
@@ -1221,20 +1994,582 @@ export async function startReadModelProjector(
     }
     return counts
   }
-  try {
+  /** The products whose current rows carry a remembered cache refusal
+   * (`readSealedProductCacheHits`): not handed to the writer again. */
+  let coldCacheRefused: { object: ReadonlySet<string>; connection: ReadonlySet<string> } | null | undefined
+  // VERIFY-AND-ADOPT IN SHADOW (G4-16f C6-1, `adoptVerify.ts`): the claim's
+  // checks, under the projection mutex and the fence and adopt row locks,
+  // then rolled back — nothing claimed, nothing written. Observation only:
+  // `verifyAdoptShadow` never throws (a failure is the verdict `error`), and
+  // the cold build below runs exactly as with the flag off whatever the
+  // verdict. The verdict is LOGGED either way; the log line is guarded so a
+  // logging failure cannot reach the build either.
+  let shadowVerdict: AdoptVerdict | null = null
+  if (adoptMode === 'shadow') {
+    shadowVerdict = await verifyAdoptShadow(db, key, {
+      orgId, fenceObserved: fenceObservedAtStart, sealedCeiling, posture: projectorPosture,
+    })
+    try {
+      console.log(JSON.stringify({
+        event: 'read_model.adopt_verdict',
+        workspace: `${key.landscapeId}/${key.versionId}`,
+        mode: shadowVerdict.mode,
+        verdict: shadowVerdict.verdict,
+        reason: shadowVerdict.reason,
+        stage: shadowVerdict.stage,
+        ...(shadowVerdict.detail === undefined ? {} : { detail: shadowVerdict.detail }),
+        verifyMs: shadowVerdict.verifyMs,
+        stepMs: shadowVerdict.stepMs,
+        counts: shadowVerdict.counts,
+      }))
+    } catch (error) {
+      console.error('[read-model] could not log the adopt verdict', error)
+    }
+  }
+  // VERIFY-AND-ADOPT, `on` (G4-16f C6-2a, `adoptVerify.ts`): the same checks,
+  // and on an adoptable verdict the CLAIM (S6) in the same transaction — the
+  // fence CAS from `fenceObservedAtStart` to this instance, the row marked
+  // NOT attached. A refusal or an error before S6 cold-builds below, in this
+  // call, exactly as `off` does. An authority loss at S6 (a release during
+  // the checks: `stillClaiming`) or a commit whose outcome is unknown THROWS,
+  // before anything is acquired: the attach fails as a cold build's lost
+  // claim does.
+  /** The claimed verdict: this attach ADOPTS (B1-B5) instead of cold-building. */
+  let adoptClaim: AdoptVerdict | null = null
+  const adoptStartedAt = performance.now()
+  if (adoptMode === 'on') {
+    const verdict = await claimAdopt(db, key, {
+      orgId, fenceObserved: fenceObservedAtStart, sealedCeiling, posture: projectorPosture,
+      instanceId: projectorInstanceId,
+      stillClaiming: () => !stopped && stillOwned() && !adoptAbort.signal.aborted,
+    })
+    try {
+      console.log(JSON.stringify({
+        event: 'read_model.adopt_verdict',
+        workspace: `${key.landscapeId}/${key.versionId}`,
+        mode: verdict.mode,
+        verdict: verdict.verdict,
+        reason: verdict.reason,
+        stage: verdict.stage,
+        ...(verdict.detail === undefined ? {} : { detail: verdict.detail }),
+        verifyMs: verdict.verifyMs,
+        stepMs: verdict.stepMs,
+        counts: verdict.counts,
+      }))
+    } catch (error) {
+      console.error('[read-model] could not log the adopt verdict', error)
+    }
+    if (verdict.verdict === 'claimed') {
+      adoptClaim = verdict
+      // ---- SERVING (C6-2b): the claim has committed (`claimAdopt` returns
+      // a `claimed` verdict only after its COMMIT), so the kept rows may be
+      // served — under a status that refuses freshness (`idle`) until B5.
+      // Synchronous, before any further await. What can happen between here
+      // and B5, every await of it, and what a throw or a stop there
+      // leaves:
+      //  - `admitBuild` (below; the fleet's build slot): a throw fails the
+      //    attach as B1 (`aborted` when torn down), nothing yet resolved;
+      //  - B1-B3 (`adoptBuild`), the B3 watchers, B4 and B5: each await
+      //    followed by `assertAdoptLive` (C6-2a, A5 at eleven awaits);
+      // every failure runs the F4 cleanup (`attachFailed`), gives this
+      // owner's leases back and leaves the binding on the previous fence
+      // and `projector_attached = false`: the window's `idle` never turns
+      // into a freshness claim. The caller (the fleet) stops serving on the
+      // rejection.
+      try {
+        attachOptions.onServing?.()
+      } catch (error) {
+        console.error('[read-model] the onServing hook threw', error)
+      }
+      try {
+        console.log(JSON.stringify({
+          event: 'read_model.adopt_serving',
+          workspace: `${key.landscapeId}/${key.versionId}`,
+          ms: Math.round((performance.now() - adoptStartedAt) * 10) / 10,
+          verifyMs: verdict.verifyMs,
+        }))
+      } catch (error) {
+        console.error('[read-model] could not log adopt serving', error)
+      }
+    }
+  }
+  /** What the adopting attach did, logged once (`read_model.adopt_attach`). */
+  const adoptPhases = {
+    claimMs: performance.now() - adoptStartedAt,
+    b1Ms: 0, b2Ms: 0, b3SeedMs: 0, b3WatchMs: 0, b4Ms: 0, b5Ms: 0,
+    cacheHits: 0, cacheHeadsRefused: 0, productsLoaded: 0, changedProducts: 0,
+    seededAtLive: 0, seededByView: 0, newShards: 0,
+  }
+  /** Listed shards with no row of any kind (S5 `new`): attached with their
+   * initial apply, like a shard appended mid-session. */
+  const adoptNewShards = new Set<string>()
+  /** Sealed products whose live heads are not their H_r (changed while no
+   * owner ran): degraded at B4 (`sealedProductChanged`), before the row may
+   * say attached. */
+  const adoptChangedProducts: string[] = []
+  /** THE CHECK AFTER EVERY AWAIT of the adopting attach (not only after the
+   * longest one): a stop, a lost
+   * ownership or generation (`release`, `evict`, `stopAll`) or an abort
+   * (`adoptAbort`) fails the attach — the F4 cleanup and the try's
+   * `releaseOwner` give everything back, and nothing reaches B5. */
+  const assertAdoptLive = (stage: AdoptAttachStage): void => {
+    if (stopped || !stillOwned() || adoptAbort.signal.aborted) throw new ReadModelAdoptAttachError(stage, 'aborted')
+  }
+  /** Run one phase of the adopting attach: an authority loss and an adopt
+   * failure pass as they are; anything else becomes the adopt failure of
+   * `stage` (`aborted` when the attach was being torn down, `error`
+   * otherwise), its cause kept. On a cold build (no claim) it only runs. */
+  /** The abort an ADOPTING attach's watcher resolutions take while it runs
+   * (B3: a `new` shard's resolution can wait ~219 s); none otherwise — a
+   * cold build's and every later resolution keep their own patience. */
+  const adoptWatchSignal = (): AbortSignal | undefined => (adoptClaim && !bootComplete ? adoptAbort.signal : undefined)
+  let adoptStageNow: AdoptAttachStage = 'B1'
+  const adoptStep = async <T>(stage: AdoptAttachStage, run: () => Promise<T>): Promise<T> => {
+    adoptStageNow = stage
+    try {
+      return await run()
+    } catch (error) {
+      // A cold build's errors are its own, untouched.
+      if (!adoptClaim || error instanceof ReadModelAdoptAttachError || isReadModelAuthorityLoss(error)) throw error
+      const aborted = stopped || !stillOwned() || adoptAbort.signal.aborted
+      const reason = aborted ? 'aborted' : (error as Error)?.name === 'AdoptSeedHeadsUnknownError' ? 'seed-heads-unknown' : 'error'
+      throw new ReadModelAdoptAttachError(adoptStageNow, reason, { cause: error })
+    }
+  }
+  /**
+   * B1-B3's reads, IN PLACE OF the cold build (G4-16f C6-2a). Writes no row:
+   * the rows are the kept ones. Assigns what the post-build sequence needs —
+   * `rootHandle`, `rootDoc`, `metaHandle`, `model` (with each watched shard's
+   * SEED as its baseline), `retirements` — and parks the sealed products.
+   * Every await is followed by `assertAdoptLive`; a throw anywhere is the
+   * try's below (`releaseOwner`) and `attachFailed`'s:
+   *  - B1: the root, ModelMeta (both leased), the topology against the kept
+   *    row's (a shard listed or a head moved while no owner ran fails:
+   *    `topology-moved`), the registry shards (`readDiagrams`, leased; a
+   *    defect fails), the retirement rows (pointer first, as the cold build);
+   *  - B2 (parking on): the extract cache's headers, the hits narrowed to
+   *    the products whose header heads ARE their H_r BEFORE the winners
+   *    statement (a hit dropped after it would leave the ids it won served
+   *    by nobody, `parkCachedHits`), the winners statement (ids only;
+   *    values come from the extracts), then each product that missed:
+   *    resolved, its arrival read BEFORE its content (the parking
+   *    argument), its content AT H_r (`adoptSeedContent`: a head absent
+   *    from its history fails), indexed with its values PINNED and parked
+   *    if sealed, flushed and given back; live heads other than H_r are a
+   *    change while no owner ran (degraded in B4). Its extract is written
+   *    after B5 (the writer is held). A cache that cannot be read misses;
+   *  - B3 (seeds): every other listed shard resolved (leased) and seeded AT
+   *    ITS SEED HEADS (`adoptSeedMap`, the S5 rule: `forwarded_heads ?? H_r`
+   *    for a retired head, H_r for a product, `projected_heads` otherwise);
+   *    a shard with no row at all is attached with its initial apply.
+   */
+  const adoptBuild = async (claim: AdoptVerdict): Promise<{
+    rootHandle: DocHandle<unknown>
+    rootDoc: RootLike
+    metaHandle: DocHandle<unknown>
+    model: ExtractedModel
+  }> => {
+    const lists = claim.keptLists!
+    const seedByKey = new Map((claim.seeds ?? []).map((seed) => [`${seed.collection}:${seed.documentId}`, seed]))
+    const seedOf = (kind: 'object' | 'connection', url: string): ShardSeed => {
+      const seed = seedByKey.get(`${kind}:${documentIdOf(url)}`)
+      if (!seed) throw new ReadModelAdoptAttachError(adoptStageNow, 'seed-missing')
+      return seed
+    }
+    let phaseAt = performance.now()
+    // ---- B1
+    assertAdoptLive('B1')
+    const rootHandle = await resolveHandle(rootUrl, 'other', adoptAbort.signal)
+    assertAdoptLive('B1')
+    const rootDoc = rootHandle.doc() as RootLike
+    if (!rootDoc.modelMetaUrl) throw new ReadModelAdoptAttachError('B1', 'topology-moved')
+    const metaHandle = await resolveHandle(rootDoc.modelMetaUrl, 'other', adoptAbort.signal)
+    assertAdoptLive('B1')
+    const meta = metaView(metaHandle.doc())!
+    const topology = adoptTopology(rootHandle.documentId, rootDoc, meta)
+    const sameIds = (a: readonly string[] | null, b: readonly string[]) => Boolean(a) && JSON.stringify(a) === JSON.stringify(b)
+    if (topology.digest !== claim.keptTopologyDigest || !sameIds(topology.objectShardIds, lists.objectShardIds)
+      || !sameIds(topology.connectionShardIds, lists.connectionShardIds) || !sameIds(topology.registryShardIds, lists.registryShardIds)) {
+      throw new ReadModelAdoptAttachError('B1', 'topology-moved')
+    }
+    const defects: ModelDefect[] = []
+    const { diagrams, registryShardUrls } = await readDiagrams(rootDoc,
+      async (url) => (await resolveHandle(url, 'extract', adoptAbort.signal)).doc(), defects)
+    assertAdoptLive('B1')
+    if (defects.length) throw new ReadModelAdoptAttachError('B1', `registry-defects: ${summarizeModelDefects(defects)}`)
+    const objectShardUrls = [...(meta.objectShardUrls ?? [])]
+    const connectionShardUrls = [...(meta.connectionShardUrls ?? [])]
+    rememberShardReferences(objectShardUrls, connectionShardUrls)
+    const model: ExtractedModel = {
+      objects: [], connections: [], groups: [], diagrams,
+      objectShardUrls, connectionShardUrls, registryShardUrls: [...registryShardUrls],
+      objectsByShardUrl: new Map(), connectionsByShardUrl: new Map(),
+      objectShardHeadsByUrl: new Map(), connectionShardHeadsByUrl: new Map(), defects,
+    }
+    // Pointer first, rows second (`retirements`).
+    const pointer = writeHeadPointer(meta)
+    retirements = await loadOrdinaryHeadRetirements(db, key)
+    retirementsPointer = pointer
+    assertAdoptLive('B1')
+    adoptPhases.b1Ms = performance.now() - phaseAt
+    phaseAt = performance.now()
+    const listOf = (kind: 'object' | 'connection') => (kind === 'object' ? objectShardUrls : connectionShardUrls)
+    // ---- B2
+    adoptStageNow = 'B2'
+    if (sealedParking) {
+      const cacheMiss = (error: unknown): null => {
+        console.warn(`[read-model] sealed-product cache read failed for ${key.landscapeId}/${key.versionId} (adopt); loading documents`, error)
+        return null
+      }
+      const cacheHits = sealedProductCacheEnabled()
+        ? await readSealedProductCacheHits(db, key, {
+          object: objectShardUrls.map(documentIdOf),
+          connection: connectionShardUrls.map(documentIdOf),
+        }).catch(cacheMiss)
+        : null
+      assertAdoptLive('B2')
+      coldCacheRefused = cacheHits?.refused ?? null
+      for (const kind of ['object', 'connection'] as const) {
+        const list = listOf(kind)
+        const hits = new Map<string, SealedProductCacheHit>()
+        for (const url of new Set(list)) {
+          const seed = seedOf(kind, url)
+          const hit = cacheHits?.[kind].get(documentIdOf(url))
+          if (seed.source !== 'product' || !hit || hit.entityCount < sealedCeiling || syncedHandle(repo, hit.documentId)) continue
+          // THE CANDIDATES, not the answer: a header written at heads other
+          // than the product's H_r is a miss BEFORE the winners statement.
+          if (!seedHeadsEqual(hit.heads, seed.heads!)) {
+            adoptPhases.cacheHeadsRefused += 1
+            continue
+          }
+          hits.set(url, hit)
+        }
+        if (!hits.size) continue
+        const winners = await readSealedWinners(db, key, kind, list, [...hits].map(([url, hit]) => ({
+          url, documentId: hit.documentId, rowsDigest: hit.rowsDigest, entityCount: hit.entityCount,
+        })), { values: false }).catch(cacheMiss)
+        assertAdoptLive('B2')
+        if (!winners) continue
+        parkCachedHits(kind, list, hits, winners)
+        adoptPhases.cacheHits += winners.wonBy.size
+      }
+      for (const kind of ['object', 'connection'] as const) {
+        const list = listOf(kind)
+        for (const url of new Set(list)) {
+          const seed = seedOf(kind, url)
+          if (seed.source !== 'product' || parkedSealedProducts.has(url)) continue
+          const handle = await resolveHandle(url, 'attach', adoptAbort.signal)
+          assertAdoptLive('B2')
+          const documentId = handle.documentId
+          // BEFORE the content (`parkRetiredHead`'s parking argument).
+          const watermark = (await documentContentArrivals(db, [documentId])).get(documentId) ?? null
+          assertAdoptLive('B2')
+          const doc = handle.doc()
+          const { content } = adoptSeedContent(doc as Doc<unknown>, seed.heads!)
+          // Below the seal: watched like any shard, seeded in B3.
+          if (!isSealedProductDoc(kind, content)) continue
+          indexSealedProduct(kind, url, content, sealedRankIn(list))
+          parkedSealedProducts.set(url, { kind, documentId, watermark, heads: [...seed.heads!], changed: false })
+          adoptPhases.productsLoaded += 1
+          if (!seedHeadsEqual(tryGetAutomergeHeads(doc) ?? [], seed.heads!)) {
+            adoptChangedProducts.push(url)
+            adoptPhases.changedProducts += 1
+          }
+          await repo.flush([documentId])
+          if (residency && leasedDocumentIds.delete(documentId)) residency.release(documentId, residencyOwner)
+          assertAdoptLive('B2')
+        }
+      }
+    }
+    adoptPhases.b2Ms = performance.now() - phaseAt
+    phaseAt = performance.now()
+    // ---- B3, the seeds (the watchers are attached after the try).
+    adoptStageNow = 'B3'
+    for (const kind of ['object', 'connection'] as const) {
+      const byUrl = (kind === 'object' ? model.objectsByShardUrl : model.connectionsByShardUrl) as Map<string, Record<string, unknown>>
+      const headsByUrl = kind === 'object' ? model.objectShardHeadsByUrl : model.connectionShardHeadsByUrl
+      for (const url of listOf(kind)) {
+        if (parkedSealedProducts.has(url)) continue
+        const seed = seedOf(kind, url)
+        if (seed.source === 'new') {
+          adoptNewShards.add(url)
+          adoptPhases.newShards += 1
+          continue
+        }
+        const handle = await resolveHandle(url, 'attach', adoptAbort.signal)
+        assertAdoptLive('B3')
+        const atLive = seedHeadsEqual(tryGetAutomergeHeads(handle.doc()) ?? [], seed.heads!)
+        const map = adoptSeedMap(handle.doc() as Doc<unknown>, seed.heads!, entityFieldOf(kind))
+        if (!map) throw new ReadModelAdoptAttachError('B3', 'seed-unreadable')
+        if (atLive) adoptPhases.seededAtLive += 1
+        else adoptPhases.seededByView += 1
+        byUrl.set(url, map)
+        headsByUrl.set(url, [...seed.heads!])
+      }
+    }
+    adoptPhases.b3SeedMs = performance.now() - phaseAt
+    return { rootHandle, rootDoc, metaHandle, model }
+  }
+  // The caller's build admission (C6-2b), once the claim has decided and
+  // before the first document is resolved. Adopting: the first await after
+  // SERVING; a throw (an admission refused or stopped, the wait aborted)
+  // fails the attach as B1 — `aborted` when it was being torn down.
+  if (attachOptions.admitBuild) {
+    try {
+      await attachOptions.admitBuild()
+    } catch (error) {
+      if (!adoptClaim) throw error
+      assertAdoptLive('B1')
+      throw new ReadModelAdoptAttachError('B1', 'admission', { cause: error })
+    }
+  }
+  /** Where the cold build's time went (G4-16f, the aged bench: a 61 s cold
+   * attach). Logged once, `read_model.cold_build_phases`. Wall times; the
+   * shard reads include their storage reads and synchronous loads. */
+  const coldBuildPhases = {
+    startedAt: performance.now(),
+    metaResolveMs: 0,
+    sealedProducts: { count: 0, ms: 0 },
+    otherShards: { count: 0, ms: 0 },
+    /** From the start to the first shard read (root, meta, registry). */
+    beforeShardsMs: 0,
+    /** Between two shard reads: the cooperative yield and the merge. */
+    betweenShardsMs: 0,
+    /** From the last shard read to the row writes (proof, flush, watermarks). */
+    afterShardsMs: 0,
+    rowWritesMs: 0,
+    /** `rowWritesMs` by phase (`rowWriteTimings.ts`, G4-16f C7); the
+     * phases sum to at most `rowWritesMs` (the remainder is JS between
+     * them). */
+    rowWritesBreakdown: {} as RowWriteTimings,
+    /** Tables whose bounded ANALYZE was skipped at its lock ceiling. */
+    analyzeSkippedTables: [] as string[],
+    proofMemoHits: 0,
+    proofMemoMisses: 0,
+    /** Sealed products served from the extract cache (G4-16f C4), and those
+     * read from their document (a header that missed, or none); the cache's
+     * own SQL time (the header read and each hit's entity read). */
+    cacheHits: 0,
+    cacheMisses: 0,
+    cacheReadMs: 0,
+    lastShardEndedAt: null as number | null,
+  }
+  // ADOPTING (`adoptClaim`): B1-B3's reads instead of the cold build, under
+  // the same catch (every lease of this owner given back on a throw).
+  // Otherwise the COLD BUILD, unchanged — the `else` takes the `try` below
+  // as its single statement.
+  if (adoptClaim) {
+    try {
+      const built = await adoptStep('B1', () => adoptBuild(adoptClaim!))
+      rootHandle = built.rootHandle
+      rootDoc = built.rootDoc
+      metaHandle = built.metaHandle
+      model = built.model
+    } catch (error) {
+      if (residency) residency.releaseOwner(residencyOwner)
+      throw error
+    }
+  } else try {
     rootHandle = await resolveHandle(rootUrl)
     rootDoc = rootHandle.doc() as RootLike
+    const metaStartedAt = performance.now()
     metaHandle = rootDoc.modelMetaUrl
       ? await resolveHandle(rootDoc.modelMetaUrl)
       : null
+    coldBuildPhases.metaResolveMs = performance.now() - metaStartedAt
     // This map belongs only to the cold extraction, never to the long-lived
     // resolver used by later callbacks. Keep the exact handles sampled.
     const extractionHandles = new Map<string, DocHandle<unknown>>()
+    /**
+     * THE STREAMING COLD BUILD (G4-16f). Shards are read one at a time; a
+     * SEALED fold product is read, indexed, parked and given back before the
+     * next shard is resolved, so at most one is resident at any moment (the
+     * cold build used to resolve every shard before reading any). Every await
+     * of the sealed branch, and what a throw or a stop there leaves:
+     *   1. `resolveHandle` — leased; a throw fails the build, whose catch
+     *      below gives every lease of this owner back;
+     *   2. `documentContentArrivals` (S, BEFORE the content: the parking
+     *      argument of `parkRetiredHead`) — same; nothing indexed yet;
+     * then SYNCHRONOUSLY: the content copied into the index, the product
+     * parked, its heads captured;
+     *   3. `repo.flush` — a change that reached the handle after the sample
+     *      has its chunk (above S) before the eviction drops the save
+     *      listener; a throw fails the build as in 1.
+     * Then the lease goes, synchronously (the eviction removes it from the
+     * Repo's cache in the same turn). A stop during the build is the build's
+     * own business: it fails or is disowned, and the catch releases the owner.
+     * Unsealed shards, and every shard with parking off, are read as before:
+     * resident, their handle kept for the proof below.
+     */
+    // THE EXTRACT CACHE (G4-16f C4, `sealedProductCache.ts`): ONE statement
+    // before the stream, the cached headers of the products ModelMeta lists
+    // now, each against its product's current row versions. A product listed
+    // only by the revision the extraction reads later simply misses.
+    const cacheMeta = metaView(metaHandle?.doc())
+    const cacheStartedAt = performance.now()
+    // Never fatal: a cache that cannot be read is a cache that missed.
+    const cacheMiss = (error: unknown): null => {
+      console.warn(`[read-model] sealed-product cache read failed for ${key.landscapeId}/${key.versionId}; reading documents`, error)
+      return null
+    }
+    const cacheHits = sealedParking && sealedProductCacheEnabled()
+      ? await readSealedProductCacheHits(db, key, {
+        object: (cacheMeta?.objectShardUrls ?? []).map(documentIdOf),
+        connection: (cacheMeta?.connectionShardUrls ?? []).map(documentIdOf),
+      }).catch(cacheMiss)
+      : null
+    coldCacheRefused = cacheHits?.refused ?? null
+    coldBuildPhases.cacheReadMs += performance.now() - cacheStartedAt
+    /**
+     * A HIT (its rows' digest equals the header's, its version is current,
+     * it holds at least the seal, and this Repo does not have the document
+     * loaded — a resident copy may carry a change storage does not): the
+     * entity map is read from SQL, in this stream slot (list order), and the
+     * product is indexed and parked exactly as the sealed branch below does,
+     * WITHOUT resolving the document. Its parking watermark is max(S) of the
+     * row versions the hit was decided on, so a write after that read is
+     * above it and the arrival poll degrades the product; its heads are the
+     * header's, remembered against S — and the table S was read from, which
+     * each row of `hit.rows` carries — in the durable-heads memo (a fact a
+     * strict decode of S established when the extract was written), so the
+     * proof below certifies it without decoding. Null: the document path.
+     */
+    //
+    // THE WINNERS FROM SQL (G4-16f C5, `sealedWinners.ts`): on the first
+    // shard read of a kind, ONE statement over every hit the list it merges
+    // names computes which hit wins each id, with the winners' values, and
+    // the slot where the merge first inserts each id. The hits are decided
+    // THERE, once — a hit the statement counted is served from it at its
+    // slot even should the Repo load its document in between (the arrival
+    // poll covers a write since: its watermark is max(S)). A hit whose rows
+    // do not number its `entity_count`, or a statement that fails, is a
+    // miss. At its slot a hit then yields the values of the ids it wins
+    // among the hits, plus `undefined` at the ids it is the first hit to
+    // hold without winning — so every key enters the merge at the slot the
+    // full map put it in (insertion order is what `Object.values` and so
+    // the duplicate-id rule's "last occurrence" follow); the winner's value
+    // overwrites each such placeholder later in the same merge, a miss's
+    // full map overwrites anything. Every served hit is parked as soon as
+    // the statement answers (`parkCachedHits`), indexed with the ids it wins
+    // among the hits and NO values: a value it serves later is read from its
+    // extract.
+    //
+    // The memo is per kind AND per list: the extraction hands every shard of
+    // a kind the same list array, so a call with another list is a defect of
+    // the caller and fails the build rather than reuse winners ranked by a
+    // list it does not merge.
+    const coldWinners: Partial<Record<'object' | 'connection', {
+      list: readonly string[]
+      read: Promise<{ winners: SealedWinners | null; hits: Map<string, SealedProductCacheHit> }>
+    }>> = {}
+    const winnersFor = (kind: 'object' | 'connection', list: readonly string[]) => {
+      const memo = coldWinners[kind]
+      if (memo) {
+        if (memo.list !== list) throw new Error(`cold build: the ${kind} winners were read for another list`)
+        return memo.read
+      }
+      const read = (async () => {
+        const hits = new Map<string, SealedProductCacheHit>()
+        for (const url of new Set(list)) {
+          const hit = cacheHits?.[kind].get(documentIdOf(url))
+          if (!hit || hit.entityCount < sealedCeiling || syncedHandle(repo, hit.documentId)) continue
+          hits.set(url, hit)
+        }
+        if (!hits.size) return { winners: null, hits }
+        const startedAt = performance.now()
+        const winners = await readSealedWinners(db, key, kind, list, [...hits].map(([url, hit]) => ({
+          url, documentId: hit.documentId, rowsDigest: hit.rowsDigest, entityCount: hit.entityCount,
+        })), { values: true }).catch(cacheMiss)
+        coldBuildPhases.cacheReadMs += performance.now() - startedAt
+        if (winners) parkCachedHits(kind, list, hits, winners)
+        return { winners, hits }
+      })()
+      coldWinners[kind] = { list, read }
+      return read
+    }
+    const readCachedShard = async (url: string, kind: 'object' | 'connection', list: readonly string[]): Promise<ModelShardRead | null> => {
+      if (!cacheHits?.[kind].has(documentIdOf(url))) return null
+      const { winners } = await winnersFor(kind, list)
+      const won = winners?.wonBy.get(url)
+      if (!winners || !won) return null
+      const sealed: Record<string, unknown> = {}
+      const wonIds = new Set(won)
+      for (const id of [...won, ...winners.firstHeldBy.get(url) ?? []].sort(codePointOrder)) {
+        sealed[id] = wonIds.has(id) ? winners.values.get(id) : undefined
+      }
+      coldBuildPhases.cacheHits += 1
+      return { sealed }
+    }
+    const readShard: ModelShardStream = async (url, kind, list) => {
+      if (sealedParking) {
+        const cached = await readCachedShard(url, kind, list)
+        if (cached) return cached
+      }
+      const handle = await resolveHandle(url)
+      if (!sealedParking || !isSealedProductDoc(kind, handle.doc())) {
+        extractionHandles.set(url, handle)
+        return { doc: handle.doc() }
+      }
+      const documentId = handle.documentId
+      const watermark = (await documentContentArrivals(db, [documentId])).get(documentId) ?? null
+      const doc = handle.doc()
+      const heads = tryGetAutomergeHeads(doc)
+      // Rewritten under the read (no longer sealed), or unreadable heads:
+      // read as any shard, resident and watched.
+      if (!heads || !isSealedProductDoc(kind, doc)) {
+        extractionHandles.set(url, handle)
+        sealedDeclinedAtColdBuild.add(url)
+        return { doc }
+      }
+      // Ranked by the list THIS extraction merges, never ModelMeta's live one:
+      // a concurrent unlist would make `add` refuse and fail the build, a
+      // reorder would index winners the merged rows do not have. A list that
+      // moved since is caught by `checkSealedIndexOrder` on the first meta
+      // pass (the index keeps this order).
+      const entities = indexSealedProduct(kind, url, doc, sealedRankIn(list))
+      parkedSealedProducts.set(url, { kind, documentId, watermark, heads: [...heads], changed: false })
+      if (cacheHits) coldBuildPhases.cacheMisses += 1
+      await repo.flush([documentId])
+      if (residency && leasedDocumentIds.delete(documentId)) residency.release(documentId, residencyOwner)
+      return { sealed: entities }
+    }
+    /** `readShard`, timed into `coldBuildPhases` (no behaviour of its own):
+     * a sealed product's whole read (resolve, arrival read, copy, flush,
+     * release), or any other shard's. */
+    const streamShard: ModelShardStream = async (url, kind, list) => {
+      const startedAt = performance.now()
+      if (coldBuildPhases.lastShardEndedAt === null) {
+        coldBuildPhases.beforeShardsMs = startedAt - coldBuildPhases.startedAt
+      } else {
+        coldBuildPhases.betweenShardsMs += startedAt - coldBuildPhases.lastShardEndedAt
+      }
+      const read = await readShard(url, kind, list)
+      const phase = 'sealed' in read ? coldBuildPhases.sealedProducts : coldBuildPhases.otherShards
+      phase.count += 1
+      coldBuildPhases.lastShardEndedAt = performance.now()
+      phase.ms += coldBuildPhases.lastShardEndedAt - startedAt
+      return read
+    }
+    // What the adopt stamps need of the CONTROL documents this extraction
+    // reads through the resolver (ModelMeta, registry shards, a monolith):
+    // the heads of the very revision read, and ModelMeta's for the topology.
+    const extractionSampledHeads = new Map<string, readonly string[] | null>()
+    let extractionMeta: MetaLike | undefined
     model = await extractModelEntities(rootDoc, async (url) => {
       const handle = await resolveHandle(url)
       extractionHandles.set(url, handle)
-      return handle.doc()
-    })
+      const doc = handle.doc()
+      noteSampledHeads(extractionSampledHeads, url, doc)
+      if (url === rootDoc.modelMetaUrl) extractionMeta = metaView(doc)
+      return doc
+    }, streamShard)
+    coldBuildControlHeads = {
+      root: tryGetAutomergeHeads(rootDoc),
+      byUrl: new Map([
+        ...(rootDoc.modelMetaUrl ? [rootDoc.modelMetaUrl] : rootDoc.modelUrl ? [rootDoc.modelUrl] : []),
+        ...model.registryShardUrls,
+      ].map((url) => [url, extractionSampledHeads.get(url) ?? null])),
+    }
     rememberShardReferences(model.objectShardUrls, model.connectionShardUrls)
     // ONLY the object/connection shard documents are stamped — and only the
     // ones whose read did not defect. (1) A stamped document with NO
@@ -1252,7 +2587,9 @@ export async function startReadModelProjector(
       return urls.map(url => ({ url,
         // This map retains only the last sample of an exact URL. It cannot
         // vouch for an earlier occurrence read at a different revision.
-        sampledHeads: occurrences.get(url) === 1 ? headsByUrl.get(url) ?? null : null,
+        sampledHeads: occurrences.get(url) === 1
+          ? headsByUrl.get(url) ?? parkedSealedProducts.get(url)?.heads ?? null
+          : null,
       }))
     }
     const sampledShards = [
@@ -1260,6 +2597,21 @@ export async function startReadModelProjector(
       ...sampledReferences(model.connectionShardUrls, model.connectionShardHeadsByUrl),
     ].filter(({ url }) => !defectedIds.has(documentIdOfUrl(url))).map(sample => {
       const documentId = documentIdOfUrl(sample.url) as DocumentId
+      const sealed = parkedSealedProducts.get(sample.url)
+      if (sealed) {
+        // Streamed and given back (G4-16f): no handle to re-check. The proof
+        // is its heads captured at the read, against the durable heads — and
+        // against the live document should something have loaded it again
+        // since (a peer's sync): a change through this Repo shows there; one
+        // still being saved is waited for by the preparation's drain.
+        return { documentId, sampledHeads: sample.sampledHeads,
+          currentHandle: (): null => null,
+          readCurrentHeads: () => {
+            const live = syncedHandle(repo, documentId)
+            if (!live) return sealed.heads
+            return live.state === 'ready' ? tryGetAutomergeHeads(live.doc()) : null
+          } }
+      }
       const handle = extractionHandles.get(sample.url)
       const currentHandle = () => {
         const state = repo.synchronizer.docSynchronizers[documentId]?.query.peek()
@@ -1272,11 +2624,46 @@ export async function startReadModelProjector(
         readCurrentHeads: () => tryGetAutomergeHeads(currentHandle().doc()) }
     })
     for (const sample of sampledShards) sample.currentHandle()
+    // The adopt stamps (G4-16f, `adoptState.ts`): root, ModelMeta, registry
+    // shards, a monolith model — exact or 0, through the same proof as the
+    // shards. A control document whose read defected certifies nothing.
+    const controlUrls = [
+      ...(rootDoc.modelMetaUrl ? [rootDoc.modelMetaUrl] : rootDoc.modelUrl ? [rootDoc.modelUrl] : []),
+      ...model.registryShardUrls,
+    ]
+    const adoptSamples: AdoptSample[] = [
+      { documentId: rootHandle.documentId, sampledHeads: tryGetAutomergeHeads(rootDoc),
+        readCurrentHeads: adoptLiveHeads(rootHandle.documentId, rootHandle) },
+      ...controlUrls.map((url): AdoptSample => {
+        const documentId = documentIdOfUrl(url)
+        const handle = extractionHandles.get(url)
+        return { documentId,
+          sampledHeads: defectedIds.has(documentId) || !handle ? null : extractionSampledHeads.get(url) ?? null,
+          readCurrentHeads: adoptLiveHeads(documentId, handle) }
+      }),
+    ]
+    const adoptIds = [...new Set(adoptSamples.map(sample => sample.documentId as DocumentId))]
     await repo.flush([...new Set(sampledShards.map(sample => sample.documentId))])
+    // Hits/misses of the process-wide memo across this proof, so a binding
+    // that silently stops (the proof stays correct, only slow again) shows in
+    // `cold_build_phases`. A delta of process counters: another workspace's
+    // proof running at the same moment is counted too.
+    const memoHitsBefore = durableHeadsMemo.hits
+    const memoMissesBefore = durableHeadsMemo.misses
     const preparedWatermarks = await prepareShardWatermarks(sampledShards.map(sample => sample.documentId))
+    const adoptPrepared = await prepareAdoptWatermarks(adoptIds)
+    coldBuildPhases.proofMemoHits = durableHeadsMemo.hits - memoHitsBefore
+    coldBuildPhases.proofMemoMisses = durableHeadsMemo.misses - memoMissesBefore
     for (const sample of sampledShards) sample.currentHandle()
+    let coldAdoptCertified = new Set<string>()
     await runTracked('cold_build', async (tx) => {
-      await coldBuildReadModel(tx, key, orgId, model.objects, model.connections, model.groups, model.diagrams)
+      const rowsStartedAt = performance.now()
+      if (coldBuildPhases.lastShardEndedAt !== null) {
+        coldBuildPhases.afterShardsMs = rowsStartedAt - coldBuildPhases.lastShardEndedAt
+      }
+      await coldBuildReadModel(tx, key, orgId, model.objects, model.connections, model.groups, model.diagrams,
+        { timings: coldBuildPhases.rowWritesBreakdown, analyzeSkipped: coldBuildPhases.analyzeSkippedTables })
+      coldBuildPhases.rowWritesMs = performance.now() - rowsStartedAt
       // Atomic with the rows they describe, and unconditional: if this
       // build is disowned, its claim below is skipped or its CAS misses, the
       // assert fails and the WHOLE transaction — these watermarks included —
@@ -1285,7 +2672,9 @@ export async function startReadModelProjector(
       await recordSampledDocumentWatermarks(tx, key, sampledShards, preparedWatermarks)
       // Claim the row-write fence atomically with the rows it will guard,
       // at the END of the action so the state-row lock is taken after the ro_*
-      // locks. Two layers, each covering what the other cannot:
+      // locks (only the adopt bookkeeping follows it, and that takes the same
+      // state row first: `withAdoptSavepoint`). Two layers, each covering
+      // what the other cannot:
       //
       //  - the `stillOwned` fast-fail: a cold build the fleet has already
       //    released skips the claim, fails its own assert, and rolls back —
@@ -1297,25 +2686,167 @@ export async function startReadModelProjector(
       //    DB-truth, so a released build that would otherwise commit LAST and
       //    steal the fence from the live takeover — wedging the workspace —
       //    misses zero rows and dies whole.
-      if (!stopped && stillOwned()) {
-        await claimReadModelWriteFence(tx, key, orgId, projectorInstanceId, fenceObservedAtStart)
-      }
+      const claimed = !stopped && stillOwned()
+      if (claimed) await claimReadModelWriteFence(tx, key, orgId, projectorInstanceId, fenceObservedAtStart)
+      // In THIS transaction, like the shard stamps: a build that rolls back
+      // leaves no adopt row (`adoptState.ts`); under a savepoint, so the
+      // adopt bookkeeping can never roll the build back.
+      //
+      // THE FENCE BINDING (`adoptState.ts`, ADOPT_STATE_VERSION) is the last
+      // write of the SAME savepoint as the row it binds, after the claim: the
+      // row is bound to the fence this transaction holds, and only if this
+      // transaction's row was written — a failed `writeAdoptState` must not
+      // leave an earlier owner's row (its lists, its digests) bound to this
+      // fence. Unclaimed (the build is about to fail its own assert), nothing
+      // is bound.
+      await withAdoptSavepoint(tx, key, async () => {
+        coldAdoptCertified = await recordAdoptWatermarks(tx, key, adoptSamples, adoptPrepared)
+        await writeAdoptState(tx, key, {
+          orgId,
+          topology: adoptTopology(rootHandle.documentId, rootDoc, extractionMeta),
+          defects: model.defects.length,
+          sealedCeiling,
+          posture: projectorPosture,
+        })
+        if (claimed) await bindAdoptFence(tx, key, projectorInstanceId)
+      })
     }, { kind: 'reset', scope: 'all' }, fullExtractionIntegrity(model))
+    // Committed: what the build certified is the baseline of the deferred
+    // stamps (`runAdoptStamps`). A control document it could NOT certify is
+    // scheduled (T-SUM-2c): its adopt certificate now lifts the absence proof
+    // (`DOCUMENT_ARRIVAL_BRANCH_SQL`), and a compaction's re-attach is a cold
+    // build, so a 0 left here would otherwise wait for the next pass.
+    noteAdoptProjected(adoptSamples, [], coldAdoptCertified,
+      adoptSamples.some((sample) => !coldAdoptCertified.has(sample.documentId)))
     // Inside the try, so a failed read releases the leases like every other
     // boot failure. A failure is NOT read as "no retirements": that would
     // project a retired head directly and hide its forwarded edits.
-    const pointer = writeHeadPointer(metaHandle?.doc() as MetaLike | undefined)
+    const pointer = writeHeadPointer(metaView(metaHandle?.doc()))
     retirements = await loadOrdinaryHeadRetirements(db, key)
     retirementsPointer = pointer
   } catch (error) {
     if (residency) residency.releaseOwner(residencyOwner)
     throw error
   }
-  console.log(
+
+  const cleanups: Array<() => void> = []
+  /** The initial diagram probe THIS attach registered (below), so a failed
+   * attach removes its own entry and never a successor's. */
+  const ownDiagramProbe: { promise?: Promise<void> } = {}
+  // F4 (G4-16f C6-1): an attach that throws from here on — right after the
+  // cold build's own catch, which only covers its try — returns no stop(),
+  // so nothing else would ever run what it registered: every watcher,
+  // listener, coalescer, retry, poll and timer pushed onto `cleanups`, and
+  // every residency lease of this owner. `startReadModelProjector` runs
+  // this hook on the way out; each cleanup in its own try, so one that
+  // throws does not leave the rest registered. `stopped` is already true by
+  // then (the first `attachFailed` hook), so nothing re-arms. Detached by
+  // CAS on this instance's id: a no-op unless this attach had marked itself
+  // attached. NOT covered: a resolve still in flight when this runs leases
+  // its handle afterwards (the resolvers do not check `stopped` before
+  // `acquire`) — the same residual as `stop()`.
+  attachFailed.push(() => {
+    for (const cleanup of cleanups.splice(0)) {
+      try { cleanup() } catch (error) { console.error('[read-model] a failed attach\'s cleanup threw', error) }
+    }
+    residency?.releaseOwner(residencyOwner)
+    if (ownDiagramProbe.promise && initialDiagramProbes.get(keyOf(key)) === ownDiagramProbe.promise) initialDiagramProbes.delete(keyOf(key))
+    void markReadModelProjectorDetached(db, key, projectorInstanceId)
+      .catch((error) => console.error('[read-model] failed to mark a failed attach detached', error))
+  })
+  // SHADOW, after the build committed (`adoptVerify.ts`): the id-set
+  // digests the verifier read from the KEPT rows beside the ones this
+  // extraction seals; how many listed OBJECT and CONNECTION shards the build
+  // read at heads other than the seed an adopter would have used; and
+  // whether the topology (root as the build read it, ModelMeta as its handle
+  // holds it now) is the one the kept row recorded
+  // (a shard listed while no owner ran is invisible to the seeds). An
+  // object or connection digest that differs while every seed matched and
+  // the topology matched is the finding this exists for: the verifier would
+  // have kept rows an extraction disagrees with. Groups (ModelMeta) and
+  // diagrams (registry shards) have no seed comparison, so a difference
+  // there may be ordinary catch-up. Before `model.objects` is cleared below
+  // (the extraction's ids). Never fails the attach: logged, not thrown.
+  if (shadowVerdict?.keptDigests) {
+    try {
+      const built = fullExtractionIntegrity(model).digests ?? {}
+      const kept = shadowVerdict.keptDigests
+      const equal = Object.fromEntries(DIGEST_KINDS.map((kind) => {
+        const a = kept[kind]
+        const b = built[kind]
+        return [kind, Boolean(a && b && a.n === b.n && a.x === b.x)]
+      }))
+      const seedHeads = shadowVerdict.seeds ? await seedHeadsAgainstBuild(db, key, shadowVerdict.seeds) : null
+      const topologyMatches = shadowVerdict.keptTopologyDigest === null
+        ? null
+        : adoptTopology(rootHandle.documentId, rootDoc, metaView(metaHandle?.doc())).digest === shadowVerdict.keptTopologyDigest
+      console.log(JSON.stringify({
+        event: 'read_model.adopt_shadow_comparison',
+        workspace: `${key.landscapeId}/${key.versionId}`,
+        verdict: shadowVerdict.verdict,
+        reason: shadowVerdict.reason,
+        kept,
+        built,
+        equal,
+        seedHeads,
+        topologyMatches,
+      }))
+    } catch (error) {
+      console.error(`[read-model] adopt shadow comparison failed for ${key.landscapeId}/${key.versionId}`, error)
+    }
+  }
+  // An ADOPTING attach built nothing: neither cold-build line (its own is
+  // `read_model.adopt_attach`, at B5).
+  if (!adoptClaim) console.log(
     `[read-model] cold build (${key.landscapeId}/${key.versionId}): ${model.objects.length} objects, ` +
       `${model.connections.length} connections, ${model.groups.length} groups, ${model.diagrams.length} diagrams ` +
       `across ${model.objectShardUrls.length}+${model.connectionShardUrls.length} model shards`
   )
+  // Written: the merged lists are never read again, and with sealed products
+  // streamed they are the only holder of the values those products lose
+  // (G4-16f). The per-shard maps stay — the boot watchers seed from them.
+  model.objects = []
+  model.connections = []
+  const roundMs = (ms: number) => Math.round(ms * 10) / 10
+  if (!adoptClaim) console.log(JSON.stringify({
+    event: 'read_model.cold_build_phases',
+    workspace: `${key.landscapeId}/${key.versionId}`,
+    totalMs: roundMs(performance.now() - coldBuildPhases.startedAt),
+    metaResolveMs: roundMs(coldBuildPhases.metaResolveMs),
+    sealedProducts: coldBuildPhases.sealedProducts.count,
+    sealedProductsMs: roundMs(coldBuildPhases.sealedProducts.ms),
+    otherShards: coldBuildPhases.otherShards.count,
+    otherShardsMs: roundMs(coldBuildPhases.otherShards.ms),
+    rowWritesMs: roundMs(coldBuildPhases.rowWritesMs),
+    rowWritesBreakdown: roundedRowWriteTimings(coldBuildPhases.rowWritesBreakdown),
+    derivedAnalyzeSkipped: coldBuildPhases.analyzeSkippedTables.length > 0,
+    analyzeSkippedTables: coldBuildPhases.analyzeSkippedTables,
+    duplicateIdsDropped: model.defects.filter((defect) => defect.kind === 'duplicate-id').length,
+    beforeShardsMs: roundMs(coldBuildPhases.beforeShardsMs),
+    betweenShardsMs: roundMs(coldBuildPhases.betweenShardsMs),
+    afterShardsMs: roundMs(coldBuildPhases.afterShardsMs),
+    proofMemoHits: coldBuildPhases.proofMemoHits,
+    proofMemoMisses: coldBuildPhases.proofMemoMisses,
+    cacheHits: coldBuildPhases.cacheHits,
+    cacheMisses: coldBuildPhases.cacheMisses,
+    cacheReadMs: roundMs(coldBuildPhases.cacheReadMs),
+  }))
+  if (parkedSealedProducts.size) {
+    console.log(JSON.stringify({
+      event: 'read_model.ordinary_sealed_products_streamed',
+      workspace: `${key.landscapeId}/${key.versionId}`,
+      products: parkedSealedProducts.size,
+      indexedObjects: sealedIndex.object.entities,
+      indexedConnections: sealedIndex.connection.entities,
+      // G4-16f C5: values held in memory (the products read from their
+      // document, until their extract is committed).
+      pinnedValues: sealedValuesHeld(),
+    }))
+  }
+  sealedValueCounters.set(keyOf(key), sealedValuesHeld)
+  const dropValueCounter = () => {
+    if (sealedValueCounters.get(keyOf(key)) === sealedValuesHeld) sealedValueCounters.delete(keyOf(key))
+  }
   // A cold build is the one moment the whole read model is written from scratch,
   // so it is also the moment an unreadable document does the most damage: every
   // id it held is simply absent, and every later delta projection is relative to
@@ -1323,12 +2854,41 @@ export async function startReadModelProjector(
   // a database query.
   if (model.defects.length > 0) {
     console.warn(
-      `[read-model] cold build (${key.landscapeId}/${key.versionId}) could not read ` +
-        `${model.defects.length} document(s): ${summarizeModelDefects(model.defects)}`
+      `[read-model] cold build (${key.landscapeId}/${key.versionId}) recorded ` +
+        `${model.defects.length} model defect(s) (unreadable documents, dropped duplicate ids): ${summarizeModelDefects(model.defects)}`
     )
   }
 
-  const cleanups: Array<() => void> = []
+  cleanups.push(() => {
+    if (adoptStampTimer) clearTimeout(adoptStampTimer)
+    adoptStampTimer = null
+    dropStampIdler()
+  })
+  cleanups.push(dropValueCounter)
+  attachFailed.push(dropValueCounter)
+  // After the commit, in the background (`sealedProductCache.ts`): drop the
+  // extracts of products no longer listed, then cache each product this
+  // build read from its document. `stop()` aborts the writer (a write in
+  // flight rolls back and gives its client back).
+  if (sealedCache) {
+    sealedCache.prune({
+      object: model.objectShardUrls.map(documentIdOf),
+      connection: model.connectionShardUrls.map(documentIdOf),
+    })
+    for (const entry of parkedSealedProducts.values()) {
+      // Served from the cache, or refused against these very rows before:
+      // nothing to write.
+      if (entry.cached || coldCacheRefused?.[entry.kind].has(entry.documentId)) continue
+      sealedCache.enqueue({ kind: entry.kind, documentId: entry.documentId, heads: entry.heads })
+    }
+    sealedProductCacheWriters.set(keyOf(key), sealedCache)
+    const dropWriter = () => {
+      if (sealedProductCacheWriters.get(keyOf(key)) === sealedCache) sealedProductCacheWriters.delete(keyOf(key))
+      void sealedCache.stop()
+    }
+    cleanups.push(dropWriter)
+    attachFailed.push(dropWriter)
+  }
   /** Widened from a bare disposer: the resident sweep needs the handle to tell
    * whether this watcher is still attached to the repo's CURRENT handle for that
    * document, and the diagram to re-attach with. */
@@ -1787,6 +3347,13 @@ export async function startReadModelProjector(
     })
     diagramUrlByDocumentId.set(String(handle.documentId), docUrl)
     lastKnownDiagram.set(docUrl, diagram)
+    /** T-DIAGDEF-2: the heads the attach's own projection read.
+     * `project()` reads the document, then awaits a whole transaction, and
+     * only then is the watcher attached — a change in between (a flow added
+     * right after the diagram's creation, a peer syncing during a cold build)
+     * fired nothing and never reached `ro_connection_flows`. Compared once the
+     * watcher is attached, the control documents' rule (`controlGapSince`). */
+    let readHeads: readonly string[] | null = null
     // Later flow projections degrade the workspace too: a change that cannot be
     // written must not disappear into a log line.
     const project = async () => {
@@ -1796,7 +3363,9 @@ export async function startReadModelProjector(
         // would wipe its flows silently. Diagram documents always carry `flows: {}` (client
         // `createDiagramHandle`, server `starterDiagramDoc`), so an absent key is
         // never a legitimately flow-less diagram.
-        const readFlows = readEntityMapOrDefect<FlowInput>(handle.doc(), 'flows', 'registry-shard', docUrl)
+        const doc = handle.doc()
+        readHeads = tryGetAutomergeHeads(doc)
+        const readFlows = readEntityMapOrDefect<FlowInput>(doc, 'flows', 'registry-shard', docUrl)
         if (isUninformative(readFlows.defect)) {
           recordRefusedProjection()
           console.warn(
@@ -1907,6 +3476,13 @@ export async function startReadModelProjector(
         diagram,
         stop: () => { coalescer.dispose(); handle.off('change', onChange) },
       })
+      // T-DIAGDEF-2: watched now; a move since `project()` read
+      // the document is the gap — its pass, as if the change had just come.
+      // Unknown on one side = moved; on both = no evidence.
+      const liveHeads = tryGetAutomergeHeads(handle.doc())
+      if ((readHeads || liveHeads) && !(readHeads && liveHeads && watermarkHeadsEqual(readHeads, liveHeads))) {
+        coalescer.trigger()
+      }
     }
     try {
       await projectThenWatch()
@@ -2083,15 +3659,35 @@ export async function startReadModelProjector(
     // the complete transaction through the fence.
     // The certificate/refusal decision lives in recordSampledDocumentWatermark,
     // where real PostgreSQL/Automerge races exercise both outcomes.
-    await recordSampledDocumentWatermark(
+    const outcome = await recordSampledDocumentWatermark(
       tx, key, handle.documentId, sampledHeads, () => {
-        const meta = metaHandle?.doc() as MetaLike | undefined
+        const meta = metaView(metaHandle?.doc())
         const references = rememberShardReferences(meta?.objectShardUrls ?? [], meta?.connectionShardUrls ?? [])
         if (ambiguousShardDocuments.has(handle.documentId) || references.get(handle.documentId) !== 1) return null
         const state = repo.synchronizer.docSynchronizers[handle.documentId]?.query.peek()
         return state?.state === 'ready' && state.handle === handle ? tryGetHeads(handle.doc()) : null
-      }, preparedWatermarks,
+      }, preparedWatermarks, () => withdrawnByStop(handle),
     )
+    if (outcome === 'withdrawn') await withdrawShardCertificate(tx, key, handle.documentId)
+  }
+  /** T-ZEROWM-2 (4): `stop()` (and a failed attach's cleanup) release this
+   * owner's leases WITHOUT draining the passes in flight — the residency then
+   * evicts a shard under its pass, whose certificate would be 0. With
+   * `READ_MODEL_ADOPT=on` the next attach could adopt that row: it seeded the
+   * shard at the 0's `projected_heads` (the pass's sample), found the live
+   * heads equal, ran no pass, and the 0 refused the absence proof until the
+   * next write into that shard (reproduced by a red test). So
+   * once `stopped`, a handle no longer the Repo's — and referenced once,
+   * unambiguous, so that the refusal 0 of an ambiguous reference stays — is
+   * WITHDRAWN: its row becomes 0 with NULL heads (`withdrawShardCertificate`),
+   * which no adopter accepts — the next attach cold-builds and re-certifies. */
+  const withdrawnByStop = (handle: DocHandle<unknown>): boolean => {
+    if (!stopped) return false
+    const meta = metaView(metaHandle?.doc())
+    const references = rememberShardReferences(meta?.objectShardUrls ?? [], meta?.connectionShardUrls ?? [])
+    if (ambiguousShardDocuments.has(handle.documentId) || references.get(handle.documentId) !== 1) return false
+    const state = repo.synchronizer.docSynchronizers[handle.documentId]?.query.peek()
+    return !(state?.state === 'ready' && state.handle === handle)
   }
   /**
    * Acknowledge write batches whose rows are ALREADY published without a
@@ -2131,7 +3727,7 @@ export async function startReadModelProjector(
         throw error
       }
     })
-    projectionTail = task.then(() => undefined, () => undefined)
+    chainProjectionTail(task)
     return task
   }
   /** Re-read the retirement rows when a write-head pointer has moved since the
@@ -2141,7 +3737,7 @@ export async function startReadModelProjector(
   let retirementsLoad: Promise<void> | null = null
   const freshRetirements = async (): Promise<void> => {
     for (;;) {
-      const pointer = writeHeadPointer(metaHandle?.doc() as MetaLike | undefined)
+      const pointer = writeHeadPointer(metaView(metaHandle?.doc()))
       if (pointer === retirementsPointer) return
       if (!retirementsLoad) {
         retirementsLoad = (async () => {
@@ -2162,7 +3758,7 @@ export async function startReadModelProjector(
    * no, and the head is projected directly, exactly as before phase 2. */
   const isForwardedHead = (collection: 'object' | 'connection', documentId: string, url: string): boolean => {
     if (!forwardsLateWrites(retirements.get(retirementKey(collection, documentId)))) return false
-    const meta = metaHandle?.doc() as MetaLike | undefined
+    const meta = metaView(metaHandle?.doc())
     const current = collection === 'object' ? meta?.editsObjectShardUrl : meta?.editsConnectionShardUrl
     return Boolean(current) && current !== url
   }
@@ -2172,6 +3768,201 @@ export async function startReadModelProjector(
    * that has never been rotated — byte-identical to before. */
   const forwardedBatchIdsOf = (doc: ObjShardLike | ConnShardLike | undefined): string[] =>
     retirements.size ? doc?.forwardedBatchIds ?? [] : []
+  /**
+   * THE VALUES PARKED SEALED PRODUCTS SERVE (G4-16f C5): for each of `urls`
+   * (parked sealed products), the value of each of `ids` it WINS — exactly
+   * what the index held when it kept every value, or a throw; never an
+   * omission. From memory for a PINNED product; otherwise ONE statement per
+   * kind over the extracts, joined on the digest each product's values were
+   * served with. A product whose extract cannot give every value asked (the
+   * extract deleted, pruned or rewritten since, a row gone, no digest
+   * recorded) is RELOADED from its document (`reloadSealedValues`) and
+   * answers from the values pinned again. An id the product does not win is
+   * absent from its map.
+   */
+  const parkedSealedValues = async (
+    urls: readonly string[],
+    ids: readonly string[],
+  ): Promise<Map<string, Map<string, unknown>>> => {
+    const out = new Map<string, Map<string, unknown>>()
+    const reads: Record<'object' | 'connection', SealedValueRequest[]> = { object: [], connection: [] }
+    const reload = new Set<string>()
+    // A pinned product answers for every id it wins (`SealedWinnerIndex.pin`);
+    // a won id without a pinned value is refused here all the same, never
+    // served as `undefined`.
+    const fromPins = (url: string, won: readonly string[]): boolean => {
+      const entry = parkedSealedProducts.get(url)
+      const index = entry ? sealedIndex[entry.kind] : null
+      if (!index?.isPinned(url)) return false
+      const values = new Map<string, unknown>()
+      for (const id of won) {
+        if (!index.wins(url, id)) continue
+        const value = index.pinnedValue(url, id)
+        if (value === undefined) return false
+        values.set(id, value)
+      }
+      out.set(url, values)
+      return true
+    }
+    const wonOf = new Map<string, string[]>()
+    for (const url of new Set(urls)) {
+      const entry = parkedSealedProducts.get(url)
+      if (!entry) continue
+      const won = ids.filter((id) => sealedIndex[entry.kind].wins(url, id))
+      wonOf.set(url, won)
+      if (!won.length) { out.set(url, new Map()); continue }
+      if (fromPins(url, won)) continue
+      if (!entry.rowsDigest) { reload.add(url); continue }
+      reads[entry.kind].push({ url, documentId: entry.documentId, rowsDigest: entry.rowsDigest, ids: won })
+    }
+    for (const kind of ['object', 'connection'] as const) {
+      if (!reads[kind].length) continue
+      const answer = await readSealedValues(db, key, kind, reads[kind])
+      for (const request of reads[kind]) {
+        const values = answer.get(request.url) ?? new Map<string, unknown>()
+        if (request.ids.every((id) => values.has(id))) out.set(request.url, values)
+        else reload.add(request.url)
+      }
+    }
+    for (const url of reload) {
+      const won = wonOf.get(url) ?? []
+      await reloadSealedValues(url)
+      if (fromPins(url, won)) continue
+      // The writer may have committed the re-queued extract and unpinned it
+      // between the reload and here (`onSealedExtractWritten`): that extract
+      // answers then. Bounded: twice, then a throw.
+      let answered = false
+      for (let attempt = 0; attempt < 2 && !answered; attempt += 1) {
+        const entry = parkedSealedProducts.get(url)
+        if (fromPins(url, won)) { answered = true; break }
+        if (!entry?.rowsDigest) break
+        const values = (await readSealedValues(db, key, entry.kind, [
+          { url, documentId: entry.documentId, rowsDigest: entry.rowsDigest, ids: won },
+        ])).get(url) ?? new Map<string, unknown>()
+        if (won.every((id) => values.has(id))) {
+          out.set(url, values)
+          answered = true
+        }
+      }
+      if (!answered) {
+        throw new Error(`parked sealed product ${url}: its values could not be read back (${key.landscapeId}/${key.versionId})`)
+      }
+    }
+    return out
+  }
+  /** A parked sealed product whose values can be read from nowhere, for a
+   * DETERMINISTIC reason (`reloadSealedValues`: its document deleted or
+   * invalid, its parked heads absent from its history, a won id absent at
+   * those heads — the same bytes give the same answer every time): degraded
+   * once, under its own error (not a fold-product change), and marked so no
+   * later read loads its document again. Only a cold build lifts it. A
+   * transient failure never comes here: it is rethrown, and the forward's
+   * own degrade-and-backoff retries it. */
+  const sealedValuesLost = (url: string, entry: { kind: 'object' | 'connection'; changed: boolean; valuesLost?: string }, reason: string, error: unknown): void => {
+    if (stopped || entry.valuesLost) return
+    entry.valuesLost = reason
+    const message = error instanceof Error ? error.message : String(error)
+    console.error(JSON.stringify({
+      event: 'read_model.ordinary_sealed_values_lost',
+      workspace: `${key.landscapeId}/${key.versionId}`,
+      kind: entry.kind,
+      url,
+      reason,
+      error: message,
+    }))
+    // Reported once: the park poll does not report it again (`changed`).
+    if (entry.changed) return
+    entry.changed = true
+    degradeShard(url, entry.kind === 'object' ? 'object_shard' : 'connection_shard',
+      new Error(`sealed product ${url}: its values could not be read back (${reason}): ${message}`))
+  }
+  /** Reloads in flight, by url (two forwards asking at once share one). */
+  const sealedValueReloads = new Map<string, Promise<void>>()
+  /**
+   * A parked sealed product's values, from its DOCUMENT (G4-16f C5, I5.2):
+   * the extract they were read from is gone or no longer answers. The
+   * content at the heads it was parked with (`view`: the index serves what
+   * was read then, even should the document have moved since — a change
+   * degrades the product, never re-reads it), PINNED again, and the extract
+   * queued for a rewrite (`onSealedExtractWritten` drops the pins once it is
+   * committed at those heads). Heads absent from the document's history, a
+   * won id absent from the content at those heads, or a document the
+   * resolution classifies as deleted or invalid THROW, and mark the
+   * product's values lost (`sealedValuesLost`: degraded, never reloaded
+   * again) — a failure that would repeat on every forward is not retried by
+   * every forward. Any OTHER resolution failure (a timeout, the document
+   * temporarily unavailable, a stopping Repo) is rethrown unmarked: the
+   * forward fails, backs off and retries, and a later reload succeeds. Every
+   * await, and what a throw or a stop there leaves:
+   *   1. `resolveHandle` — on success the document is leased; a throw leaves
+   *      nothing leased, nothing pinned;
+   * then SYNCHRONOUSLY: the view, the copy, the completeness check, the
+   * pin, the enqueue;
+   *   2. `releaseSealedLease` (in the finally, durable first) — the lease
+   *      goes back as a park gives it; a failed flush is logged and leaves
+   *      it leased, which the park poll retries (`pollParkedSealedProducts`);
+   *      after `stop()` the lease is dropped unflushed, including one
+   *      `resolveHandle` acquired after the stop released the owner.
+   */
+  const reloadSealedValues = (url: string): Promise<void> => {
+    const inFlight = sealedValueReloads.get(url)
+    if (inFlight) return inFlight
+    const running = (async () => {
+      const entry = parkedSealedProducts.get(url)
+      if (!entry) throw new Error(`not a parked sealed product: ${url}`)
+      if (entry.valuesLost) throw new Error(`parked sealed product ${url}: its values are lost (${entry.valuesLost})`)
+      let handle: DocHandle<unknown>
+      try {
+        handle = await resolveHandle(url, 'sealed-values')
+      } catch (error) {
+        // Lost only when the resolution says the document is GONE (deleted,
+        // an invalid url). A timeout, a slow storage read, a Repo stopping
+        // before `stopped` is set: rethrown unmarked, retried by the forward.
+        const outcome = classifyDocumentResolutionError(error, () => documentRepoState(repo, url))
+        if (outcome === 'invalid' && parkedSealedProducts.get(url) === entry) sealedValuesLost(url, entry, 'deleted', error)
+        throw error
+      }
+      try {
+        let entities: Record<string, unknown>
+        try {
+          const content = viewDoc(handle.doc() as Doc<Record<string, unknown>>, [...entry.heads])
+          const field = content[entityFieldOf(entry.kind)]
+          entities = (field === undefined ? {} : JSON.parse(JSON.stringify(field))) as Record<string, unknown>
+          const missing = sealedIndex[entry.kind].idsWonBy(url).find((id) => entities[id] === undefined)
+          if (missing !== undefined) throw new Error(`${missing} is absent from its content at the parked heads`)
+        } catch (error) {
+          if (parkedSealedProducts.get(url) === entry) sealedValuesLost(url, entry, 'unreadable', error)
+          throw error
+        }
+        if (parkedSealedProducts.get(url) !== entry) return
+        sealedIndex[entry.kind].pin(url, entities)
+        entry.rowsDigest = undefined
+        entry.cached = false
+        sealedCache?.enqueue({ kind: entry.kind, documentId: entry.documentId, heads: entry.heads })
+        console.warn(JSON.stringify({
+          event: 'read_model.ordinary_sealed_values_reloaded',
+          workspace: `${key.landscapeId}/${key.versionId}`,
+          kind: entry.kind,
+          url,
+        }))
+      } finally {
+        if (stopped) dropLease(entry.documentId)
+        else {
+          await releaseSealedLease(url).catch((error: unknown) => {
+            console.error(JSON.stringify({
+              event: 'read_model.ordinary_sealed_product_release_failed',
+              workspace: `${key.landscapeId}/${key.versionId}`,
+              kind: entry.kind,
+              documentId: entry.documentId,
+              error: error instanceof Error ? error.message : String(error),
+            }))
+          })
+        }
+      }
+    })().finally(() => sealedValueReloads.delete(url))
+    sealedValueReloads.set(url, running)
+    return running
+  }
   /** What the segments OTHER than the current head serve for `ids`, ModelMeta
    * order, later wins — the cold build's `Object.assign` minus its last term. */
   const servedOutsideCurrentHead = async (
@@ -2179,12 +3970,27 @@ export async function startReadModelProjector(
     currentUrl: string,
     ids: readonly string[],
   ): Promise<Map<string, Record<string, unknown>>> => {
-    const meta = metaHandle?.doc() as MetaLike | undefined
+    const meta = metaView(metaHandle?.doc())
     const urls = (collection === 'object' ? meta?.objectShardUrls : meta?.connectionShardUrls) ?? []
     const field = collection === 'object' ? 'objects' : 'connections'
     const served = new Map<string, Record<string, unknown>>()
+    // Every parked sealed product of the list at once (G4-16f C5): ONE value
+    // read for the ids they win, before the walk. A product parked during
+    // the walk is asked on its own when reached.
+    const sealedUrls = urls.filter((url) => url !== currentUrl && parkedSealedProducts.has(url))
+    const sealedValues = await parkedSealedValues(sealedUrls, ids)
     for (const url of urls) {
       if (url === currentUrl) continue
+      // A parked sealed product: the ids it wins, from memory or from its
+      // extract — never a whole-product copy per forward (G4-16f).
+      if (parkedSealedProducts.has(url)) {
+        const values = sealedValues.get(url) ?? (await parkedSealedValues([url], ids)).get(url) ?? new Map<string, unknown>()
+        for (const id of ids) {
+          const value = values.get(id)
+          if (value && typeof value === 'object') served.set(id, JSON.parse(JSON.stringify(value)))
+        }
+        continue
+      }
       const entities = ((await resolve(url)) as Record<string, Record<string, unknown> | undefined> | undefined)?.[field]
       for (const id of ids) {
         const value = entities?.[id]
@@ -2202,7 +4008,11 @@ export async function startReadModelProjector(
    * can stop being watched while the projector runs (a folded source,
    * `ordinaryChainFold.ts`). Every entry still runs at `stop()`; a stop that
    * ran early is not run twice. */
-  const shardStops = new Map<string, { documentId: DocumentId; stop: () => void; idle: () => Promise<void> }>()
+  const shardStops = new Map<string, {
+    documentId: DocumentId; stop: () => void; idle: () => Promise<void>
+    /** The watcher's last projection ended on an error (B4 reads it). */
+    failed: () => boolean
+  }>()
   /** Fold sources whose detach has begun and not finished: neither watched
    * nor released yet, so the folded-head poll leaves them alone. */
   const foldSourcesDetaching = new Set<string>()
@@ -2217,12 +4027,13 @@ export async function startReadModelProjector(
     documentId: DocumentId,
     stop: () => void,
     idle: () => Promise<void>,
+    failed: () => boolean,
   ): void => {
     // The reference is dropped once run, so a watcher stopped early is not
     // kept alive (its snapshot, its handle) by `cleanups` until `stop()`.
     let pendingStop: (() => void) | null = stop
     const once = () => { const run = pendingStop; pendingStop = null; run?.() }
-    shardStops.set(url, { documentId, stop: once, idle })
+    shardStops.set(url, { documentId, stop: once, idle, failed })
     cleanups.push(once)
   }
   /** The watcher body of a fold product: a change after its seed is never
@@ -2311,7 +4122,7 @@ export async function startReadModelProjector(
    * refusals as `recordShardWatermark`: referenced once, not ambiguous, and
    * still the repo's ready handle. */
   const liveHeadsForStamp = (handle: DocHandle<unknown>): readonly string[] | null => {
-    const meta = metaHandle?.doc() as MetaLike | undefined
+    const meta = metaView(metaHandle?.doc())
     const references = rememberShardReferences(meta?.objectShardUrls ?? [], meta?.connectionShardUrls ?? [])
     if (ambiguousShardDocuments.has(handle.documentId) || references.get(handle.documentId) !== 1) return null
     const state = repo.synchronizer.docSynchronizers[handle.documentId]?.query.peek()
@@ -2323,9 +4134,11 @@ export async function startReadModelProjector(
     preparedWatermarks: PreparedDocumentWatermarks,
   ): Promise<void> => {
     for (const stamp of stamps) {
-      await recordSampledDocumentWatermark(
+      const outcome = await recordSampledDocumentWatermark(
         tx, key, stamp.handle.documentId, stamp.heads, () => liveHeadsForStamp(stamp.handle), preparedWatermarks,
+        () => withdrawnByStop(stamp.handle),
       )
+      if (outcome === 'withdrawn') await withdrawShardCertificate(tx, key, stamp.handle.documentId)
     }
   }
 
@@ -2401,7 +4214,7 @@ export async function startReadModelProjector(
      * poll advances its watermark only on a forward that HAPPENED. */
     onOutcome?: (outcome: Awaited<ReturnType<typeof forwardRetiredHead>>) => void,
   ): Promise<boolean> => {
-    const meta = metaHandle?.doc() as MetaLike | undefined
+    const meta = metaView(metaHandle?.doc())
     const currentUrl = collection === 'object' ? meta?.editsObjectShardUrl : meta?.editsConnectionShardUrl
     // The current head, or no head at all: today's path, and no SQL.
     if (!currentUrl || currentUrl === url) return false
@@ -2441,7 +4254,7 @@ export async function startReadModelProjector(
         current: () => resolveHandle(currentUrl, 'rotation-current'),
         servedElsewhere: (ids) => servedOutsideCurrentHead(collection, currentUrl, ids),
         tombstones: () => {
-          const latest = metaHandle?.doc() as MetaLike | undefined
+          const latest = metaView(metaHandle?.doc())
           return new Set(collection === 'object' ? latest?.deletedObjectIds ?? [] : latest?.deletedConnectionIds ?? [])
         },
         mayWrite: () => !stopped && stillOwned(),
@@ -2452,11 +4265,15 @@ export async function startReadModelProjector(
         },
         flush: (documentIds) => repo.flush(documentIds),
         commit: (write) => {
+          // The fence row FIRST, before the retirement row the write
+          // updates: every protocol writer takes it before its first row
+          // lock (`adoptState.ts`, THE LOCK ORDER). Held FOR UPDATE to
+          // COMMIT, so a fence check after the write would read the same.
           const task = projectionTail.then(() => withReadModelProjectionTransaction(db, key, 'ordinary', async (tx) => {
-            await write(tx)
             await assertReadModelWriteFence(tx, key, projectorInstanceId)
+            await write(tx)
           }))
-          projectionTail = task.then(() => undefined, () => undefined)
+          chainProjectionTail(task)
           return task
         },
         settled: ({ retiredHeads, targetDocumentId }) => {
@@ -2517,7 +4334,7 @@ export async function startReadModelProjector(
   /** ModelMeta's two lists for a kind, from the resident handle (G4-16e):
    * the read order and the overlay list, as the fold's pass line names them. */
   const listedChain = (kind: OrdinaryHeadKind): { shards: number | null; overlay: number | null } => {
-    const doc = metaHandle?.doc() as Record<string, unknown> | undefined
+    const doc = metaView(metaHandle?.doc()) as Record<string, unknown> | undefined
     const length = (field: string) => (Array.isArray(doc?.[field]) ? (doc[field] as unknown[]).length : null)
     return kind === 'object'
       ? { shards: length('objectShardUrls'), overlay: length('editsObjectShardUrls') }
@@ -2555,6 +4372,16 @@ export async function startReadModelProjector(
       leasedDocumentIds.add(handle.documentId)
       residency.acquire(handle, residencyOwner, `${key.landscapeId}/${key.versionId}`)
     }
+  }
+  /** A rotation child ModelMeta never named keeps no residency lease (the
+   * fold's `releaseProduct`, for the rotator's orphans). Never a listed
+   * segment: only the rotator knows the child before it publishes it. */
+  const releaseRotationChild = (documentId: DocumentId): void => {
+    const meta = metaView(metaHandle?.doc())
+    const url = stringifyAutomergeUrl({ documentId })
+    if (meta?.objectShardUrls?.includes(url) || meta?.connectionShardUrls?.includes(url)
+      || meta?.editsObjectShardUrl === url || meta?.editsConnectionShardUrl === url) return
+    if (residency && leasedDocumentIds.delete(documentId)) residency.release(documentId, residencyOwner)
   }
   /**
    * A due head is not rotated mid-burst (`DEFAULT_ORDINARY_HEAD_ROTATION_QUIET_MS`,
@@ -2606,7 +4433,7 @@ export async function startReadModelProjector(
       // Nothing can be in flight or backing off here (requestRotation arms
       // neither alongside a deferral), so the line below names a rotation
       // startRotation does start.
-      const latest = meta.doc() as MetaLike | undefined
+      const latest = metaView(meta.doc())
       const current = kind === 'object' ? latest?.editsObjectShardUrl : latest?.editsConnectionShardUrl
       if (current !== url || !observeWriteHead(kind, url, handle.doc())) return
       console.warn(JSON.stringify({
@@ -2623,6 +4450,23 @@ export async function startReadModelProjector(
     armed.timer.unref?.()
     rotationDeferrals.set(kind, armed)
   }
+  /**
+   * G4-16f epochs: is `metaUrl` still the ModelMeta the ROOT
+   * names? The rotator and the fold writer hold a ModelMeta handle across
+   * awaits; after an epoch roll (or any repoint) they must stop writing the
+   * superseded one. A write that slipped past this check would land after the
+   * cut and be forwarded — not lost — but this keeps that path rare and named.
+   * Synchronous, beside `mayWrite`. A root naming no ModelMeta (a monolith,
+   * an unreadable root) is not a repoint: true, as before epochs.
+   */
+  const metaIsCurrent = (metaUrl: string): boolean => {
+    const pointer = (rootHandle?.doc() as RootLike | undefined)?.modelMetaUrl as unknown
+    // Both sides NORMALISED to a document id: a
+    // root may spell the same ModelMeta as an ImmutableString, or with
+    // heads (`#…`) or a query — the handle's URL never does.
+    const pointed = metaDocumentIdOf(pointer)
+    return !pointed || pointed === metaDocumentIdOf(metaUrl)
+  }
   const startRotation = (kind: OrdinaryHeadKind, handle: DocHandle<unknown>, url: string): void => {
     if (!headRotation.rotates || stopped || !metaHandle) return
     if (rotationsInFlight.has(kind) || rotationRetries.get(kind)?.timer) return
@@ -2636,7 +4480,7 @@ export async function startReadModelProjector(
       const fire = () => {
         rotationRetries.set(kind, { timer: null, attempt })
         if (stopped) return
-        const latest = meta.doc() as MetaLike | undefined
+        const latest = metaView(meta.doc())
         const current = kind === 'object' ? latest?.editsObjectShardUrl : latest?.editsConnectionShardUrl
         // Straight to the rotator: the backoff already waited.
         if (current === url && observeWriteHead(kind, url, handle.doc())) startRotation(kind, handle, url)
@@ -2651,7 +4495,7 @@ export async function startReadModelProjector(
       retired: { url, documentId: handle.documentId, doc: () => handle.doc() },
       meta: { documentId: meta.documentId, doc: () => meta.doc() as Record<string, unknown> | undefined },
       publishedHeads: () => publishedHeadsByDocument.get(handle.documentId) ?? null,
-      mayWrite: () => !stopped && stillOwned(),
+      mayWrite: () => !stopped && stillOwned() && metaIsCurrent(meta.url),
       assertAuthority: async () => {
         const held = await readWriteFence(db, key)
         if (held !== projectorInstanceId) throw new ReadModelWriteFenceError(key, projectorInstanceId, held)
@@ -2664,10 +4508,19 @@ export async function startReadModelProjector(
         return db.connect()
       },
       createChild: async () => {
-        const child = await createClaimedOverlaySegment(
-          repo, collection, touchRotatedChild, { workspace: key, rootUrl, ownerPlacement: true },
-        )
-        return { url: child.url, documentId: child.documentId }
+        let built: DocumentId | null = null
+        try {
+          const child = await createClaimedOverlaySegment(
+            repo, collection, (created) => { built = created.documentId; touchRotatedChild(created) },
+            { workspace: key, rootUrl, ownerPlacement: true },
+          )
+          return { url: child.url, documentId: child.documentId }
+        } catch (error) {
+          // Created and leased, then its flush or claim threw: the rotator
+          // never learns its id, so its lease goes here (G4-16f).
+          if (built) releaseRotationChild(built)
+          throw error
+        }
       },
       flush: (documentIds) => repo.flush(documentIds),
       assertTransactionAuthority: async (tx) => {
@@ -2689,8 +4542,17 @@ export async function startReadModelProjector(
         requestFold(kind)
         return
       }
+      // A child nothing names (ModelMeta moved, or ownership went, after it
+      // existed): a claimed orphan GC sweeps, whose lease would otherwise stay
+      // for the projector's life — one per superseded attempt (G4-16f).
+      if (result.outcome === 'superseded' && isValidAutomergeUrl(result.childUrl)) {
+        releaseRotationChild(parseAutomergeUrl(result.childUrl).documentId)
+      }
       if (result.outcome === 'lock-refused') scheduleRetry()
     }, (error: unknown) => {
+      // Thrown after the child existed and before ModelMeta named it.
+      const unpublished = unpublishedRotationChildOf(error)
+      if (unpublished) releaseRotationChild(unpublished)
       if (isReadModelAuthorityLoss(error)) {
         reportFenceLost(kind === 'object' ? 'object_shard' : 'connection_shard', error)
         return
@@ -2720,6 +4582,11 @@ export async function startReadModelProjector(
   const chainFold = headRotation.rotates ? ordinaryHeadRotation.chainFold : undefined
   const FOLD_RETRY_DELAYS_MS = [1_000, 5_000, 30_000, 60_000]
   const foldsInFlight = new Set<OrdinaryHeadKind>()
+  /** This workspace's FOREGROUND work is in flight — a transaction on
+   * `projectionTail`, a fold pass, a rotation: the sealed-product cache
+   * writer waits for it before taking the decoder or a client
+   * (`SealedProductCacheWriter`, `foregroundBusy`). */
+  const foregroundBusy = (): boolean => tailChained !== tailSettledAt || foldsInFlight.size > 0 || rotationsInFlight.size > 0
   /** Kinds a SWEEP asked a pass of while one was in flight (G4-16d): that
    * pass may have read the hold, or the owed set, before they changed, and
    * `requestFold` drops a request made during a pass — so one more pass runs
@@ -2779,7 +4646,7 @@ export async function startReadModelProjector(
      * failed log must not skip the retry below. */
     const logPass = (outcome: string, extra: Record<string, unknown> = {}): void => {
       try {
-        const doc = meta.doc()
+        const doc = metaView(meta.doc()) as Record<string, unknown> | undefined
         const listed = (field: string) => (Array.isArray(doc?.[field]) ? (doc[field] as unknown[]).length : null)
         console.warn(JSON.stringify({
           event: 'read_model.ordinary_chain_fold_pass',
@@ -2806,8 +4673,13 @@ export async function startReadModelProjector(
       minChain: chainFold.minChain,
       budget: chainFold.budget,
       retainMs: chainFold.retainMs,
-      mayWrite: () => !stopped && stillOwned(),
+      // The seal the parking uses too (`sealedCeiling`).
+      segmentCeiling: sealedCeiling,
+      ...(chainFold.windowEntities !== undefined ? { windowEntities: chainFold.windowEntities } : {}),
+      mayWrite: () => !stopped && stillOwned() && metaIsCurrent(meta.url),
       watched: (url) => (kind === 'object' ? model.objectShardUrls : model.connectionShardUrls).includes(url),
+      // G4-16f: sealed and given back — skipped, never resolved.
+      parked: (url) => parkedSealedProducts.has(url),
       // G4-16d: no fold row of a head owed a handover re-check goes — nor any,
       // before the re-check has run (`handoverSweepHold`).
       sweepKeep: () => {
@@ -2876,7 +4748,9 @@ export async function startReadModelProjector(
         again = true
         return
       }
-      if (result.outcome === 'skipped' && result.reason !== 'sources-not-settled') {
+      // Both retried on the backoff: a fold whose sources settle, and one an
+      // open epoch forward journal holds back (G4-16f, R4-a) — it lives seconds.
+      if (result.outcome === 'skipped' && result.reason !== 'sources-not-settled' && result.reason !== 'epoch-forward-pending') {
         foldRetries.delete(kind)
         return
       }
@@ -2950,25 +4824,24 @@ export async function startReadModelProjector(
   const commitFoldedArrival = (hit: { collection: 'object' | 'connection'; documentId: string; watermark: string | null; arrivalSeq: string }) => {
     const task = projectionTail.then(() => withReadModelProjectionTransaction(db, key, 'ordinary', async (tx) => {
       if (stopped || !stillOwned()) return
-      await advanceFoldedArrivalWatermark(tx, key, hit.collection, hit.documentId, hit.watermark, hit.arrivalSeq)
+      // The fence row first (`adoptState.ts`, THE LOCK ORDER).
       await assertReadModelWriteFence(tx, key, projectorInstanceId)
+      await advanceFoldedArrivalWatermark(tx, key, hit.collection, hit.documentId, hit.watermark, hit.arrivalSeq)
     }))
-    projectionTail = task.then(() => undefined, () => undefined)
+    chainProjectionTail(task)
     return task
   }
-  /** Several advances from NULL in ONE transaction, fenced as above; the ids
+  /** Several advances from NULL in ONE statement, fenced as above (one
+   * statement: the adopt triggers re-stamp once for the batch); the ids
    * whose CAS moved. */
   const commitDetachedWatermarks = (collection: 'object' | 'connection', hits: ReadonlyArray<{ documentId: string; arrivalSeq: string }>) => {
     const task = projectionTail.then(() => withReadModelProjectionTransaction(db, key, 'ordinary', async (tx) => {
-      const moved = new Set<string>()
-      if (stopped || !stillOwned()) return moved
-      for (const hit of hits) {
-        if (await advanceFoldedArrivalWatermark(tx, key, collection, hit.documentId, null, hit.arrivalSeq)) moved.add(hit.documentId)
-      }
+      if (stopped || !stillOwned()) return new Set<string>()
+      // The fence row first (`adoptState.ts`, THE LOCK ORDER).
       await assertReadModelWriteFence(tx, key, projectorInstanceId)
-      return moved
+      return advanceFoldedArrivalWatermarks(tx, key, collection, hits)
     }))
-    projectionTail = task.then(() => undefined, () => undefined)
+    chainProjectionTail(task)
     return task
   }
   /**
@@ -3239,9 +5112,12 @@ export async function startReadModelProjector(
     if (stopped) return
     for (const row of rows.values()) handoverRecheck.add(row.documentId)
     for (const entry of parkedRetiredHeads.values()) handoverRecheck.add(entry.documentId)
+    // Parked sealed products: re-checked from storage's heads, never loaded
+    // (`pollParkedSealedProducts`).
+    for (const entry of parkedSealedProducts.values()) handoverRecheck.add(entry.documentId)
     // The current write heads have the same residual (a handle loaded before
     // the old save committed); one read each.
-    const meta = metaHandle?.doc() as MetaLike | undefined
+    const meta = metaView(metaHandle?.doc())
     for (const url of [meta?.editsObjectShardUrl, meta?.editsConnectionShardUrl]) {
       if (url) handoverRecheck.add(parseAutomergeUrl(url as AutomergeUrl).documentId)
     }
@@ -3346,7 +5222,8 @@ export async function startReadModelProjector(
     const known = new Set<string>()
     for (const entry of shardStops.values()) known.add(entry.documentId)
     for (const entry of parkedRetiredHeads.values()) known.add(entry.documentId)
-    for (const url of [...foldSourcesDetaching, ...retiredHeadsParking]) {
+    for (const entry of parkedSealedProducts.values()) known.add(entry.documentId)
+    for (const url of [...foldSourcesDetaching, ...retiredHeadsParking, ...sealedProductsParking]) {
       known.add(parseAutomergeUrl(url as AutomergeUrl).documentId)
     }
     return known
@@ -3443,7 +5320,7 @@ export async function startReadModelProjector(
       stampWaits.delete(documentId)
       return false
     }
-    const meta = metaHandle?.doc() as MetaLike | undefined
+    const meta = metaView(metaHandle?.doc())
     const currentUrl = kind === 'object' ? meta?.editsObjectShardUrl : meta?.editsConnectionShardUrl
     const targetProjects = Boolean(currentUrl) && shardStops.get(currentUrl!)?.documentId === stamp.target
     const waits = stampWaits.get(documentId) ?? 0
@@ -3610,6 +5487,188 @@ export async function startReadModelProjector(
           documentId: entry.documentId,
           error: error instanceof Error ? error.message : String(error),
         }))
+      }
+    }
+  }
+  /** Sealed products whose park has begun and not finished. */
+  const sealedProductsParking = new Set<string>()
+  /** A parked sealed product's lease back, durable first; after `stop()`
+   * released at once, unflushed, as `releaseOwner` does. No stamp can name
+   * it: a product is never forwarded. */
+  const releaseSealedLease = async (url: string): Promise<void> => {
+    const entry = parkedSealedProducts.get(url)
+    if (!entry || !residency || !leasedDocumentIds.has(entry.documentId)) return
+    if (stopped) { dropLease(entry.documentId); return }
+    await repo.flush([entry.documentId as DocumentId])
+    // Synchronous from here to the eviction `release` starts.
+    if (parkedSealedProducts.get(url) !== entry) return
+    dropLease(entry.documentId)
+  }
+  /** A parked sealed product changed (`reason`): degraded, exactly as its
+   * watcher would have (`refuseFoldProductChange`), once. Never unparked,
+   * never forwarded: what it serves stays what the index holds, and only a
+   * cold build lifts the degradation. */
+  const sealedProductChanged = (url: string, entry: { kind: 'object' | 'connection'; changed: boolean }, reason: string): void => {
+    if (entry.changed) return
+    entry.changed = true
+    console.warn(JSON.stringify({
+      event: 'read_model.ordinary_sealed_product_changed',
+      workspace: `${key.landscapeId}/${key.versionId}`,
+      kind: entry.kind,
+      url,
+      reason,
+    }))
+    void refuseFoldProductChange(url, entry.kind === 'object' ? 'object_shard' : 'connection_shard')()
+  }
+  /**
+   * Park one ATTACHED sealed fold product (G4-16f, `parkedSealedProducts`).
+   * Every await between deciding and handing it to the poll, and what a throw
+   * or a stop there leaves:
+   *   1. `resolveHandle` — the watcher's resident handle, already leased:
+   *      nothing moved; a stop returns (`releaseOwner` has the lease);
+   *   2. `documentContentArrivals` (S, read BEFORE the content) — nothing
+   *      moved; a stop returns at the re-check.
+   * Then SYNCHRONOUSLY with the re-checks (still this watcher, not degraded,
+   * still listed, still sealed, not stopped): the content copied into the
+   * index, out of `shardStops` and the per-shard maps, into
+   * `parkedSealedProducts` (from here the poll covers it), watcher stopped.
+   * A change that reached the handle before the sample is in the index AND
+   * fired the watcher, which degraded it synchronously: not parked. One after
+   * the stop is saved with an arrival above S: the poll degrades it.
+   *   3. `entry.idle()` — a refusing pass in flight; it does not reject, and
+   *      is caught regardless;
+   *   4. `repo.flush` in `releaseSealedLease` — throws: parked AND leased
+   *      (resident, its save listener intact), the poll retries the release.
+   *      A stop during 3–4: `releaseSealedLease` releases without a flush.
+   */
+  const parkSealedProduct = async (kind: 'object' | 'connection', url: string): Promise<boolean> => {
+    if (!sealedParking || stopped) return false
+    const entry = shardStops.get(url)
+    if (!entry || parkedSealedProducts.has(url) || sealedProductsParking.has(url)) return false
+    sealedProductsParking.add(url)
+    let parked = false
+    try {
+      const handle = await resolveHandle(url, 'park')
+      // Not sealed: no arrival read for nothing (a product below the seal is
+      // asked on every meta pass while it is listed).
+      if (stopped || !isSealedProductDoc(kind, handle.doc())) return false
+      const documentId = handle.documentId
+      const watermark = (await documentContentArrivals(db, [documentId])).get(documentId) ?? null
+      const doc = handle.doc()
+      const heads = tryGetHeads(doc)
+      const rankOf = listRankOf(kind)
+      if (stopped || !heads || shardStops.get(url) !== entry || degradedShards.has(url)
+        || rankOf(url) < 0 || !isSealedProductDoc(kind, doc)) return false
+      indexSealedProduct(kind, url, doc, rankOf)
+      shardStops.delete(url)
+      parkedSealedProducts.set(url, { kind, documentId, watermark, heads: [...heads], changed: false })
+      parked = true
+      // Its extract, in the background (`sealedProductCache.ts`).
+      sealedCache?.enqueue({ kind, documentId, heads })
+      if (kind === 'object') model.objectsByShardUrl.delete(url)
+      else model.connectionsByShardUrl.delete(url)
+      model.objectShardHeadsByUrl.delete(url)
+      model.connectionShardHeadsByUrl.delete(url)
+      entry.stop()
+      try { await entry.idle() } catch { /* the pass's own handling ran */ }
+      await releaseSealedLease(url)
+      console.log(JSON.stringify({
+        event: 'read_model.ordinary_sealed_product_parked',
+        workspace: `${key.landscapeId}/${key.versionId}`,
+        kind,
+        url,
+        watermark,
+        indexed: sealedIndex[kind].entities,
+      }))
+      return true
+    } finally {
+      sealedProductsParking.delete(url)
+      if (parked) startFoldedArrivalPoll()
+    }
+  }
+  /**
+   * One read for every parked sealed product; an arrival above its watermark
+   * DEGRADES it (`sealedProductChanged`) — what its watcher did on a change —
+   * and is never forwarded. Owed the handover re-check (an old owner's save
+   * may sit below the watermark): storage's heads, decoded off the event
+   * loop, against the heads its content was read at; a difference degrades it
+   * too. Neither loads it. A release that failed earlier is retried here.
+   */
+  const pollParkedSealedProducts = async (budget: RecheckPass): Promise<void> => {
+    const parked = [...parkedSealedProducts.entries()].filter(([url]) => !sealedProductsParking.has(url))
+    if (!parked.length) return
+    const arrivals = await documentContentArrivals(db, parked.map(([, entry]) => entry.documentId))
+    for (const [url, entry] of parked) {
+      if (stopped || !stillOwned()) return
+      if (parkedSealedProducts.get(url) !== entry) continue
+      if (leasedDocumentIds.has(entry.documentId)) {
+        try {
+          await releaseSealedLease(url)
+        } catch (error) {
+          console.error(JSON.stringify({
+            event: 'read_model.ordinary_sealed_product_release_failed',
+            workspace: `${key.landscapeId}/${key.versionId}`,
+            kind: entry.kind,
+            documentId: entry.documentId,
+            error: error instanceof Error ? error.message : String(error),
+          }))
+        }
+      }
+      if (entry.changed) {
+        // Reported already; the re-check has nothing left to find.
+        if (handoverRecheck.has(entry.documentId)) handoverRecheckDone(entry.documentId)
+        continue
+      }
+      const arrived = arrivalAbove(arrivals.get(entry.documentId) ?? null, entry.watermark)
+      const rechecking = handoverRecheck.has(entry.documentId) && budget.left > 0
+      if (!arrived && !rechecking) continue
+      // Backing off: no re-check slot spent on it this pass.
+      const backoff = foldedArrivalBackoff.get(entry.documentId)
+      if (backoff && Date.now() < backoff.until) continue
+      if (rechecking) budget.left -= 1
+      try {
+        // Storage's heads, every content chunk read in ONE statement and
+        // decoded off the event loop — never `Automerge.load` here. A chunk
+        // re-saved with the same content (an arrival, no change) is no change:
+        // the watermark moves to the highest chunk READ, and anything later
+        // is above it.
+        const { chunks, maxSeq } = await withHandoverRecheckPermit(() => documentContentChunks(db, entry.documentId))
+        const durable = chunks.length ? await durableHeadsDecoder.decode(entry.documentId, chunks) : null
+        if (stopped) return
+        if (parkedSealedProducts.get(url) !== entry) continue
+        if (!durable || !headsEqual([...durable].sort(), [...entry.heads].sort())) {
+          sealedProductChanged(url, entry, rechecking && !arrived ? 'handover-recheck' : 'arrival')
+        } else if (arrivalAbove(maxSeq, entry.watermark)) {
+          entry.watermark = maxSeq
+        }
+        foldedArrivalBackoff.delete(entry.documentId)
+        if (rechecking) handoverRecheckDone(entry.documentId)
+      } catch (error) {
+        const delay = Math.min(FOLDED_ARRIVAL_MAX_BACKOFF_MS, Math.max(foldedArrivalPollMs, (backoff?.delay ?? 0) * 2))
+        foldedArrivalBackoff.set(entry.documentId, { until: Date.now() + delay, delay })
+        if (rechecking) handoverRecheckFailed(entry.documentId)
+        console.error(JSON.stringify({
+          event: 'read_model.ordinary_sealed_product_check_failed',
+          workspace: `${key.landscapeId}/${key.versionId}`,
+          kind: entry.kind,
+          documentId: entry.documentId,
+          error: error instanceof Error ? error.message : String(error),
+        }))
+      }
+    }
+  }
+  /** After a ModelMeta change: an index whose products ModelMeta no longer
+   * lists in the order it ranked them by cannot answer (a client rewrote the
+   * lists; `SealedWinnerIndex.orderMatches`). Every parked product of the
+   * kind is degraded; a cold build rebuilds the index. A list that is not
+   * there at all (a missing field) says nothing, as for the fold's detach. */
+  const checkSealedIndexOrder = (latest: MetaLike | undefined): void => {
+    for (const kind of ['object', 'connection'] as const) {
+      if (!sealedIndex[kind].products) continue
+      const list = kind === 'object' ? latest?.objectShardUrls : latest?.connectionShardUrls
+      if (!Array.isArray(list) || sealedIndex[kind].orderMatches(list)) continue
+      for (const [url, entry] of parkedSealedProducts) {
+        if (entry.kind === kind) sealedProductChanged(url, entry, 'list-order-changed')
       }
     }
   }
@@ -3872,6 +5931,7 @@ export async function startReadModelProjector(
       }
       if (handoverRecheck.size) await recheckWatchedRetiredHeads(budget)
       await pollParkedRetiredHeads(budget)
+      await pollParkedSealedProducts(budget)
       forgetUnknownHandoverRechecks(owedAtStart, knownAtStart, new Set(hits.map((hit) => hit.documentId)))
       // Owed heads left the set: the fold's row sweep kept their rows
       // (`sweepKeep`) and nothing else would ask for a pass, so ask now —
@@ -3935,7 +5995,9 @@ export async function startReadModelProjector(
      * assuming no gap is the unsafe direction. */
     extractionHeads?: readonly string[] | null,
   ) => {
-    const h = applyInitial ? await resolveHandleRetry(url) : await resolveHandle(url, 'attach')
+    const h = applyInitial
+      ? await resolveHandleRetry(url, 'attach', adoptWatchSignal())
+      : await resolveHandle(url, 'attach', adoptWatchSignal())
     const attachDoc = h.doc()
     const attachHeads = tryGetHeads(attachDoc)
     // A fold product, mid-session or at boot, is never projected
@@ -4012,7 +6074,7 @@ export async function startReadModelProjector(
     // cold build's extraction when the heads prove it equal to the live doc.
     // Otherwise the immediate gap projection acknowledges from its own,
     // fresher sample.
-    const currentOverlayAtAttach = (metaHandle?.doc() as MetaLike | undefined)?.editsObjectShardUrl === url
+    const currentOverlayAtAttach = (metaView(metaHandle?.doc()))?.editsObjectShardUrl === url
     const dueAtAttach = currentOverlayAtAttach && observeWriteHead('object', url, attachDoc)
     // What the cold build published for a boot shard is its extraction.
     if (extractionSeed !== undefined) notePublished(h.documentId, extractionHeads)
@@ -4027,6 +6089,7 @@ export async function startReadModelProjector(
       const candidateIds = [...initial.map((object) => object.id), ...parentIds]
       await repo.flush([h.documentId])
       const preparedWatermarks = await prepareShardWatermarks([h.documentId])
+      let initialDropped: DroppedDuplicateId[] = []
       await runTracked(
         'object_shard',
         async (tx) => {
@@ -4037,18 +6100,20 @@ export async function startReadModelProjector(
           }
           await acknowledgeOverlayBatches(tx, key, 'object', h.documentId, attachBatchIds, 'projected', 0, 0)
           const changes = await servedObjectRowsChangedBy(tx, key, candidateIds,
-            () => applyObjectShardDelta(tx, key, orgId, [], initial))
+            async () => { initialDropped = await applyObjectShardDelta(tx, key, orgId, [], initial) })
           await recordShardWatermark(tx, h, attachHeads, preparedWatermarks)
           return changes
         },
         // See projectLatest below: only the ids whose served row changed.
         (changes) => ({ kind: 'objects', ...changes }),
         // One shard's ids are not the workspace's, so `object` cannot be
-        // re-sealed here and goes un-comparable until the next full extraction.
-        // The other three are untouched and keep theirs.
-        { unchanged: ['connection', 'group', 'diagram'] },
+        // re-sealed here; it is MAINTAINED instead (C6a: the ids that entered
+        // and left ro_objects are XORed into the seal). The other three are
+        // untouched and keep theirs.
+        { unchanged: ['connection', 'group', 'diagram'], maintained: ['object'] },
       )
       notePublished(h.documentId, attachHeads)
+      noteLiveDuplicateIds('object-shard', key, url, initialDropped)
       for (const batchId of attachBatchIds) acknowledgedBatchIds.add(batchId)
       // Deliberately NOT swallowed: a PostgreSQL failure here means the shard's
       // objects are absent from the read model. Propagating leaves the shard
@@ -4092,7 +6157,7 @@ export async function startReadModelProjector(
         const sourceConflicts = collectAutomergeEntityConflicts(
           source?.objects as Record<string, unknown> | undefined,
         )
-        const isCurrentOverlay = (metaHandle?.doc() as MetaLike | undefined)?.editsObjectShardUrl === url
+        const isCurrentOverlay = (metaView(metaHandle?.doc()))?.editsObjectShardUrl === url
         const due = isCurrentOverlay && observeWriteHead('object', url, source)
         // THE SERVER WRITES INTO THIS DOCUMENT IN ONE CASE: two clients put a
         // whole entity at the same key concurrently (`$`), and the other branch's
@@ -4167,6 +6232,7 @@ export async function startReadModelProjector(
         // on the shard's next edit and a precise feed would otherwise never name
         // (`servedObjectRowsChangedBy`).
         const candidateIds = [...objects.map((object) => object.id), ...parentIds, ...deletedIds]
+        let dropped: DroppedDuplicateId[] = []
         await runTracked(
           'object_shard',
           async (tx) => {
@@ -4189,7 +6255,7 @@ export async function startReadModelProjector(
               () => diagramIdsReferencing(tx, key, deletedIds, []),
               async () => {
                 objectChanges = await servedObjectRowsChangedBy(tx, key, candidateIds,
-                  () => applyObjectShardDelta(tx, key, orgId, oldIds, objects))
+                  async () => { dropped = await applyObjectShardDelta(tx, key, orgId, oldIds, objects) })
               })
             await recordShardWatermark(tx, h, sampledHeads, preparedWatermarks)
             await recordRetiredHeadStamps(tx, stamps, preparedWatermarks)
@@ -4198,13 +6264,14 @@ export async function startReadModelProjector(
           // A row that vanished is a delete; one that appeared or moved, an
           // upsert. Objects only — the plain event — unless a manifest moved.
           (changes): ReadModelChangePayload => ({ kind: 'exact', changes }),
-          { unchanged: ['connection', 'group', 'diagram'] },
+          { unchanged: ['connection', 'group', 'diagram'], maintained: ['object'] },
         )
         stampsPublished = true
         // Advance only after rows + feed + generation commit atomically.
         snap = next
         for (const batchId of batchIds) acknowledgedBatchIds.add(batchId)
         notePublished(h.documentId, sampledHeads)
+        noteLiveDuplicateIds('object-shard', key, url, dropped)
         if (due) requestRotation('object', h, url)
       } finally {
         if (!stampsPublished) restoreRetiredHeadStamps(stamps)
@@ -4218,7 +6285,7 @@ export async function startReadModelProjector(
     shardTriggers.set(h.documentId, coalescer.trigger)
     watchShardStop(url, h.documentId, () => {
       coalescer.dispose(); h.off('change', onChange); shardTriggers.delete(h.documentId)
-    }, coalescer.idle)
+    }, coalescer.idle, coalescer.failed)
     // Extraction-seeded boot shards project once immediately WHEN the live
     // heads differ from the extraction's (or either is unknown): the delta vs
     // the extraction baseline emits exactly the arrivals the cold build's
@@ -4251,7 +6318,9 @@ export async function startReadModelProjector(
     /** See watchObjectShard — equal heads at attach skip the boot projection. */
     extractionHeads?: readonly string[] | null,
   ) => {
-    const h = applyInitial ? await resolveHandleRetry(url) : await resolveHandle(url, 'attach')
+    const h = applyInitial
+      ? await resolveHandleRetry(url, 'attach', adoptWatchSignal())
+      : await resolveHandle(url, 'attach', adoptWatchSignal())
     const attachDoc = h.doc()
     const attachHeads = tryGetHeads(attachDoc)
     // A fold product, mid-session or at boot, is never projected
@@ -4275,7 +6344,7 @@ export async function startReadModelProjector(
     const unacknowledged = (doc: ConnShardLike | undefined): string[] =>
       [...new Set([...(doc?.writeBatchIds ?? []), ...forwardedBatchIdsOf(doc)])]
         .filter((batchId) => !acknowledgedBatchIds.has(batchId))
-    const currentOverlayAtAttach = (metaHandle?.doc() as MetaLike | undefined)?.editsConnectionShardUrl === url
+    const currentOverlayAtAttach = (metaView(metaHandle?.doc()))?.editsConnectionShardUrl === url
     const dueAtAttach = currentOverlayAtAttach && observeWriteHead('connection', url, attachDoc)
     if (extractionSeed !== undefined) notePublished(h.documentId, extractionHeads)
     await freshRetirements()
@@ -4287,6 +6356,7 @@ export async function startReadModelProjector(
     if (applyInitial && initial.length && !forwardedAtAttach) {
       await repo.flush([h.documentId])
       const preparedWatermarks = await prepareShardWatermarks([h.documentId])
+      let initialDropped: DroppedDuplicateId[] = []
       await runTracked(
         'connection_shard',
         async (tx) => {
@@ -4297,15 +6367,16 @@ export async function startReadModelProjector(
           }
           await acknowledgeOverlayBatches(tx, key, 'connection', h.documentId, attachBatchIds, 'projected', 0, 0)
           const changes = await servedConnectionRowsChangedBy(tx, key, initial.map((connection) => connection.id),
-            () => applyConnectionShardDelta(tx, key, orgId, [], initial))
+            async () => { initialDropped = await applyConnectionShardDelta(tx, key, orgId, [], initial) })
           await recordShardWatermark(tx, h, attachHeads, preparedWatermarks)
           return changes
         },
         // See watchObjectShard: only the ids whose served row changed.
         (changes) => ({ kind: 'connections', ...changes }),
-        { unchanged: ['object', 'group', 'diagram'] },
+        { unchanged: ['object', 'group', 'diagram'], maintained: ['connection'] },
       )
       notePublished(h.documentId, attachHeads)
+      noteLiveDuplicateIds('connection-shard', key, url, initialDropped)
       for (const batchId of attachBatchIds) acknowledgedBatchIds.add(batchId)
       // See watchObjectShard: an initial apply failure must not be absorbed.
     } else if (attachBatchIds.length) {
@@ -4335,7 +6406,7 @@ export async function startReadModelProjector(
         const sourceConflicts = collectAutomergeEntityConflicts(
           source?.connections as Record<string, unknown> | undefined,
         )
-        const isCurrentOverlay = (metaHandle?.doc() as MetaLike | undefined)?.editsConnectionShardUrl === url
+        const isCurrentOverlay = (metaView(metaHandle?.doc()))?.editsConnectionShardUrl === url
         const due = isCurrentOverlay && observeWriteHead('connection', url, source)
         // Same rule and same measurement as `watchObjectShard` above, from the
         // same module: `$` entities only, one replacement each, heads guarded.
@@ -4367,6 +6438,7 @@ export async function startReadModelProjector(
         const next = new Map(connections.map((c) => [c.id, c]))
         const deletedIds = oldIds.filter((id) => !next.has(id))
         const batchIds = unacknowledged(source)
+        let dropped: DroppedDuplicateId[] = []
         await runTracked(
           'connection_shard',
           async (tx) => {
@@ -4387,19 +6459,20 @@ export async function startReadModelProjector(
               async () => {
                 connectionChanges = await servedConnectionRowsChangedBy(tx, key,
                   [...connections.map((connection) => connection.id), ...deletedIds],
-                  () => applyConnectionShardDelta(tx, key, orgId, oldIds, connections))
+                  async () => { dropped = await applyConnectionShardDelta(tx, key, orgId, oldIds, connections) })
               })
             await recordShardWatermark(tx, h, sampledHeads, preparedWatermarks)
             await recordRetiredHeadStamps(tx, stamps, preparedWatermarks)
             return { connections: connectionChanges, diagrams: diagramChanges }
           },
           (changes): ReadModelChangePayload => ({ kind: 'exact', changes }),
-          { unchanged: ['object', 'group', 'diagram'] },
+          { unchanged: ['object', 'group', 'diagram'], maintained: ['connection'] },
         )
         stampsPublished = true
         snap = next
         for (const batchId of batchIds) acknowledgedBatchIds.add(batchId)
         notePublished(h.documentId, sampledHeads)
+        noteLiveDuplicateIds('connection-shard', key, url, dropped)
         if (due) requestRotation('connection', h, url)
       } finally {
         if (!stampsPublished) restoreRetiredHeadStamps(stamps)
@@ -4413,7 +6486,7 @@ export async function startReadModelProjector(
     shardTriggers.set(h.documentId, coalescer.trigger)
     watchShardStop(url, h.documentId, () => {
       coalescer.dispose(); h.off('change', onChange); shardTriggers.delete(h.documentId)
-    }, coalescer.idle)
+    }, coalescer.idle, coalescer.failed)
     // See watchObjectShard: seeded boot shards project the extraction gap once
     // — only when the heads say a gap is possible — and a forwarded head
     // forwards once, whatever its heads.
@@ -4439,8 +6512,35 @@ export async function startReadModelProjector(
   // each shard's own burst correctly but nothing collapses the burst ACROSS
   // shards, and six shards changing in one tick — a rename sweep, an import —
   // would do six identical full passes (measured: 102 finds where 17 suffice).
-  const registryProjectLatest = async () => {
-    const m = await extractModelEntities(rootHandle.doc() as RootLike, resolve)
+  /** The registry pass's SQL half: the extraction and the diagram sync
+   * (`registryProjectLatest` then reconciles the diagram documents). An
+   * adopting attach runs it alone, in B4 (G4-16f C6-2a): the registry may
+   * have moved while no owner ran, and the diagram documents are the
+   * initial probe's business, after B5, as for a cold build. Returns the
+   * diagrams it synced. */
+  const registrySync = async (): Promise<DiagramInput[]> => {
+    // The adopt stamps of what this pass projects (G4-16f): the root it read
+    // and each registry shard, at the revisions read; the topology too.
+    const root = rootHandle.doc() as RootLike
+    const sampledHeads = new Map<string, readonly string[] | null>()
+    const m = await extractModelEntities(root, async (url) => {
+      const doc = await resolve(url)
+      noteSampledHeads(sampledHeads, url, doc)
+      return doc
+    })
+    const registryDefects = new Set(m.defects.flatMap((defect) => defect.url ? [documentIdOf(defect.url)] : []))
+    const adoptSamples: AdoptSample[] = [
+      { documentId: rootHandle.documentId, sampledHeads: tryGetAutomergeHeads(root),
+        readCurrentHeads: adoptLiveHeads(rootHandle.documentId, rootHandle) },
+      ...m.registryShardUrls.map((url): AdoptSample => {
+        const documentId = documentIdOf(url)
+        return { documentId, sampledHeads: registryDefects.has(documentId) ? null : sampledHeads.get(url) ?? null,
+          readCurrentHeads: adoptLiveHeads(documentId) }
+      }),
+    ]
+    // Their 0, where the revision moved, rides the pass; the exact value
+    // follows it (`runAdoptStamps`).
+    const adoptRefused = adoptRefusalsOf(adoptSamples)
     // A full extraction, so its defect list describes the workspace — but only
     // the DIAGRAM digest is sealed: `syncDiagrams` is a full sync of ro_diagrams
     // and nothing else, so the object/connection/group rows this generation
@@ -4460,6 +6560,10 @@ export async function startReadModelProjector(
         () => syncDiagrams(tx, key, orgId, m.diagrams))
       const countsAfter = await connectionMembershipCounts(tx, key)
       const moved = changedCacheRowIds([...countsBefore.keys(), ...countsAfter.keys()], countsBefore, countsAfter)
+      await withAdoptSavepoint(tx, key, async () => {
+        await refuseAdoptWatermarks(tx, key, adoptRefused)
+        await updateAdoptTopology(tx, key, adoptTopology(rootHandle.documentId, root, metaView(metaHandle?.doc())))
+      })
       return { diagrams, connections: { upsertIds: moved, deleteIds: [] } }
     },
       (changes): ReadModelChangePayload => ({ kind: 'exact', changes }),
@@ -4472,16 +6576,42 @@ export async function startReadModelProjector(
         // remain accurate and only move generation.
         unchanged: ['object', 'connection', 'group'],
       })
-    await reconcileDiagramDocs(m.diagrams)
+    noteAdoptProjected(adoptSamples, adoptRefused)
+    return m.diagrams
+  }
+  const registryProjectLatest = async () => {
+    await reconcileDiagramDocs(await registrySync())
   }
   const registryCoalescer = coalescedProjection('registry sync', registryProjectLatest)
   cleanups.push(() => registryCoalescer.dispose())
 
+  /**
+   * T-DIAGDEF-2 (A): did this control document move since the cold build's
+   * extraction read it (`coldBuildControlHeads`)? Asked ONCE, by a watcher
+   * just attached: from then on its `change` listener sees every arrival, so
+   * a move found here is exactly the gap, and its pass is run as if the
+   * change had arrived just after the attach. Heads unknown on ONE side count
+   * as moved (one more full pass, the safe direction): a document the
+   * extraction could not read and the watcher can, or a url read twice at
+   * two revisions (`noteSampledHeads`). Unknown on BOTH sides is no evidence
+   * of a move — nothing a pass could read either (and every plain test
+   * document, which has no heads). False when adopting (no extraction gap:
+   * see the declaration).
+   */
+  const controlGapSince = (read: readonly string[] | null | undefined, handle: DocHandle<unknown> | null | undefined): boolean => {
+    if (!coldBuildControlHeads) return false
+    const live = tryGetAutomergeHeads(handle?.doc())
+    if (!read && !live) return false
+    return !(read && live && headsEqual(read, live))
+  }
+  /** The registry shards the boot watched, by url, for the gap check. */
+  const bootRegistryHandles = new Map<string, DocHandle<unknown>>()
   const watchRegistryShard = async (url: string) => {
-    const h = await resolveHandle(url, 'attach')
+    const h = await resolveHandle(url, 'attach', adoptWatchSignal())
     const onChange = registryCoalescer.trigger
     h.on('change', onChange)
     cleanups.push(() => { h.off('change', onChange) })
+    return h
   }
 
   // Boot shards seed their delta baseline from the EXTRACTION the cold build
@@ -4489,21 +6619,48 @@ export async function startReadModelProjector(
   // arrival of the ]extraction, attach[ gap forever. `?? {}`
   // covers a shard whose read defected: the cold build projected nothing for
   // it, so an empty baseline makes the first delta emit its whole content.
-  for (const url of model.objectShardUrls) {
-    await watchObjectShard(
-      url, false,
-      model.objectsByShardUrl.get(url) ?? {},
-      model.objectShardHeadsByUrl.get(url) ?? null,
-    )
-  }
-  for (const url of model.connectionShardUrls) {
-    await watchConnectionShard(
-      url, false,
-      model.connectionsByShardUrl.get(url) ?? {},
-      model.connectionShardHeadsByUrl.get(url) ?? null,
-    )
-  }
-  for (const url of model.registryShardUrls) await watchRegistryShard(url)
+  // A sealed product the cold build parked is not watched (G4-16f): the
+  // arrival poll answers for it.
+  //
+  // ADOPTING (B3, G4-16f C6-2a): the baseline is the SEED — the content at
+  // the heads the kept rows were projected at (`adoptBuild`) — so the
+  // watcher's gap projection, which fires whenever the live heads differ
+  // from the seed's (and always for a forwarded head), emits exactly what
+  // arrived while no owner ran: a write, and a delete (an id the seed held
+  // and the live document does not). A listed shard with no row of any kind
+  // is attached with its initial apply. Every await is checked.
+  const b3At = performance.now()
+  await adoptStep('B3', async () => {
+    for (const url of model.objectShardUrls) {
+      if (parkedSealedProducts.has(url)) continue
+      if (adoptNewShards.has(url)) await watchObjectShard(url, true)
+      else {
+        await watchObjectShard(
+          url, false,
+          model.objectsByShardUrl.get(url) ?? {},
+          model.objectShardHeadsByUrl.get(url) ?? null,
+        )
+      }
+      if (adoptClaim) assertAdoptLive('B3')
+    }
+    for (const url of model.connectionShardUrls) {
+      if (parkedSealedProducts.has(url)) continue
+      if (adoptNewShards.has(url)) await watchConnectionShard(url, true)
+      else {
+        await watchConnectionShard(
+          url, false,
+          model.connectionsByShardUrl.get(url) ?? {},
+          model.connectionShardHeadsByUrl.get(url) ?? null,
+        )
+      }
+      if (adoptClaim) assertAdoptLive('B3')
+    }
+    for (const url of model.registryShardUrls) {
+      bootRegistryHandles.set(url, await watchRegistryShard(url))
+      if (adoptClaim) assertAdoptLive('B3')
+    }
+  })
+  adoptPhases.b3WatchMs = performance.now() - b3At
 
   // ------------------------------------------------------------------
   // The ROOT is a live document, not boot configuration.
@@ -4524,28 +6681,61 @@ export async function startReadModelProjector(
   // the meta path uses): O(1), and it does not capture `model`.
   // ------------------------------------------------------------------
   const watchedRegistryShards = new Set<string>(model.registryShardUrls)
+  let modelMetaRepointReported = false
+  /** Watch every registry shard the LIVE root lists and nothing watches yet
+   * (the root pass's half that needs no projection; B4 runs it alone). */
+  const watchListedRegistryShards = async (): Promise<void> => {
+    const root = rootHandle.doc() as RootLike
+    for (const url of root.shardUrls ?? []) {
+      // In flight elsewhere too (B4 and a root pass may overlap now): one
+      // listener per shard.
+      if (watchedRegistryShards.has(url) || watchingRegistryShards.has(url)) continue
+      watchingRegistryShards.add(url)
+      try {
+        await watchRegistryShard(url)
+        watchedRegistryShards.add(url)
+        degradedShards.delete(url)
+      } catch (error) {
+        // An adopt being abandoned (its watch signal aborted) is not a
+        // degradation of the workspace: B4's `assertAdoptLive` reports it.
+        if (adoptWatchSignal()?.aborted) throw error
+        // Left OUT of the watched set, so the next root change re-attempts it —
+        // symmetric with the meta path's handling of a new object shard.
+        console.error('[read-model] new registry shard watch failed', error)
+        degradeShard(url, 'registry', error)
+      } finally {
+        watchingRegistryShards.delete(url)
+      }
+    }
+  }
+  /** Registry shards whose watch is being set up (`watchListedRegistryShards`). */
+  const watchingRegistryShards = new Set<string>()
   const rootProjectLatest = async () => {
+    // G4-16f (design R4-d): a REPOINT of the root's ModelMeta, whoever made it.
+    // This projector watches the ModelMeta it attached to and that epoch's
+    // shards; it cannot follow a new one in place, so it asks to be recycled.
+    const pointer = (rootHandle.doc() as RootLike | undefined)?.modelMetaUrl
+    if (rootDoc.modelMetaUrl && pointer !== rootDoc.modelMetaUrl) {
+      if (!modelMetaRepointReported) {
+        modelMetaRepointReported = true
+        console.warn(JSON.stringify({
+          event: 'read_model.model_meta_repointed',
+          workspace: `${key.landscapeId}/${key.versionId}`,
+          from: rootDoc.modelMetaUrl,
+          to: pointer ?? null,
+        }))
+        try { attachOptions.onModelMetaRepointed?.(rootDoc.modelMetaUrl, pointer) } catch (error) {
+          console.error('[read-model] onModelMetaRepointed hook failed', error)
+        }
+      }
+      return
+    }
     // `watchRegistryShard` resolves through `resolveHandle`, which polls for
     // the shard's ARRIVAL at `CONTROL_DOCUMENT_TRIES` (3), and `degradedShards`
     // stays empty until the last one fails. So without this guard the 1 s
     // health beat would publish "nothing outstanding" for ~32 s about a
     // workspace in the middle of picking up a shard it had not read a byte of.
-    await withReconciling(async () => {
-      const root = rootHandle.doc() as RootLike
-      for (const url of root.shardUrls ?? []) {
-        if (watchedRegistryShards.has(url)) continue
-        try {
-          await watchRegistryShard(url)
-          watchedRegistryShards.add(url)
-          degradedShards.delete(url)
-        } catch (error) {
-          // Left OUT of the watched set, so the next root change re-attempts it —
-          // symmetric with the meta path's handling of a new object shard.
-          console.error('[read-model] new registry shard watch failed', error)
-          degradeShard(url, 'registry', error)
-        }
-      }
-    })
+    await withReconciling(watchListedRegistryShards)
     // DELIBERATELY NOT handled here: a workspace whose model KIND changes under
     // a running projector (`modelMetaUrl` appearing on a root that booted as a
     // monolith). That is a real defect — every later object/connection edit goes
@@ -4578,7 +6768,16 @@ export async function startReadModelProjector(
   const onRootChange = rootCoalescer.trigger
   rootHandle.on('change', onRootChange)
   cleanups.push(() => { rootCoalescer.dispose(); rootHandle.off('change', onRootChange) })
+  // T-DIAGDEF-2 (A): the root and every boot registry shard are watched now.
+  // One of them moved in the extraction gap → the root pass (it watches a
+  // shard appended in the gap, then runs the registry pass, a full sync).
+  if (controlGapSince(coldBuildControlHeads?.root, rootHandle)
+    || model.registryShardUrls.some((url) => controlGapSince(coldBuildControlHeads?.byUrl.get(url), bootRegistryHandles.get(url)))) {
+    rootCoalescer.trigger()
+  }
 
+  /** The ModelMeta pass (set below on a sharded workspace), for B4. */
+  let adoptMetaPass: (() => Promise<void>) | null = null
   // Monolith fallback (not sharded): re-extract + cold build on the model doc's change.
   if (!rootDoc.modelMetaUrl && rootDoc.modelUrl) {
     const modelHandle = await resolveHandle(rootDoc.modelUrl)
@@ -4592,11 +6791,16 @@ export async function startReadModelProjector(
     const onChange = coalescer.trigger
     modelHandle.on('change', onChange)
     cleanups.push(() => { coalescer.dispose(); modelHandle.off('change', onChange) })
+    // T-DIAGDEF-2 (A): the extraction gap (see `controlGapSince`).
+    if (controlGapSince(coldBuildControlHeads?.byUrl.get(rootDoc.modelUrl), modelHandle)) coalescer.trigger()
   } else if (rootDoc.modelMetaUrl) {
     // Groups (+ new shard urls) live on the meta doc.
     if (!metaHandle) throw new Error('ModelMeta handle is unavailable')
     const projectLatest = async () => {
-      const meta = metaHandle.doc() as MetaLike
+      // The DOCUMENT for its heads (a view is a plain copy, it has none), the
+      // view for every field read.
+      const metaDoc = metaHandle.doc()
+      const meta = metaView(metaDoc)!
       rememberShardReferences(meta.objectShardUrls ?? [], meta.connectionShardUrls ?? [])
       const readGroups = readEntityMapOrDefect<GroupInput>(
         meta, 'groups', 'model-meta', rootDoc.modelMetaUrl ?? null)
@@ -4613,7 +6817,14 @@ export async function startReadModelProjector(
             'its ModelMeta carries no groups map; group rows left untouched')
         return
       }
-      const groups = Object.values(readGroups.map)
+      // One inner id under two map keys: the last occurrence kept
+      // (`lastOccurrenceById`, the cold build's rule and key), BEFORE
+      // `syncGroups` and the group seal. Raw, two copies in one 1 000-row
+      // `bulkUpsert` chunk fail the pass (21000) on every ModelMeta change
+      // until `consecutive_failures` walks the workspace to `failed`; across
+      // chunks they overcount `group_count` and seal a digest of n+1 ids over
+      // n rows, which reads as corruption.
+      const { kept: groups, dropped: groupsDropped } = lastOccurrenceById('group', Object.values(readGroups.map))
       // Every change of ModelMeta lands here — a group renamed (a Structurizr
       // system's boundary group follows the system's name), a tombstone, a new
       // overlay head — and each used to publish reset/all. The served rows it
@@ -4623,6 +6834,11 @@ export async function startReadModelProjector(
       // connections, and the diagram manifests that listed a tombstone.
       const tombstonedObjectIds = meta.deletedObjectIds ?? []
       const tombstonedConnectionIds = meta.deletedConnectionIds ?? []
+      // ModelMeta's adopt stamp (G4-16f): 0 in the pass where its revision
+      // moved, the exact value after it (`runAdoptStamps`).
+      const metaAdoptSamples: AdoptSample[] = [{ documentId: metaHandle.documentId, sampledHeads: tryGetAutomergeHeads(metaDoc),
+        readCurrentHeads: adoptLiveHeads(metaHandle.documentId, metaHandle) }]
+      const metaAdoptRefused = adoptRefusalsOf(metaAdoptSamples)
       await runTracked('metadata', async (tx) => {
         let connections: ServedRowChanges = { upsertIds: [], deleteIds: [] }
         let objects: ServedRowChanges = { upsertIds: [], deleteIds: [] }
@@ -4647,27 +6863,32 @@ export async function startReadModelProjector(
           connections = await servedConnectionRowsChangedBy(tx, key, tombstonedConnectionIds,
             () => deleteConnections(tx, key, tombstonedConnectionIds))
         }) })
+        await withAdoptSavepoint(tx, key, async () => {
+          await refuseAdoptWatermarks(tx, key, metaAdoptRefused)
+          await updateAdoptTopology(tx, key, adoptTopology(rootHandle.documentId, rootHandle.doc() as RootLike, meta))
+        })
         return { objects, connections, diagrams }
       }, (changes): ReadModelChangePayload => ({ kind: 'exact', changes }),
       // GROUPS are re-sealed: `syncGroups` is a full sync of ro_groups.
       //
-      // Objects and connections are only carried forward when this pass applies
-      // NO tombstones — `deleteObjects`/`deleteConnections` return immediately on
-      // an empty list, so on the overwhelmingly common path nothing of theirs
-      // changes and their seals stay good. When there ARE tombstones the ids
-      // removed are known but the resulting full set is not, so those kinds are
-      // deliberately left to go un-comparable rather than guessed at.
+      // Objects and connections are MAINTAINED (C6a): the tombstone deletes
+      // are the only writes of theirs in this pass, and `deleteObjects` /
+      // `deleteConnections` record the ids that actually left (RETURNING), so
+      // the seals are carried forward with those ids XORed out — and with
+      // nothing XORed on the common path with no tombstones.
       //
       // No `defects`: this reads ONE document, so its view is not the
-      // workspace's. A defect on it is logged below instead.
+      // workspace's. A defect on it is logged below instead, and a dropped
+      // duplicate group is logged as a `duplicate-id` defect and counted
+      // (`noteLiveDuplicateIds`). The seal is over the deduplicated ids, the
+      // ones `syncGroups` leaves in ro_groups.
       {
         digests: { group: digestOfIds(groups.map((group) => group.id)) },
-        unchanged: [
-          'diagram',
-          ...((meta.deletedObjectIds ?? []).length === 0 ? ['object' as const] : []),
-          ...((meta.deletedConnectionIds ?? []).length === 0 ? ['connection' as const] : []),
-        ],
+        unchanged: ['diagram'],
+        maintained: ['object', 'connection'],
       })
+      noteAdoptProjected(metaAdoptSamples, metaAdoptRefused)
+      noteLiveDuplicateIds('model-meta', key, rootDoc.modelMetaUrl ?? null, groupsDropped)
       // A `field-not-a-map` reaches here rather than the refusal above: the field
       // WAS written, so its shape is corruption rather than absence, and the full
       // sync is at least acting on something a writer really produced.
@@ -4709,7 +6930,7 @@ export async function startReadModelProjector(
       const timer = setTimeout(() => {
         attachRetry = { timer: null, attempt }
         if (stopped) return
-        const latest = metaHandle.doc() as MetaLike | undefined
+        const latest = metaView(metaHandle.doc())
         if (latest) void attachNewShards(latest)
       }, delay)
       timer.unref?.()
@@ -4730,7 +6951,7 @@ export async function startReadModelProjector(
      * pending). The current write head, or a source whose heads cannot be
      * read, is never settled. */
     const unsettledFoldSources = async (kind: 'object' | 'connection', sources: readonly string[]): Promise<string[]> => {
-      const latest = metaHandle.doc() as MetaLike | undefined
+      const latest = metaView(metaHandle.doc())
       const current = kind === 'object' ? latest?.editsObjectShardUrl : latest?.editsConnectionShardUrl
       const unsettled: string[] = []
       const sampled: Array<{ url: string; documentId: string; heads: string[]; current: false }> = []
@@ -4754,7 +6975,7 @@ export async function startReadModelProjector(
       const doc = h.doc()
       const sources = ordinaryFoldSourcesOf(doc)
       if (!sources) return null
-      const latest = metaHandle.doc() as MetaLike | undefined
+      const latest = metaView(metaHandle.doc())
       const current = field === 'objects' ? latest?.editsObjectShardUrl : latest?.editsConnectionShardUrl
       if (current === url) throw new Error(`fold product ${url} is the current write head`)
       const unwatched = sources.filter((source) => !watched.includes(source))
@@ -4786,7 +7007,7 @@ export async function startReadModelProjector(
      * detached? A retry pass iterates the ModelMeta it started on. */
     const stillListed = (kind: 'object' | 'connection', url: string): boolean => {
       if (detachedFoldSources.has(url)) return false
-      const latest = metaHandle.doc() as MetaLike | undefined
+      const latest = metaView(metaHandle.doc())
       return Boolean((kind === 'object' ? latest?.objectShardUrls : latest?.connectionShardUrls)?.includes(url))
     }
     /** The sources of one kind a pass detaches, TOGETHER: their watchers
@@ -4829,7 +7050,7 @@ export async function startReadModelProjector(
       }
       try {
         for (const url of urls) {
-          const latest = metaHandle.doc() as MetaLike | undefined
+          const latest = metaView(metaHandle.doc())
           if ((kind === 'object' ? latest?.editsObjectShardUrl : latest?.editsConnectionShardUrl) === url) {
             degradeShard(url, kind === 'object' ? 'object_shard' : 'connection_shard',
               new Error(`fold source ${url} is the current write head; not detached`))
@@ -4964,7 +7185,7 @@ export async function startReadModelProjector(
         // After the attaches: a source is detached only once the product that
         // replaces it is attached, so no value is ever served by neither.
         // Against the LATEST ModelMeta, not the one this pass started on.
-        const latest = metaHandle.doc() as MetaLike | undefined
+        const latest = metaView(metaHandle.doc())
         for (const product of foldSourcesByProduct.keys()) {
           if (!latest?.objectShardUrls?.includes(product) && !latest?.connectionShardUrls?.includes(product)) {
             foldSourcesByProduct.delete(product)
@@ -4974,6 +7195,40 @@ export async function startReadModelProjector(
           model.objectShardUrls, 'object')
         await detachFoldSources(foldSourcesToDetach(model.connectionShardUrls, latest?.connectionShardUrls ?? [], foldSourcesByProduct),
           model.connectionShardUrls, 'connection')
+        // G4-16f: a sealed product is parked once attached and its sources
+        // detached (it is never a source itself). Every product still
+        // watched is asked — this pass's, and one whose park failed or was
+        // refused earlier; an unsealed one costs a resident lookup. A failure
+        // leaves it watched and leased: today's behaviour, retried next pass.
+        if (sealedParking) {
+          // Candidates: the products this projector attached mid-session, and
+          // the sealed ones its cold build read but declined to park (heads
+          // unreadable, or rewritten under the read). Each is asked at most
+          // SEALED_PARK_MAX_ATTEMPTS times: an unsealed product never seals
+          // (its content never changes unrefused), and a refused one
+          // (degraded) stays watched until a cold build.
+          for (const product of new Set([...foldSourcesByProduct.keys(), ...sealedDeclinedAtColdBuild])) {
+            if (!shardStops.has(product) || parkedSealedProducts.has(product)) continue
+            const attempts = sealedParkAttempts.get(product) ?? 0
+            if (attempts >= SEALED_PARK_MAX_ATTEMPTS) continue
+            const kind = model.objectShardUrls.includes(product) ? 'object'
+              : model.connectionShardUrls.includes(product) ? 'connection' : null
+            if (!kind) continue
+            sealedParkAttempts.set(product, attempts + 1)
+            try {
+              await parkSealedProduct(kind, product)
+            } catch (error) {
+              console.error(JSON.stringify({
+                event: 'read_model.ordinary_sealed_product_park_failed',
+                workspace: `${key.landscapeId}/${key.versionId}`,
+                kind,
+                url: product,
+                error: error instanceof Error ? error.message : String(error),
+              }))
+            }
+          }
+          checkSealedIndexOrder(metaView(metaHandle.doc()))
+        }
       })
       if (failed) scheduleAttachRetry()
       else if (!attachRetry?.timer) attachRetry = null
@@ -4982,11 +7237,20 @@ export async function startReadModelProjector(
       // `reconcilePass`).
       clearDegradationIfRecovered()
     }
+    // B4 of an adopting attach runs this pass once and awaits it: groups and
+    // tombstones may have moved while no owner ran.
+    adoptMetaPass = projectLatest
     const coalescer = coalescedProjection('meta sync', projectLatest)
     const onChange = coalescer.trigger
     metaHandle.on('change', onChange)
     cleanups.push(() => { coalescer.dispose(); metaHandle.off('change', onChange) })
+    // T-DIAGDEF-2 (A): the extraction gap (see `controlGapSince`) — a
+    // tombstone, a group, a new shard url that arrived in it.
+    if (controlGapSince(coldBuildControlHeads?.byUrl.get(rootDoc.modelMetaUrl), metaHandle)) coalescer.trigger()
   }
+  // Asked once, by each watcher above: a later attach of a new shard is not a
+  // boot watcher.
+  coldBuildControlHeads = null
 
   // ------------------------------------------------------------------
   // Detach on evict, re-attach while resident.
@@ -5156,8 +7420,95 @@ export async function startReadModelProjector(
   // would leave such a gate shut forever. Ownership is checked through
   // `stillOwned`, which is process-local and does not depend on any write
   // succeeding, so this call is telemetry only.
-  await markReadModelProjectorAttached(db, key, orgId, projectorInstanceId)
-    .catch((error) => console.error('[read-model] failed to mark projector attached', error))
+  //
+  // NOT for an ADOPTING attach (G4-16f C6-2a), where `projector_attached` is
+  // the freshness gate: false from the claim to B5, so the status reads
+  // `idle` (no `caughtUp`, no `absenceProvable`, no compaction, no
+  // promotion) while the kept rows are caught up. B4 first, then B5 sets it
+  // in ONE fenced transaction with the adopt row's binding.
+  if (!adoptClaim) {
+    await markReadModelProjectorAttached(db, key, orgId, projectorInstanceId)
+      .catch((error) => console.error('[read-model] failed to mark projector attached', error))
+  } else {
+    // ---- B4: what moved while no owner ran, projected and AWAITED before
+    // the row may say attached. Each await checked.
+    const b4At = performance.now()
+    await adoptStep('B4', async () => {
+      // A sealed product changed while no owner ran (B2): degraded, once,
+      // as its watcher or the poll would have — only a cold build lifts it.
+      for (const url of adoptChangedProducts) {
+        const entry = parkedSealedProducts.get(url)
+        if (entry) sealedProductChanged(url, entry, 'changed-while-ownerless')
+      }
+      if (!adoptMetaPass) throw new ReadModelAdoptAttachError('B4', 'no-meta-pass')
+      await adoptMetaPass()
+      assertAdoptLive('B4')
+      // T-DIAGDEF-2: B1 read the root, and its watcher is
+      // attached only after B3: a registry shard appended in between reached
+      // the rows through the registry pass below (it reads the live root) but
+      // was never WATCHED, so its later edits were never projected. Watched
+      // here, as the root pass would have — its watching half alone: the
+      // registry pass is the next line, awaited, not a coalesced one beside it.
+      await watchListedRegistryShards()
+      assertAdoptLive('B4')
+      model.diagrams = await registrySync()
+      assertAdoptLive('B4')
+      // Every boot shard's gap projection (triggered at its watch, B3): a
+      // forwarded head's forward too. `idle` waits for the run in flight and
+      // any it re-ran.
+      await Promise.all([...shardStops.values()].map((entry) => entry.idle()))
+      assertAdoptLive('B4')
+      // FINISHED is not SUCCEEDED: a watcher's coalescer logs and swallows a
+      // failed run, so a gap pass that threw (SQL, a mutex timeout) would
+      // leave the ownerless writes out of the rows while B5 certified them.
+      // Any watcher whose last run failed fails the attach (the fleet then
+      // cold-builds once).
+      const failedGaps = [...shardStops.entries()].filter(([, entry]) => entry.failed()).map(([url]) => url)
+      if (failedGaps.length) throw new ReadModelAdoptAttachError('B4', `gap-failed: ${failedGaps.slice(0, 3).join(',')}`)
+    })
+    adoptPhases.b4Ms = performance.now() - b4At
+    // ---- B5: on the tail (no pass interleaves), ONE fenced transaction —
+    // the fence ours (and the connection a protocol participant), the adopt
+    // row bound to it (from here a later attach may adopt it), the row
+    // attached. A fence lost since the claim fails here, whole.
+    const b5At = performance.now()
+    const bound = await adoptStep('B5', async () => {
+      const task = projectionTail.then(() => withReadModelProjectionTransaction(db, key, 'ordinary', async (tx) => {
+        assertAdoptLive('B5')
+        await assertReadModelWriteFence(tx, key, projectorInstanceId)
+        const bindsRow = await bindAdoptFence(tx, key, projectorInstanceId)
+        await markReadModelProjectorAttached(tx, key, orgId, projectorInstanceId)
+        return bindsRow
+      }))
+      chainProjectionTail(task)
+      return task
+    })
+    adoptPhases.b5Ms = performance.now() - b5At
+    // No adopt row to bind (gone since S2): attached, unbound — the next
+    // attach cold-builds. Not a failure of this one.
+    if (!bound) console.warn(`[read-model] adopt attach (${key.landscapeId}/${key.versionId}): no adopt row to bind; left unbound`)
+    console.log(JSON.stringify({
+      event: 'read_model.adopt_attach',
+      workspace: `${key.landscapeId}/${key.versionId}`,
+      totalMs: roundMs(performance.now() - adoptStartedAt),
+      claimMs: roundMs(adoptPhases.claimMs),
+      b1Ms: roundMs(adoptPhases.b1Ms),
+      b2Ms: roundMs(adoptPhases.b2Ms),
+      b3SeedMs: roundMs(adoptPhases.b3SeedMs),
+      b3WatchMs: roundMs(adoptPhases.b3WatchMs),
+      b4Ms: roundMs(adoptPhases.b4Ms),
+      b5Ms: roundMs(adoptPhases.b5Ms),
+      bound,
+      parkedProducts: parkedSealedProducts.size,
+      cacheHits: adoptPhases.cacheHits,
+      cacheHeadsRefused: adoptPhases.cacheHeadsRefused,
+      productsLoaded: adoptPhases.productsLoaded,
+      changedProducts: adoptPhases.changedProducts,
+      seededAtLive: adoptPhases.seededAtLive,
+      seededByView: adoptPhases.seededByView,
+      newShards: adoptPhases.newShards,
+    }))
+  }
 
   // A legacy registry can reference a DiagramDoc that was never durably
   // published. Its optional flow projection must not hold every core read-model
@@ -5172,9 +7523,11 @@ export async function startReadModelProjector(
   // counter inside `reconcileDiagramDocs` — `publishHealthIfNothingOutstanding`
   // refuses to speak while a pass is in flight, so an in-progress probe can
   // never be read as a healthy workspace.
-  initialDiagramProbes.set(keyOf(key), reconcileDiagramDocs(model.diagrams).catch((error) => {
+  const initialDiagramProbe = reconcileDiagramDocs(model.diagrams).catch((error) => {
     console.error(`[read-model] diagram reconcile failed for ${key.landscapeId}/${key.versionId}`, error)
-  }))
+  })
+  ownDiagramProbe.promise = initialDiagramProbe
+  initialDiagramProbes.set(keyOf(key), initialDiagramProbe)
 
   // Deliberately NOT unconditional. Reaching here means the cold build committed
   // and every shard is watched, but diagram documents that have not synced yet
@@ -5192,6 +7545,8 @@ export async function startReadModelProjector(
   requestFold('connection')
   // Folded heads from an earlier life are never attached: poll them.
   if ([...retirements.values()].some((row) => row.status === 'folded')) startFoldedArrivalPoll()
+  // Sealed products the cold build parked: only the poll answers for them.
+  if (parkedSealedProducts.size) startFoldedArrivalPoll()
   // Fold off: retired heads are parked once settled (`parkRetiredHead`).
   startRetiredHeadParkSweep()
   // G4-16e: what this projector already holds, published by the stats route
@@ -5223,7 +7578,7 @@ export async function startReadModelProjector(
         return { retired, folded, createdAtMs }
       },
       currentHead: (kind) => {
-        const meta = metaHandle?.doc() as MetaLike | undefined
+        const meta = metaView(metaHandle?.doc())
         return headRotation.lastObserved(kind, kind === 'object' ? meta?.editsObjectShardUrl : meta?.editsConnectionShardUrl)
       },
     }))
@@ -5235,6 +7590,8 @@ export async function startReadModelProjector(
   // once, `handoverRecheckMs` from now.
   armHandoverRecheck()
   attachDone = true
+  // The attach is complete: the cache writer may run (it was HELD).
+  sealedCache?.start()
   // One line for the attach's own loads (G4-16 M3, `documentLoadTelemetry.ts`).
   // `ms` is the SUM of each load's wall time (storage read included); loads
   // run concurrently during an attach, so it overstates the time they took.
@@ -5244,6 +7601,8 @@ export async function startReadModelProjector(
     loads: attachLoads.loads,
     ms: Math.round(attachLoads.ms),
   }))
+  // The attach is done: the caller's signal concerns it no more.
+  dropCallerAbort()
 
   return () => {
     if (stopped) return
@@ -5286,6 +7645,70 @@ interface FleetEntry {
   pinned?: boolean
 }
 
+/** One start in flight (G4-16f C6-2b). `attached` settles when the attach
+ * does (B5, or the cold build's end — a fallback cold build's included).
+ * `serving` settles first on an adopting start: true at its claim
+ * (`onServing`); on a cold build it IS `attached`. `served` stays true once
+ * `serving` resolved, so a start whose serving was REVOKED (released, or its
+ * attach failed into the fallback cold build) is answered with `attached`,
+ * never with the spent `serving`. */
+interface StartInFlight {
+  serving: Promise<boolean>
+  attached: Promise<boolean>
+  served: boolean
+  /** The compaction window this start was made in (T-VANISH), if any: only
+   * a start of the CURRENT window may be joined by the compaction's own
+   * re-attach — one begun before it read documents the fold then rewrote. */
+  window?: number
+}
+
+/** The claim's own admission (G4-16f C6-2b, design risk 1): an adopting
+ * start's static check, root resolution and claim (S1-S6) run under it and
+ * NOT in a cold-build slot, so a third workspace taken over at once claims
+ * (and serves) without waiting for two others' B1-B5; its background attach
+ * then takes a cold-build slot (`admitBuild`). Each claim holds one pooled
+ * connection of the read-model pool (default max 4, `DB_READ_MODEL_POOL_MAX`)
+ * for its whole transaction — including a wait of up to 5 s on a live old
+ * owner's projection mutex — so the bound stays at half that pool, the same
+ * as the cold-build default. A CHOICE, not a measurement: the claim's hold
+ * time under contention is not measured. */
+const DEFAULT_MAX_CONCURRENT_CLAIMS = 2
+
+/** Raised by {@link acquireAdmissionSlot} when the start's signal aborted
+ * while it waited for a slot. */
+class AdmissionWaitAbortedError extends Error {
+  constructor() {
+    super('the start was aborted while waiting for an admission slot')
+    this.name = 'AdmissionWaitAbortedError'
+  }
+}
+
+/**
+ * A slot of `admission`, held until the returned function is called (it is
+ * idempotent). Rejects with the admission's own error (queue full, stopped)
+ * or, when `signal` aborts while the request is queued,
+ * {@link AdmissionWaitAbortedError}: the queued request is then REMOVED from
+ * the admission's queue (`ColdBuildAdmission.run`'s `signal`), so an
+ * abandoned wait neither keeps a queue position nor, later, a slot.
+ * `exemptFromQueueLimit`: see `ColdBuildAdmission.run`.
+ */
+function acquireAdmissionSlot(
+  admission: ColdBuildAdmission,
+  signal: AbortSignal,
+  options: { exemptFromQueueLimit?: boolean } = {},
+): Promise<() => void> {
+  return new Promise<() => void>((resolve, reject) => {
+    admission.run(() => new Promise<void>((done) => {
+      // Granted: the caller owns the slot from here (a slot granted to a
+      // start aborted in the same turn is the caller's to give back — its
+      // `finally` does).
+      resolve(() => done())
+    }), { signal, ...options }).catch((error: unknown) => {
+      reject(signal.aborted ? new AdmissionWaitAbortedError() : error)
+    })
+  })
+}
+
 /** Resolves a workspace key to its Automerge root URL, or null if it doesn't
  * exist. Matches `resolveRootUrl`'s shape (server/src/landscapes.ts) without
  * this module importing it directly — landscapes.ts already imports
@@ -5306,6 +7729,9 @@ export interface ProjectorFleetOptions {
   /** Shared with the default-workspace boot/compaction paths in production so
    * every cross-workspace cold start consumes the same process-wide budget. */
   coldBuildAdmission?: ColdBuildAdmission
+  /** The adopting claim's own admission (C6-2b); defaults to a private one
+   * of {@link DEFAULT_MAX_CONCURRENT_CLAIMS}. Injectable for tests. */
+  claimAdmission?: ColdBuildAdmission
   /** Test seam for deterministic admission/shutdown tests. */
   startProjector?: typeof startReadModelProjector
   /** Shared document lease registry; production uses it to make projector
@@ -5323,7 +7749,27 @@ export interface ProjectorFleetOptions {
   /** Production passes the value `index.ts` parsed at boot, where an invalid
    * `AM_ORDINARY_HEAD_ROTATION` refuses to start; defaults to the same parse. */
   ordinaryHeadRotation?: OrdinaryHeadRotationConfig
+  /** `READ_MODEL_ADOPT` as `index.ts` parsed it at boot (`readModelAdoptMode`,
+   * where an invalid value refuses to start); defaults to the same parse, so
+   * a fleet built without it still follows the environment. `ensure(key,
+   * { adopt: false })` overrides it to `off` for one start (compaction). */
+  adopt?: ReadModelAdoptMode
+  /** T-VANISH: the longest a compaction window may refuse starts
+   * (`openCompactionWindow`), default {@link COMPACTION_WINDOW_MAX_MS}. */
+  compactionWindowMaxMs?: number
+  /** The clock of the compaction window. Tests only. */
+  now?: () => number
 }
+
+/**
+ * T-VANISH: 10 min. Measured on the e2e stack: the 13 windows that logged
+ * their age (`read_model.compaction_window_refused`) lasted 103–151 ms, fold
+ * and re-attach included; the slowest re-attach this tree
+ * documents is a 45–90 s cold build on slow storage and a 169 s row-lock
+ * hold (`compactionReattach.ts`). Above both, so a healthy pass never meets
+ * it; low enough that a stalled one costs minutes of 503s, not the process.
+ */
+export const COMPACTION_WINDOW_MAX_MS = 600_000
 
 export interface ProjectorFleetSnapshot extends ColdBuildAdmissionSnapshot {
   residentProjectors: number
@@ -5337,6 +7783,13 @@ export interface ProjectorFleetSnapshot extends ColdBuildAdmissionSnapshot {
    * means another instance took a workspace this fleet still had resident —
    * each one also triggers a recycle of the losing projector. */
   writeFenceAborts: number
+  /** C6-2b: workspaces claimed and attaching in the background (served,
+   * not resident). `inFlightWorkspaces` counts them too. */
+  servingWorkspaces: number
+  /** C6-2b: the adopting claims' own admission (`active`, `queued`). The
+   * cold-build fields above count SLOT HOLDS since C6-2b: an adopting
+   * attach's slot task completes whether its attach succeeds or not. */
+  claimAdmission: { active: number; queued: number; rejected: number }
 }
 
 export class ProjectorOwnershipError extends Error {
@@ -5346,6 +7799,41 @@ export class ProjectorOwnershipError extends Error {
   constructor() {
     super('Read-model workspace is not owned by this sync cell')
     this.name = 'ProjectorOwnershipError'
+  }
+}
+
+/**
+ * A start refused because a compaction is folding this workspace right now
+ * (T-VANISH).
+ *
+ * Between `release(key, 'compaction')` and the end of that pass
+ * (`endCompactionWindow`), the documents are being rewritten under a
+ * detached projector: the fold writes the base shards, then the clear
+ * removes the folded entries from the overlay head. A cold build started in
+ * that window extracts the head BEFORE the clear and seeds its watcher with
+ * the folded entries; the clear is then a "delete" to that watcher and the
+ * rows go, while the base shard holds them (measured: 31/31 runs on real
+ * PostgreSQL storage). So the only start the window admits is the
+ * compaction's own `{ adopt: false }` re-attach, which runs after the fold
+ * (and which any caller may join once it is building).
+ *
+ * RETRYABLE: the window lasts one pass (103–151 ms measured on the e2e
+ * stack, re-attach included; at most `COMPACTION_WINDOW_MAX_MS`). Every
+ * caller treats it as an expected refusal (`classifyWarmupFailure`): the read
+ * route answers its retryable 503 (`Retry-After: 2`), the live residency
+ * counts it `refused` and asks again 250 ms later instead of after its 5 s
+ * throttle.
+ */
+export class ProjectorCompactionInProgressError extends Error {
+  readonly code = 'read_model_compaction_in_progress'
+  readonly retryable = true
+
+  constructor(key: WorkspaceKey) {
+    super(
+      `Read-model workspace ${key.landscapeId}/${key.versionId} is being compacted: no projector starts `
+      + 'until the compaction re-attaches its own',
+    )
+    this.name = 'ProjectorCompactionInProgressError'
   }
 }
 
@@ -5397,6 +7885,20 @@ export class ProjectorStaticWorkspaceError extends Error {
  * already resident in `byKey` (a cold build only registers itself there once
  * `startReadModelProjector` resolves), so an in-flight build always finishes
  * before it could be picked as the eviction victim.
+ *
+ * EARLY SERVING (G4-16f C6-2b, the owner's decision 1 of 2026-11-07): with
+ * `READ_MODEL_ADOPT=on`, a start whose claim commits is SERVING (`serving`,
+ * `isServing`) while its attach runs in the background; it is RESIDENT
+ * (`byKey`, `isResident`) only once that attach is done. The read route and
+ * boot readiness ask `isServing`; compaction, divergence detection, live
+ * residency and the promotion's instance check keep `isResident`. A serving
+ * start is not in `byKey`, so the LRU can never pick it (it is evicted
+ * neither mid-attach nor for it: the cap is enforced when it becomes
+ * resident, as for any cold build). `release` and `stopAll` end serving at
+ * once and abort the attach. An adopt failure of the attach's own
+ * cold-builds in the background (the start's `attached`), still serving the
+ * kept rows under `idle`; any other failure, or a failed fallback, ends
+ * serving.
  */
 export class ProjectorFleet {
   private readonly repo: Repo
@@ -5410,9 +7912,29 @@ export class ProjectorFleet {
   private readonly isStaticWorkspace: (key: WorkspaceKey) => Promise<boolean>
   private readonly residency?: AutomergeResidencyLeases
   private readonly ordinaryHeadRotation: OrdinaryHeadRotationConfig
+  private readonly adopt: ReadModelAdoptMode
 
+  private readonly claimAdmission: ColdBuildAdmission
   private readonly byKey = new Map<string, FleetEntry>()
-  private readonly inFlight = new Map<string, Promise<boolean>>()
+  private readonly inFlight = new Map<string, StartInFlight>()
+  /** Claimed and attaching in the background (C6-2b): the kept rows are
+   * served, freshness is refused (`idle`) until the attach is done. */
+  private readonly serving = new Map<string, { start: StartInFlight }>()
+  /** The abort of each start in flight (G4-16f C6-2a; `start`). */
+  private readonly attaching = new Map<string, AbortController>()
+  /** Workspaces a compaction has detached and not re-attached: every start
+   * of them is `off` (G4-16f C6-2a; `release`, `ensure`). */
+  private readonly compactionDetached = new Set<string>()
+  /** Workspaces a compaction is folding NOW (T-VANISH): opened by
+   * `release(key, 'compaction')`, closed by `endCompactionWindow`, which the
+   * pass calls on every way out of its detached span. The value is the
+   * window's number, so a start can tell which window it belongs to. Only
+   * `{ adopt: false }` starts are admitted inside one. */
+  private readonly compactionWindows = new Map<string, { id: number; refused: number; openedAt: number }>()
+  private windowCounter = 0
+  private readonly compactionWindowMaxMs: number
+  private readonly now: () => number
+  private compactionWindowRefusals = 0
   private readonly generations = new Map<string, number>()
   private readonly pinnedKeys = new Set<string>()
   private clock = 0
@@ -5420,6 +7942,10 @@ export class ProjectorFleet {
   private ownershipRejectedStarts = 0
   private ownershipEvictions = 0
   private writeFenceAborts = 0
+  /** Told when a workspace becomes RESIDENT, whoever started it (G4-16f:
+   * the compaction re-attach supervisor learns at once that a read's cold
+   * build ended an outage). */
+  private readonly residentListeners = new Set<(key: WorkspaceKey) => void>()
   constructor(repo: Repo, resolveRoot: RootResolver, opts: ProjectorFleetOptions) {
     this.repo = repo
     this.resolveRoot = resolveRoot
@@ -5427,6 +7953,10 @@ export class ProjectorFleet {
     this.fallbackRootUrl = opts.fallbackRootUrl
     this.cap = opts.maxProjectors ?? maxProjectors()
     this.coldBuildAdmission = opts.coldBuildAdmission ?? new ColdBuildAdmission(coldBuildAdmissionConfig())
+    this.claimAdmission = opts.claimAdmission ?? new ColdBuildAdmission({
+      maxConcurrent: DEFAULT_MAX_CONCURRENT_CLAIMS,
+      maxQueued: coldBuildAdmissionConfig().maxQueued,
+    })
     this.startProjector = opts.startProjector ?? startReadModelProjector
     this.ownsWorkspace = opts.ownsWorkspace ?? (() => true)
     this.isStaticWorkspace = opts.isStaticWorkspace ?? (async (key) => {
@@ -5445,6 +7975,9 @@ export class ProjectorFleet {
     })
     this.residency = opts.residency
     this.ordinaryHeadRotation = opts.ordinaryHeadRotation ?? ordinaryHeadRotationConfig()
+    this.adopt = opts.adopt ?? readModelAdoptMode()
+    this.compactionWindowMaxMs = opts.compactionWindowMaxMs ?? COMPACTION_WINDOW_MAX_MS
+    this.now = opts.now ?? (() => Date.now())
   }
 
   /** Keep a fleet-managed workspace resident across LRU pressure. Ownership
@@ -5460,8 +7993,24 @@ export class ProjectorFleet {
    * listeners) if needed. Returns false if the workspace doesn't resolve to a
    * root (caller should 404) — true otherwise, including when a projector was
    * already resident. Memoized per key: concurrent callers for the same
-   * not-yet-resident workspace share one in-flight ensure. */
-  async ensure(key: WorkspaceKey): Promise<boolean> {
+   * not-yet-resident workspace share one in-flight ensure.
+   *
+   * WHEN it resolves (C6-2b): `until: 'serving'` (the default) resolves as
+   * soon as the workspace is SERVED — at an adopting start's claim, or at a
+   * cold build's full attach; `until: 'attached'` only once it is RESIDENT
+   * (the attach done, a background fallback cold build included). With
+   * adopt off, the two are the same moment. `adopt: false` always means
+   * `attached`. */
+  async ensure(
+    key: WorkspaceKey,
+    /** `adopt: false` (G4-16f C6-2a): this start never adopts, whatever
+     * `READ_MODEL_ADOPT` says — compaction's re-attach and its instance
+     * refresh, which need a cold build's rows and acknowledgement — and it
+     * resolves at full attach (C6-2b), so a start already in flight (the
+     * memo, possibly an adopting one) is awaited to its end, never to its
+     * serving. */
+    options: { adopt?: boolean; until?: 'serving' | 'attached' } = {},
+  ): Promise<boolean> {
     if (this.stopped) throw new ColdBuildAdmissionStoppedError()
     const k = keyOf(key)
     if (!this.ownsWorkspace(key)) {
@@ -5474,18 +8023,169 @@ export class ProjectorFleet {
       existing.lastUsed = ++this.clock
       return true
     }
+    // T-VANISH: inside a compaction's window only its own `{ adopt: false }`
+    // re-attach starts (`ProjectorCompactionInProgressError`). And that
+    // re-attach never JOINS a start of another window (or of none): such a
+    // start extracted documents the fold has rewritten since. It waits for
+    // it to settle (a released generation never becomes resident) and builds
+    // its own.
+    const open = this.openCompactionWindow(key, k)
+    const window = open?.id
+    if (open !== undefined) {
+      const current = this.inFlight.get(k)
+      if (options.adopt !== false) {
+        // The compaction's own re-attach, already building after the fold:
+        // joined, as every start is (its extraction reads the compacted
+        // documents). Anything else is refused.
+        if (current && current.window === window) {
+          return options.until === 'attached' ? current.attached : current.serving
+        }
+        this.compactionWindowRefusals += 1
+        open.refused += 1
+        throw new ProjectorCompactionInProgressError(key)
+      }
+      if (current && current.window !== window) {
+        await current.attached.catch(() => undefined)
+        return this.ensure(key, options)
+      }
+    }
+    const untilAttached = options.adopt === false || options.until === 'attached'
     const inflight = this.inFlight.get(k)
-    if (inflight) return inflight
+    if (inflight) {
+      if (untilAttached) return inflight.attached
+      if (this.serving.get(k)?.start === inflight) return true
+      // Serving revoked (released, or failed into the fallback cold build):
+      // the spent `serving` would answer true for a workspace not served.
+      return inflight.served ? inflight.attached : inflight.serving
+    }
 
     const generation = this.generations.get(k) ?? 0
-    const p = this.coldBuildAdmission.run(() => this.start(key, k, generation)).finally(() => {
-      if (this.inFlight.get(k) === p) this.inFlight.delete(k)
-    })
-    this.inFlight.set(k, p)
-    return p
+    // A workspace compaction has detached (`compactionDetached`): no start
+    // adopts until compaction's own `{ adopt: false }` re-attach has built.
+    const adopt: ReadModelAdoptMode = options.adopt === false || this.compactionDetached.has(k) ? 'off' : this.adopt
+    const lift = (started: boolean) => {
+      if (started && options.adopt === false) this.compactionDetached.delete(k)
+      return started
+    }
+    let record: StartInFlight
+    if (adopt === 'on') {
+      // ADOPTING: no cold-build slot around the start — the claim runs under
+      // `claimAdmission` and the background attach takes a cold-build slot
+      // itself (`start`, `admitBuild`).
+      let markServing!: (served: boolean) => void
+      let failServing!: (error: unknown) => void
+      const servingPromise = new Promise<boolean>((resolve, reject) => { markServing = resolve; failServing = reject })
+      record = { serving: servingPromise, attached: null as unknown as Promise<boolean>, served: false }
+      const started = record
+      record.attached = this.start(key, k, generation, adopt, {
+        record: started,
+        markServing: () => {
+          started.served = true
+          markServing(true)
+        },
+      }).then(
+        (value) => { markServing(value); return lift(value) },
+        (error: unknown) => { failServing(error); throw error },
+      ).finally(() => {
+        if (this.inFlight.get(k) === started) this.inFlight.delete(k)
+      })
+      // A caller that took `serving` never awaits `attached` (and one that
+      // took `attached` never awaits `serving`): neither rejection may go
+      // unhandled. A failure after serving is logged by `start`; one before
+      // it reaches whoever awaited (`serving` or `attached`).
+      record.attached.catch(() => undefined)
+      record.serving.catch(() => undefined)
+    } else {
+      const p = this.coldBuildAdmission.run(async () => lift(await this.start(key, k, generation, adopt)))
+        .finally(() => {
+          if (this.inFlight.get(k)?.attached === p) this.inFlight.delete(k)
+        })
+      record = { serving: p, attached: p, served: false }
+    }
+    if (window !== undefined) record.window = window
+    this.inFlight.set(k, record)
+    return untilAttached ? record.attached : record.serving
   }
 
-  private async start(key: WorkspaceKey, k: string, generation: number): Promise<boolean> {
+  /** `serve` (C6-2b): an ADOPTING start — the claim under `claimAdmission`,
+   * `onServing` and `admitBuild` handed to the projector, the fallback cold
+   * build in the same (background) start. */
+  private async start(
+    key: WorkspaceKey,
+    k: string,
+    generation: number,
+    adopt: ReadModelAdoptMode = this.adopt,
+    serve?: { record: StartInFlight; markServing: () => void },
+  ): Promise<boolean> {
+    // One per start (G4-16f C6-2a): `release` and `stopAll` abort it, so an
+    // ADOPTING attach stops at its next check (and its resolutions give up)
+    // rather than run to B5 for a workspace this fleet no longer serves; and
+    // (C6-2b) a wait for an admission slot gives up.
+    const controller = new AbortController()
+    this.attaching.set(k, controller)
+    /** The slots this start holds (adopting only); given back in `finally`. */
+    const slots: { claim: (() => void) | null; build: (() => void) | null } = { claim: null, build: null }
+    try {
+      try {
+        if (serve) slots.claim = await acquireAdmissionSlot(this.claimAdmission, controller.signal)
+        return await this.startAdmitted(key, k, generation, adopt, controller, serve && {
+          ...serve,
+          admitBuild: async () => {
+            slots.claim?.()
+            slots.claim = null
+            // The fallback cold build keeps the slot its adopt attempt took.
+            // A start whose claim COMMITTED queues past `maxQueued` (their
+            // number is bounded by the serving workspaces): refusing it here
+            // would turn a served takeover into a forced cold build into the
+            // same saturated queue (C6-2b).
+            if (!slots.build) {
+              slots.build = await acquireAdmissionSlot(this.coldBuildAdmission, controller.signal, {
+                exemptFromQueueLimit: serve.record.served,
+              })
+            }
+          },
+        })
+      } catch (error) {
+        // Released or stopped while waiting for a slot (a cold build's wait
+        // inside the projector included): the accounting of a disowned start.
+        if (!(error instanceof AdmissionWaitAbortedError)) throw error
+        if (this.stopped) throw new ColdBuildAdmissionStoppedError()
+        this.ownershipRejectedStarts += 1
+        throw new ProjectorOwnershipError()
+      }
+    } catch (error) {
+      if (serve?.record.served) {
+        // A failure AFTER serving: serving ends (below), and a caller told
+        // `serving` awaits nothing more — so it is said here, once. A
+        // release, an ownership loss or a stop is the ordinary end of a
+        // window, not a failure: logged, not warned.
+        const ordinary = error instanceof ProjectorOwnershipError || error instanceof ColdBuildAdmissionStoppedError
+        ;(ordinary ? console.log : console.warn)(JSON.stringify({
+          event: ordinary ? 'read_model.adopt_serving_ended' : 'read_model.adopt_serving_failed',
+          workspace: k,
+          error: error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+        }))
+      }
+      throw error
+    } finally {
+      slots.claim?.()
+      slots.build?.()
+      if (this.attaching.get(k) === controller) this.attaching.delete(k)
+      // Resident (`byKey` is set before this `finally` runs, so `isServing`
+      // is true through either map across the hand-over) or failed:
+      // either way no longer `serving`.
+      if (serve && this.serving.get(k)?.start === serve.record) this.serving.delete(k)
+    }
+  }
+
+  private async startAdmitted(
+    key: WorkspaceKey,
+    k: string,
+    generation: number,
+    adopt: ReadModelAdoptMode,
+    controller: AbortController,
+    serve?: { record: StartInFlight; markServing: () => void; admitBuild: () => Promise<void> },
+  ): Promise<boolean> {
     this.assertStartAllowed(key, k, generation)
     // BEFORE resolving a root or admitting a cold build: a summary workspace
     // belongs to the StaticDeltaProjector, and two writers on one workspace's
@@ -5538,13 +8238,81 @@ export class ProjectorFleet {
     // is exactly what the id is needed to VALIDATE, so reading it back would be
     // the witness-derives-from-the-claim shape.
     let projectorInstanceId: string | null = null
+    // SERVING (C6-2b), fired by the projector the moment its claim has
+    // committed. Not for a start this fleet no longer speaks for (released,
+    // evicted, stopped, disowned): its attach fails at its next check.
+    const onServing = () => {
+      if (!serve || !stillOwned() || controller.signal.aborted) return
+      this.serving.set(k, { start: serve.record })
+      serve.markServing()
+    }
+    // G4-16f (design R4-d): the root's ModelMeta was repointed under this
+    // projector (an epoch roll, a repair, the slim script). Recycled the way a
+    // lost fence is — deferred, generation-checked — so the next `ensure`
+    // cold-builds on the new ModelMeta.
+    const onModelMetaRepointed = () => {
+      const timer = setTimeout(() => {
+        if (this.stopped) return
+        if ((this.generations.get(k) ?? 0) !== generation) return
+        this.release(key, 'model-meta-repointed')
+      }, 0)
+      timer.unref?.()
+    }
+    const startOnce = (mode: ReadModelAdoptMode) => this.startProjector(
+      this.repo, rootUrl, this.db, key, this.residency, undefined, undefined, stillOwned, onFenceLost,
+      (instanceId) => { projectorInstanceId = instanceId },
+      this.ordinaryHeadRotation,
+      serve
+        ? { adopt: mode, signal: controller.signal, onServing, admitBuild: serve.admitBuild, onModelMetaRepointed }
+        : { adopt: mode, signal: controller.signal, onModelMetaRepointed },
+    )
     try {
-      stop = await this.startProjector(
-        this.repo, rootUrl, this.db, key, this.residency, undefined, undefined, stillOwned, onFenceLost,
-        (instanceId) => { projectorInstanceId = instanceId },
-        this.ordinaryHeadRotation,
-      )
+      try {
+        stop = await startOnce(adopt)
+      } catch (error) {
+        // An ADOPTING attach that failed after its claim, for a reason of its
+        // own (the topology moved, a seed head unknown, a pass that threw):
+        // its F4 cleanup ran and the adopt row is bound to the previous
+        // fence, so ANY next attach would refuse it and cold-build. This one
+        // cold-builds at once, in the same cold-build slot — `off`, so it can
+        // never adopt again (no adopt loop) — so a boot or a read does not
+        // fail on it. Torn down (`aborted`) or disowned: not retried. A claim
+        // whose commit outcome is unknown is retried the same way: the cold
+        // build re-reads the fence it compares, whichever it is.
+        //
+        // SERVING CONTINUES through the fallback (C6-2b): the
+        // kept rows stay served under the same contract as the window — the
+        // row is `projector_attached = false` (status `idle`: no `caughtUp`,
+        // no absence proof) from the claim on, and the cold build replaces
+        // the rows in its one transaction and sets `attached` only once its
+        // own rows committed. Readers see the kept rows, then the rebuilt
+        // ones, never a freshness claim over the abandoned adopt's — and no
+        // served → 503 → served flap for the cold build's duration. Serving
+        // ends if the fallback is not run (below) or fails (`start`).
+        const unknownClaim = error instanceof AdoptClaimOutcomeUnknownError
+        if ((!(error instanceof ReadModelAdoptAttachError) || error.reason === 'aborted') && !unknownClaim) throw error
+        // Disowned meanwhile: the same accounting as an aborted attach.
+        if (!stillOwned()) throw new ReadModelAdoptAttachError('B1', 'aborted', { cause: error })
+        console.warn(JSON.stringify({
+          event: 'read_model.adopt_attach_failed',
+          workspace: k,
+          stage: unknownClaim ? 'S6' : (error as ReadModelAdoptAttachError).stage,
+          reason: unknownClaim ? 'claim-outcome-unknown' : (error as ReadModelAdoptAttachError).reason,
+          cause: (() => {
+            const cause = (error as Error).cause
+            return cause instanceof Error ? cause.message : cause === undefined ? null : String(cause)
+          })(),
+        }))
+        stop = await startOnce('off')
+      }
     } catch (error) {
+      if (error instanceof ReadModelAdoptAttachError && error.reason === 'aborted') {
+        // Released, evicted or stopped while adopting: the same accounting
+        // as a cold build disowned mid-flight (below).
+        if (this.stopped) throw new ColdBuildAdmissionStoppedError()
+        this.ownershipRejectedStarts += 1
+        throw new ProjectorOwnershipError()
+      }
       if (isReadModelAuthorityLoss(error)) {
         // The build lost the workspace mid-flight: its fence claim was
         // skipped (or another instance claimed first) and the whole cold
@@ -5579,6 +8347,10 @@ export class ProjectorFleet {
     this.byKey.set(k, {
       key, stop, projectorInstanceId, lastUsed: ++this.clock, pinned: this.pinnedKeys.has(k),
     })
+    for (const listener of this.residentListeners) {
+      // A listener is telemetry and bookkeeping: it must not fail a start.
+      try { listener(key) } catch (error) { console.warn('[read-model] resident listener failed', error) }
+    }
     return true
   }
 
@@ -5592,7 +8364,8 @@ export class ProjectorFleet {
   /** Evict the least-recently-used resident projector if adding one more would
    * exceed the cap. Only considers ALREADY-RESIDENT, UNPINNED entries (`byKey`),
    * never an in-flight cold build (so a build in progress can never be evicted
-   * mid-way) and never a pinned entry. */
+   * mid-way) and never a pinned entry. A SERVING start (C6-2b) is not in
+   * `byKey` either: it is never a victim while it attaches. */
   private evictIfOverCap(): void {
     if (this.byKey.size < this.cap) return
     let victim: FleetEntry | null = null
@@ -5629,10 +8402,112 @@ export class ProjectorFleet {
     console.log(`[read-model] evicted projector for ${k} (LRU cap ${this.cap}) — rows kept, listeners detached`)
   }
 
-  /** For tests/diagnostics: is this workspace's projector currently resident
-   * (listeners attached)? */
+  /** Is this workspace's projector RESIDENT — its attach done, its listeners
+   * attached? What compaction, divergence detection, live residency and the
+   * promotion's instance check mean by "this cell projects it": never true
+   * for a start that is only SERVING (C6-2b). */
   isResident(key: WorkspaceKey): boolean {
     return this.byKey.has(keyOf(key))
+  }
+
+  /** Are this workspace's rows SERVED by this cell (C6-2b): resident, or
+   * claimed by an adopting start whose attach runs in the background — the
+   * kept rows under a status that refuses freshness (`idle`) until B5. What
+   * the read route and boot readiness ask; nothing that needs the attach
+   * done may ask it (`isResident`). */
+  isServing(key: WorkspaceKey): boolean {
+    const k = keyOf(key)
+    return this.byKey.has(k) || this.serving.has(k)
+  }
+
+  /** Called with the key each time a workspace becomes RESIDENT (any start:
+   * a read's, the live residency's, a compaction's). Returns the unsubscribe. */
+  onResident(listener: (key: WorkspaceKey) => void): () => void {
+    this.residentListeners.add(listener)
+    return () => { this.residentListeners.delete(listener) }
+  }
+
+  /** Is this workspace still marked as detached by a compaction (every start
+   * `off`, `release`/`ensure`)? Diagnostics and tests. */
+  isCompactionDetached(key: WorkspaceKey): boolean {
+    return this.compactionDetached.has(keyOf(key))
+  }
+
+  /**
+   * Lift the compaction mark of a workspace that is RESIDENT again through a
+   * start that did not pass `{ adopt: false }` (a read's or the live
+   * residency's cold build, which ran `off` because of the mark and so built
+   * from the documents — the documents as they were while it ran, which can
+   * overlap the end of a fold for a start begun during one; its projector
+   * follows them from then on). Only the compaction re-attach supervisor
+   * calls it, when the compaction slot is free (`compactionReattach.ts`).
+   * A no-op unless the workspace is resident: a mark on a detached workspace
+   * is what keeps its next start from adopting the pre-fold rows.
+   */
+  liftCompactionDetached(key: WorkspaceKey): void {
+    if (this.byKey.has(keyOf(key))) this.compactionDetached.delete(keyOf(key))
+  }
+
+  /**
+   * Close the compaction window `release(key, 'compaction')` opened
+   * (T-VANISH). `runWorkspaceCompaction` calls it on EVERY way out of its
+   * detached span — re-attached, re-attach failed or skipped, the fold
+   * thrown — in a `finally` of its own; idempotent. After it, any start is
+   * admitted again: the pass has returned, so a cold build reads the
+   * compacted documents (and `compactionDetached`, still set when the pass
+   * left the workspace detached, keeps it from ADOPTING the pre-fold rows).
+   */
+  endCompactionWindow(key: WorkspaceKey): void {
+    const k = keyOf(key)
+    const open = this.compactionWindows.get(k)
+    if (!open) return
+    this.compactionWindows.delete(k)
+    // Not silent: the starts this window turned away (each one a build that
+    // would have read the documents mid-fold), once per window.
+    if (open.refused > 0) {
+      console.log(JSON.stringify({
+        event: 'read_model.compaction_window_refused',
+        workspace: k,
+        refused: open.refused,
+        windowMs: this.now() - open.openedAt,
+      }))
+    }
+  }
+
+  /** Is a compaction window open for this workspace? Diagnostics and tests. */
+  isCompactionWindowOpen(key: WorkspaceKey): boolean {
+    return this.openCompactionWindow(key, keyOf(key)) !== undefined
+  }
+
+  /**
+   * The window open for `k`, or none. A window older than
+   * `compactionWindowMaxMs` is CLOSED here, with one warning
+   * (`read_model.compaction_window_overdue`): nothing in a fold has a
+   * deadline (a `flush` on a saturated pool, a statement with no timeout), and
+   * an open window refuses every read of the workspace. Past the ceiling the
+   * fleet goes back to the behaviour before T-VANISH — a start may read the
+   * documents mid-fold — rather than to an outage of unbounded length; the
+   * warning names the workspace so the stalled pass can be found.
+   */
+  private openCompactionWindow(key: WorkspaceKey, k: string): { id: number; refused: number; openedAt: number } | undefined {
+    const open = this.compactionWindows.get(k)
+    if (!open) return undefined
+    const ageMs = this.now() - open.openedAt
+    if (ageMs <= this.compactionWindowMaxMs) return open
+    this.compactionWindows.delete(k)
+    console.warn(JSON.stringify({
+      event: 'read_model.compaction_window_overdue',
+      workspace: `${key.landscapeId}/${key.versionId}`,
+      ageMs,
+      maxMs: this.compactionWindowMaxMs,
+      refused: open.refused,
+    }))
+    return undefined
+  }
+
+  /** Starts refused by a compaction window since boot. Diagnostics and tests. */
+  compactionWindowRefusalCount(): number {
+    return this.compactionWindowRefusals
   }
 
   /** For tests/diagnostics: how many projectors are currently resident. */
@@ -5666,6 +8541,19 @@ export class ProjectorFleet {
   release(key: WorkspaceKey, reason = 'released'): void {
     const k = keyOf(key)
     this.generations.set(k, (this.generations.get(k) ?? 0) + 1)
+    // Serving ends NOW (C6-2b), not when the aborted attach notices.
+    this.serving.delete(k)
+    // A start in flight: an adopting one stops at its next check.
+    this.attaching.get(k)?.abort()
+    // Compaction detaches (`compaction`, `compaction-instance-refresh`) and
+    // then rewrites the documents the kept rows describe: a read's ensure in
+    // that window must not ADOPT those rows (G4-16f C6-2a). Lifted by
+    // compaction's own `{ adopt: false }` re-attach once it has built.
+    if (reason.startsWith('compaction')) this.compactionDetached.add(k)
+    // T-VANISH: the FOLD's detach opens the window (`ensure`); the instance
+    // refresh (`compaction-instance-refresh`) rewrites no document and does
+    // not. Closed by the pass itself (`endCompactionWindow`).
+    if (reason === 'compaction') this.compactionWindows.set(k, { id: ++this.windowCounter, refused: 0, openedAt: this.now() })
     const entry = this.byKey.get(k)
     if (!entry) return
     entry.stop()
@@ -5710,6 +8598,8 @@ export class ProjectorFleet {
       ownershipRejectedStarts: this.ownershipRejectedStarts,
       ownershipEvictions: this.ownershipEvictions,
       writeFenceAborts: this.writeFenceAborts,
+      servingWorkspaces: this.serving.size,
+      claimAdmission: (({ active, queued, rejected }) => ({ active, queued, rejected }))(this.claimAdmission.snapshot()),
     }
   }
 
@@ -5719,6 +8609,9 @@ export class ProjectorFleet {
     if (this.stopped) return
     this.stopped = true
     this.coldBuildAdmission.stop()
+    this.claimAdmission.stop()
+    this.serving.clear()
+    for (const controller of this.attaching.values()) controller.abort()
     for (const entry of this.byKey.values()) entry.stop()
     this.byKey.clear()
   }

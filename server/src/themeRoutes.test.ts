@@ -41,7 +41,7 @@ async function start(auth?: Claims): Promise<{ url: string; close: () => Promise
   app.use(express.json())
   if (auth) app.use((req, _res, next) => { req.auth = auth; next() })
   registerThemeRoutes(app)
-  const server: Server = await new Promise((resolve) => { const s = app.listen(0, () => resolve(s)) })
+  const server: Server = await new Promise((resolve) => { const s = app.listen(0, '127.0.0.1', () => resolve(s)) })
   return {
     url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
     close: () => new Promise((resolve) => server.close(() => resolve())),

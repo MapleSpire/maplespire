@@ -14,6 +14,7 @@
 
 import type { RequestHandler } from 'express'
 import type { Pool } from 'pg'
+import type { InFlightHandlers, LongLivedResponses } from '../httpShutdown.js'
 import type { WorkspaceKey } from '../rbac/docScope.js'
 import { checkWorkspaceAccess } from '../rbac/workspaceGate.js'
 import type { SyncCellOwnerRoute, SyncCellOwnership } from './ownership.js'
@@ -312,6 +313,12 @@ export interface WorkspaceHttpRoutingOptions {
   resolveMergeParent?: MergeParentResolver
   /** Same contract as `resolveMergeParent`, for the two creation doors. The statement is covered by `landscapeDefaultRoute.integration.test.ts`. */
   resolveLandscapeDefault?: LandscapeDefaultResolver
+  /** The cell's long-lived responses: a relayed SSE stream registers there,
+   * so the shutdown's `http` step ends it. */
+  longLived?: LongLivedResponses
+  /** The cell's handler census: a relayed request is held until the relay to
+   * the owner is over. */
+  inFlight?: InFlightHandlers
 }
 
 /** Express admission/router for workspace-affine HTTP traffic. Both the landing
@@ -415,6 +422,8 @@ export function createWorkspaceHttpRouting(options: WorkspaceHttpRoutingOptions)
           advertiseUrl: decision.owner.advertiseUrl,
           sourceCellId: decision.placement.localCellId,
           ...(writeFamily ? { timeoutMs: ROUTED_WRITE_HEADER_DEADLINE_MS } : {}),
+          ...(options.longLived ? { longLived: options.longLived } : {}),
+          ...(options.inFlight ? { inFlight: options.inFlight } : {}),
         })
         console.log(JSON.stringify({
           event: 'sync.cell.http_route_proxy_result',

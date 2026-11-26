@@ -18,6 +18,7 @@ import {
   projectionMutexKey,
   type ReadModelPlane,
 } from './projectionAuthority.js'
+import { lostMarkerOf } from './protocolParticipant.js'
 import { isPool } from './queryableShape.js'
 import type { WorkspaceKey } from './projector.js'
 import type { Queryable } from './types.js'
@@ -122,6 +123,9 @@ export async function withReadModelProjectionTransaction<T>(
     })
     throw error
   } finally {
-    client.release(rollbackFailure)
+    // A connection whose protocol marker was found lost is destroyed too
+    // (`protocolParticipant.ts`, A LOST MARKER ENDS THE CONNECTION): returned,
+    // it would refuse every later projection that draws it.
+    client.release(rollbackFailure ?? lostMarkerOf(client))
   }
 }

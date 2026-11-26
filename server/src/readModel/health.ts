@@ -15,6 +15,14 @@
 import { randomUUID } from 'node:crypto'
 import type { Queryable } from './types.js'
 import type { WorkspaceKey } from './projector.js'
+import type { MetricSample } from '../runtime/metrics.js'
+import {
+  assertProtocolParticipant,
+  PARTICIPANT_VERSION_SQL,
+  ReadModelProtocolMarkerError,
+  recordLostMarker,
+} from './protocolParticipant.js'
+import { isPool } from './queryableShape.js'
 
 export type ProjectionKind =
   | 'cold_build'
@@ -393,8 +401,11 @@ export async function markReadModelProjectorAttached(
  *    stealing the fence off the live takeover, including when the
  *    process-local lease check cannot see the takeover at all (a stale lease
  *    copy, or ownership disabled entirely — two processes on one database);
- *  - every projection transaction ASSERTS the fence `FOR UPDATE` immediately
- *    before it completes. A mismatch throws, rolling back rows, watermark,
+ *  - every projection transaction ASSERTS the fence `FOR UPDATE` before it
+ *    completes — a pass that writes only `ro_*` rows at its end, a
+ *    transaction that writes the protocol tables (retirements, folds) BEFORE
+ *    its first such write, which their trigger enforces (`adoptState.ts`,
+ *    THE LOCK ORDER). A mismatch throws, rolling back rows, watermark,
  *    change feed and integrity stamp together — so a disowned pass cannot
  *    commit AFTER the takeover's cold build.
  *
@@ -566,12 +577,18 @@ export async function claimReadModelWriteFence(
  * commit together.
  *
  * MUST run LAST in that transaction, after the document claims and the
- * allow-list. `read_model_projection_state` is the terminal lock for both
- * projectors too, so a resource that is always terminal cannot appear in a
- * cycle. Taken FIRST it closes one immediately: this transaction would hold the
+ * allow-list. `read_model_projection_state` is the terminal lock of the
+ * static publish and of an ordinary pass's `ro_*` writes, so against them
+ * it closes no cycle. Taken FIRST it closes one immediately: this transaction would hold the
  * state row and want `read_model_static_documents` while a static publish holds
  * `read_model_static_documents` and wants the state row — 40P01 on a single
- * workspace with no fan-out needed.
+ * workspace with no fan-out needed. It is NOT terminal for the ordinary
+ * protocol writers (rotator, fold, forwarder, settle, folded-arrival
+ * advances): they take it FIRST, then retirement/fold rows, then the adopt
+ * row (`adoptState.ts`, THE LOCK ORDER). No cycle with this transaction
+ * either, because a promotion locks none of those rows (it only READS the
+ * retirement rows, `promoteSummaryWorkspace.ts`) — a promotion that ever
+ * writes one must take this row before it, like them.
  *
  * An `UPDATE` with the `rowCount` CHECKED — deliberately not the upsert that
  * {@link claimReadModelWriteFence} uses; both obvious choices are wrong in
@@ -615,25 +632,120 @@ export async function claimLifecycleWriteFence(
   return fence
 }
 
-/** Throws `ReadModelWriteFenceError` unless this instance holds the fence.
- * MUST be called inside the projection transaction, after the row writes and
- * before `completeReadModelProjection`. A missing row fails closed: it means
- * the workspace's state was wiped underneath this projector, and rows written
- * into that void would belong to nobody. */
+/**
+ * The transaction-local setting that records which workspaces' fence rows
+ * this transaction holds FOR UPDATE: a list of `,<xid>:<token>` entries,
+ * `<token>` being `md5(jsonb_build_array(landscape_id, version_id)::text)`
+ * and `<xid>` this transaction's `pg_current_xact_id()` (the top-level id,
+ * also inside a savepoint). Written ONLY in the statement that takes the row
+ * ({@link assertReadModelWriteFence}), read by the protocol tables'
+ * statement trigger (`schema.ts`, `ADOPT_PROTOCOL_TOUCHED_BODY`), which, on
+ * a participant connection (`protocolParticipant.ts`), REFUSES a write to
+ * `read_model_ordinary_head_retirements` / `read_model_ordinary_chain_folds`
+ * of a workspace whose entry for THIS transaction is absent (`adoptState.ts`,
+ * THE LOCK ORDER). A `ROLLBACK TO SAVEPOINT` reverts the setting together
+ * with the row lock taken under the savepoint, so the two cannot disagree.
+ *
+ * The xid is what makes the list mean "taken in this transaction": a value
+ * the setting carries from anywhere else — `ALTER ROLE/DATABASE … SET`, a
+ * startup option, a session-level `SET` — was written before this
+ * transaction had an id, so no entry in it can name it. Without the xid, a
+ * role-level `,<token>` (or the fixtures' wildcard) would disable the check
+ * for every session of that role.
+ */
+export const PROTOCOL_FENCE_ROWS_SETTING = 'maplespire.read_model_fence_rows'
+
+/** Throws `ReadModelWriteFenceError` unless this instance holds the fence —
+ * that verdict FIRST — and then `ReadModelProtocolMarkerError`
+ * (`protocolParticipant.ts`) when the connection is not a protocol
+ * participant of at least the lock order's version (its marker lost to a
+ * session reset, a transaction-mode pooler, a hand-opened client): the
+ * trigger would not check its writes, so they are refused here instead of
+ * silently unenforced, and the connection is recorded as lost
+ * (`lostMarkerOf`) for its owner to destroy. MUST be called inside the projection transaction before
+ * `completeReadModelProjection` — and, in a transaction that writes the
+ * protocol tables (retirements, folds), BEFORE the first such write: the
+ * statement that takes the row FOR UPDATE also records it in
+ * {@link PROTOCOL_FENCE_ROWS_SETTING}, and the protocol tables' trigger
+ * refuses a write made before it (`adoptState.ts`, THE LOCK ORDER). A
+ * projection pass that writes only `ro_*` rows asserts it at its end. A
+ * missing row fails closed: it means the workspace's state was wiped
+ * underneath this projector, and rows written into that void would belong
+ * to nobody. */
 export async function assertReadModelWriteFence(
   db: Queryable,
   key: WorkspaceKey,
   instanceId: string
 ): Promise<void> {
-  const { rows } = await db.query<{ write_fence: string | null }>(
-    `SELECT write_fence FROM read_model_projection_state
+  // One statement takes the row and records that it is held. The token is
+  // built from the PARAMETERS, not the scanned row, so however the filter is
+  // ordered it can only ever name this workspace (and it is appended once);
+  // with no row the assertion below throws and the transaction does not go
+  // on to write. `pg_current_xact_id()` assigns the id the FOR UPDATE needs
+  // anyway. The connection's participant version rides on the same row.
+  const { rows } = await db.query<{ write_fence: string | null; participant: number }>(
+    `SELECT write_fence, ${PARTICIPANT_VERSION_SQL} AS participant FROM read_model_projection_state
      WHERE landscape_id = $1 AND version_id = $2
+       AND (SELECT set_config('${PROTOCOL_FENCE_ROWS_SETTING}',
+              CASE WHEN held.rows LIKE '%,' || held.token || '%' THEN held.rows
+                   ELSE held.rows || ',' || held.token END, true)
+              FROM (SELECT coalesce(current_setting('${PROTOCOL_FENCE_ROWS_SETTING}', true), '') AS rows,
+                           pg_current_xact_id()::text || ':' || md5(jsonb_build_array($1::text, $2::text)::text) AS token) held) IS NOT NULL
      FOR UPDATE`,
     [key.landscapeId, key.versionId]
   )
+  // The FENCE VERDICT FIRST. An instance that has lost the fence is told so
+  // whatever its connection carries: its caller treats a fence loss as an
+  // authority loss (it rolls back, never writes failure telemetry onto the
+  // row that now belongs to the new owner, and the instance is recycled).
+  // Reported as a marker fault instead, `failReadModelProjection` would
+  // write this instance's failure onto the new owner's row.
   const held = rows[0]?.write_fence
   if (rows.length === 0 || held !== instanceId) {
     throw new ReadModelWriteFenceError(key, instanceId, rows.length === 0 ? undefined : held)
+  }
+  // FAIL CLOSED ON A LOST MARKER (`protocolParticipant.ts`), checked only
+  // once the fence is known to be ours: on a connection whose session reset
+  // dropped the participant marker (RESET ALL, DISCARD ALL, a
+  // transaction-mode pooler), the trigger would not enforce the lock order
+  // on this transaction's writes. A configuration fault, reported as
+  // itself. The connection is recorded as lost (`recordLostMarker`) so the
+  // code that checked it out DESTROYS it rather than handing it back to the
+  // pool, where it would refuse every later writer that draws it.
+  try {
+    assertProtocolParticipant(key, Number(rows[0]!.participant))
+  } catch (error) {
+    if (error instanceof ReadModelProtocolMarkerError && !isPool(db)) recordLostMarker(db, error)
+    throw error
+  }
+}
+
+/** The CLAIM of a verify-and-adopt attach (G4-16f C6-2a, `adoptVerify.ts`,
+ * S6), in the claim's transaction, right after the fence CAS and its
+ * assertion: the row now names `instanceId`, and is NOT attached —
+ * `projector_attached = false` until the attach's last transaction (B5,
+ * `projectorService.ts`) sets it in the same fenced transaction as the
+ * adopt row's binding. Between the two the status ladder reads `idle` (or
+ * `failed`, which ranks above it, after a failed pass; never `healthy`:
+ * `projectionStatusSql`), so `caughtUp` and `absenceProvable` are false,
+ * compaction's acknowledgement is refused and promotion with it, while the
+ * attach's own passes complete generations on the kept rows. Throws when the
+ * row is gone (the CAS just matched it under the lock, so that is a defect). */
+export async function markReadModelProjectorAdopting(
+  tx: Queryable,
+  key: WorkspaceKey,
+  instanceId: string,
+): Promise<void> {
+  const result = await tx.query(
+    `UPDATE read_model_projection_state SET
+       projector_attached = false,
+       projector_instance_id = $3,
+       updated_at = now()
+     WHERE landscape_id = $1 AND version_id = $2`,
+    [key.landscapeId, key.versionId, instanceId],
+  )
+  if ((result.rowCount ?? 0) !== 1) {
+    throw new Error(`adopt claim: no read_model_projection_state row for ${key.landscapeId}/${key.versionId}`)
   }
 }
 
@@ -747,12 +859,29 @@ export interface WorkspaceProjectionFreshness {
    * a timestamp clause — and the fallback can never override an exact
    * refusal. `absenceProvable ⊆ caughtUp` always.
    *
-   * Exactness is scoped to the object/connection shard documents (where the
-   * entities this witness proves live): they are stamped by the cold build
-   * and re-stamped by every shard delta. Root, meta, registry shards,
-   * monolith and DiagramDocs are deliberately NOT stamped — their handlers
-   * record no watermark, so stamping them once would turn any later write
-   * into a PERMANENT exact refusal; on the fallback they stay self-healing.
+   * On the ORDINARY plane exactness is scoped to the object/connection shard
+   * documents (where the entities this witness proves live): they are
+   * stamped by the cold build and re-stamped by every shard delta. Root,
+   * meta, registry shards, monolith and DiagramDocs are deliberately NOT
+   * stamped there — their handlers record no watermark, so stamping them
+   * once would turn any later write into a PERMANENT exact refusal; on the
+   * fallback they stay self-healing. Since T-SUM-2c the CONTROL documents
+   * among them (root, ModelMeta, registry shards, monolith) can also be
+   * LIFTED by their adopt certificate (`read_model_adopt_watermarks`), which
+   * never refuses: a 0 or a value below the arrival falls to the timestamp.
+   * DiagramDocs have no adopt certificate and stay on the timestamp alone —
+   * the same race (a save landing after the pass that projected it) is
+   * possible there, not measured. Holes in the adopt lift, each leaving the
+   * timestamp to decide until the next pass (logged after 30 s by
+   * `noteAbsenceProof`): a preparation or stamp transaction that fails
+   * (stamped or left 0, no retry), an adopting attach that inherits rows and
+   * stamps nothing until a pass. On the STATIC plane (T-SUM-2) every
+   * document a pass projects is stamped by that pass, in the transaction that
+   * publishes or acknowledges it (`StaticDeltaProjector.recordPassWatermark`),
+   * and the allow-list is marked once on entry (`markStaticEntryWatermarks`);
+   * a demotion drops the static certificates the ordinary plane would never
+   * lift. Documents registered after the entry stay on the fallback until
+   * their first tracked write.
    * sync-state chunks are excluded from both clocks: protocol bookkeeping
    * that never moves heads would freeze the proof. Remaining residuals:
    * fallback-scope documents keep the timestamp clause's grace windows;
@@ -762,12 +891,78 @@ export interface WorkspaceProjectionFreshness {
    * domain); the single-process heads argument is documented in
    * arrivalWatermark.ts. */
   absenceProvable: boolean
+  /** T-SUM-2c: the admitted documents the arrival clause refuses, by branch
+   * (`DOCUMENT_ARRIVAL_BRANCH_SQL`: `zero`, `exact` for a certificate below the
+   * arrival, `fallback` for the timestamp), and at most five of them as
+   * `documentId:branch:newestArrival`. Whatever `caughtUp` says. */
+  arrivalRefusals?: { zero: number; exact: number; fallback: number; sample: string[] }
 }
+
+/**
+ * ONE admitted document's arrival coverage, the per-document clause of
+ * `absenceProvable` — shared with `markStaticEntryWatermarks`
+ * (`arrivalWatermark.ts`), which may turn a coverage into an exact
+ * certificate only where THIS clause holds, so the two cannot drift. Expects
+ * `wm` bound to the document's `read_model_document_watermarks` row (or
+ * NULLs), `newest` to its newest non-sync-state chunk (`max_seq`,
+ * `newest_at`) and `p` to the workspace's `read_model_projection_state`.
+ *
+ *  - an explicit refusal (0) wins even for legacy/absent content whose
+ *    arrival sequence is NULL — a timestamp cannot certify it;
+ *  - EXACT when both sides of the order exist;
+ *  - T-SUM-2c: a document with NO certificate row is covered when its ADOPT
+ *    certificate (`aw`, `read_model_adopt_watermarks`) is positive and at or
+ *    above its newest arrival. That row is written only for the ordinary
+ *    plane's CONTROL documents (root, ModelMeta, registry shards, a monolith
+ *    model), exact or 0, by the cold build in its own transaction and by the
+ *    deferred stamp that follows every metadata and registry pass
+ *    (`projectorService.ts`, `runAdoptStamps`): positive only when the
+ *    revision a COMMITTED pass projected equals the document's durable heads
+ *    and its live heads — the shard certificate's rule (`adoptState.ts`,
+ *    `recordAdoptWatermarks`). Its 0 is NOT a refusal here (every pass writes
+ *    one until its deferred stamp runs): it falls through to the timestamp,
+ *    as before. Measured, T-SUM-2c: on the ordinary plane, the Repo's save of
+ *    the ModelMeta revision a metadata pass had just projected landed 1–3 ms
+ *    after that pass's `last_projected_at`, so the timestamp below refused it
+ *    until the next pass of any kind — 91 s and more on a quiet workspace
+ *    after a compaction — while its adopt certificate already covered it;
+ *  - otherwise the timestamp FALLBACK: the newest write predates the last
+ *    completed projection. It is WEAKER than it reads: any later publish of
+ *    ANY document of the workspace moves `last_projected_at` past an arrival
+ *    nothing projected (measured, T-SUM-2: a raw chunk in a summary head was
+ *    "proven absent" 555 ms after an unrelated connection edit). Hence T-SUM-2
+ *    moves the static plane's documents onto the exact branch.
+ *
+ * Expects `aw` bound to the document's `read_model_adopt_watermarks` row (or
+ * NULLs) as well.
+ *
+ * ONE CASE names the branch a document takes ({@link DOCUMENT_ARRIVAL_BRANCH_SQL});
+ * coverage, certification and the refusal kind are all read off that name, so
+ * the three cannot drift (T-SUM-2c).
+ */
+export const DOCUMENT_ARRIVAL_BRANCH_SQL = `CASE
+                  WHEN wm.projected_watermark = 0 THEN 'zero'
+                  WHEN newest.max_seq IS NOT NULL AND wm.projected_watermark IS NOT NULL
+                    THEN CASE WHEN wm.projected_watermark >= newest.max_seq THEN 'exact_ok' ELSE 'exact_low' END
+                  WHEN newest.max_seq IS NOT NULL AND aw.adopt_watermark > 0
+                    AND aw.adopt_watermark >= newest.max_seq THEN 'adopt_ok'
+                  WHEN COALESCE(newest.newest_at IS NULL OR newest.newest_at < p.last_projected_at, false) THEN 'ts_ok'
+                  ELSE 'ts_refused'
+                END`
+
+/** The branch names {@link DOCUMENT_ARRIVAL_BRANCH_SQL} covers with. */
+const COVERING_BRANCHES = `('exact_ok', 'adopt_ok', 'ts_ok')`
+
+export const DOCUMENT_ARRIVAL_COVERED_SQL = `((${DOCUMENT_ARRIVAL_BRANCH_SQL}) IN ${COVERING_BRANCHES})`
 
 /**
  * The one-workspace freshness read behind the durability-witness endpoint.
  * Same status ladder as the org view and the fleet rollup (`projectionStatusSql`)
- * — a third private copy would drift invisibly. The grace-window residual the
+ * — a third private copy would drift invisibly. NOT the same INPUT since
+ * T-SUM-2c (nor before it: they count sync-state chunks): the newest write the
+ * `stale` rung reads leaves out documents a certificate covers, so the org
+ * view and `/metrics` can report `stale` for a workspace this reads healthy
+ * (a known gap, not covered by a test). The grace-window residual the
  * ladder carries (a young unobserved write still reads `healthy`) is closed
  * FOR THE PROOF by `absenceProvable`'s arrival clause; `caughtUp` keeps the
  * ladder semantics and stays display-grade. The arrival clause's own inherited
@@ -782,11 +977,16 @@ export async function getWorkspaceProjectionFreshness(
     projected_generation: string
     admitted_count: string
     arrival_covered: boolean
+    refused_zero: string | null
+    refused_exact: string | null
+    refused_fallback: string | null
+    refused_sample: string[] | null
   }>(
     `SELECT ${projectionStatusSql('$3')} AS status,
             COALESCE(p.projected_generation, 0)::text AS projected_generation,
             COALESCE(d.admitted_count, 0)::text AS admitted_count,
-            COALESCE(d.arrival_covered, false) AS arrival_covered
+            COALESCE(d.arrival_covered, false) AS arrival_covered,
+            d.refused_zero::text, d.refused_exact::text, d.refused_fallback::text, d.refused_sample
      FROM (VALUES (1)) AS anchor(one)
      LEFT JOIN read_model_projection_state p
        ON p.landscape_id = $1 AND p.version_id = $2
@@ -801,19 +1001,29 @@ export async function getWorkspaceProjectionFreshness(
        -- yet watermark-projected since the deploy): exactness grows one
        -- projection at a time and the fallback can never override an exact
        -- refusal. Cost: two backwards index probes per admitted document
-       -- (idx_automerge_storage_doc_updated / _doc_arrival) plus a PK join.
+       -- (idx_automerge_storage_doc_updated / _doc_arrival) plus two PK joins
+       -- (the document certificate, the adopt certificate).
        SELECT count(dw.document_id) AS admitted_count,
-              max(newest.newest_at) AS newest_durable_write_at,
-              bool_and(
-                CASE
-                  -- Explicit refusal wins even for legacy/absent content whose
-                  -- arrival sequence is NULL. A timestamp cannot certify it.
-                  WHEN wm.projected_watermark = 0 THEN false
-                  WHEN newest.max_seq IS NOT NULL AND wm.projected_watermark IS NOT NULL
-                    THEN wm.projected_watermark >= newest.max_seq
-                  ELSE COALESCE(newest.newest_at IS NULL OR newest.newest_at < p.last_projected_at, false)
-                END
-              ) AS arrival_covered
+              -- The stale detector's input, WITHOUT the documents whose newest
+              -- arrival a certificate covers (T-SUM-2c): such a write is
+              -- projected content saved after the pass (measured 1-3 ms after
+              -- it on ModelMeta), not a write the projector missed. Left in, it
+              -- turns a quiet workspace stale once the grace has passed:
+              -- measured with a 200 ms grace (projectorWatermark.races.test.ts,
+              -- T-SUM-2c case); at the default 60 s, by the same rule, NOT
+              -- measured on a stack. ONLY HERE: the org view and the fleet
+              -- rollup keep the raw newest write (and sync-state chunks too),
+              -- so they can still read stale where this reads healthy.
+              max(newest.newest_at) FILTER (WHERE branch.name NOT IN ('exact_ok', 'adopt_ok')) AS newest_durable_write_at,
+              bool_and(branch.name IN ${COVERING_BRANCHES}) AS arrival_covered,
+              -- T-SUM-2c: WHICH documents refuse, by branch, so a refused
+              -- proof can say what it waits on (noteAbsenceProof).
+              count(*) FILTER (WHERE branch.name = 'zero') AS refused_zero,
+              count(*) FILTER (WHERE branch.name = 'exact_low') AS refused_exact,
+              count(*) FILTER (WHERE branch.name = 'ts_refused') AS refused_fallback,
+              (array_agg(dw.document_id || ':' || CASE branch.name WHEN 'exact_low' THEN 'exact' WHEN 'ts_refused' THEN 'fallback' ELSE branch.name END
+                   || ':' || COALESCE(newest.max_seq::text, '')
+                 ORDER BY dw.document_id) FILTER (WHERE branch.name NOT IN ${COVERING_BRANCHES}))[1:5] AS refused_sample
        FROM automerge_document_workspace dw
        LEFT JOIN LATERAL (
          -- sync-state chunks are protocol bookkeeping written on every peer
@@ -832,6 +1042,11 @@ export async function getWorkspaceProjectionFreshness(
          ON wm.landscape_id = dw.landscape_id
         AND wm.version_id = dw.version_id
         AND wm.document_id = dw.document_id
+       LEFT JOIN read_model_adopt_watermarks aw
+         ON aw.landscape_id = dw.landscape_id
+        AND aw.version_id = dw.version_id
+        AND aw.document_id = dw.document_id
+       CROSS JOIN LATERAL (SELECT ${DOCUMENT_ARRIVAL_BRANCH_SQL} AS name) branch
        WHERE dw.landscape_id = $1 AND dw.version_id = $2
      ) d ON true`,
     [key.landscapeId, key.versionId, String(Math.round(staleGraceMs()))],
@@ -846,7 +1061,96 @@ export async function getWorkspaceProjectionFreshness(
     admittedDocuments,
     caughtUp,
     absenceProvable: caughtUp && row?.arrival_covered === true,
+    arrivalRefusals: {
+      zero: Number(row?.refused_zero ?? 0),
+      exact: Number(row?.refused_exact ?? 0),
+      fallback: Number(row?.refused_fallback ?? 0),
+      sample: row?.refused_sample ?? [],
+    },
   }
+}
+
+/**
+ * T-SUM-2c: A REFUSED PROOF SAYS WHAT IT WAITS ON. Before it, a workspace
+ * whose projection was caught up could answer `absenceProvable: false` for
+ * minutes — measured, 91 s and more after a compaction — and nothing anywhere
+ * said so: the replay that asked deferred its intent and asked again later.
+ * Called by the durability witness for every answer: a caught-up answer whose
+ * arrival clause refuses counts once per refusing branch
+ * (`maplespire_read_model_absence_unprovable_total{branch}`); when the SAME
+ * refusal (the same documents, branches and newest arrivals) is answered again
+ * {@link ABSENCE_STUCK_AFTER_MS} or more after it was first seen, it logs
+ * `read_model.absence_unprovable_stuck` once, naming them, and counts
+ * `maplespire_read_model_absence_unprovable_stuck_total`. A refusal that
+ * changes (a new arrival, a pass) starts its clock again. Process memory, at
+ * most {@link ABSENCE_STUCK_WORKSPACES} workspaces, oldest dropped first.
+ * Nothing is asked when nobody waits: the counters move only when a witness is
+ * asked.
+ */
+export const ABSENCE_STUCK_AFTER_MS = 30_000
+export const ABSENCE_STUCK_WORKSPACES = 1_024
+const absenceRefusedSince = new Map<string, { signature: string; since: number; logged: boolean }>()
+const absenceUnprovableCounts: Record<'zero' | 'exact' | 'fallback', number> = { zero: 0, exact: 0, fallback: 0 }
+let absenceStuckCount = 0
+
+export function noteAbsenceProof(
+  key: { landscapeId: string; versionId: string },
+  freshness: Pick<WorkspaceProjectionFreshness, 'caughtUp' | 'absenceProvable' | 'arrivalRefusals'>,
+  now: number = Date.now(),
+  log: (line: string) => void = (line) => console.warn(line),
+): void {
+  const workspace = `${key.landscapeId}/${key.versionId}`
+  const refusals = freshness.arrivalRefusals
+  if (!freshness.caughtUp || freshness.absenceProvable || !refusals) {
+    absenceRefusedSince.delete(workspace)
+    return
+  }
+  for (const branch of ['zero', 'exact', 'fallback'] as const) if (refusals[branch] > 0) absenceUnprovableCounts[branch] += 1
+  const signature = JSON.stringify([refusals.zero, refusals.exact, refusals.fallback, refusals.sample])
+  const seen = absenceRefusedSince.get(workspace)
+  if (!seen || seen.signature !== signature) {
+    absenceRefusedSince.delete(workspace)
+    absenceRefusedSince.set(workspace, { signature, since: now, logged: false })
+    while (absenceRefusedSince.size > ABSENCE_STUCK_WORKSPACES) absenceRefusedSince.delete(absenceRefusedSince.keys().next().value!)
+    return
+  }
+  if (seen.logged || now - seen.since < ABSENCE_STUCK_AFTER_MS) return
+  seen.logged = true
+  absenceStuckCount += 1
+  log(JSON.stringify({
+    event: 'read_model.absence_unprovable_stuck',
+    workspace,
+    sinceMs: now - seen.since,
+    refused: { zero: refusals.zero, exact: refusals.exact, fallback: refusals.fallback },
+    // `documentId:branch:newestArrival`, at most five.
+    documents: refusals.sample,
+  }))
+}
+
+export function absenceProofMetricSamples(): MetricSample[] {
+  return [
+    {
+      name: 'maplespire_read_model_absence_unprovable_total',
+      help: 'Durability-witness answers on a caught-up workspace whose absence proof was refused by the per-document arrival clause, by refusing branch (zero: an explicit refusal; exact: a certificate below the newest arrival; fallback: a write at or after the last completed projection, on a document without a certificate). A short burst after each write is expected; see maplespire_read_model_absence_unprovable_stuck_total.',
+      type: 'counter',
+      values: (['zero', 'exact', 'fallback'] as const).map((branch) => ({ labels: { branch }, value: absenceUnprovableCounts[branch] })),
+    },
+    {
+      name: 'maplespire_read_model_absence_unprovable_stuck_total',
+      help: 'Refusals of the absence proof answered unchanged for 30 s or more on a caught-up workspace: the proof waits on something no pass is coming to fix. Each one logs read_model.absence_unprovable_stuck naming the documents.',
+      type: 'counter',
+      values: [{ value: absenceStuckCount }],
+    },
+  ]
+}
+
+/** Tests: forget the counters and the refusal clocks. */
+export function resetAbsenceProofForTest(): void {
+  absenceRefusedSince.clear()
+  absenceUnprovableCounts.zero = 0
+  absenceUnprovableCounts.exact = 0
+  absenceUnprovableCounts.fallback = 0
+  absenceStuckCount = 0
 }
 
 /** Org-admin aggregate. Scope rows define the tenant boundary and ensure a

@@ -54,6 +54,23 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
+/** A ModelMeta base-shard list as the document RULES it (G4-16f): under
+ * the marker `metaUrlFormat: 2` the list lives in `…Refs` and its elements
+ * are `ImmutableString`s (`.val`), which the `typeof` filter below would drop
+ * silently. Read here from the document's own shape, NOT through
+ * `modelMetaUrls.ts`: an oracle that shares the writer's reader agrees with
+ * it by construction (this file's first rule). */
+function ruledShardList(meta: Record<string, unknown>, field: 'objectShardUrls' | 'connectionShardUrls'): unknown {
+  const scalar = meta.metaUrlFormat === 2
+  const raw = meta[scalar ? (field === 'objectShardUrls' ? 'objectShardRefs' : 'connectionShardRefs') : field]
+  if (!Array.isArray(raw)) return raw
+  return raw.map((entry: unknown) => {
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) return entry
+    const val = (entry as { val?: unknown }).val
+    return typeof val === 'string' ? val : entry
+  })
+}
+
 function stringArray(value: unknown, what: string): string[] {
   if (value === undefined || value === null) return []
   if (!Array.isArray(value)) throw new InventoryError(`${what} is not an array`)
@@ -102,11 +119,11 @@ export async function collectCrdtInventory(rootDoc: unknown, resolve: ResolveDoc
 
   if (modelMetaUrl) {
     const meta = await readDoc(resolve, modelMetaUrl, 'ModelMeta')
-    for (const url of stringArray(meta.objectShardUrls, 'ModelMeta.objectShardUrls')) {
+    for (const url of stringArray(ruledShardList(meta, 'objectShardUrls'), 'ModelMeta.objectShardUrls')) {
       const shard = await readDoc(resolve, url, 'object shard')
       for (const id of keysOfMap(shard, 'objects', 'object shard')) objects.add(id)
     }
-    for (const url of stringArray(meta.connectionShardUrls, 'ModelMeta.connectionShardUrls')) {
+    for (const url of stringArray(ruledShardList(meta, 'connectionShardUrls'), 'ModelMeta.connectionShardUrls')) {
       const shard = await readDoc(resolve, url, 'connection shard')
       for (const id of keysOfMap(shard, 'connections', 'connection shard')) connections.add(id)
     }

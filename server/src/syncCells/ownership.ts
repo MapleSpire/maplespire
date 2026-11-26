@@ -16,6 +16,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import { hostname } from 'node:os'
 import type { Pool } from 'pg'
 import type { Queryable } from '../readModel/types.js'
+import { EPOCH_RESOLVE_FENCE_PREFIX, isActiveEpochResolveFence } from '../readModel/epochResolveFence.js'
 import {
   ceilingIsUnbounded,
   readEffectiveCeilings,
@@ -1134,7 +1135,15 @@ export class FencedPartitionLeaseStore {
 interface LocalLease extends FencedLease {
   workspace: WorkspaceKey
   validUntil: number
+  /** When this cell last wrote `lease_observed_expires_at` for this lease
+   * (`persistLease`, `refreshLeaseObservations`); local clock. */
+  observedAt?: number
 }
+
+/** How often a held lease's durable `lease_observed_expires_at` is refreshed
+ * on renewal (`refreshLeaseObservations`). Twelve times inside the one hour
+ * `epoch:resolve-repointing` requires before it calls a lease stale. */
+export const LEASE_OBSERVATION_REFRESH_MS = 5 * 60_000
 
 interface LocalPartitionLease extends FencedLease {
   partition: number
@@ -1795,6 +1804,19 @@ export class StaleDurableFenceError extends Error {
   constructor(detail: string) {
     super(`Durable fence refused the write: ${detail}`)
     this.name = 'StaleDurableFenceError'
+  }
+}
+
+/** `persistLease` refused: an `epoch:resolve-repointing` run holds the
+ * workspace's write fence (`readModel/epochResolveFence.ts`). Every caller
+ * already treats a throw here as "no lease": acquisition and recovery clean
+ * the unpublished Redis lease up, the repair counts a failure. */
+export class EpochResolveFenceHeldError extends Error {
+  readonly code = 'sync_cell_epoch_resolve_fence_held'
+  constructor(workspace: WorkspaceKey, intent: 'acquire' | 'repair', fence: string) {
+    super(`lease ${intent} refused for ${workspace.landscapeId}/${workspace.versionId}: `
+      + `epoch:resolve-repointing holds the write fence (${fence}); it is released when the run ends — re-run the CLI if it died, never clear it by hand`)
+    this.name = 'EpochResolveFenceHeldError'
   }
 }
 
@@ -2594,6 +2616,7 @@ export class SyncCellOwnershipCoordinator implements SyncCellOwnership {
       return
     }
     const leases = [...this.leases.entries()]
+    const renewed: LocalLease[] = []
     await this.inBatches(leases, async ([key, lease]) => {
       const startedAt = this.now()
       if (this.stopping || this.leases.get(key) !== lease
@@ -2604,6 +2627,7 @@ export class SyncCellOwnershipCoordinator implements SyncCellOwnership {
             || (!this.partitionWorker && lease.validUntil <= this.now())) return
           lease.validUntil = this.conservativeValidUntil(startedAt)
           this.renewalCount += 1
+          renewed.push(lease)
         } else if (this.partitionWorker && await this.recoverWorkspaceLease(key, lease)) {
           // The isolated worker still proves exclusive ownership of the
           // partition. A missed per-workspace TTL is metadata loss, not an
@@ -2621,6 +2645,7 @@ export class SyncCellOwnershipCoordinator implements SyncCellOwnership {
         // storm while remaining fail-closed at lease expiry.
       }
     })
+    if (!this.stopping) await this.refreshLeaseObservations(renewed.filter((lease) => this.leases.get(workspaceKey(lease.workspace)) === lease))
   }
 
   partitionFor(workspace: WorkspaceKey): number {
@@ -4101,10 +4126,33 @@ export class SyncCellOwnershipCoordinator implements SyncCellOwnership {
     lease: LocalLease,
     intent: 'acquire' | 'repair',
   ): Promise<void> {
+    // THE EPOCH-RESOLVE FENCE (G4-16f). While
+    // `epoch:resolve-repointing` holds `maintenance:epoch-resolve-repointing:`
+    // in `write_fence`, its network-less Repo is rewriting the root: NO lease
+    // may be written — not an acquisition, not the in-place RECOVERY (which
+    // runs no acquisition listener), not a repair. ONE statement, so one
+    // transaction, in the CLI claim's lock order: the CTE takes the state row
+    // `FOR SHARE` FIRST (waiting for a claim in progress), and under READ
+    // COMMITTED a locking read returns the row's LATEST committed version —
+    // the fence the claim just wrote — where a plain `NOT EXISTS` would read
+    // the statement's snapshot, taken before that commit. Only then the
+    // upsert, gated on that locked read. A database without the read-model
+    // schema has no fence to honour (and no CLI that could set one).
+    const { rows: present } = await this.db.query<{ present: boolean }>(
+      `SELECT to_regclass('read_model_projection_state') IS NOT NULL AS present`)
+    const fenced = present[0]?.present === true
     const result = await this.db.query<{ fencing_token: string; released: boolean }>(
-      `INSERT INTO sync_workspace_ownership (
+      `${fenced ? `WITH maintenance_fence AS MATERIALIZED (
+         SELECT write_fence FROM read_model_projection_state
+          WHERE landscape_id = $1 AND version_id = $2
+          FOR SHARE
+       )
+       ` : ''}INSERT INTO sync_workspace_ownership (
          landscape_id, version_id, cell_id, fencing_token, lease_observed_expires_at, acquired_at, updated_at, released_at
-       ) VALUES ($1, $2, $3, $4, $5, NOW(), NOW(), NULL)
+       ) ${fenced
+        ? `SELECT $1, $2, $3, $4::bigint, $5::timestamptz, NOW(), NOW(), NULL::timestamptz
+           WHERE NOT EXISTS (SELECT 1 FROM maintenance_fence WHERE starts_with(write_fence, $7::text))`
+        : 'VALUES ($1, $2, $3, $4, $5, NOW(), NOW(), NULL)'}
        ON CONFLICT (landscape_id, version_id) DO UPDATE SET
          cell_id = EXCLUDED.cell_id,
          fencing_token = EXCLUDED.fencing_token,
@@ -4122,11 +4170,20 @@ export class SyncCellOwnershipCoordinator implements SyncCellOwnership {
         lease.token,
         new Date(lease.validUntil),
         intent === 'acquire',
+        ...(fenced ? [EPOCH_RESOLVE_FENCE_PREFIX] : []),
       ],
     )
-    // `rowCount === 0` now has TWO causes and they need different reports, so
+    // `rowCount === 0` now has THREE causes and they need different reports, so
     // the caller is told which. Conflating them would make a correctly-skipped
     // reset look like a failed repair, and a failed repair look like a skip.
+    // The fence is re-read only to NAME the refusal: the decision was taken
+    // under the lock, inside the statement.
+    if (result.rowCount === 0 && fenced) {
+      const { rows } = await this.db.query<{ write_fence: string | null }>(
+        'SELECT write_fence FROM read_model_projection_state WHERE landscape_id = $1 AND version_id = $2',
+        [lease.workspace.landscapeId, lease.workspace.versionId])
+      if (isActiveEpochResolveFence(rows[0]?.write_fence)) throw new EpochResolveFenceHeldError(lease.workspace, intent, rows[0]!.write_fence!)
+    }
     if (result.rowCount === 0) {
       throw new StaleDurableFenceError(
         intent === 'repair'
@@ -4139,6 +4196,43 @@ export class SyncCellOwnershipCoordinator implements SyncCellOwnership {
       // than one row means the statement did not do what its name says, and a
       // repair counter that trusted it would be counting fiction.
       throw new Error(`persistLease wrote ${result.rowCount} rows for one workspace`)
+    }
+    lease.observedAt = this.now()
+  }
+
+  /**
+   * THE OBSERVED EXPIRY, REFRESHED. Renewal used
+   * to write nothing, so `lease_observed_expires_at` aged from acquisition
+   * on and every healthy cell holding a workspace for an hour looked as
+   * "expired" as a dead one — which made `epoch:resolve-repointing`'s
+   * stale-lease gate filter nothing. Now a renewed lease whose durable
+   * observation is older than {@link LEASE_OBSERVATION_REFRESH_MS} gets it
+   * rewritten to its new local validity: ONE batched statement per renewal
+   * pass, for the leases due, so the cost is one row write per lease per
+   * interval (about 3 writes/s for 1 000 workspaces at 5 minutes), never one
+   * per renewal. Only this cell's unreleased row at this token is touched: an
+   * operator's release, a newer owner or a restore is never overwritten. A
+   * failure is counted and retried on the next pass; renewal itself does not
+   * depend on it. The parameter is ONE JSON document, not parallel arrays.
+   */
+  private async refreshLeaseObservations(leases: LocalLease[]): Promise<void> {
+    const now = this.now()
+    const due = leases.filter((lease) => now - (lease.observedAt ?? 0) >= LEASE_OBSERVATION_REFRESH_MS)
+    if (due.length === 0) return
+    try {
+      await this.db.query(
+        `UPDATE sync_workspace_ownership o
+            SET lease_observed_expires_at = to_timestamp((x->>'validUntil')::float8 / 1000), updated_at = NOW()
+           FROM jsonb_array_elements($1::jsonb) AS x
+          WHERE o.landscape_id = x->>'landscapeId' AND o.version_id = x->>'versionId'
+            AND o.cell_id = $2 AND o.fencing_token = (x->>'token')::bigint AND o.released_at IS NULL`,
+        [JSON.stringify(due.map((lease) => ({
+          landscapeId: lease.workspace.landscapeId, versionId: lease.workspace.versionId,
+          token: String(lease.token), validUntil: lease.validUntil,
+        }))), this.config.cellId])
+      for (const lease of due) lease.observedAt = now
+    } catch (error) {
+      this.recordError('lease-observation-refresh', error)
     }
   }
 

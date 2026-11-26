@@ -24,8 +24,29 @@ import {
 import { describe, expect, it, vi } from 'vitest'
 import {
   acknowledgeDurableHeads,
+  currentEpochForwardTargets,
   parseDurableHeadRequests,
 } from './durableHeads.js'
+
+describe('currentEpochForwardTargets: errors', () => {
+  const ws = { landscapeId: 'l', versionId: 'v' }
+  const failing = (code: string) => ({ query: vi.fn(async () => { throw Object.assign(new Error(`sql ${code}`), { code }) }) })
+  it('a database without the epoch tables (42P01) has no targets', async () => {
+    await expect(currentEpochForwardTargets(failing('42P01') as never, ws)).resolves.toEqual([])
+  })
+  it('ANY other SQL error propagates: swallowed, the ack would answer "forwarded" with no target and the tab would swap without the forward', async () => {
+    await expect(currentEpochForwardTargets(failing('XX000') as never, ws)).rejects.toThrow('sql XX000')
+  })
+  it('the hashes are capped per target and bounded to the PREDECESSOR epoch\'s publication in SQL (the parameters it sends)', async () => {
+    const query = vi.fn(async () => ({ rows: [{ target_document_id: 't', hashes: ['b', 'a'] }] }))
+    await expect(currentEpochForwardTargets({ query } as never, ws)).resolves.toEqual([{ documentId: 't', heads: ['a', 'b'] }])
+    const [sql, params] = query.mock.calls[0] as unknown as [string, unknown[]]
+    expect(params).toEqual(['l', 'v', 32])
+    expect(sql).toMatch(/w\.written_at >= coalesce\(p\.published_at, e\.published_at\)/)
+    expect(sql).toMatch(/p\.epoch_no = e\.predecessor_epoch/)
+    expect(sql).toMatch(/e\.state = 'published'/)
+  })
+})
 
 /**
  * One connected peer that never answers — the state of a server whose only

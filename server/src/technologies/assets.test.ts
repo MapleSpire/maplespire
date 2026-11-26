@@ -157,7 +157,7 @@ describe('technology icon assets', () => {
     })
     registerTechnologyRoutes(app, pool)
     const server: Server = await new Promise((resolve) => {
-      const listener = app.listen(0, () => resolve(listener))
+      const listener = app.listen(0, '127.0.0.1', () => resolve(listener))
     })
     const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
     const bytes = Buffer.from('<svg viewBox="0 0 24 24"><path fill="#000" d="M0 0h24v24H0z"/></svg>')

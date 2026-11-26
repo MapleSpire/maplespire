@@ -18,6 +18,7 @@ import { X, FileInput, AlertTriangle, CheckCircle2, Layers, Sparkles, Upload } f
 import { useTranslation } from 'react-i18next'
 import type { TFunction } from 'i18next'
 import { useModelStore } from '../../stores/modelStore'
+import { useAutomergeStatus } from '../../stores/automergeStatusStore'
 import { useUIStore } from '../../stores/uiStore'
 import { useWorkspaceStore } from '../../stores/workspaceStore'
 import { useDraftsStore } from '../../stores/draftsStore'
@@ -60,6 +61,7 @@ export function ImportModal({ open, onClose }: ImportModalProps) {
   const setCurrentView = useUIStore((s) => s.setCurrentView)
 
   const workspaceReadOnly = useModelStore((s) => s.workspaceReadOnly)
+  const notProjected = useAutomergeStatus((s) => s.projectedWorkspace === null)
   const landscapes = useWorkspaceStore((s) => s.landscapes)
   const workspaceRef = useWorkspaceStore((s) => s.ref)
 
@@ -753,6 +755,10 @@ export function ImportModal({ open, onClose }: ImportModalProps) {
                 // Count objects too, not just diagrams: a model-only workspace
                 // is routine (views often live in a separate file).
                 result.stats.diagrams + result.stats.objects === 0 ||
+                // Not before this workspace's boot has
+                // wired the store to its documents — an import landed then
+                // reached no document (lost with the tab, "Synced" shown).
+                (notProjected && (!chooseTarget || target === 'current')) ||
                 (chooseTarget &&
                   ((target === 'current' && workspaceReadOnly) ||
                     (target === 'new' && !newName.trim()) ||

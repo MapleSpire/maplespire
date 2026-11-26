@@ -15,6 +15,7 @@
 import { getHeads } from '@automerge/automerge'
 import { isValidAutomergeUrl, type Repo } from '@automerge/automerge-repo'
 import { findReadyDocument } from '../automergeRepoCompat.js'
+import { withMetaUrlView } from '../modelMetaUrls.js'
 
 /**
  * Server-side capture of a root's per-document Automerge heads — the 3-way-merge
@@ -130,7 +131,8 @@ export async function captureRootManifest(repo: Repo, rootUrl: string): Promise<
   const root = (await capture(rootUrl, 'root')) as RootLike
 
   if (root.modelMetaUrl && isValidAutomergeUrl(root.modelMetaUrl)) {
-    const meta = (await capture(root.modelMetaUrl, 'modelMeta')) as MetaLike
+    // The ruling URL values, plain strings.
+    const meta = withMetaUrlView((await capture(root.modelMetaUrl, 'modelMeta')) as MetaLike)
     for (const u of meta.objectShardUrls ?? []) await capture(u, 'objectShard')
     for (const u of meta.connectionShardUrls ?? []) await capture(u, 'connectionShard')
     for (const u of meta.decisionRecordShardUrls ?? []) await capture(u, 'decisionRecordShard')

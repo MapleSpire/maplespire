@@ -17,6 +17,7 @@ import * as A from '@automerge/automerge'
 import { Repo, type AutomergeUrl, type DocHandle } from '@automerge/automerge-repo'
 import { PostgresStorageAdapter } from '../automergeStorage.js'
 import { createIsolatedSchemaDb, type IsolatedSchemaDb } from '../testing/isolatedSchema.js'
+import { markProtocolFixture, protocolFixtureQuery } from '../testing/protocolFixture.js'
 import { setWorkspaceDocumentsRegistrationForTest } from '../rbac/docScope.js'
 import { ensureReadModelSchema } from './schema.js'
 import { startReadModelProjector } from './projectorService.js'
@@ -315,6 +316,7 @@ suite('ordinary chain fold, the writer (G4-16b phase 4 step 3) — real storage,
       const client = await db.pool.connect()
       try {
         await client.query('BEGIN')
+        await markProtocolFixture(client)
         await recordOrdinaryChainFold(client, WS, {
           collection: 'object',
           productDocumentId: product.documentId,
@@ -776,7 +778,7 @@ suite('ordinary chain fold, the writer (G4-16b phase 4 step 3) — real storage,
       const id = folded[0]!.documentId
       const first = await until(() => watermarkOf(id), (w) => w !== null)
       expect(first).not.toBeNull()
-      await db.pool.query(
+      await protocolFixtureQuery(db.pool,
         `UPDATE read_model_ordinary_head_retirements SET forwarded_heads = ARRAY[$3]::text[]
           WHERE landscape_id = $1 AND version_id = $2 AND document_id = $4`,
         [WS.landscapeId, WS.versionId, 'ab'.repeat(32), id],

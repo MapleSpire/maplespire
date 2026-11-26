@@ -31,6 +31,37 @@ export class WorkspaceRootHttpError extends Error {
   }
 }
 
+/**
+ * T-DIAGDEF-2 (B): the root request got NO HTTP answer — the connection was
+ * refused, or nothing answered within the boot read bound. Raised only for a
+ * rejection of the request itself (never for what reading its response
+ * threw), so a `TypeError` from a defect in the code is never read as an
+ * unreachable server. It says nothing about the REFERENCE: the boot's
+ * dangling-ref rebounds, which re-resolve the ref through more requests to
+ * the same unreachable server, do not apply to it (`startBridge`).
+ */
+export class WorkspaceRootUnreachableError extends Error {
+  constructor(cause: unknown) {
+    super(`The server could not be reached for the workspace root (${cause instanceof Error ? cause.message : String(cause)})`, { cause })
+    this.name = 'WorkspaceRootUnreachableError'
+  }
+}
+
+/** A `fetch` that rejected without an answer: a network failure (`TypeError`)
+ * or the request's own timeout/abort. */
+export function isRequestTransportFailure(error: unknown): boolean {
+  if (error instanceof TypeError) return true
+  return error instanceof DOMException && (error.name === 'TimeoutError' || error.name === 'AbortError')
+}
+
+/** A gateway's answer for a backend it could not reach: 502/503/504 that the
+ * SERVER did not mark retryable (every refusal of the server's own sets the
+ * mark; a proxy in front of a dead backend sets none). Same meaning, for the
+ * boot, as a request that got no answer at all (T-DIAGDEF-2 B). */
+export function isGatewayFailure(error: WorkspaceRootHttpError): boolean {
+  return !error.retryable && (error.status === 502 || error.status === 503 || error.status === 504)
+}
+
 /** Read the server's retry signal off a non-ok root response. */
 export async function workspaceRootHttpError(res: Response): Promise<WorkspaceRootHttpError> {
   let retryable = res.headers.get('Retry-After') !== null

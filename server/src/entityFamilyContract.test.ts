@@ -246,11 +246,15 @@ describe('entity-family contract — operations walks', () => {
     const text = source('./gc.ts')
     for (const family of sharded) {
       const shards = family.shards!
-      expect(text, shards.urlsField).toMatch(new RegExp(`for \\(const u of m\\.${shards.urlsField}( \\?\\? \\[\\])?\\) add\\(u\\)`))
+      // A raw read, or the reference-closure read of both copies.
+      const list = (field: string) => `(?:m\\.${field}|readMetaUrlsUnion\\(m, '${field}'\\))`
+      expect(text, shards.urlsField).toMatch(new RegExp(`for \\(const u of ${list(shards.urlsField)}( \\?\\? \\[\\])?\\) add\\(u\\)`))
       if (shards.overlay) {
-        expect(text, shards.overlay.headField).toMatch(new RegExp(`add\\(m\\.${shards.overlay.headField}\\)`))
+        expect(text, shards.overlay.headField).toMatch(new RegExp(
+          `for \\(const u of readMetaUrlsUnion\\(m, '${shards.overlay.headField}'\\) \\?\\? \\[\\]\\) add\\(u\\)`,
+        ))
         expect(text, shards.overlay.urlsField).toMatch(
-          new RegExp(`for \\(const u of m\\.${shards.overlay.urlsField} \\?\\? \\[\\]\\) add\\(u\\)`),
+          new RegExp(`for \\(const u of ${list(shards.overlay.urlsField)} \\?\\? \\[\\]\\) add\\(u\\)`),
         )
       }
     }
@@ -260,14 +264,17 @@ describe('entity-family contract — operations walks', () => {
     const text = source('./rbac/docScope.ts')
     for (const family of sharded) {
       const shards = family.shards!
+      // A raw read, or the reference-closure read of both copies.
+      const list = (field: string) => `(?:meta\\.${field}|readMetaUrlsUnion\\(meta, '${field}'\\))`
       expect(text, shards.urlsField).toMatch(
-        new RegExp(`for \\(const u of meta\\.${shards.urlsField} \\?\\? \\[\\]\\) \\{\\s*await findLeaf\\(u\\)`),
+        new RegExp(`for \\(const u of ${list(shards.urlsField)} \\?\\? \\[\\]\\) \\{\\s*await findLeaf\\(u\\)`),
       )
       if (shards.overlay) {
-        expect(text, shards.overlay.headField).toMatch(new RegExp(`await findLeaf\\(meta\\.${shards.overlay.headField}\\)`))
-        expect(text, shards.overlay.headField).toMatch(new RegExp(`await reference\\(meta\\.${shards.overlay.headField}\\)`))
+        const head = shards.overlay.headField
+        expect(text, head).toMatch(new RegExp(`for \\(const url of readMetaUrlsUnion\\(meta, '${head}'\\) \\?\\? \\[\\]\\) await findLeaf\\(url\\)`))
+        expect(text, head).toMatch(new RegExp(`for \\(const u of readMetaUrlsUnion\\(meta, '${head}'\\) \\?\\? \\[\\]\\) await reference\\(u\\)`))
         expect(text, shards.overlay.urlsField).toMatch(
-          new RegExp(`for \\(const url of meta\\.${shards.overlay.urlsField} \\?\\? \\[\\]\\) \\{\\s*await findLeaf\\(url\\)`),
+          new RegExp(`for \\(const url of ${list(shards.overlay.urlsField)} \\?\\? \\[\\]\\) \\{\\s*await findLeaf\\(url\\)`),
         )
       }
     }

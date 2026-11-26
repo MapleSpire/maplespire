@@ -40,6 +40,7 @@ import { useModelIndexVersion } from '../../lib/modelQuery/indexSync'
 import type { ConnectionRow } from '../../lib/modelQuery/types'
 import { useVirtualRows } from '../common/VirtualList'
 import { useCursorRows, useDebouncedValue } from '../common/useCursorRows'
+import { OverrideRowMarker } from '../layout/EpochOverrideMarkers'
 
 // Sender/receiver endpoints render as a per-C4-type tinted tile (design: app keys
 // off the brand orange, system reads blue-grey, others stay calm warm-grey). The
@@ -259,14 +260,17 @@ export function ConnectionsTable({
                   <td style={{ paddingLeft: 'var(--pad-l)' }} className="relative pr-4 py-2.5">
                     {/* Selected rows carry the design's 3px accent bar at the row's left edge. */}
                     {selected && <div className="absolute inset-y-0 left-0 w-[3px] bg-accent" />}
-                    <span
-                      className={cn(
-                        'block truncate text-[13px]',
-                        selected ? 'text-accent font-medium' : 'text-fg'
-                      )}
-                    >
-                      {row.connection.label || t('dataViewsA.connectionsTable.unnamedConnection')}
-                    </span>
+                    <div className="flex min-w-0 items-center">
+                      <span
+                        className={cn(
+                          'min-w-0 truncate text-[13px]',
+                          selected ? 'text-accent font-medium' : 'text-fg'
+                        )}
+                      >
+                        {row.connection.label || t('dataViewsA.connectionsTable.unnamedConnection')}
+                      </span>
+                      <OverrideRowMarker entityId={row.connection.id} testIdPrefix="mc-override" />
+                    </div>
                   </td>
                   <td className="px-3 py-2.5">
                     <div className="flex items-center gap-2 overflow-hidden">

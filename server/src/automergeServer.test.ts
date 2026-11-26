@@ -102,6 +102,35 @@ describe('AuthenticatedWSServerAdapter inbound fairness', () => {
     expect(processInboundFrame.mock.calls.map(([message]) => [...message])).toEqual([[1], [2]])
     server.close()
   })
+
+  // The doc index hears of every document a peer
+  // syncs or requests — before any gate, whatever the gates decide — so an
+  // evicted control document coming back is watched again.
+  it('tells documentMessage the document of every inbound sync and request message, and only those', () => {
+    const server = new WebSocketServer({ noServer: true })
+    const adapter = new AuthenticatedWSServerAdapter(server as never)
+    const seen: string[] = []
+    adapter.documentMessage = (documentId) => { seen.push(documentId) }
+    adapter.writeGate = { process: () => undefined } as never // drops everything
+    adapter.emit('message', { type: 'sync', documentId: 'doc-a', senderId: 'p', targetId: 's', data: new Uint8Array() } as never)
+    adapter.emit('message', { type: 'request', documentId: 'doc-b', senderId: 'p', targetId: 's', data: new Uint8Array() } as never)
+    adapter.emit('message', { type: 'ephemeral', documentId: 'doc-c', senderId: 'p', targetId: 's', data: new Uint8Array() } as never)
+    adapter.emit('message', { type: 'doc-unavailable', documentId: 'doc-d', senderId: 'p', targetId: 's' } as never)
+    expect(seen).toEqual(['doc-a', 'doc-b'])
+    adapter.documentMessage = () => { throw new Error('boom') }
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    expect(() => adapter.emit('message', { type: 'sync', documentId: 'doc-e', senderId: 'p', targetId: 's', data: new Uint8Array() } as never)).not.toThrow()
+    warn.mockRestore()
+    server.close()
+  })
+
+  // No test boots `startAutomergeSync`; the one wiring line is pinned at the
+  // source (the AUTH-off e2e is its only behavioural witness).
+  it('startAutomergeSync hands the adapter\'s document messages to the doc index', async () => {
+    const { readFile } = await import('node:fs/promises')
+    const source = await readFile(new URL('./automergeServer.ts', import.meta.url), 'utf8')
+    expect(source).toMatch(/adapter\.documentMessage = \(documentId\) => docIndex\.noteDocumentMessage\(documentId\)/)
+  })
 })
 
 describe('createEmptyRoot durable bootstrap', () => {

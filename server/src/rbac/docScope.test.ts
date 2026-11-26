@@ -15,9 +15,9 @@
 import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll, vi } from 'vitest'
 import pg from 'pg'
 import { randomBytes } from 'node:crypto'
-import { Repo } from '@automerge/automerge-repo'
+import { ImmutableString, Repo } from '@automerge/automerge-repo'
 import { mintDocumentIdBytes } from './documentIdMint.js'
-import { WorkspaceDocIndex, buildAccessCheck, buildWorkspaceRouteCheck, allowedWorkspaceKeys, ensureScopesForExistingWorkspaces, notifyWorkspaceCreated, docScopeGateMissTotal, docScopeMetricSamples, MAX_STALE_REPAIR_FAILURES, STALE_REPAIR_MIN_INTERVAL_MS, type PeerIdentityLookup } from './docScope.js'
+import { WorkspaceDocIndex, buildAccessCheck, buildWorkspaceRouteCheck, allowedWorkspaceKeys, ensureScopesForExistingWorkspaces, notifyWorkspaceCreated, docScopeGateMissTotal, docScopeMetricSamples, docScopeWalkStats, _setOrphanedControlDocsMaxForTests, MAX_STALE_REPAIR_FAILURES, STALE_REPAIR_MIN_INTERVAL_MS, type PeerIdentityLookup } from './docScope.js'
 import { renderPrometheus } from '../runtime/metrics.js'
 import { ensureAuthSchema, ensureDefaultOrg } from '../auth/schema.js'
 import { ensureRbacSchema, upsertVersionScope } from './schema.js'
@@ -97,6 +97,43 @@ describe('WorkspaceDocIndex — doc graph walk (in-memory Repo, no DB)', () => {
     await expect(expectResolves(String(registry.documentId))).resolves.toEqual({ landscapeId: 'L1', versionId: 'V1' })
     await expect(expectResolves(String(diagram.documentId))).resolves.toEqual({ landscapeId: 'L1', versionId: 'V1' })
     await expect(expectResolves(String(monolith.documentId))).resolves.toEqual({ landscapeId: 'L1', versionId: 'V1' })
+  })
+
+  // G4-16f: under the scalar marker the walk indexes what the SCALAR
+  // copies name (heads and lists) and what the FROZEN text copies name — each
+  // document below is named by one copy of one field only.
+  it('indexes the documents a scalar-ruled ModelMeta names, in either copy', async () => {
+    const repo = new Repo({})
+    const docs = Object.fromEntries(['base', 'segment', 'head', 'connHead', 'frozen'].map((name) => [name, repo.create({ objects: {} })]))
+    const meta = repo.create({
+      metaUrlFormat: 2,
+      objectShardUrls: [docs.frozen!.url],
+      connectionShardUrls: [],
+      objectShardRefs: [new ImmutableString(docs.base!.url)],
+      connectionShardRefs: [],
+      editsObjectShardRefs: [new ImmutableString(docs.segment!.url)],
+      editsObjectShardRef: new ImmutableString(docs.head!.url),
+      editsConnectionShardRef: new ImmutableString(docs.connHead!.url),
+    })
+    const registry = repo.create({ diagrams: {} })
+    const monolith = repo.create({ objects: {} })
+    const root = repo.create({ modelUrl: monolith.url, modelMetaUrl: meta.url, shardUrls: [registry.url] })
+    await Promise.all([...Object.values(docs), meta, registry, monolith, root].map((h) => h.whenReady()))
+    const index = new WorkspaceDocIndex(repo, fakePool(), { durable: false })
+    notifyWorkspaceCreated({ landscapeId: 'L2', versionId: 'V2', rootUrl: root.url })
+    const expectResolves = async (docId: string) => {
+      const deadline = Date.now() + 2000
+      let last: unknown = null
+      while (Date.now() < deadline) {
+        last = await index.resolveDocWorkspace(docId)
+        if (last) return last
+        await new Promise((r) => setTimeout(r, 20))
+      }
+      return last
+    }
+    for (const [name, handle] of Object.entries(docs)) {
+      await expect(expectResolves(String(handle.documentId)), name).resolves.toEqual({ landscapeId: 'L2', versionId: 'V2' })
+    }
   })
 
   it('a doc never linked into any workspace resolves to null (default-deny quarantine)', async () => {
@@ -433,6 +470,130 @@ describe('WorkspaceDocIndex — doc graph walk (in-memory Repo, no DB)', () => {
       await vi.waitFor(async () => {
         expect(await index.resolveDocWorkspace(String(afterEviction.documentId))).toEqual(KEY)
       }, { timeout: 5_000 })
+    }, 30_000)
+
+    /**
+     * The same eviction with NO resolve miss after
+     * it — the claim-only access check (AUTH off) never denies, so nothing
+     * asks again, and a miss inside the repair's rate limit is dropped. On
+     * the e2e stack a compaction evicted the CURRENT ModelMeta this way; the
+     * author's new shard pointer then reached a handle with no listener and
+     * the shard was never claimed. A peer's message about the evicted control
+     * document is what re-watches it. Observed through `peekDocWorkspace`
+     * (memory only): `resolveDocWorkspace` would itself schedule the repair.
+     */
+    it('re-walks a workspace when a peer presents an evicted control document again, with no resolve miss', async () => {
+      const { repo, meta, root } = await workspaceFixture()
+      const metaDocId = String(meta.documentId)
+      const db = durableRegistry([{ ...KEY, rootUrl: root.url }])
+      const residency = fakeResidency()
+      const index = new WorkspaceDocIndex(repo, db.pool)
+      index.trackResidency(residency.source)
+      notifyWorkspaceCreated({ ...KEY, rootUrl: root.url })
+      await vi.waitFor(() => { expect(index.peekDocWorkspace(metaDocId)).toEqual(KEY) }, { timeout: 5_000 })
+
+      // A compaction's projector release evicts the meta (no peer on it).
+      residency.evictNotify(metaDocId)
+      await repo.flush()
+      await repo.removeFromCache(meta.documentId)
+      const reopened = await repo.find<{ objectShardUrls: string[] }>(meta.url)
+      await reopened.whenReady()
+      expect(reopened).not.toBe(meta)
+
+      // The author's pointer to a shard she created offline.
+      const shard = repo.create({ objects: {} })
+      await shard.whenReady()
+      const shardId = String(shard.documentId)
+      reopened.change((d) => { d.objectShardUrls.push(shard.url) })
+      await new Promise((r) => setTimeout(r, 200))
+      expect(index.peekDocWorkspace(shardId)).toBeNull()
+
+      // Her sync message about the meta reaches the transport.
+      index.noteDocumentMessage(metaDocId)
+      await vi.waitFor(() => { expect(index.peekDocWorkspace(shardId)).toEqual(KEY) }, { timeout: 5_000 })
+
+      // Watched again: a later pointer is claimed by the change alone.
+      const second = repo.create({ objects: {} })
+      await second.whenReady()
+      reopened.change((d) => { d.objectShardUrls.push(second.url) })
+      await vi.waitFor(() => { expect(index.peekDocWorkspace(String(second.documentId))).toEqual(KEY) }, { timeout: 5_000 })
+      // Once per eviction: a message about a watched document walks nothing.
+      await new Promise((r) => setTimeout(r, 200))
+      const walks = docScopeWalkStats().total
+      index.noteDocumentMessage(metaDocId)
+      await new Promise((r) => setTimeout(r, 200))
+      expect(docScopeWalkStats().total).toBe(walks)
+    }, 30_000)
+
+    it('a control document watched again by another walk before any message walks nothing on its next message', async () => {
+      const { repo, meta, root } = await workspaceFixture()
+      const metaDocId = String(meta.documentId)
+      const db = durableRegistry([{ ...KEY, rootUrl: root.url }])
+      const residency = fakeResidency()
+      const index = new WorkspaceDocIndex(repo, db.pool)
+      index.trackResidency(residency.source)
+      notifyWorkspaceCreated({ ...KEY, rootUrl: root.url })
+      await vi.waitFor(() => { expect(index.peekDocWorkspace(metaDocId)).toEqual(KEY) }, { timeout: 5_000 })
+      residency.evictNotify(metaDocId)
+      await repo.flush()
+      await repo.removeFromCache(meta.documentId)
+      const reopened = await repo.find<{ objectShardUrls: string[] }>(meta.url)
+      await reopened.whenReady()
+      // The root changes: its re-walk watches the reopened meta.
+      const linked = repo.create({ objects: {} })
+      await linked.whenReady()
+      root.change((d: { shardUrls: string[] }) => { d.shardUrls.push(linked.url) })
+      await vi.waitFor(() => { expect(index.peekDocWorkspace(String(linked.documentId))).toEqual(KEY) }, { timeout: 5_000 })
+      await new Promise((r) => setTimeout(r, 200))
+      const walks = docScopeWalkStats().total
+      index.noteDocumentMessage(metaDocId)
+      await new Promise((r) => setTimeout(r, 200))
+      expect(docScopeWalkStats().total).toBe(walks)
+    }, 30_000)
+
+    it('ONCE per eviction — three messages in a burst after it make exactly one walk', async () => {
+      const { repo, meta, root } = await workspaceFixture()
+      const metaDocId = String(meta.documentId)
+      const db = durableRegistry([{ ...KEY, rootUrl: root.url }])
+      const residency = fakeResidency()
+      const index = new WorkspaceDocIndex(repo, db.pool)
+      index.trackResidency(residency.source)
+      notifyWorkspaceCreated({ ...KEY, rootUrl: root.url })
+      await vi.waitFor(() => { expect(index.peekDocWorkspace(metaDocId)).toEqual(KEY) }, { timeout: 5_000 })
+      await new Promise((r) => setTimeout(r, 200))
+      residency.evictNotify(metaDocId)
+      const walks = docScopeWalkStats().total
+      index.noteDocumentMessage(metaDocId)
+      index.noteDocumentMessage(metaDocId)
+      index.noteDocumentMessage(metaDocId)
+      await new Promise((r) => setTimeout(r, 1_000))
+      expect(docScopeWalkStats().total).toBe(walks + 1)
+    }, 30_000)
+
+    it('the orphaned control documents are BOUNDED — past the bound the oldest is forgotten (its message walks nothing), the newest still walks', async () => {
+      const { repo, meta, root } = await workspaceFixture()
+      const metaDocId = String(meta.documentId)
+      const rootDocId = String(root.documentId)
+      const db = durableRegistry([{ ...KEY, rootUrl: root.url }])
+      const residency = fakeResidency()
+      const index = new WorkspaceDocIndex(repo, db.pool)
+      index.trackResidency(residency.source)
+      notifyWorkspaceCreated({ ...KEY, rootUrl: root.url })
+      await vi.waitFor(() => { expect(index.peekDocWorkspace(metaDocId)).toEqual(KEY) }, { timeout: 5_000 })
+      await new Promise((r) => setTimeout(r, 200))
+      _setOrphanedControlDocsMaxForTests(1)
+      try {
+        residency.evictNotify(metaDocId)
+        residency.evictNotify(rootDocId)
+        const walks = docScopeWalkStats().total
+        index.noteDocumentMessage(metaDocId)
+        await new Promise((r) => setTimeout(r, 500))
+        expect(docScopeWalkStats().total).toBe(walks)
+        index.noteDocumentMessage(rootDocId)
+        await vi.waitFor(() => { expect(docScopeWalkStats().total).toBe(walks + 1) }, { timeout: 5_000 })
+      } finally {
+        _setOrphanedControlDocsMaxForTests(null)
+      }
     }, 30_000)
 
     /**

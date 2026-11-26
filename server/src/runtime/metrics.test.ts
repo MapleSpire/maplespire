@@ -33,6 +33,25 @@ describe('renderPrometheus', () => {
     )
   })
 
+  it('renders a histogram as its _bucket, _sum and _count series under one HELP and TYPE', () => {
+    expect(renderPrometheus([{
+      name: 'm_seconds', help: 'h', type: 'histogram',
+      values: [
+        { suffix: '_bucket', labels: { le: '0.5' }, value: 1 },
+        { suffix: '_bucket', labels: { le: '+Inf' }, value: 2 },
+        { suffix: '_sum', value: 1.25 },
+        { suffix: '_count', value: 2 },
+      ],
+    }])).toBe(
+      '# HELP m_seconds h\n'
+      + '# TYPE m_seconds histogram\n'
+      + 'm_seconds_bucket{le="0.5"} 1\n'
+      + 'm_seconds_bucket{le="+Inf"} 2\n'
+      + 'm_seconds_sum 1.25\n'
+      + 'm_seconds_count 2\n',
+    )
+  })
+
   it('emits an unlabelled sample without braces', () => {
     // `metric{} 1` is accepted by Prometheus but not by every downstream parser,
     // and it reads as a mistake in a scrape someone is debugging at 3am.

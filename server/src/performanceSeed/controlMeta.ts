@@ -13,6 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import { OVERLAY_WRITE_HEAD_VERSION } from '../modelMeta.js'
+import { withMetaUrlView } from '../modelMetaUrls.js'
 
 export interface PerformanceControlMetaInput extends Record<string, unknown> {
   objectShardUrls?: string[]
@@ -86,6 +87,8 @@ export function pruneCoveredPerformanceOverlayHistory(
   snapshots: PerformanceOverlaySnapshots,
   options: PerformanceOverlayPruneOptions = {},
 ): PerformanceControlMetaInput {
+  // The ruling URL values, and a result that carries no stale copy.
+  source = withMetaUrlView(source)
   const objectUrls = orderedOverlays([
     ...(source.editsObjectShardUrls ?? []), source.editsObjectShardUrl,
   ])
@@ -139,7 +142,9 @@ export function toPerformanceControlMeta(
     ...(source.editsConnectionShardUrls ?? []),
     source.editsConnectionShardUrl,
   ])
-  const plain = JSON.parse(JSON.stringify(source)) as PerformanceControlMetaInput
+  // A copy for a NEW document — ruling URL values, no scalar copies, no
+  // marker (`withMetaUrlView`, see there for the stale-marker defect).
+  const plain = JSON.parse(JSON.stringify(withMetaUrlView(source))) as PerformanceControlMetaInput
   return {
     ...plain,
     staticBaseline: true,

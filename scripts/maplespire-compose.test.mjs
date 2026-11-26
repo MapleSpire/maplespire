@@ -668,6 +668,57 @@ test('the cluster reaps a client that stopped answering in minutes, not hours', 
   assert.ok(count <= 127, 'a count above 127 is silently ignored')
 })
 
+/** `max_wal_size=<n>GB` or `<n>MB` as the server reads it, in MB. */
+const walSizeMb = (value) => {
+  const match = /^(\d+)(GB|MB)$/.exec(value)
+  assert.ok(match, `max_wal_size must be written as <n>GB or <n>MB, got ${value}`)
+  return Number(match[1]) * (match[2] === 'GB' ? 1024 : 1)
+}
+
+/** The minimum: a checkpoint is requested at ~max_wal_size /
+ *  1.9; a 119 000-object rebuild writes up to ~4.7 GB in one transaction. */
+const MIN_WAL_MB = 8192
+
+test('every PostgreSQL the repository ships runs with max_wal_size >= 8 GB', async () => {
+  // A read-model cold build writes its whole workspace in ONE transaction:
+  // 2.8-4.7 GB of WAL at 119 000 objects with the search index, and
+  // the server requests a checkpoint at max_wal_size /
+  // (1 + checkpoint_completion_target): measured one or two per build at
+  // 4 GB; at 8 GB none, except one for a rebuild beside other workspaces.
+  // A checkpoint mid-build made one
+  // attach 153 s on a slow disk. Read from each file's COMMAND, never from
+  // its prose.
+  const compose = serviceBlock('postgres').split('\n')
+  const start = compose.findIndex((line) => /^\s+command:\s*$/.test(line))
+  const args = []
+  for (const line of compose.slice(start + 1)) {
+    const item = line.match(/^\s+- (\S.*)$/)
+    if (!item) break
+    args.push(item[1].trim())
+  }
+  const listed = args.find((arg) => arg.startsWith('max_wal_size='))
+  assert.ok(listed, 'compose.maplespire.yml: postgres must set max_wal_size on its command line')
+  assert.equal(args[args.indexOf(listed) - 1], '-c', 'compose.maplespire.yml: max_wal_size must follow -c')
+  assert.ok(walSizeMb(listed.slice('max_wal_size='.length)) >= MIN_WAL_MB, `compose.maplespire.yml: ${listed}`)
+
+  for (const file of ['../docker-compose.yml', '../infra/compose/sync-cell-failover.yml', '../docker/performance-validation.compose.yml']) {
+    const source = await readFile(new URL(file, import.meta.url), 'utf8')
+    const lines = source.split(/\r?\n/)
+    const at = lines.findIndex((line) => /^ {2}postgres:\s*$/.test(line))
+    assert.notEqual(at, -1, `${file}: a postgres service`)
+    const end = lines.findIndex((line, index) => index > at && /^ {2}\S/.test(line))
+    const command = lines.slice(at, end === -1 ? undefined : end).find((line) => /^\s+command:\s*\[/.test(line))
+    assert.ok(command, `${file}: postgres must declare an inline command array`)
+    const parts = JSON.parse(command.replace(/^\s+command:\s*/, ''))
+    assert.equal(parts[0], 'postgres', `${file}: the command must start with postgres`)
+    const value = parts.find((part) => typeof part === 'string' && part.startsWith('max_wal_size='))
+    assert.ok(value, `${file}: postgres must set max_wal_size`)
+    assert.equal(parts[parts.indexOf(value) - 1], '-c', `${file}: max_wal_size must follow -c`)
+    assert.ok(walSizeMb(value.slice('max_wal_size='.length)) >= MIN_WAL_MB, `${file}: ${value}`)
+  }
+
+})
+
 test('every service built from server/Dockerfile names its stage', () => {
   // With no `target`, BuildKit builds the LAST stage. server/Dockerfile ends
   // with `drill` (added after `runtime`), so an untargeted service silently

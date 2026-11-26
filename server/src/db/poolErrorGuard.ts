@@ -12,8 +12,9 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU Affero General Public License for more details.
 
-import type { Pool } from 'pg'
+import type { Pool, PoolClient } from 'pg'
 import { meterPool } from './poolMeter.js'
+import { READ_MODEL_PROTOCOL_SETTING, READ_MODEL_PROTOCOL_VERSION } from '../readModel/protocolParticipant.js'
 
 /**
  * Make an idle-client failure survivable, for every pg pool in the server.
@@ -51,6 +52,30 @@ export function guardIdleClientErrors<T extends Pool>(
    */
   log: (event: string, fields: Record<string, unknown>) => void = defaultLog,
 ): T {
+  // THE MARKER'S HOOK, checked before anything is attached (installed
+  // below). `onConnect` exists from pg-pool 3.13.0 (shipped with pg 8.20.0,
+  // whose changelog adds it). An older pg-pool ignores the option without a
+  // word and every connection would be a non-participant; what excludes it
+  // is the floor in `server/package.json` (pg ^8.20.0, which requires
+  // pg-pool ^3.13.0) — this check cannot tell an older pg-pool, which has an
+  // `options` object too. What it refuses, HERE at creation, is a pool that
+  // cannot carry the hook at all (no options object, a non-function
+  // `onConnect`), rather than letting it surface at run time as every
+  // read-model write refused (the fence assertion fails closed on an
+  // unmarked connection). That the installed pg-pool really runs the hook is
+  // proved against a database by `adoptState.integration.test.ts`, MIXED
+  // VERSION 1 (a guarded pool's connection reads the marker back).
+  const options = (pool as { options?: { onConnect?: (client: PoolClient) => unknown } }).options
+  if (!options || typeof options !== 'object') {
+    throw new Error(`guardIdleClientErrors(${label}): this pool has no options object to install the read-model `
+      + 'protocol marker into (pg-pool onConnect, pg >= 8.20.0); refusing to build a pool whose connections would be '
+      + 'non-participants (readModel/protocolParticipant.ts)')
+  }
+  const built = options.onConnect
+  if (built !== undefined && typeof built !== 'function') {
+    throw new Error(`guardIdleClientErrors(${label}): the pool's onConnect is not a function`)
+  }
+
   pool.on('error', (error) => {
     // `error.code` is what an operator greps for — `57P01` admin shutdown,
     // `57P02` crash shutdown, `ECONNRESET` a dropped socket. Passing the error
@@ -92,6 +117,24 @@ export function guardIdleClientErrors<T extends Pool>(
       })
     })
   })
+
+  // THE PROTOCOL PARTICIPANT MARKER (`readModel/protocolParticipant.ts`):
+  // every connection of this pool belongs to a process that keeps the
+  // read-model lock order, so the protocol tables' trigger enforces it on
+  // them. Session scope, once per physical connection, through pg-pool's
+  // `onConnect`, which the pool AWAITS before handing the client to its
+  // first caller and which, when it rejects, ends the client and fails that
+  // caller's `connect()` — so no connection of this pool is ever handed out
+  // unmarked. Not a query from the `'connect'` listener above: that one is
+  // not awaited, and queueing a query behind another is deprecated in pg 8
+  // (a warning measured on this branch) and removed in pg 9. Runs before any
+  // `onConnect` the pool was built with.
+  //
+  // (`options` and `built` are validated at the top of this function.)
+  options.onConnect = async (client: PoolClient) => {
+    await client.query(`SET ${READ_MODEL_PROTOCOL_SETTING} = '${READ_MODEL_PROTOCOL_VERSION}'`)
+    if (built) await built(client)
+  }
 
   // THE METER, registered here because this function is the single seam every
   // pg pool enters the server through: the source gate in this file's test

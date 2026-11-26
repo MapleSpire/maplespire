@@ -12,7 +12,7 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU Affero General Public License for more details.
 
-import { Repo } from '@automerge/automerge-repo'
+import { ImmutableString, Repo } from '@automerge/automerge-repo'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { gcOrphanedDocs } from './gc.js'
 
@@ -478,5 +478,175 @@ describe('Automerge GC — folded ordinary heads (G4-16b phase 4)', () => {
     const result = await run(repo, poolFor(root.url, [root, meta, registry, head], 'absent'))
     expect(result.aborted).toBe(false)
     expect(result.incompleteReasons).toEqual([])
+  })
+
+  /**
+   * G4-16f: GC marks what EITHER copy of a ModelMeta URL field names —
+   * the heads too, in both authorities. Each document below is named by ONE
+   * field of ONE copy only, so dropping that read sweeps it.
+   */
+  async function namedOnce(meta: (urls: Record<string, string>) => Record<string, unknown>) {
+    const repo = new Repo({ network: [] })
+    repos.push(repo)
+    const names = ['base', 'segment', 'head', 'connHead', 'frozen', 'scalarOnly'] as const
+    const docs = Object.fromEntries(names.map((name) => [name, repo.create({ objects: {} })]))
+    const registry = repo.create({ diagrams: {} })
+    const urls = Object.fromEntries(names.map((name) => [name, docs[name]!.url]))
+    const metaHandle = repo.create(meta(urls))
+    const root = repo.create({ modelMetaUrl: metaHandle.url, shardUrls: [registry.url] })
+    await Promise.all([...Object.values(docs), registry, metaHandle, root].map((handle) => handle.whenReady()))
+    const all = [root, metaHandle, registry, ...Object.values(docs)]
+    return { repo, root, all }
+  }
+
+  it('text authority: the heads alone keep their documents', async () => {
+    const { repo, root, all } = await namedOnce((u) => ({
+      objectShardUrls: [u.base], connectionShardUrls: [],
+      editsObjectShardUrls: [u.segment], editsObjectShardUrl: u.head, editsConnectionShardUrl: u.connHead,
+    }))
+    const result = await run(repo, poolFor(root.url, all, []))
+    // root, meta, registry, base, segment, head, connHead — not frozen, not scalarOnly.
+    expect(result.reachable).toBe(7)
+  })
+
+  it('scalar authority: the scalar copies AND the frozen text copies keep their documents', async () => {
+    const { repo, root, all } = await namedOnce((u) => ({
+      metaUrlFormat: 2,
+      // Frozen text (an old client may still ask for these).
+      objectShardUrls: [u.frozen], connectionShardUrls: [],
+      // The ruling scalars.
+      objectShardRefs: [new ImmutableString(u.base)], connectionShardRefs: [],
+      editsObjectShardRefs: [new ImmutableString(u.segment), new ImmutableString(u.scalarOnly)],
+      editsObjectShardRef: new ImmutableString(u.head),
+      editsConnectionShardRef: new ImmutableString(u.connHead),
+    }))
+    const result = await run(repo, poolFor(root.url, all, []))
+    expect(result.reachable).toBe(9)
+  })
+})
+
+/**
+ * G4-16f epochs: GC marks the
+ * documents of every in-flight, current or retained epoch and the UNION
+ * closure of every retained ModelMeta, through `modelEpochGcRoots`. The fake
+ * answers the two epoch queries with what their SQL would select; the SQL
+ * predicates themselves (states, the `versions` join) are pinned against a
+ * real PostgreSQL in `readModel/modelEpochStore.integration.test.ts`.
+ */
+describe('Automerge GC model epochs', () => {
+  async function epochWorld() {
+    const repo = new Repo({ network: [] })
+    repos.push(repo)
+    // Epoch 1 (current): root -> meta2 -> base2, head.
+    const head = repo.create({ objects: {} })
+    const base2 = repo.create({ objects: {} })
+    const registry = repo.create({ diagrams: {} })
+    const meta2 = repo.create({ objectShardUrls: [base2.url, head.url], connectionShardUrls: [], editsObjectShardUrl: head.url })
+    const root = repo.create({ modelMetaUrl: meta2.url, shardUrls: [registry.url] })
+    // Epoch 0 (retained): meta1 names base1, a folded segment only it still
+    // lists, and a decision-record shard; none of them is named by the root.
+    const base1 = repo.create({ objects: {} })
+    const oldSegment = repo.create({ objects: {} })
+    const decisionShard = repo.create({ records: {} })
+    const meta1 = repo.create({
+      objectShardUrls: [base1.url, oldSegment.url], connectionShardUrls: [],
+      editsObjectShardUrls: [oldSegment.url], decisionRecordShardUrls: [decisionShard.url],
+    })
+    const all = [head, base2, registry, meta2, root, base1, oldSegment, decisionShard, meta1]
+    await Promise.all(all.map((handle) => handle.whenReady()))
+    // Two documents present in STORAGE only (never in this Repo's memory, which
+    // GC never sweeps): a retiring epoch document and a plain orphan.
+    const stored = [...all, { documentId: 'retiringepochdocument00000001' }, { documentId: 'plainorphandocument000000001' }]
+    return { repo, root, meta1, base1, oldSegment, decisionShard, stored }
+  }
+
+  function epochPool(rootUrl: string, stored: Array<{ documentId: string }>, epochs: {
+    rows: Array<{ meta_url: string | null; slots: unknown }>
+    docs: Array<{ document_id: string; role: string; superseded_epoch: number | null }>
+  } | 'absent') {
+    return vi.fn(async (sql: string) => {
+      // MATCHED ON THE TABLE, not on an exact SQL string.
+      if (sql.includes("'.read_model_model_epochs'")) {
+        return { rows: [{ epochs: epochs !== 'absent', docs: epochs !== 'absent' }] }
+      }
+      if (epochs !== 'absent' && sql.includes('FROM read_model_model_epochs epoch')) return { rows: epochs.rows }
+      if (epochs !== 'absent' && sql.includes('FROM read_model_model_epoch_docs doc')) return { rows: epochs.docs }
+      if (sql.includes('FROM versions')) return { rows: [{ root_url: rootUrl }] }
+      if (sql.includes("'.read_model_static_workspaces'")) return { rows: [{ present: false }] }
+      if (sql.includes('FROM automerge_storage')) {
+        return { rows: stored.map((doc) => ({ doc: doc.documentId, updated_at: new Date(0) })) }
+      }
+      return { rows: [] }
+    })
+  }
+
+  const run = (repo: Repo, query: ReturnType<typeof vi.fn>) => gcOrphanedDocs(repo, {
+    db: { query } as never, minimumAgeMs: 0, now: new Date('2026-11-12T00:00:00Z'),
+    reportOnly: true, includeCandidateDocumentIds: true,
+  })
+
+  // The root walk marks 5 (root, meta2, base2, head, registry). Each case
+  // below says how many MORE an epoch root must add.
+  const ROOT_WALK = 5
+
+  it('keeps a retained epoch and its meta\'s whole union closure (folded segment, decision shard)', async () => {
+    const w = await epochWorld()
+    const result = await run(w.repo, epochPool(w.root.url, w.stored, {
+      rows: [{ meta_url: w.meta1.url, slots: [{ slot: 0, url: w.base1.url }] }],
+      docs: [
+        { document_id: w.meta1.documentId, role: 'meta', superseded_epoch: 1 },
+        { document_id: w.base1.documentId, role: 'base', superseded_epoch: 1 },
+      ],
+    }))
+    expect(result.aborted).toBe(false)
+    expect(result.reachable).toBe(ROOT_WALK + 4) // meta1, base1, oldSegment, decisionShard
+    // The retiring document (state not live/pinned: not selected) and the orphan.
+    expect([...(result.candidateDocumentIds ?? [])].sort())
+      .toEqual(['plainorphandocument000000001', 'retiringepochdocument00000001'])
+  })
+
+  it('an epoch ROW alone marks what it names, without walking a closure', async () => {
+    const w = await epochWorld()
+    const result = await run(w.repo, epochPool(w.root.url, w.stored, {
+      rows: [{ meta_url: w.meta1.url, slots: [{ slot: 0, url: w.base1.url }, { slot: 1 }, null] }],
+      docs: [],
+    }))
+    expect(result.aborted).toBe(false)
+    expect(result.reachable).toBe(ROOT_WALK + 2) // meta1, base1; malformed slots skipped
+  })
+
+  it('a retained BASE doc does not walk a closure: only a superseded meta does', async () => {
+    const w = await epochWorld()
+    const result = await run(w.repo, epochPool(w.root.url, w.stored, {
+      rows: [],
+      docs: [{ document_id: w.base1.documentId, role: 'base', superseded_epoch: 1 }],
+    }))
+    expect(result.reachable).toBe(ROOT_WALK + 1)
+  })
+
+  it('a CURRENT (not superseded) meta row walks no second closure', async () => {
+    const w = await epochWorld()
+    const result = await run(w.repo, epochPool(w.root.url, w.stored, {
+      rows: [],
+      docs: [{ document_id: w.meta1.documentId, role: 'meta', superseded_epoch: null }],
+    }))
+    expect(result.reachable).toBe(ROOT_WALK + 1)
+  })
+
+  it('control: without epoch tables, the previous epoch is not marked (the root no longer names it)', async () => {
+    const w = await epochWorld()
+    const result = await run(w.repo, epochPool(w.root.url, w.stored, 'absent'))
+    expect(result.aborted).toBe(false)
+    expect(result.reachable).toBe(ROOT_WALK)
+  })
+
+  it('an unreadable retained meta aborts the sweep instead of dropping its closure', async () => {
+    const w = await epochWorld()
+    const result = await run(w.repo, epochPool(w.root.url, w.stored, {
+      rows: [],
+      docs: [{ document_id: 'nosuchdocument1111111111111', role: 'meta', superseded_epoch: 1 }],
+    }))
+    expect(result.aborted).toBe(true)
+    expect(result.proposedDeletions).toBe(0)
   })
 })

@@ -37,6 +37,7 @@ import {
 import { pageAllComplete } from '../modelQuery/pageAllComplete'
 import type { ExportBundle, ExportModelProvenance, ExportModelSource, ExportScope } from './types'
 import { referencedTagSnapshots } from '../tags/assignments'
+import { readMetaUrls } from '../automerge/modelMetaUrls'
 
 
 /** Resolve to `null` instead of hanging when a doc/server never answers —
@@ -176,8 +177,9 @@ async function gatherLandscapeModel(
   // overlays in the shards, so the shard union is NOT the model there (rung 3).
   if (meta && !meta.staticBaseline) {
     const [objectShards, connectionShards] = await Promise.all([
-      withTimeout(getModelShardHandles<ObjectShard>(meta.objectShardUrls ?? []), 15_000),
-      withTimeout(getModelShardHandles<ConnectionShard>(meta.connectionShardUrls ?? []), 15_000),
+      // The ruling lists, plain strings (`modelMetaUrls.ts`).
+      withTimeout(getModelShardHandles<ObjectShard>(readMetaUrls(meta, 'objectShardUrls') ?? []), 15_000),
+      withTimeout(getModelShardHandles<ConnectionShard>(readMetaUrls(meta, 'connectionShardUrls') ?? []), 15_000),
     ])
     if (objectShards && connectionShards) {
       const model = modelShardsToRootModel(

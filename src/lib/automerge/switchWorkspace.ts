@@ -12,8 +12,9 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU Affero General Public License for more details.
 
-import { preferInitialDiagram, startBridge, stopBridge } from './bridge'
-import { forgetWorkspace, routeWorkspaceNetwork } from './repo'
+import { preferInitialDiagram, startBridge, stopBridge, takeStoppedSessionDurableDebt } from './bridge'
+import { drainOutgoingWorkspace } from './workspaceSwitchDrain'
+import { forgetWorkspace, hasConnectedSyncPeer, routeWorkspaceNetwork, serverKnownHeads } from './repo'
 import { holdWorkspaceOn } from './workspaceBinding'
 import { setActiveWorkspaceRef, workspaceRefEquals, currentWorkspaceRef, type WorkspaceRef } from './workspace'
 import { useModelStore } from '../../stores/modelStore'
@@ -35,6 +36,10 @@ import { resetWorkspaceProjection } from './workspaceProjection'
  * two stop/start cycles (which would race the bridge's module state).
  */
 let chain: Promise<void> = Promise.resolve()
+/** The destination of the last switch asked and not yet loaded (null when
+ * none is queued), and the number of that request. */
+let pendingTarget: WorkspaceRef | null = null
+let switchRequests = 0
 
 function serialize(work: () => Promise<void>): Promise<void> {
   chain = chain.then(work, work)
@@ -55,6 +60,28 @@ async function loadWorkspace(ref: WorkspaceRef, openDiagramId?: string, preferDi
   // no-ops. startBridge() sets 'ready' again when the projection is in.
   useAutomergeStatus.getState().beginWorkspaceSwitch()
   stopBridge()
+  // T-DIAGDEF-2: the destination's access is ASKED now, beside the drain
+  // below (both bounded at 3 s: `WORKSPACE_ACCESS_TIMEOUT_MS`,
+  // `WORKSPACE_SWITCH_DRAIN_MS`), and applied where it always was, before the
+  // bridge starts. In series, a server that accepts and never answers made
+  // the two waits add up; before the access probe had a bound at all, it held
+  // the switch for good.
+  const applyReadOnly = askWorkspaceReadOnly(ref)
+  // T-DIAGDEF: the stop's lifecycle flush has just written the
+  // session's last edits (a not-open diagram's delete, still in the write
+  // debounce) into its documents. They leave on the OUTGOING socket before the
+  // route moves — bounded; past the bound the persisted ledger re-presents
+  // them when this workspace is opened again (`workspaceSwitchDrain.ts`).
+  // No peer on the outgoing transport answers at once; a
+  // drain whose answers and server heads stop moving ends at the stall bound.
+  const drained = await drainOutgoingWorkspace(takeStoppedSessionDurableDebt(), {
+    connected: hasConnectedSyncPeer,
+    serverHeads: serverKnownHeads,
+  })
+  if (drained.outcome !== 'nothing-owed' && drained.outcome !== 'durable') {
+    console.warn(`[switchWorkspace] ${drained.pending} document(s) of the workspace left are not durable yet (${drained.outcome}); `
+      + 'they are re-presented when it is opened again')
+  }
   // Park the deep-linked diagram id (if any) across the reset instead of nulling it,
   // so the bridge's default-diagram pick (`currentDiagramId ?? default`) keeps it —
   // a switch driven by opening /app/landscape/…/diagram/X lands on X, not the
@@ -69,26 +96,52 @@ async function loadWorkspace(ref: WorkspaceRef, openDiagramId?: string, preferDi
   // moving `current` pointer must also force a reconnect even though its ref is
   // textually unchanged.
   await routeWorkspaceNetwork(ref, true)
-  await refreshWorkspaceReadOnly(ref)
+  await applyReadOnly()
   await startBridge(ref)
   if (import.meta.env.DEV) {
     console.info(`[switchWorkspace] ${ref.landscapeId}/${ref.versionId} in ${Math.round(performance.now() - t0)}ms`)
   }
 }
 
-/** Re-resolve the session's write access for the workspace being loaded and
- * lock/unlock the editor accordingly (a user can be an editor on one landscape
- * and a viewer on another). Stage 'off' / signed-out sessions always unlock —
+/** Ask, now, the session's write access for the workspace being loaded: is
+ * the editor to be locked (a user can be an editor on one landscape and a
+ * viewer on another)? Stage 'off' / signed-out sessions always unlock —
  * mirrors AutomergeBridge's boot-time resolution. UX only; the server's write
- * gates enforce regardless. */
-async function refreshWorkspaceReadOnly(ref: WorkspaceRef): Promise<void> {
+ * gates enforce regardless. Returns the step that APPLIES it, before the
+ * bridge starts: never rejects, bounded (`workspaceAccess` fails open at its
+ * patience).
+ *
+ * A LATE answer (after the patience, within the request's own bound) is kept
+ * here, by THIS switch: applied by the step if it came first —
+ * it used to be dropped when it arrived before the active ref moved, and
+ * overwritten by the fail-open value when it arrived before the step — and
+ * applied at once if it comes after, while the app is still on this switch's
+ * workspace. Never for another identity than the one that asked. */
+function askWorkspaceReadOnly(ref: WorkspaceRef): () => Promise<void> {
+  const lock = (readOnly: boolean) => useModelStore.getState().setWorkspaceReadOnly(readOnly)
   const auth = useAuthStore.getState()
-  if (auth.config?.stage === 'off' || !auth.user) {
-    useModelStore.getState().setWorkspaceReadOnly(false)
-    return
+  if (auth.config?.stage === 'off' || !auth.user) return async () => { lock(false) }
+  const identity = `${auth.user.id}\u0000${auth.orgId ?? ''}`
+  const sameIdentity = () => {
+    const now = useAuthStore.getState()
+    return `${now.user?.id ?? ''}\u0000${now.orgId ?? ''}` === identity
   }
-  const access = await workspaceAccess(ref.landscapeId, ref.versionId)
-  useModelStore.getState().setWorkspaceReadOnly(access.enforced && !access.canWrite)
+  let late: boolean | null = null
+  let applied = false
+  const early = workspaceAccess(ref.landscapeId, ref.versionId, {
+    onLateAnswer: (answer) => {
+      if (!sameIdentity()) return
+      late = answer.enforced && !answer.canWrite
+      if (applied && workspaceRefEquals(currentWorkspaceRef(), ref)) lock(late)
+    },
+  }).then((access) => access.enforced && !access.canWrite)
+  return async () => {
+    const value = await early
+    // Asked for another identity than the one signed in now: no answer of
+    // its holds — open, as for no answer at all.
+    lock(sameIdentity() ? late ?? value : false)
+    applied = true
+  }
 }
 
 /** Switch to a different workspace ref. No-op if already there. `openDiagramId`
@@ -100,8 +153,29 @@ export function switchWorkspace(
   openDiagramId?: string,
   opts?: { preferDiagram?: boolean },
 ): Promise<void> {
-  if (workspaceRefEquals(ref, currentWorkspaceRef())) return Promise.resolve()
-  return serialize(() => loadWorkspace(ref, openDiagramId, opts?.preferDiagram ?? false))
+  // Judged against where the queue ENDS, not where the app is now. A load
+  // drains the outgoing transport (up to 3 s) BEFORE it moves the active
+  // ref, so during that drain the active ref
+  // still names the workspace being LEFT: a return to it was taken for a no-op
+  // (the app ended in B, the URL said A), and a second click on B queued a
+  // second full reload of B.
+  if (workspaceRefEquals(ref, pendingTarget ?? currentWorkspaceRef())) return pendingTarget ? chain : Promise.resolve()
+  pendingTarget = ref
+  const request = ++switchRequests
+  const preferDiagram = opts?.preferDiagram ?? false
+  const job = serialize(async () => {
+    // Coalesced: a later switch was asked before this one started — only the
+    // LAST destination is loaded.
+    if (request !== switchRequests) return
+    // The queue may already stand where this one leads (A→B→A, B skipped).
+    if (workspaceRefEquals(ref, currentWorkspaceRef())) return
+    await loadWorkspace(ref, openDiagramId, preferDiagram)
+  })
+  // Both settlements clear the target, and this side branch never rejects: a
+  // failed load reaches the CALLER through `job`, not as an unhandled rejection.
+  const settled = () => { if (request === switchRequests) pendingTarget = null }
+  job.then(settled, settled)
+  return job
 }
 
 /** Force-reload the CURRENT workspace (e.g. after set-default moves what a

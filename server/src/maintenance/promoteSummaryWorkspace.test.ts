@@ -229,6 +229,7 @@ function promotableFacts(overrides: Partial<PromotionFacts> = {}): PromotionFact
     readModelDiagrams: new Map(diagrams),
     unresolvedRegistryShards: [],
     ordinaryHeadRetirements: 0,
+    modelEpochBlockers: 0,
     ...overrides,
   }
 }
@@ -362,6 +363,14 @@ describe('evaluatePromotionPreconditions', () => {
     expect(rotated.map((blocker) => blocker.code)).toEqual(['ordinary-head-retirements'])
     expect(rotated[0]!.detail).toContain('AM_ORDINARY_HEAD_ROTATION')
     expect(codes(promotableFacts({ ordinaryHeadRetirements: null }))).toEqual(['ordinary-head-retirements'])
+  })
+
+  it('G4-16f: refuses while an epoch roll is in flight or a superseded epoch is not retired, and when unknown', () => {
+    // The epoch forwarder carries a superseded epoch's late writes; the static
+    // plane runs no forwarder and fences the base shards they land in.
+    expect(codes(promotableFacts({ modelEpochBlockers: 0 }))).toEqual([])
+    expect(codes(promotableFacts({ modelEpochBlockers: 3 }))).toEqual(['model-epoch-late-writes'])
+    expect(codes(promotableFacts({ modelEpochBlockers: null }))).toEqual(['model-epoch-late-writes'])
   })
 
   it('refuses a connected peer, and NAMES the reason (a classic tab journals no entity write)', () => {

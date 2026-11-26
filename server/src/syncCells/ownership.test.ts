@@ -24,6 +24,7 @@ import { syncCellPartitionConfig, workspacePartition } from './assignment.js'
 import {
   FencedPartitionLeaseStore,
   FencedWorkspaceLeaseStore,
+  LEASE_OBSERVATION_REFRESH_MS,
   SyncCellOwnershipCoordinator,
   SyncCellTopologyMismatchError,
   syncCellOwnershipConfig,
@@ -1072,6 +1073,33 @@ describe('SyncCellOwnershipCoordinator', () => {
     }])
     expect(ownsWhileNotifying).toEqual([false])
     expect(coordinator.snapshot()).toMatchObject({ ownedWorkspaceCount: 0, lossCount: 1, ready: false })
+    await coordinator.stop()
+  })
+
+  it('G4-16f: renewal REFRESHES the observed expiry — once per interval, batched, never on every renewal', async () => {
+    const redis = new FakeRedis()
+    const pool = fakePool()
+    const refreshes: Array<{ text: string; values: unknown[] }> = []
+    const query = pool.query.bind(pool) as (text: string, values?: unknown[]) => Promise<unknown>
+    ;(pool as unknown as { query: unknown }).query = (text: string, values?: unknown[]) => {
+      if (text.includes('SET lease_observed_expires_at')) refreshes.push({ text, values: values ?? [] })
+      return query(text, values)
+    }
+    const coordinator = new SyncCellOwnershipCoordinator(pool, redis as unknown as RedisRuntime, config('cell-a'))
+    await coordinator.start()
+    await coordinator.renewNow()
+    expect(refreshes).toEqual([]) // just acquired: the acquisition's observation is fresh
+    const lease = (coordinator as unknown as { leases: Map<string, { observedAt?: number; token: string }> }).leases.values().next().value!
+    lease.observedAt = Date.now() - LEASE_OBSERVATION_REFRESH_MS - 1_000
+    await coordinator.renewNow()
+    expect(refreshes).toHaveLength(1)
+    const [doc, cell] = refreshes[0]!.values as [string, string]
+    expect(cell).toBe('cell-a')
+    expect(JSON.parse(doc)).toEqual([expect.objectContaining({ landscapeId: 'landscape-1', versionId: 'current', token: String(lease.token) })])
+    await coordinator.renewNow()
+    await coordinator.renewNow()
+    expect(refreshes).toHaveLength(1) // throttled
+    expect(coordinator.snapshot()).toMatchObject({ ready: true, renewalCount: 4 })
     await coordinator.stop()
   })
 

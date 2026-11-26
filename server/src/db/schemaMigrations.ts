@@ -16,7 +16,9 @@ import type { Pool } from 'pg'
 import { ensureAuthSchema } from '../auth/schema.js'
 import { ensureBackupSchema } from '../backup/schema.js'
 import { ensureMaintenanceSchema } from '../maintenance/schema.js'
-import { backfillC4ParentIds, ensureReadModelSchema } from '../readModel/schema.js'
+import {
+  backfillC4ParentIds, dropRedundantObjectTrigramIndexes, ensureReadModelSchema, reportStaticMembershipHeadIndex,
+} from '../readModel/schema.js'
 import { ensureSyncCellOwnershipSchema } from '../syncCells/ownership.js'
 import { ensureSyncTopologyContractSchema } from '../syncCells/topologyMirror.js'
 import { ensurePlacementProposerSchema } from '../syncCells/placementProposerSchema.js'
@@ -111,6 +113,58 @@ export function schemaMigrations(pool: Pool): Migration[] {
       // case — see `backfillC4ParentIds`.
       id: '0005-ro-objects-c4-parent',
       run: backfillC4ParentIds,
+    },
+    {
+      // Drops the two `ro_objects` trigram indexes the baseline no longer
+      // creates (`dropRedundantObjectTrigramIndexes`). Non-transactional:
+      // `DROP INDEX CONCURRENTLY` is refused inside a transaction block.
+      //
+      // REPEATABLE, although it is not bootstrap DDL, because what it converges
+      // on is a property of the code that is running rather than of history: an
+      // older build's baseline re-creates both indexes on every boot of that
+      // build (a rollback, or a mixed fleet during a rolling deploy). Run once,
+      // the first such boot after this entry is recorded would leave them in
+      // place for good. On a database without them it is two catalog lookups.
+      // A drop that cannot get its locks within its bound is DEFERRED to the
+      // next boot and logged, never failed (see the function for why).
+      id: '0006-ro-objects-drop-redundant-trgm',
+      repeatable: true,
+      transactional: false,
+      run: async (client) => {
+        await dropRedundantObjectTrigramIndexes(client)
+      },
+    },
+    {
+      // T-DIAGDEF: every DiagramDoc pass of the static plane asks
+      // the write-head membership of ONE diagram (`diagramDocVerdict`), and the
+      // retired-row sweep its head memberships — by `entity_id`, which the
+      // primary key (… membership_kind, owner_id, entity_id …) cannot serve
+      // without the owner. `0007` is not reused (a withdrawn id stays burnt).
+      //
+      // A PARTIAL index — `(landscape_id, version_id,
+      // entity_id) WHERE membership_kind = 'registry_shard_diagram'`, the head
+      // rows only, not every diagram membership — and built like 0006: each
+      // lock wait bounded below `deadlock_timeout`, retried, then DEFERRED to
+      // the next boot (logged), never failing it. REPEATABLE for the same
+      // reason as 0006 (it converges on what the running code needs): a lost
+      // or INVALID index is rebuilt on the next boot, the full index of the
+      // first version is dropped. Non-transactional: CONCURRENTLY. The
+      // baseline also builds it, plain, on an EMPTY table (a new database, an
+      // isolated test schema) — `ensureStaticMembershipHeadIndex` says why.
+      //
+      // REDUCED TO THE CATALOGUE. Built here, the first
+      // CONCURRENTLY build read the whole table twice UNDER the migration key
+      // while every other booting cell waited for it. The build now runs in
+      // the background after readiness (`startStaticMembershipHeadIndexBuild`,
+      // index.ts); this entry only reads and logs the index's state. It stays
+      // in the runner — removed, a ledger that recorded it would read as a
+      // database AHEAD of this build.
+      id: '0008-static-membership-entity-index',
+      repeatable: true,
+      transactional: false,
+      run: async (client) => {
+        await reportStaticMembershipHeadIndex(client)
+      },
     },
   ]
 }

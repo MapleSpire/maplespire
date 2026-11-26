@@ -20,6 +20,7 @@ import {
 } from '@automerge/automerge-repo'
 import { findReadyDocument } from './automergeRepoCompat.js'
 import { envNumber } from './envNumber.js'
+import { appendMetaUrl, readMetaUrl, readMetaUrls, writeMetaUrl, writeMetaUrls } from './modelMetaUrls.js'
 import { notifyWorkspaceDocumentCreated, type WorkspaceKey } from './rbac/docScope.js'
 import { noteServerCreationPlacement } from './rbac/serverCreationPlacement.js'
 import type { SealedRepo } from './rbac/sealedRepo.js'
@@ -110,9 +111,9 @@ const fields = (collection: OverlayCollection) => collection === 'objects'
 
 export function overlaySegmentUrls(meta: OverlayMetaLike | undefined, collection: OverlayCollection): string[] {
   const field = fields(collection)
-  const urls = [...(meta?.[field.segments] ?? [])]
+  const urls = [...(readMetaUrls(meta, field.segments) ?? [])]
     .filter((url): url is string => typeof url === 'string' && isValidAutomergeUrl(url))
-  const current = meta?.[field.current]
+  const current = readMetaUrl(meta, field.current)
   if (typeof current === 'string' && isValidAutomergeUrl(current)) {
     const index = urls.indexOf(current)
     if (index >= 0) urls.splice(index, 1)
@@ -285,16 +286,18 @@ export function publishOverlaySegment(
 ): void {
   const field = fields(collection)
   metaHandle.change((meta) => {
+    // The list this change has always WRITTEN — the canonical read (valid
+    // urls, deduplicated, the previous current moved last) plus `url` —
+    // reached IN PLACE (`rewriteListInPlace`): in the ordinary case one push.
+    // It used to be assigned whole, which re-created every element (and every
+    // character of each) per rotation: quadratic ModelMeta history (G4-16f).
     const segments = overlaySegmentUrls(meta, collection)
     if (!segments.includes(url)) segments.push(url)
-    meta[field.segments] = segments
-    meta[field.current] = url
+    // Through `modelMetaUrls.ts`: text or scalar by the document's marker.
+    writeMetaUrls(meta, field.segments, segments)
+    writeMetaUrl(meta, field.current, url)
     meta.editsOverlayWriteHeadVersion = OVERLAY_WRITE_HEAD_VERSION
-    // Assign, then RE-READ: `meta[f] ?? (meta[f] = [])` yields the plain `[]`,
-    // not the document's list, and the push into it is lost.
-    if (!meta[field.shards]) meta[field.shards] = []
-    const shardUrls = meta[field.shards] as string[]
-    if (!shardUrls.includes(url)) shardUrls.push(url)
+    appendMetaUrl(meta, field.shards, url)
   })
 }
 

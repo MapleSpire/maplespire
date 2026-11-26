@@ -204,13 +204,18 @@ describe('Automerge drain failure propagation', () => {
     // executable helper tests by checking that the boot-time consumer uses it.
     const server = readFileSync(new URL('./automergeServer.ts', import.meta.url), 'utf8')
     const index = readFileSync(new URL('./index.ts', import.meta.url), 'utf8')
+    // T-ZEROWM-2: the sequence lives in serverShutdown.ts; index.ts hands it
+    // the resources (the ownership release among them).
+    const sequence = readFileSync(new URL('./serverShutdown.ts', import.meta.url), 'utf8')
     expect(server).toContain('await drainAutomergeResources({')
     expect(server).toContain('stopWorkspaceCacheInvalidation: () => workspaceCacheInvalidation?.stop()')
-    const start = index.indexOf('const drainResults = await Promise.allSettled([')
-    const release = index.indexOf('await syncCellOwnership?.stop()', start)
+    expect(index).toContain('shutdownStarted = runGracefulShutdown(signal, {')
+    expect(index).toContain('stopOwnership: async () => { await syncCellOwnership?.stop() }')
+    const start = sequence.indexOf('const drainResults = await Promise.allSettled([')
+    const release = sequence.indexOf("await step('ownership', resources.stopOwnership)", start)
     expect(start).toBeGreaterThan(0)
     expect(release).toBeGreaterThan(start)
-    const beforeRelease = index.slice(start, release)
+    const beforeRelease = sequence.slice(start, release)
     expect(beforeRelease).toContain("result.status === 'rejected'")
     expect(beforeRelease).toContain('if (failedDrains.length) throw new AggregateError(')
     expect(index).toContain('void shutdown(signal).catch((error) => {')

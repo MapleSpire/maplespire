@@ -53,7 +53,7 @@ async function makeServer(opts: { shareConfig?: ShareConfig; floodAll?: boolean 
     network: [new NodeWSServerAdapter(wss as unknown as WssParam)],
     ...(opts.floodAll ? { sharePolicy: async () => true } : { shareConfig: opts.shareConfig }),
   })
-  await new Promise<void>((res) => http.listen(0, res))
+  await new Promise<void>((res) => http.listen(0, '127.0.0.1', res))
   const port = (http.address() as { port: number }).port
   return {
     repo,
@@ -67,7 +67,7 @@ async function makeServer(opts: { shareConfig?: ShareConfig; floodAll?: boolean 
 }
 
 function makeClient(port: number, shareConfig?: ShareConfig): { repo: Repo; close: () => void } {
-  const adapter = new BrowserWebSocketClientAdapter(`ws://localhost:${port}`)
+  const adapter = new BrowserWebSocketClientAdapter(`ws://127.0.0.1:${port}`)
   const repo = new Repo({
     network: [adapter],
     ...(shareConfig ? { shareConfig } : { sharePolicy: async () => true }),

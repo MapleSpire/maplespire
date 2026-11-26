@@ -98,6 +98,7 @@ import type { PoolClient } from 'pg'
 // `pg_advisory_unlock` on a pooled client, imported rather than restated.
 import { ADVISORY_LOCK_RELEASE_CEILING_MS, withCeiling } from '../db/sessionAdvisoryLock.js'
 import type { MetricSample } from '../runtime/metrics.js'
+import { lostMarkerOf } from './protocolParticipant.js'
 
 /** What this session knows about the key — not "did I take it". A throw from
  * the acquisition leaves `unknown`, which is neither of the other two: the
@@ -223,6 +224,21 @@ export async function releaseOverlayRotationLock(
   lockKey: string,
   state: OverlayRotationLockState,
 ): Promise<void> {
+  // A connection whose protocol marker the fence assertion found lost is
+  // DESTROYED, whatever the key's state (`protocolParticipant.ts`, A LOST
+  // MARKER ENDS THE CONNECTION): returned, it would refuse every later
+  // rotation, fold or compaction that draws it. Ending the session returns
+  // the key too, so no unlock is attempted on it first.
+  const lost = lostMarkerOf(client)
+  if (lost) {
+    console.warn(JSON.stringify({
+      event: 'read_model.protocol_marker_lost_connection_destroyed',
+      lockKey,
+      detail: 'the fence assertion refused this connection (protocol marker lost); ending the session',
+    }))
+    client.release(lost)
+    return
+  }
   if (state === 'refused') {
     client.release()
     return
@@ -347,8 +363,18 @@ const REFUSAL_STREAK_TTL_MS = 600_000
  * neither is, is CONTINUOUS: fsck is a command. That is what
  * {@link overlayRotationLockMetricSamples} is for.
  */
+/** Told every refused rotation or fold: the server
+ * entry point makes the workspace's event-driven epoch forward YIELD, so the
+ * rotation's retry finds its keys free. One listener; null removes it. */
+export type OverlayRotationContendedListener = (detail: { landscapeId: string; versionId: string; path: string }) => void
+let contendedListener: OverlayRotationContendedListener | null = null
+export function setOverlayRotationContendedListener(listener: OverlayRotationContendedListener | null): void {
+  contendedListener = listener
+}
+
 export function reportOverlayRotationLockContended(detail: {
-  path: 'rotate' | 'recover-admitted' | 'fold'
+  /** `compaction`: `runWorkspaceCompaction` (G4-16i), which skips its pass. */
+  path: 'rotate' | 'recover-admitted' | 'fold' | 'compaction'
   landscapeId: string
   versionId: string
   kind: OverlayRotationKind
@@ -364,6 +390,9 @@ export function reportOverlayRotationLockContended(detail: {
   const streak = { count: (previous?.count ?? 0) + 1, since: previous?.since ?? at, lastAt: at }
   refusalStreaks.set(lockKey, streak)
   refusalsTotal += 1
+  if (detail.path !== 'compaction') {
+    try { contendedListener?.({ landscapeId: detail.landscapeId, versionId: detail.versionId, path: detail.path }) } catch { /* never the reporter's failure */ }
+  }
   // Pruned HERE, on the write path, and not in the sample function: a map swept
   // only by its reader is swept only while someone is asking. The map holds at
   // most two entries per workspace this process has ever served, so the scan is

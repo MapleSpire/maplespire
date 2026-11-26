@@ -25,6 +25,8 @@ import { isDocumentStorageKey } from './automergeStorage.js'
 import { envNumber } from './envNumber.js'
 import { enumerateMaintainableWorkspaces } from './maintenance/maintainableWorkspaces.js'
 import { foldedArrivalPendingSql } from './readModel/ordinaryFoldedArrivals.js'
+import { readMetaUrlsUnion } from './modelMetaUrls.js'
+import { modelEpochGcRoots } from './readModel/modelEpochStore.js'
 
 /**
  * Mark-and-sweep GC of ORPHANED Automerge documents.
@@ -170,6 +172,34 @@ export async function gcOrphanedDocs(repo: Repo, options: GcOptions = {}): Promi
     }
   }
 
+  /** Mark a ModelMeta and everything it names. False (and `complete = false`)
+   * when it cannot be read or is degenerate. Shared by the root walk and the
+   * retained-epoch metas below, so the two can never mark different closures.
+   * A REFERENCE closure, so every URL either copy names (the ruling field
+   * and the frozen or shadow one) is marked — `readMetaUrlsUnion`. */
+  const markModelMetaClosure = async (metaUrl: string, referencedBy: string): Promise<boolean> => {
+    add(metaUrl)
+    const m = (await read(metaUrl, referencedBy)) as MetaLike | undefined
+    if (!m || readMetaUrlsUnion(m, 'objectShardUrls') === undefined || readMetaUrlsUnion(m, 'connectionShardUrls') === undefined) {
+      complete = false
+      incompleteReasons.push({
+        kind: 'degenerate-model-meta',
+        url: metaUrl,
+        referencedBy,
+      })
+      console.warn('[gc] modelMeta degenerate (missing shard arrays); marking incomplete:', metaUrl)
+      return false
+    }
+    for (const u of readMetaUrlsUnion(m, 'objectShardUrls') ?? []) add(u)
+    for (const u of readMetaUrlsUnion(m, 'connectionShardUrls') ?? []) add(u)
+    for (const u of m.decisionRecordShardUrls ?? []) add(u)
+    for (const u of readMetaUrlsUnion(m, 'editsObjectShardUrl') ?? []) add(u)
+    for (const u of readMetaUrlsUnion(m, 'editsConnectionShardUrl') ?? []) add(u)
+    for (const u of readMetaUrlsUnion(m, 'editsObjectShardUrls') ?? []) add(u)
+    for (const u of readMetaUrlsUnion(m, 'editsConnectionShardUrls') ?? []) add(u)
+    return true
+  }
+
   // --- MARK: every doc reachable from a version root (+ the legacy primary root) ---
   const rootUrls = new Set<string>()
   const staticRoots = new Map<string, { landscapeId: string; versionId: string }>()
@@ -250,25 +280,7 @@ export async function gcOrphanedDocs(repo: Repo, options: GcOptions = {}): Promi
     }
     add(root.modelUrl)
     if (root.modelMetaUrl) {
-      add(root.modelMetaUrl)
-      const m = (await read(root.modelMetaUrl, rootUrl)) as MetaLike | undefined
-      if (!m || m.objectShardUrls === undefined || m.connectionShardUrls === undefined) {
-        complete = false
-        incompleteReasons.push({
-          kind: 'degenerate-model-meta',
-          url: root.modelMetaUrl,
-          referencedBy: rootUrl,
-        })
-        console.warn('[gc] modelMeta degenerate (missing shard arrays); marking incomplete:', root.modelMetaUrl)
-        continue
-      }
-      for (const u of m.objectShardUrls) add(u)
-      for (const u of m.connectionShardUrls) add(u)
-      for (const u of m.decisionRecordShardUrls ?? []) add(u)
-      add(m.editsObjectShardUrl)
-      add(m.editsConnectionShardUrl)
-      for (const u of m.editsObjectShardUrls ?? []) add(u)
-      for (const u of m.editsConnectionShardUrls ?? []) add(u)
+      if (!(await markModelMetaClosure(root.modelMetaUrl, rootUrl))) continue
     }
     for (const shardUrl of root.shardUrls) {
       add(shardUrl)
@@ -297,6 +309,21 @@ export async function gcOrphanedDocs(repo: Repo, options: GcOptions = {}): Promi
   for (const row of snaprows) {
     for (const d of row.manifest?.docs ?? []) add(d.url)
   }
+
+  // MODEL EPOCHS (G4-16f).
+  // A previous epoch's ModelMeta and base shards are no longer named by the
+  // root, but a client that was offline across the roll still holds them and
+  // writes into them, and the epoch forwarder reads them to carry those late
+  // writes; sweeping one inside retention loses the offline edits silently.
+  // So: every document an in-flight, current or retained epoch row names,
+  // every `live` or `pinned` epoch document, and — for each retained ModelMeta
+  // — its whole UNION closure, because the client holding it asks for every
+  // segment it names (the same closure as the root's, one function).
+  // `preparing` rows are marked too: the age floor already protects their
+  // fresh documents, and this root does not depend on that floor.
+  const epochRoots = await modelEpochGcRoots(db)
+  for (const url of epochRoots.urls) add(url)
+  for (const metaUrl of epochRoots.retainedMetaUrls) await markModelMetaClosure(metaUrl, 'model-epoch')
 
   // RETIRED OVERLAY SEGMENTS, retained for offline clients.
   //
@@ -523,6 +550,17 @@ export async function gcOrphanedDocs(repo: Repo, options: GcOptions = {}): Promi
       // document with no storage describes nothing and would sit forever.
       await client.query(
         `DELETE FROM read_model_document_watermarks WHERE document_id = ANY($1::text[])`,
+        [batch],
+      )
+      // And for their G4-16f siblings: an adopt watermark, and a cached
+      // sealed-product extract (its entity rows go with it, ON DELETE
+      // CASCADE), describe a document that no longer exists.
+      await client.query(
+        `DELETE FROM read_model_adopt_watermarks WHERE document_id = ANY($1::text[])`,
+        [batch],
+      )
+      await client.query(
+        `DELETE FROM read_model_sealed_product_extracts WHERE product_document_id = ANY($1::text[])`,
         [batch],
       )
       await client.query('COMMIT')

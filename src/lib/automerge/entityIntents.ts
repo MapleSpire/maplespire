@@ -192,6 +192,13 @@ interface EntityIntentBase {
    * unconfirmed: the edit is a field patch for every ordinary replay, but a
    * carried replay must create the entity when the new version lacks it. */
   createIfAbsent?: true
+  /** T-SUM-2b: the user RE-ADDED this entity over a tombstone (an undo of a
+   * delete, a paste of the same id — `detectEdits`, `tombstoneObjects.delete`
+   * true). The one upsert the replay may still lift a tombstone for: every
+   * other upsert over a durable deletion loses, as it does live (the
+   * projector drops a tombstoned id whatever the overlay holds). Kept by the
+   * later records of the same entity, like `createIfAbsent`. */
+  reAdded?: true
 }
 
 export interface ObjectUpsertIntent extends EntityIntentBase {
@@ -520,11 +527,19 @@ export class PendingEntityIntents {
     // lens, 2026-10-31: dropping it turned crash replays into whole-value
     // writes over a colleague's concurrent edit).
     const sentRecord = this.sentByWorkspace.get(workspaceKey)?.get(key)
+    const pendingRecord = this.byWorkspace.get(workspaceKey)?.get(key)
+    // T-SUM-2b: a PENDING creation owes its creation just as a SENT one does.
+    // Without it an edit made before the creation's write was acknowledged
+    // reads, once the entity is proved absent, as "an entity that existed and
+    // was deleted since" — and the replay drops the user's creation.
     const createIfAbsent = baseline !== undefined && (
       isCreation(sentRecord)
       || sentRecord?.createIfAbsent === true
-      || this.byWorkspace.get(workspaceKey)?.get(key)?.createIfAbsent === true
+      || isCreation(pendingRecord)
+      || pendingRecord?.createIfAbsent === true
     )
+    const reAdded = (pendingRecord?.op === 'upsert' && pendingRecord.reAdded === true)
+      || (sentRecord?.op === 'upsert' && sentRecord.reAdded === true)
     // Snapshot and baseline are held BY REF — store entities are immutable
     // (immer), so recording costs no copy; cloning happens at serialization.
     const record = {
@@ -537,10 +552,20 @@ export class PendingEntityIntents {
       snapshot,
       ...(baseline !== undefined ? { baseline } : {}),
       ...(createIfAbsent ? { createIfAbsent: true } : {}),
+      ...(reAdded ? { reAdded: true } : {}),
     } as SerializedEntityIntent
     this.records(workspaceKey).set(key, record)
     this.forgetSent(workspaceKey, key)
     return revision
+  }
+
+  /** Flag the pending upsert of `kind:id` as a RE-ADD over a tombstone
+   * (`EntityIntentBase.reAdded`). Persisted with the record. */
+  markReAdded(workspaceKey: string, kind: EntityIntentKind, id: string): void {
+    const records = this.byWorkspace.get(workspaceKey)
+    const key = intentKey(kind, id)
+    const record = records?.get(key)
+    if (records && record?.op === 'upsert' && record.reAdded !== true) records.set(key, { ...record, reAdded: true })
   }
 
   recordDelete(
@@ -916,6 +941,36 @@ export interface EntityIntentReplayInput {
    * Such intents are DEFERRED — kept journaled (the badge already counts
    * them) until a witness is reachable. Defaults to true. */
   witnessesReliable?: boolean
+  /** Batch ids the SERVER acknowledges having received
+   * (`read_model_overlay_batch_acks`, via the durability witness) — the same
+   * proof as membership in `objectBatchIds`/`connectionBatchIds`, but one a
+   * rotation, a fold or a compaction cannot take out of sight. T-SUM-2b:
+   * without it a stamped upsert whose segment left the loaded head reads as
+   * "lost", and once the absence is provable its snapshot is replayed over
+   * whatever followed — a colleague's deletion included (the entity came
+   * back, measured on both the whole-model and the static plane). */
+  landedBatchIds?: ReadonlySet<string>
+  /** Entities whose value already waits in RAM for this session's next
+   * overlay write (`dirtyObjectIds`/`dirtyConnectionIds`): an earlier replay
+   * pass injected it, or the user edited it since. That write will stamp the
+   * intent; replaying it again is the double replay (two passes on one boot,
+   * measured on a stack). Such upserts are left journaled,
+   * counted in `inFlight`. */
+  inFlightObjectIds?: ReadonlySet<string>
+  inFlightConnectionIds?: ReadonlySet<string>
+  /** T-SUM-2b, the boot-from-server replay only: a DURABLE DELETION wins over
+   * an upsert that is not a re-add (`reAdded`), as it does everywhere else —
+   * the projector drops a tombstoned id whatever the overlay holds, the
+   * server's forwarder skips tombstoned ids, a live offline edit loses to a
+   * colleague's tombstone, and `planCarriedUpsert` already applies it.
+   *  - tombstoned in ModelMeta → acknowledged, not replayed;
+   *  - not tombstoned, but ABSENT under a proof (`witnessesReliable`) while
+   *    the intent has a baseline and owes no creation (`createIfAbsent`): the
+   *    entity existed and is gone — a deletion a compaction applied and then
+   *    cleared — so it is acknowledged too.
+   * Left off by the resident replay: its witness is the local model, which
+   * can be behind, so absence there proves nothing. */
+  deletionWins?: boolean
 }
 
 export interface EntityIntentReplayPlan {
@@ -935,6 +990,13 @@ export interface EntityIntentReplayPlan {
    * replayed nor acknowledged this pass. Count only — they simply stay in the
    * journal for a later pass with a witness. */
   deferred: number
+  /** Upserts left to the write already pending in RAM (`inFlight*Ids`):
+   * neither replayed nor acknowledged this pass. Count only. */
+  inFlight: number
+  /** Upserts acknowledged WITHOUT a write because a durable deletion wins
+   * over them (`deletionWins`). Also in `satisfied`; counted apart so the
+   * bridge can say so (an intent the user made, deliberately not replayed). */
+  droppedDeleted: number
 }
 
 /**
@@ -1057,7 +1119,10 @@ export function planEntityIntentReplay(input: EntityIntentReplayInput): EntityIn
     unTombConnectionIds: [],
     satisfied: [],
     deferred: 0,
+    inFlight: 0,
+    droppedDeleted: 0,
   }
+  const landed = input.landedBatchIds ?? new Set<string>()
   for (const intent of input.intents) {
     const isObject = intent.kind === 'object'
     const current = isObject
@@ -1068,9 +1133,13 @@ export function planEntityIntentReplay(input: EntityIntentReplayInput): EntityIn
       : input.deletedConnectionIds.has(intent.id)
     const batchIds = isObject ? input.objectBatchIds : input.connectionBatchIds
     // Accomplished-by-batch: the shard carries the very batch that expressed
-    // this intent. No value comparison — the write happened; whatever the value
-    // is NOW is later history (possibly a colleague's), not ours to re-assert.
-    if (intent.writtenInBatchId && batchIds.has(intent.writtenInBatchId)) {
+    // this intent — or the server says it received that batch (applied, or
+    // parked in its conflict register under `conflict`: replaying would
+    // bypass that register). No value comparison — whatever the value is NOW
+    // is later history (possibly a colleague's, a deletion included), not
+    // ours to re-assert.
+    if (intent.writtenInBatchId
+      && (batchIds.has(intent.writtenInBatchId) || landed.has(intent.writtenInBatchId))) {
       plan.satisfied.push({ kind: intent.kind, id: intent.id, revision: intent.revision })
       continue
     }
@@ -1082,6 +1151,12 @@ export function planEntityIntentReplay(input: EntityIntentReplayInput): EntityIn
       } else {
         plan.replayDeleteConnectionIds.push(intent.id)
       }
+      continue
+    }
+    // Already on its way: the next overlay write expresses this entity and
+    // stamps the intent. A second injection is a second replay.
+    if ((isObject ? input.inFlightObjectIds : input.inFlightConnectionIds)?.has(intent.id)) {
+      plan.inFlight += 1
       continue
     }
     const snapshot = stripUndefined(intent.snapshot)
@@ -1106,12 +1181,29 @@ export function planEntityIntentReplay(input: EntityIntentReplayInput): EntityIn
       }
       continue
     }
+    // T-SUM-2b: a durable deletion wins over anything but a re-add — the
+    // tombstone is ModelMeta's, a synced document, so no absence proof is
+    // needed for it.
+    const deletionWins = input.deletionWins === true && intent.reAdded !== true
+    if (deletionWins && tombstoned) {
+      plan.satisfied.push({ kind: intent.kind, id: intent.id, revision: intent.revision })
+      plan.droppedDeleted += 1
+      continue
+    }
     // Stamped + no witness can vouch for absence: the write may have happened
     // and been consumed+compacted. Blindly re-asserting the whole snapshot here
     // is the one branch that could clobber an entity beyond the per-field
     // residual — defer instead; the journal keeps it and the badge counts it.
     if (intent.writtenInBatchId && current === undefined && !witnessesReliable) {
       plan.deferred += 1
+      continue
+    }
+    // The entity EXISTED (a baseline) and owes no creation, yet it is proved
+    // absent: someone deleted it and a compaction cleared the tombstone.
+    if (deletionWins && witnessesReliable && current === undefined
+      && intent.baseline !== undefined && intent.createIfAbsent !== true) {
+      plan.satisfied.push({ kind: intent.kind, id: intent.id, revision: intent.revision })
+      plan.droppedDeleted += 1
       continue
     }
     const baseline = intent.baseline ? stripUndefined(intent.baseline) : undefined

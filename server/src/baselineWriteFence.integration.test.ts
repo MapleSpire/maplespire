@@ -77,7 +77,7 @@ function staticTablesPool(documents: Map<string, string>): pg.Pool {
 }
 
 function makeClient(port: number, peerId: string): { repo: Repo; close: () => void } {
-  const adapter = new BrowserWebSocketClientAdapter(`ws://localhost:${port}`)
+  const adapter = new BrowserWebSocketClientAdapter(`ws://127.0.0.1:${port}`)
   const repo = new Repo({ network: [adapter], sharePolicy: async () => true, peerId: peerId as PeerId })
   return {
     repo,
@@ -110,7 +110,7 @@ describe('baseline write fence — end-to-end over real WebSockets', () => {
       onDenied: ({ peerId, documentId }) => denied.push({ peerId, documentId }),
     })
     const serverRepo = new Repo({ network: [adapter], sharePolicy: async () => true })
-    await new Promise<void>((res) => http.listen(0, res))
+    await new Promise<void>((res) => http.listen(0, '127.0.0.1', res))
     const port = (http.address() as { port: number }).port
 
     const baseHandle = serverRepo.create<DocShape>({ title: 'frozen-base' })

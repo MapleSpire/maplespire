@@ -115,6 +115,8 @@ const AFFINE_ROUTES: ReadonlyArray<readonly [string, Classification, string]> = 
     + 'inside it is relayed to its owner by the tool-call relay (task B2-10b, '
     + 'AiToolCtx.relay), which the arm below pins this door installs',
   ],
+  ['POST /api/model/epoch-overrides/resolve', 'not-workspace-affine',
+    'G4-16f epoch overrides: marks override ROWS (read_model_model_epoch_overrides) by batch id — SQL only, no workspace document; the re-apply edit itself goes through the normal write path'],
   ['POST /api/ai/run', 'not-workspace-affine', 'same as /api/ai/chat: request unplaceable, placed tool calls relayed (B2-10b)'],
   // ONE registration, TWO KEYS. The three bootstrap tools are placed on the
   // landscape's DEFAULT or the draft's PARENT — a lookup, because that is the
