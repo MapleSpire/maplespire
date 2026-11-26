@@ -53,6 +53,12 @@ regexes = ['''^maplespire-dag-7366$''']
 description = "Admin UI curl example placeholder"
 regexes = ['''bvr_YOUR_TOKEN''']
 
+# Storage row keys in the snapshot-compaction tests (`key: 'd/incremental/1'`,
+# `'d/snapshot/s'`): Automerge storage key paths, read as a generic API key.
+[[allowlists]]
+description = "Automerge storage row keys in tests"
+regexes = ['''^d/(incremental|snapshot)/[A-Za-z0-9]+$''']
+
 # The linkedin-client-id rule reads the 14 letters after `"LinkedIn",` in the
 # generated icon catalog: they are the JSON key `compatibleWith`.
 [[allowlists]]
