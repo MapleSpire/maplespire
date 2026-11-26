@@ -53,6 +53,7 @@
 import { writeFileSync } from 'node:fs'
 import pg from 'pg'
 import { Repo } from '@automerge/automerge-repo'
+import { readMetaUrl, readMetaUrls } from '../src/modelMetaUrls.ts'
 import { AuthenticatedWebSocketClientAdapter } from '../qa/authenticatedWebSocketAdapter.mjs'
 import { appendOverlayBatchId, resolveLoadHandle } from '../qa/loadUsersCore.mjs'
 
@@ -262,7 +263,7 @@ async function seedObjects(workspace, rootUrl, cookie, count, index) {
     const metaHandle = (await resolveLoadHandle(repo, root.modelMetaUrl, { tries: 20 })).handle
     await metaHandle.whenReady()
     const meta = metaHandle.doc()
-    const headUrl = meta?.editsObjectShardUrl || meta?.editsObjectShardUrls?.at(-1)
+    const headUrl = readMetaUrl(meta, 'editsObjectShardUrl') || readMetaUrls(meta, 'editsObjectShardUrls')?.at(-1)
     if (!headUrl) throw new Error(`meta of ${workspace.landscapeId} has no object write head`)
     const headHandle = (await resolveLoadHandle(repo, headUrl, { tries: 20 })).handle
     await headHandle.whenReady()

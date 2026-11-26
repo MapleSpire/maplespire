@@ -68,6 +68,10 @@ import { OVERLAY_SEGMENT_SIZE } from '../overlaySegments.js'
 import { OVERLAY_WRITE_HEAD_VERSION } from '../modelMeta.js'
 import { enumerateMaintainableWorkspaces } from './maintainableWorkspaces.js'
 import { hiddenListEntries } from './containerConflicts.js'
+import { readMetaUrl, readMetaUrls, readMetaUrlsUnion, withMetaUrlView } from '../modelMetaUrls.js'
+import { modelEpochConfig } from '../readModel/modelEpochConfig.js'
+import { storageDurableHeads } from '../readModel/modelEpochStep.js'
+import { MODEL_EPOCH_FSCK_CHECKS, checkModelEpochs, gatherModelEpochFacts } from './modelEpochFsck.js'
 
 export type FsckSeverity =
   /** A user edit is accepted by the UI and never reaches durable storage. */
@@ -101,6 +105,8 @@ export const FSCK_CHECKS = {
   'overlay-segment-retained': 'Every overlay segment still inside its retention window exists in storage.',
   'write-head-writable': 'The registry write head is listed with a WRITABLE kind, never a baseline kind.',
   'diagram-doc-url': 'Every diagram in a registry shard names a valid DiagramDoc url.',
+  // G4-16f model epochs (`modelEpochFsck.ts`).
+  ...MODEL_EPOCH_FSCK_CHECKS,
 } as const
 
 /** PARK-level checks — they look ACROSS workspaces, so they can never appear
@@ -343,12 +349,14 @@ export function collectReferencedUrls(
   for (const shard of urlList(root?.shardUrls)) out.add(shard)
   add(root?.registryWriteUrl)
 
-  for (const key of ['objectShardUrls', 'connectionShardUrls', 'decisionRecordShardUrls',
-    'editsObjectShardUrls', 'editsConnectionShardUrls'] as const) {
-    for (const shard of urlList(modelMeta?.[key])) out.add(shard)
+  for (const shard of urlList(modelMeta?.decisionRecordShardUrls)) out.add(shard)
+  // A reference closure, so what EITHER copy of a URL field names — the
+  // ruling one and the frozen or shadow one (`readMetaUrlsUnion`). Pass the
+  // raw document, not `withMetaUrlView`'s copy, which keeps only the ruling.
+  for (const key of ['objectShardUrls', 'connectionShardUrls',
+    'editsObjectShardUrls', 'editsConnectionShardUrls', 'editsObjectShardUrl', 'editsConnectionShardUrl'] as const) {
+    for (const shard of urlList(readMetaUrlsUnion(modelMeta, key))) out.add(shard)
   }
-  add(modelMeta?.editsObjectShardUrl)
-  add(modelMeta?.editsConnectionShardUrl)
 
   for (const registry of registries) {
     const diagrams = registry?.diagrams
@@ -1694,6 +1702,13 @@ export function checkWorkspaceStructure(input: StructureCheckInput): {
     }
   }
 
+  // ── the model epoch checks (G4-16f) ───────────────────────────────────────
+  // Their facts are SQL, gathered by `fsckWorkspace`, which replaces this
+  // accounting with the real answer; the structure input alone carries none.
+  for (const check of Object.keys(MODEL_EPOCH_FSCK_CHECKS) as Array<keyof typeof MODEL_EPOCH_FSCK_CHECKS>) {
+    skip(check, 'no model epochs: no epoch facts in the structure input (fsckWorkspace gathers them)')
+  }
+
   return { findings, checksRun, checksSkipped }
 }
 
@@ -1738,6 +1753,9 @@ export function fsckStatusOf(
     // `ordinary workspace` above: that check's reader is the ORDINARY projector,
     // so on a workspace the static plane serves it does not apply.
     && !entry.reason.startsWith('static workspace')
+    // `no model epochs` — G4-16f: a workspace that never rolled (or whose
+    // published epoch is the legacy one) has nothing those checks look at.
+    && !entry.reason.startsWith('no model epochs')
   ))
     ? 'incomplete'
     : findings.length > 0 ? 'violations' : 'clean'
@@ -1978,6 +1996,9 @@ export interface WorkspaceFsckOptions {
   /** `AM_ORDINARY_HEAD_ROTATION` and its knobs; read from the process
    * environment when omitted, so no caller has to remember it. */
   ordinaryHeadRotation?: OrdinaryHeadRotationConfig
+  /** G4-16f: `AM_MODEL_EPOCH_RETAIN` / `_PERIOD_DAYS` for the epoch checks;
+   * read from the process environment when omitted. */
+  modelEpochs?: { retain: number; periodDays: number }
 }
 
 /**
@@ -2000,7 +2021,10 @@ export async function fsckWorkspace(
   const root = await tryResolve(repo, rootUrl, timeoutMs)
 
   const metaUrl = url(root?.modelMetaUrl)
-  const modelMeta = metaUrl ? await tryResolve(repo, metaUrl, timeoutMs) : undefined
+  const modelMetaRaw = metaUrl ? await tryResolve(repo, metaUrl, timeoutMs) : undefined
+  // Every check reads the RULING URL values as plain strings; only the
+  // reference closure below reads the raw document (both copies).
+  const modelMeta = modelMetaRaw === undefined ? undefined : withMetaUrlView(modelMetaRaw)
   const modelMetaUnresolved = Boolean(metaUrl) && modelMeta === undefined
 
   // The CURRENT overlay write heads, measured from the DOCUMENTS. Two
@@ -2083,7 +2107,7 @@ export async function fsckWorkspace(
     writeHeadResolved = writeHeadDoc !== undefined
   }
 
-  const referenced = collectReferencedUrls(root, modelMeta, registries)
+  const referenced = collectReferencedUrls(root, modelMetaRaw, registries)
   const ids = [...new Set([rootUrl, ...referenced].map(documentIdOf))]
 
   // The COMPLETE admission set, not just the reachable slice: `document-admitted`
@@ -2364,6 +2388,32 @@ export async function fsckWorkspace(
       maxChanges: rotation.maxChanges,
     },
   })
+
+  // G4-16f: the model epoch checks.
+  const epochConfig = options.modelEpochs ?? modelEpochConfig()
+  const epochFacts = await gatherModelEpochFacts(db, key, {
+    durableHeads: (documentId) => storageDurableHeads(db, documentId),
+    supersededOverlaySegments: async (metaDocumentId) => {
+      const old = await tryResolve(repo, `automerge:${metaDocumentId}`, timeoutMs)
+      return old === undefined ? [] : [
+        ...(readMetaUrls(old, 'editsObjectShardUrls') ?? []), ...(readMetaUrls(old, 'editsConnectionShardUrls') ?? []),
+      ]
+    },
+    currentOverlaySegments: modelMeta === undefined ? [] : [
+      ...(readMetaUrls(modelMeta, 'editsObjectShardUrls') ?? []), ...(readMetaUrls(modelMeta, 'editsConnectionShardUrls') ?? []),
+      ...[readMetaUrl(modelMeta, 'editsObjectShardUrl'), readMetaUrl(modelMeta, 'editsConnectionShardUrl')].filter((u): u is string => Boolean(u)),
+    ],
+  })
+  const epochChecks = checkModelEpochs({
+    facts: epochFacts, rootMetaUrl: root?.modelMetaUrl, modelMetaRaw, retain: epochConfig.retain, periodDays: epochConfig.periodDays,
+  })
+  // checkWorkspaceStructure accounted for them as "no model epochs" (it has
+  // no epoch facts); the gathered answer REPLACES that accounting.
+  const epochCodes = new Set<string>(Object.keys(MODEL_EPOCH_FSCK_CHECKS))
+  for (let i = checksSkipped.length - 1; i >= 0; i -= 1) if (epochCodes.has(checksSkipped[i]!.check)) checksSkipped.splice(i, 1)
+  findings.push(...epochChecks.findings)
+  checksRun.push(...epochChecks.checksRun)
+  checksSkipped.push(...epochChecks.checksSkipped)
 
   // Status is decided HERE, from the completed pass, never from inside it.
   const status = fsckStatusOf(findings, checksSkipped)

@@ -40,7 +40,15 @@ import type { Queryable } from './types.js'
  *    the right values. A fold must therefore write its product WHOLE before
  *    ModelMeta names it (its marker in the creating change, its entities in
  *    bounded changes after it, all before the flush:
- *    `createClaimedOverlaySegment`), and nothing may write it again.
+ *    `createClaimedOverlaySegment`), and the FOLD never writes it again. Two
+ *    other writers do, and neither adds a value to project: a client deleting
+ *    an entity from every listed segment (`deleteObjectFromOverlaySegments` /
+ *    `deleteConnectionFromOverlaySegments`, `src/lib/automerge/bridge.ts`;
+ *    deletion's channel is ModelMeta's tombstones), and a compaction's clear
+ *    and tombstone deletes, which then record the product's post-clear heads
+ *    as its `forwarded_heads` before ModelMeta moves (G4-16i,
+ *    `settleCompactedOrdinarySegments`, `workspaceCompaction.ts`) — so the
+ *    product reads as settled again and can be folded.
  *    "Publishes nothing" is right only if every value in it was already
  *    served. So the attach is refused, loudly, unless every source is a
  *    segment this projector watches (`ORDINARY_FOLD_SOURCES_NOT_WATCHED`) and
@@ -62,7 +70,8 @@ import type { Queryable } from './types.js'
  * NOT HERE: the fold itself, its locks and rows, and what happens to a late
  * write that reaches a source after the settle check — between that check and
  * the detach, or after the detach — which this projector neither projects nor
- * forwards: phases 4.2 to 4.4 in `docs/read-model-projector-health.md`.
+ * forwards: phases 4.2 to 4.4 in
+ * https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/read-model-projector-health.md#phase-4-step-2-the-fold-record-is-the-authority.
  * The marker is in a document a client can write, like ModelMeta itself; a
  * crafted product can hide its own content until the next cold build and
  * detach shards the same client unlisted, but destroys no row. Phase 4.2's
@@ -215,22 +224,34 @@ export async function recordOrdinaryChainFold(
       return await fail(new OrdinaryChainFoldConflictError(key, fold.collection, fold.productDocumentId,
         existing.sourceDocumentIds, 'the product is already recorded with other sources'))
     }
-    const stale: string[] = []
-    for (const source of fold.sources) {
-      const result = await tx.query(
-        `UPDATE read_model_ordinary_head_retirements
-            SET status = 'folded', folded_into = $5, retain_until = $6, updated_at = now()
-          WHERE landscape_id = $1 AND version_id = $2 AND collection = $3 AND document_id = $4
-            AND status = 'retired'
-            AND forwarded_heads IS NOT DISTINCT FROM $7::text[]`,
-        [
-          key.landscapeId, key.versionId, fold.collection, source.documentId,
-          fold.productDocumentId, fold.retainUntil,
-          source.forwardedHeads ? [...source.forwardedHeads].sort() : null,
-        ],
-      )
-      if ((result.rowCount ?? 0) !== 1) stale.push(source.documentId)
-    }
+    // Every source in ONE statement, each by its own compare-and-set on the
+    // forward state the fold read (a JSON array per source, null for none):
+    // the protocol tables' statement trigger then re-stamps the adopt
+    // digests once for the record, not once per source (`schema.ts`).
+    // Sources are distinct (checked
+    // above), so each row matches at most one input.
+    const folded = await tx.query<{ document_id: string }>(
+      `UPDATE read_model_ordinary_head_retirements AS row
+          SET status = 'folded', folded_into = $5, retain_until = $6, updated_at = now()
+         FROM jsonb_to_recordset($4::jsonb) AS source(id text, forwarded jsonb)
+        WHERE row.landscape_id = $1 AND row.version_id = $2 AND row.collection = $3 AND row.document_id = source.id
+          AND row.status = 'retired'
+          AND row.forwarded_heads IS NOT DISTINCT FROM (
+            CASE WHEN source.forwarded IS NULL OR jsonb_typeof(source.forwarded) = 'null' THEN NULL
+                 ELSE ARRAY(SELECT head FROM jsonb_array_elements_text(source.forwarded) WITH ORDINALITY AS h(head, at) ORDER BY at)
+            END)
+        RETURNING row.document_id`,
+      [
+        key.landscapeId, key.versionId, fold.collection,
+        JSON.stringify(fold.sources.map((source) => ({
+          id: source.documentId,
+          forwarded: source.forwardedHeads ? [...source.forwardedHeads].sort() : null,
+        }))),
+        fold.productDocumentId, fold.retainUntil,
+      ],
+    )
+    const moved = new Set(folded.rows.map((row) => row.document_id))
+    const stale = sourceIds.filter((id) => !moved.has(id))
     if (stale.length) {
       return await fail(new OrdinaryChainFoldConflictError(key, fold.collection, fold.productDocumentId, stale,
         'source(s) not retired at the forward state the fold read'))

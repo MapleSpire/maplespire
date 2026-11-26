@@ -128,9 +128,12 @@ export interface RouteResponseLike {
 export function route<Req, Res extends RouteResponseLike>(
   handler: (req: Req, res: Res) => Promise<unknown>,
   log: (message: string, error: unknown) => void = (message, error) => console.error(message, error),
-): (req: Req, res: Res) => void {
+): (req: Req, res: Res) => Promise<void> {
+  // The promise is RETURNED: the app's
+  // mutating registrations hold it (`holdMutatingRoutes`) until the handler
+  // settles. It never rejects — the error is answered here.
   return (req, res) => {
-    handler(req, res).catch((err: unknown) => {
+    return handler(req, res).then(() => undefined, (err: unknown) => {
       // The log names the failed subsystem too, not just the body: the log line
       // is what an operator reads first, and a generic `read-model API` line
       // over a `sync-cell ownership` body sends them to the wrong place.

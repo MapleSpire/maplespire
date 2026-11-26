@@ -15,7 +15,8 @@
 import type { Queryable } from './types.js'
 import type { WorkspaceKey } from './projector.js'
 import { FLOW_INDEX_VERSION, technologyText } from './projector.js'
-import { getWorkspaceProjectionFreshness, type ReadModelWorkspaceStatus } from './health.js'
+import { getWorkspaceProjectionFreshness, noteAbsenceProof, type ReadModelWorkspaceStatus } from './health.js'
+import { overlayBatchStatuses } from './overlayHistoryStore.js'
 
 /**
  * Read-model query functions — the server side of the ModelQuery contract. They
@@ -138,6 +139,18 @@ export interface DurabilityWitnessPayload {
   projectionGeneration: number
   objects: Record<string, Json>
   connections: Record<string, Json>
+  /** The asked overlay batch ids the server has ever acknowledged
+   * (`read_model_overlay_batch_acks`, any status), with that status. A row
+   * exists only once the batch REACHED the server and was kept durably —
+   * applied, or parked in `read_model_overlay_conflicts` (`conflict`,
+   * NOT applied) — the projector writes it
+   * when it reads the batch id out of a document it projects or forwards —
+   * and no code path deletes one, so membership is a positive fact that
+   * outlives the fold and the compaction which drop the id from every listed
+   * segment (`ordinaryChainFoldWriter.ts`, "the product carries no
+   * `writeBatchIds`"). T-SUM-2b: it is what tells the replay "your write
+   * landed" once the segment that carried it is out of the client's sight. */
+  batches: Record<string, string>
 }
 
 /**
@@ -154,9 +167,18 @@ export async function durabilityWitnessPayload(
   key: WorkspaceKey,
   objectIds: string[],
   connectionIds: string[],
+  batchIds: string[] = [],
 ): Promise<DurabilityWitnessPayload> {
   const freshness = await getWorkspaceProjectionFreshness(db, key)
+  // T-SUM-2c: a refused proof on a caught-up workspace is counted, and logged
+  // once it stays the same for 30 s (`noteAbsenceProof`).
+  noteAbsenceProof(key, freshness)
   const entities = await roDurabilityWitness(db, key, objectIds, connectionIds)
+  // Read AFTER the freshness, like the entities. A row only ever appears, so
+  // a later read can only name MORE landed batches — each still a true
+  // "this batch reached the server", whatever the freshness said.
+  const batches: Record<string, string> = Object.create(null) as Record<string, string>
+  for (const row of await overlayBatchStatuses(db, key, batchIds)) batches[row.batchId] = row.status
   return {
     landscapeId: key.landscapeId,
     versionId: key.versionId,
@@ -166,6 +188,7 @@ export async function durabilityWitnessPayload(
     projectionGeneration: freshness.projectedGeneration,
     objects: entities.objects,
     connections: entities.connections,
+    batches,
   }
 }
 
@@ -515,20 +538,46 @@ function likePattern(q: string): string {
   return `%${q.replace(/([%_\\])/g, '\\$1')}%`
 }
 
+/**
+ * `roSearch`'s object filter ($1 landscape, $2 version, $3 an escaped
+ * `%q%` pattern over lower-cased text). Exported for the result-equality test
+ * (`redundantTrigramIndexes.integration.test.ts`), which runs it against the
+ * per-column predicate it replaced.
+ *
+ * TWO PREDICATES, and both are needed:
+ *  - `search_document LIKE $3` is the PREFILTER, served by
+ *    `idx_ro_objects_search_trgm`. `search_document` is
+ *    `lower(name || ' ' || description || ' ' || technology)`, GENERATED
+ *    STORED (schema.ts) — so recomputed on every write path — over three NOT
+ *    NULL columns. `lower()` of a concatenation is the concatenation of the
+ *    `lower()`s under a libc collation, which maps character by character
+ *    (the equality test runs on en_US.utf8; an ICU database, whose case
+ *    mapping is context-sensitive, is not tested), so every lower-cased
+ *    column is a substring of it, and
+ *    every row the exact predicate accepts also passes this one: a SUPERSET.
+ *  - the per-column OR is the EXACT RECHECK. The prefilter alone is not exact:
+ *    the separator is a plain space, so `'%gateway ledger%'` matches a row
+ *    named `Gateway` described `Ledger …` while no single column contains it.
+ *
+ * The per-column trigram indexes this used to need (`lower(description)`,
+ * `lower(technology)`) were dropped by migration
+ * `0006-ro-objects-drop-redundant-trgm`: they cost ~6.7 s of a 16.0 s insert
+ * of the 85 235-object corpus (measured 2026-11-08) and duplicated this one.
+ */
+export const RO_SEARCH_OBJECTS_SQL = `SELECT data FROM ro_objects
+       WHERE landscape_id = $1 AND version_id = $2
+         AND search_document LIKE $3 ESCAPE '\\'
+         AND (lower(name) LIKE $3 ESCAPE '\\'
+          OR lower(technology) LIKE $3 ESCAPE '\\'
+          OR lower(description) LIKE $3 ESCAPE '\\')`
+
 export async function roSearch(db: Queryable, key: WorkspaceKey, query: string, limit = SEARCH_LIMIT): Promise<SearchHitRow[]> {
   const q = query.trim().toLowerCase()
   if (q.length < SEARCH_MIN_CHARS) return []
   const like = likePattern(q)
 
   const [objRes, connRes] = await Promise.all([
-    db.query<{ data: Json }>(
-      `SELECT data FROM ro_objects
-       WHERE landscape_id = $1 AND version_id = $2
-         AND (lower(name) LIKE $3 ESCAPE '\\'
-          OR lower(technology) LIKE $3 ESCAPE '\\'
-          OR lower(description) LIKE $3 ESCAPE '\\')`,
-      [key.landscapeId, key.versionId, like]
-    ),
+    db.query<{ data: Json }>(RO_SEARCH_OBJECTS_SQL, [key.landscapeId, key.versionId, like]),
     db.query<{ data: Json }>(
       `SELECT data FROM ro_connections WHERE landscape_id = $1 AND version_id = $2 AND lower(label) LIKE $3 ESCAPE '\\'`,
       [key.landscapeId, key.versionId, like]

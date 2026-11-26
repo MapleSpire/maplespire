@@ -99,7 +99,7 @@ describe('live workspace residency — over real WebSockets', () => {
       onDenied: ({ documentId }) => denied.push(documentId),
     })
     const serverRepo = new Repo({ network: [adapter], sharePolicy: async () => true })
-    await new Promise<void>((resolve) => http.listen(0, resolve))
+    await new Promise<void>((resolve) => http.listen(0, '127.0.0.1', resolve))
     const port = (http.address() as { port: number }).port
 
     const ownedDoc = serverRepo.create<DocShape>({ title: 'owned' })
@@ -107,7 +107,7 @@ describe('live workspace residency — over real WebSockets', () => {
     placement.set(String(ownedDoc.documentId), OWNED)
     placement.set(String(foreignDoc.documentId), FOREIGN)
 
-    const clientAdapter = new BrowserWebSocketClientAdapter(`ws://localhost:${port}`)
+    const clientAdapter = new BrowserWebSocketClientAdapter(`ws://127.0.0.1:${port}`)
     const client = new Repo({ network: [clientAdapter], sharePolicy: async () => true, peerId: 'live-peer' as PeerId })
     try {
       // CONNECT and sync — no write yet. The handshake frames are the trigger,

@@ -28,8 +28,10 @@ import { timingSafeEqual } from 'node:crypto'
 export interface MetricSample {
   name: string
   help: string
-  type: 'gauge' | 'counter'
-  values: Array<{ labels?: Record<string, string>; value: number }>
+  type: 'gauge' | 'counter' | 'histogram'
+  /** `suffix` is for a histogram's series only (`_bucket` with an `le`
+   * label, `_sum`, `_count`), which share the metric's HELP and TYPE. */
+  values: Array<{ labels?: Record<string, string>; value: number; suffix?: '_bucket' | '_sum' | '_count' }>
 }
 
 /** Prometheus label values escape backslash, newline and double quote — nothing else. */
@@ -49,7 +51,8 @@ export function renderPrometheus(metrics: readonly MetricSample[]): string {
       // A non-finite value is not "0" — it is a broken sample, and emitting it as
       // zero would show a healthy flat line for a collector that is failing.
       const value = Number.isFinite(sample.value) ? String(sample.value) : 'NaN'
-      lines.push(labels ? `${metric.name}{${labels}} ${value}` : `${metric.name} ${value}`)
+      const name = `${metric.name}${sample.suffix ?? ''}`
+      lines.push(labels ? `${name}{${labels}} ${value}` : `${name} ${value}`)
     }
   }
   return `${lines.join('\n')}\n`

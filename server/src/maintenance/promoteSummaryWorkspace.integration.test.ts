@@ -38,6 +38,7 @@ import { createEmptyRoot } from '../automergeServer.js'
 import { PostgresStorageAdapter } from '../automergeStorage.js'
 import { cachedHandles, findReadyDocument } from '../automergeRepoCompat.js'
 import { AutomergeResidencyLeases } from '../automergeResidency.js'
+import { protocolFixtureQuery } from '../testing/protocolFixture.js'
 import { evictWorkspaceDocumentCache } from '../syncCells/repoFreshness.js'
 import { coverWorkspace } from '../rbac/claimCoverage.js'
 import { BASELINE_FENCE_ARMING_BOUND_MS, BASELINE_FENCE_TTL_MS } from '../rbac/docScope.js'
@@ -411,6 +412,34 @@ describe.skipIf(!TEST_DATABASE_URL)('summary promotion (live Postgres + real Aut
     const after = await fsckWorkspace(db.pool, repo, { landscapeId: L, versionId: 'V1' }, rootUrl)
     expect(after.findings).toEqual([])
     expect(after.status).toBe('clean')
+  })
+
+  it('G4-16f, the applyRootShape guard: a ModelMeta repoint that lands AFTER the promotion read its root is NOT reverted by the flip', async () => {
+    const L = 'L-promote-repoint'
+    const { rootUrl } = await provision(L, 'V1')
+    const before = await readRoot(rootUrl)
+    const original = await findReadyDocument<Record<string, unknown>>(repo, before.modelMetaUrl!)
+    // The repoint target: the same content under a new URL (what an epoch's
+    // new ModelMeta is, as far as the root is concerned).
+    const successor = repo.create<Record<string, unknown>>({ ...JSON.parse(JSON.stringify(original.doc())) })
+    await successor.whenReady()
+    await repo.flush([successor.documentId])
+    const { report } = await promote(L, 'V1', {
+      apply: true,
+      hooks: {
+        onStep: async (step) => {
+          // Between the root read (step 1) and the flip (step 6): a repoint.
+          if (step !== 'fence-waited') return
+          const root = await findReadyDocument<RootDoc>(repo, rootUrl)
+          root.change((doc) => { (doc as { modelMetaUrl?: string }).modelMetaUrl = successor.url })
+          await repo.flush([root.documentId])
+        },
+      },
+    })
+    expect(report.blockers).toEqual([])
+    const after = await readRoot(rootUrl)
+    expect(after.registrySummaryOnly).toBe(true) // the flip happened…
+    expect(after.modelMetaUrl).toBe(successor.url) // …and kept the pointer the root named NOW
   })
 
   it('a second promotion of the same workspace is REFUSED (it would mint a second write head)', async () => {
@@ -888,7 +917,7 @@ describe.skipIf(!TEST_DATABASE_URL)('summary promotion (live Postgres + real Aut
     const { rootUrl } = await provision(L, 'V1')
     const { report: dry } = await promote(L, 'V1')
     expect(dry.blockers).toEqual([]) // anti-void: promotable without the row
-    await db.pool.query(
+    await protocolFixtureQuery(db.pool,
       `INSERT INTO read_model_ordinary_head_retirements
          (landscape_id, version_id, collection, document_id, retirement_heads, status)
        VALUES ($1, $2, 'object', 'retired-head', ARRAY['h'], 'retired')`,
@@ -1001,7 +1030,7 @@ describe.skipIf(!TEST_DATABASE_URL)('summary promotion (live Postgres + real Aut
   it('an ADMITTED retirement row blocks promotion too (any status)', async () => {
     const L = 'L-rot-admitted'
     const { rootUrl } = await provision(L, 'V1')
-    await db.pool.query(
+    await protocolFixtureQuery(db.pool,
       `INSERT INTO read_model_ordinary_head_retirements
          (landscape_id, version_id, collection, document_id, retirement_heads, status)
        VALUES ($1, $2, 'object', 'admitted-head', NULL, 'admitted')`,
@@ -1053,7 +1082,7 @@ describe.skipIf(!TEST_DATABASE_URL)('summary promotion (live Postgres + real Aut
               counts += 1
               // A rotation commits its row right after the facts were counted.
               if (counts === 1) {
-                await target.query(
+                await protocolFixtureQuery(target,
                   `INSERT INTO read_model_ordinary_head_retirements
                      (landscape_id, version_id, collection, document_id, retirement_heads, status)
                    VALUES ($1, $2, 'object', 'raced-head', ARRAY['h'], 'retired')`,
@@ -1239,6 +1268,63 @@ describe.skipIf(!TEST_DATABASE_URL)('summary promotion (live Postgres + real Aut
     const fsck = await fsckWorkspace(db.pool, repo, { landscapeId: L, versionId: 'V1' }, rootUrl)
     expect(fsck.findings).toEqual([])
     expect(fsck.status).toBe('clean')
+  })
+
+  // ── T-SUM-2: arrival certificates across the two doors ───────────────────
+
+  it('T-SUM-2: the promotion marks the covered allow-list once, exactly; the demotion drops the certificates the ordinary plane never re-stamps', async () => {
+    const L = 'L-tsum2-marks'
+    await provision(L, 'V1')
+    const { report } = await promote(L, 'V1', { apply: true })
+    expect(report.blockers).toEqual([])
+    const marks = async () => new Map((await db.pool.query<{ document_id: string; wm: string }>(
+      `SELECT document_id, projected_watermark::text AS wm FROM read_model_document_watermarks
+        WHERE landscape_id = $1 AND version_id = $2`, [L, 'V1'])).rows.map((row) => [row.document_id, row.wm]))
+    const newest = async (documentId: string) => (await db.pool.query<{ seq: string | null }>(
+      `SELECT max(arrival_seq)::text AS seq FROM automerge_storage
+        WHERE split_part(key, '/', 1) = $1 AND split_part(key, '/', 2) <> 'sync-state'`, [documentId])).rows[0]?.seq ?? null
+    const allowList = await allowListRows(L, 'V1')
+    // The write head is minted by the promotion itself, AFTER the projection
+    // this fixture stamps: the clause does not cover it, so it is not marked
+    // (its own pass will be). Every other document predates the projection.
+    const writeHeadId = idOf(report.applied!.writeHeadUrl)
+    const covered = allowList.filter((row) => row.document_id !== writeHeadId)
+    // Not vacuous, and the kinds named literally (not derived from the code
+    // under test): a frozen monolith and registry, and pass-projected ones.
+    const kinds = new Set(covered.map((row) => row.kind))
+    for (const kind of ['model-legacy', 'registry', 'model-meta', 'root']) {
+      expect(kinds.has(kind), `${kind} in ${JSON.stringify([...kinds])}`).toBe(true)
+    }
+    const afterPromotion = await marks()
+    for (const row of covered) {
+      const mark = afterPromotion.get(row.document_id)
+      expect(mark, `${row.kind} is marked`).toBeDefined()
+      // The root and ModelMeta are written again by the promotion's later
+      // steps: their mark is below those writes (a refusal their own static
+      // pass lifts). Every other document is marked at its newest arrival.
+      if (row.kind === 'root' || row.kind === 'model-meta') {
+        expect(BigInt(mark!) < BigInt((await newest(row.document_id))!), `${row.kind}: written after the mark`).toBe(true)
+      } else {
+        expect(mark, `${row.kind} is marked at its newest arrival`).toBe(await newest(row.document_id))
+      }
+    }
+    expect(afterPromotion.has(writeHeadId), 'the fresh write head is left to its pass').toBe(false)
+
+    // The static plane's own stamps, as its passes would leave them.
+    for (const row of allowList) {
+      await db.pool.query(
+        `INSERT INTO read_model_document_watermarks (landscape_id, version_id, document_id, projected_watermark)
+         VALUES ($1, $2, $3, 1) ON CONFLICT DO NOTHING`, [L, 'V1', row.document_id])
+    }
+    const demotion = await demoteSummaryWorkspace({
+      db: db.pool, repo, workspace: { landscapeId: L, versionId: 'V1' }, apply: true, connectedPeers: () => 0,
+    })
+    expect(demotion.blockers).toEqual([])
+    const afterDemotion = await marks()
+    for (const row of allowList) {
+      const shard = row.kind.startsWith('object-') || row.kind.startsWith('connection-')
+      expect(afterDemotion.has(row.document_id), `${row.kind}: ${shard ? 'kept (re-stamped by the ordinary plane)' : 'dropped'}`).toBe(shard)
+    }
   })
 
   // ── the allow-list ⇄ admission equality guard ─────────────────────────────

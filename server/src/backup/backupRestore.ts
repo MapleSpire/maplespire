@@ -123,6 +123,10 @@ export type BackupManifest = {
   retiredWorkspaces?: RetiredWorkspace[]
   /** Individual documents written off, same reasoning one level down. */
   retiredDocuments?: RetiredDocument[]
+  /** The source's INVALID indexes (`collectInvalidIndexes`), `table|index`:
+   * out of the schema fingerprint (pg_dump does not copy them), a source-health
+   * finding instead. Absent in bundles written before it existed. */
+  invalidIndexes?: string[]
 }
 
 /**
@@ -1014,13 +1018,42 @@ export async function collectSchemaDefinitions(db: Queryable): Promise<string[]>
        FROM pg_constraint
        WHERE connamespace = 'public'::regnamespace
        UNION ALL
-       SELECT 'index|' || tablename || '|' || indexname || '|' || indexdef
-       FROM pg_indexes
-       WHERE schemaname = 'public'
+       -- VALID indexes only. pg_dump exports an index only when it is valid
+       -- and ready (getIndexes), so an INVALID one — left by an interrupted
+       -- CREATE/DROP INDEX CONCURRENTLY, e.g. a deferred
+       -- 0006 drop (readModel/schema.ts) — is never in the copy:
+       -- fingerprinting it would fail every restore over a state of the
+       -- SOURCE. That state is a source-health finding instead
+       -- (collectInvalidIndexes, the manifest's invalidIndexes), measured
+       -- 2026-11-17.
+       SELECT 'index|' || i.tablename || '|' || i.indexname || '|' || i.indexdef
+       FROM pg_indexes i
+       JOIN pg_class c ON c.relname = i.indexname AND c.relnamespace = 'public'::regnamespace
+       JOIN pg_index x ON x.indexrelid = c.oid
+       WHERE i.schemaname = 'public' AND x.indisvalid AND x.indisready
      ) definitions
      ORDER BY definition`,
   )
   return rows.map((row) => row.definition)
+}
+
+/**
+ * The source's INVALID (or not ready) indexes, `table|index`: what
+ * `collectSchemaDefinitions` leaves out because pg_dump does. A finding about
+ * the SOURCE (a CONCURRENTLY build or drop that did not finish), recorded in the
+ * manifest and failing the source-health verdict (`summariseSourceIntegrity`),
+ * never the copy's fidelity.
+ */
+export async function collectInvalidIndexes(db: Queryable): Promise<string[]> {
+  const { rows } = await db.query<{ name: string }>(
+    `SELECT t.relname || '|' || c.relname AS name
+       FROM pg_index x
+       JOIN pg_class c ON c.oid = x.indexrelid
+       JOIN pg_class t ON t.oid = x.indrelid
+      WHERE c.relnamespace = 'public'::regnamespace AND NOT (x.indisvalid AND x.indisready)
+      ORDER BY 1`,
+  )
+  return rows.map((row) => row.name)
 }
 
 export async function collectSchemaFingerprint(db: Queryable): Promise<string> {
@@ -1596,6 +1629,8 @@ export async function createDatabaseBackup(options: BackupCreationOptions): Prom
     // pg@9 will reject concurrent client.query() calls.
     const tables = await collectTableInventory(client)
     const schemaSha256 = await collectSchemaFingerprint(client)
+    // Source health, never fatal: see `collectInvalidIndexes`.
+    const invalidIndexes = await collectInvalidIndexes(client)
     const automergeStorage = await collectAutomergeStorageFingerprint(client)
     const authoritativeTables = await collectAuthoritativeTableFingerprints(client, tables)
     // Neither of these may abort the copy. They describe the SOURCE's health,
@@ -1657,6 +1692,7 @@ export async function createDatabaseBackup(options: BackupCreationOptions): Prom
       assets,
       retiredWorkspaces,
       retiredDocuments,
+      invalidIndexes,
     }
     await writeFile(join(temporary, MANIFEST_FILE), `${JSON.stringify(manifest, null, 2)}\n`, {
       encoding: 'utf8',

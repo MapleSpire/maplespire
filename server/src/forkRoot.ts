@@ -22,6 +22,8 @@ import { copyRootShape, type WorkspaceRootShape } from './rootShape.js'
 import { emptyMonolithModel } from './modelCollections.js'
 import { rollbackForkedDocuments } from './forkRollback.js'
 import type { BootstrapScope } from './bootstrapScope.js'
+import { withMetaUrlView } from './modelMetaUrls.js'
+import { EPOCH_META_HINT_FIELDS } from './modelEpochs.js'
 
 /**
  * Fork (duplicate) a workspace root: deep-copy a source version's entire Automerge
@@ -68,7 +70,18 @@ export function remapModelMeta(
   newConnectionShardUrls: string[],
   newDecisionRecordShardUrls: string[] = [],
 ): MetaLike {
+  // Remap the RULING URL values, and carry neither the scalar copies
+  // nor the marker (`withMetaUrlView`): under a copied marker the fork would
+  // read the SOURCE's shards from the unremapped copies. The fork is born
+  // under text authority.
+  meta = withMetaUrlView(meta)
   const out = plain(meta)
+  // The fork is NOT an epoch of its source. Carried, the hints would name the
+  // source version's predecessor meta (`epochPredecessorRef`, which JSON turns
+  // into `{ val }`) — and a tab of the fork would follow that predecessor
+  // chain and resume into it a shard pointer held on the SOURCE version — and
+  // its epoch number. The fork's own first roll writes its own.
+  for (const field of EPOCH_META_HINT_FIELDS) delete out[field]
   out.objectShardUrls = newObjectShardUrls
   out.connectionShardUrls = newConnectionShardUrls
   out.decisionRecordShardUrls = newDecisionRecordShardUrls
@@ -213,7 +226,7 @@ export async function forkRoot(
     // modelMetaUrl is set the monolith modelUrl is ignored by readers, so we don't
     // copy it (leave newModelUrl empty).
     if (srcRoot.modelMetaUrl && isValidAutomergeUrl(srcRoot.modelMetaUrl)) {
-      const meta = (await readDoc(repo, srcRoot.modelMetaUrl)) as MetaLike
+      const meta = withMetaUrlView((await readDoc(repo, srcRoot.modelMetaUrl)) as MetaLike)
       const newObjectShardUrls: string[] = []
       for (const u of meta.objectShardUrls ?? []) {
         if (isValidAutomergeUrl(u)) newObjectShardUrls.push(await cloneDoc(u))

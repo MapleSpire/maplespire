@@ -16,6 +16,7 @@ import 'dotenv/config'
 import { isValidAutomergeUrl, Repo, type AutomergeUrl } from '@automerge/automerge-repo'
 import { pool } from '../src/db.js'
 import { PostgresStorageAdapter } from '../src/automergeStorage.js'
+import { withMetaUrlView } from '../src/modelMetaUrls.js'
 
 function valueAfter(args: string[], flag: string): string {
   const index = args.indexOf(flag)
@@ -104,7 +105,9 @@ async function main(): Promise<void> {
     editsConnectionShardUrl?: string
   }>(modelMetaUrl as AutomergeUrl)
   await meta.whenReady()
-  const control = meta.doc()
+  // The six URL fields read as their RULING plain strings under the old names.
+  const metaDoc = meta.doc()
+  const control = metaDoc ? withMetaUrlView(metaDoc) : undefined
   if (!control?.staticBaseline) throw new Error('performance metadata is not bounded to static baseline mode')
   if ((control.objectShardUrls?.length ?? 0) > 64 || (control.connectionShardUrls?.length ?? 0) > 64) {
     throw new Error('performance metadata contains an unbounded overlay history')

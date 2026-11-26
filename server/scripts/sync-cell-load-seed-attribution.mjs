@@ -47,6 +47,7 @@ import { writeFileSync } from 'node:fs'
 import pg from 'pg'
 import * as A from '@automerge/automerge'
 import { Repo } from '@automerge/automerge-repo'
+import { readMetaUrl, readMetaUrls } from '../src/modelMetaUrls.ts'
 import { AuthenticatedWebSocketClientAdapter } from '../qa/authenticatedWebSocketAdapter.mjs'
 import { objectMap, resolveLoadHandle } from '../qa/loadUsersCore.mjs'
 
@@ -153,8 +154,8 @@ async function readWriteHead(workspace, rootUrl, cookie) {
     const metaHandle = (await resolveLoadHandle(repo, root.modelMetaUrl, { tries: 20 })).handle
     await metaHandle.whenReady()
     const meta = metaHandle.doc()
-    out.editsObjectShardUrls = meta?.editsObjectShardUrls ?? null
-    const writeHeadUrl = meta?.editsObjectShardUrl || meta?.editsObjectShardUrls?.at(-1) || null
+    out.editsObjectShardUrls = readMetaUrls(meta, 'editsObjectShardUrls') ?? null
+    const writeHeadUrl = readMetaUrl(meta, 'editsObjectShardUrl') || readMetaUrls(meta, 'editsObjectShardUrls')?.at(-1) || null
     out.writeHeadUrl = writeHeadUrl
     if (!writeHeadUrl) return out
     out.writeHeadDocumentId = writeHeadUrl.replace(/^automerge:/, '').split('?')[0]

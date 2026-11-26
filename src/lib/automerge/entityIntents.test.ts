@@ -592,6 +592,256 @@ describe('planEntityIntentReplay — the boot decision', () => {
   })
 })
 
+describe('planEntityIntentReplay — T-SUM-2b: absence provable, the batch out of sight', () => {
+  // The defect, as measured on a stack: Marie's stamped rename
+  // landed, its segment left the loaded head (rotation, fold, compaction),
+  // Paul deleted the entity; with the absence provable the planner replayed
+  // the snapshot and the entity came back.
+  const landedRename = () => {
+    const journal = new PendingEntityIntents()
+    journal.recordUpsert(WS, 'object', 'x', obj('x', 'marie-renamed'), obj('x', 'before'))
+    journal.markWritten(WS, 'object', ['x'], journal.revisionNow, 'batch-marie')
+    journal.recordUpsert(WS, 'connection', 'cx', conn('cx', 'marie-label'), conn('cx', 'before'))
+    journal.markWritten(WS, 'connection', ['cx'], journal.revisionNow, 'batch-marie-c')
+    return journal.serialize(WS)
+  }
+
+  it('a stamped upsert whose batch the SERVER received is accomplished: a colleague\'s deletion is not undone, tombstone or not', () => {
+    for (const deletedObjectIds of [new Set<string>(), new Set(['x'])]) {
+      const plan = planEntityIntentReplay({
+        ...emptyReplayState,
+        intents: landedRename(),
+        deletedObjectIds,
+        deletedConnectionIds: new Set(deletedObjectIds.size ? ['cx'] : []),
+        witnessesReliable: true,
+        landedBatchIds: new Set(['batch-marie', 'batch-marie-c']),
+      })
+      expect(plan.replayObjects).toEqual([])
+      expect(plan.replayConnections).toEqual([])
+      expect(plan.unTombObjectIds).toEqual([])
+      expect(plan.unTombConnectionIds).toEqual([])
+      expect(plan.satisfied.map((s) => `${s.kind}:${s.id}`)).toEqual(['object:x', 'connection:cx'])
+    }
+  })
+
+  it('the landed proof wins over a present, newer value too: nothing is re-asserted over later history', () => {
+    const plan = planEntityIntentReplay({
+      ...emptyReplayState,
+      intents: landedRename(),
+      currentObjects: new Map([['x', obj('x', 'paul-later')]]),
+      landedBatchIds: new Set(['batch-marie']),
+    })
+    expect(plan.replayObjects).toEqual([])
+    expect(plan.satisfied.map((s) => s.id)).toContain('x')
+  })
+
+  it('WITHOUT the server\'s answer the same journal resurrects — the control the proof is measured against', () => {
+    const plan = planEntityIntentReplay({
+      ...emptyReplayState,
+      intents: landedRename(),
+      deletedObjectIds: new Set(['x']),
+      witnessesReliable: true,
+    })
+    expect(plan.replayObjects.map((o) => o.name)).toEqual(['marie-renamed'])
+    expect(plan.unTombObjectIds).toEqual(['x'])
+  })
+
+  it('a batch the server never received is still replayed: the legitimate upsert of an entity nobody deleted is not dropped', () => {
+    const journal = new PendingEntityIntents()
+    journal.recordUpsert(WS, 'object', 'n', obj('n', 'created-then-crashed'))
+    journal.markWritten(WS, 'object', ['n'], journal.revisionNow, 'batch-never-sent')
+    const plan = planEntityIntentReplay({
+      ...emptyReplayState,
+      intents: journal.serialize(WS),
+      witnessesReliable: true,
+      // The server answered about OTHER batches only.
+      landedBatchIds: new Set(['someone-elses-batch']),
+    })
+    expect(plan.replayObjects.map((o) => o.name)).toEqual(['created-then-crashed'])
+    expect(plan.satisfied).toEqual([])
+    expect(plan.deferred).toBe(0)
+  })
+
+  it('the landed proof is per batch, never per entity: an UNSTAMPED intent is not satisfied by a landed batch of another', () => {
+    const journal = new PendingEntityIntents()
+    journal.recordUpsert(WS, 'object', 'u', obj('u', 'never-written'))
+    const plan = planEntityIntentReplay({
+      ...emptyReplayState,
+      intents: journal.serialize(WS),
+      landedBatchIds: new Set(['batch-marie']),
+    })
+    expect(plan.replayObjects.map((o) => o.name)).toEqual(['never-written'])
+  })
+
+  it('an upsert whose value already waits for this session\'s write is left in flight, not replayed a second time', () => {
+    const journal = new PendingEntityIntents()
+    journal.recordUpsert(WS, 'object', 'n', obj('n', 'created'))
+    journal.markWritten(WS, 'object', ['n'], journal.revisionNow, 'batch-never-sent')
+    journal.recordUpsert(WS, 'connection', 'c', conn('c', 'created'))
+    const input = { ...emptyReplayState, intents: journal.serialize(WS), witnessesReliable: true }
+    // First pass: both replayed.
+    const first = planEntityIntentReplay(input)
+    expect(first.replayObjects.map((o) => o.id)).toEqual(['n'])
+    expect(first.replayConnections.map((c) => c.id)).toEqual(['c'])
+    // Second pass before the write: both dirty — nothing replayed, nothing
+    // acknowledged, both still journaled.
+    const second = planEntityIntentReplay({
+      ...input,
+      inFlightObjectIds: new Set(['n']),
+      inFlightConnectionIds: new Set(['c']),
+    })
+    expect(second.replayObjects).toEqual([])
+    expect(second.replayConnections).toEqual([])
+    expect(second.satisfied).toEqual([])
+    expect(second.inFlight).toBe(2)
+  })
+
+  it('a landed batch is accomplished even while the absence is NOT provable (a positive fact, never deferred)', () => {
+    const plan = planEntityIntentReplay({
+      ...emptyReplayState,
+      intents: landedRename(),
+      witnessesReliable: false,
+      landedBatchIds: new Set(['batch-marie']),
+    })
+    expect(plan.satisfied.map((s) => s.id)).toContain('x')
+    expect(plan.deferred).toBe(1) // only the connection, whose batch was not answered
+  })
+
+  describe('deletionWins — a durable deletion beats any upsert but a re-add', () => {
+    const neverSentEdit = (reAdd = false) => {
+      const journal = new PendingEntityIntents()
+      journal.recordUpsert(WS, 'object', 'x', obj('x', 'marie-offline'), obj('x', 'before'))
+      if (reAdd) journal.markReAdded(WS, 'object', 'x')
+      journal.markWritten(WS, 'object', ['x'], journal.revisionNow, 'batch-never-sent')
+      return journal.serialize(WS)
+    }
+
+    it('tombstoned: acknowledged, not replayed, the tombstone kept — even with an overlay copy present', () => {
+      for (const currentObjects of [new Map<string, C4Object>(), new Map([['x', obj('x', 'before')]])]) {
+        const plan = planEntityIntentReplay({
+          ...emptyReplayState, intents: neverSentEdit(), currentObjects,
+          deletedObjectIds: new Set(['x']), witnessesReliable: true, deletionWins: true,
+        })
+        expect(plan.replayObjects).toEqual([])
+        expect(plan.unTombObjectIds).toEqual([])
+        expect(plan.satisfied.map((s) => s.id)).toEqual(['x'])
+        expect(plan.droppedDeleted).toBe(1)
+      }
+    })
+
+    it('tombstone cleared by a compaction: an edit of an entity proved absent is acknowledged, not resurrected', () => {
+      const plan = planEntityIntentReplay({
+        ...emptyReplayState, intents: neverSentEdit(), witnessesReliable: true, deletionWins: true,
+      })
+      expect(plan.replayObjects).toEqual([])
+      expect(plan.droppedDeleted).toBe(1)
+    })
+
+    it('…but only under a PROOF: absence not provable keeps the stamped edit deferred', () => {
+      const plan = planEntityIntentReplay({
+        ...emptyReplayState, intents: neverSentEdit(), witnessesReliable: false, deletionWins: true,
+      })
+      expect(plan.deferred).toBe(1)
+      expect(plan.satisfied).toEqual([])
+    })
+
+    it('…and an UNSTAMPED edit of an entity merely not found (no proof) is replayed, never dropped', () => {
+      // Found in review: the stamped case above is deferred by the branch before the
+      // rule, so it cannot pin the rule's own `witnessesReliable` guard. No
+      // read model (`serverWitness` off) + an entity living only in the base
+      // shards: `current` is undefined and nobody deleted anything.
+      const journal = new PendingEntityIntents()
+      journal.recordUpsert(WS, 'object', 'b', obj('b', 'marie-edit'), obj('b', 'before'))
+      const plan = planEntityIntentReplay({
+        ...emptyReplayState, intents: journal.serialize(WS), witnessesReliable: false, deletionWins: true,
+      })
+      expect(plan.replayObjects.map((o) => o.name)).toEqual(['marie-edit'])
+      expect(plan.droppedDeleted).toBe(0)
+    })
+
+    it('the re-add flag survives an edit made while the re-add is SENT and unconfirmed', () => {
+      const journal = new PendingEntityIntents()
+      journal.recordUpsert(WS, 'object', 'x', obj('x', 'undone'), obj('x', 'before'))
+      journal.markReAdded(WS, 'object', 'x')
+      journal.markSent(WS, 'object', ['x'], journal.revisionNow, { workspace: 'default/V1', carriers: [{ documentId: 'shard-1', heads: ['h1'] }] })
+      journal.recordUpsert(WS, 'object', 'x', obj('x', 'undone-then-edited'), obj('x', 'undone'))
+      const [record] = journal.pending(WS)
+      expect(record.reAdded).toBe(true)
+    })
+
+    it('a RE-ADD over the tombstone still lifts it and is replayed (the user undid a delete)', () => {
+      const plan = planEntityIntentReplay({
+        ...emptyReplayState, intents: neverSentEdit(true),
+        deletedObjectIds: new Set(['x']), witnessesReliable: true, deletionWins: true,
+      })
+      expect(plan.replayObjects.map((o) => o.name)).toEqual(['marie-offline'])
+      expect(plan.unTombObjectIds).toEqual(['x'])
+      expect(plan.droppedDeleted).toBe(0)
+    })
+
+    it('the re-add flag survives the later edits of the same entity', () => {
+      const journal = new PendingEntityIntents()
+      journal.recordUpsert(WS, 'object', 'x', obj('x', 'undone'), obj('x', 'before'))
+      journal.markReAdded(WS, 'object', 'x')
+      journal.recordUpsert(WS, 'object', 'x', obj('x', 'undone-then-edited'), obj('x', 'before'))
+      expect(journal.serialize(WS)[0].reAdded).toBe(true)
+    })
+
+    it('a creation (no baseline) is replayed whatever is absent — the legitimate upsert is not dropped', () => {
+      const journal = new PendingEntityIntents()
+      journal.recordUpsert(WS, 'object', 'n', obj('n', 'created'))
+      const plan = planEntityIntentReplay({
+        ...emptyReplayState, intents: journal.serialize(WS), witnessesReliable: true, deletionWins: true,
+      })
+      expect(plan.replayObjects.map((o) => o.name)).toEqual(['created'])
+    })
+
+    it('an edit of a creation still PENDING owes the creation: replayed when absent, not dropped', () => {
+      const journal = new PendingEntityIntents()
+      journal.recordUpsert(WS, 'object', 'n', obj('n', 'created'))
+      journal.recordUpsert(WS, 'object', 'n', obj('n', 'created-then-renamed'), obj('n', 'created'))
+      const [record] = journal.serialize(WS)
+      expect(record.createIfAbsent).toBe(true)
+      const plan = planEntityIntentReplay({
+        ...emptyReplayState, intents: [record], witnessesReliable: true, deletionWins: true,
+      })
+      expect(plan.replayObjects.map((o) => o.name)).toEqual(['created-then-renamed'])
+    })
+
+    it('an edit of an entity nobody deleted (present) is still merged and replayed', () => {
+      const plan = planEntityIntentReplay({
+        ...emptyReplayState, intents: neverSentEdit(),
+        currentObjects: new Map([['x', obj('x', 'before', { description: 'paul' })]]),
+        witnessesReliable: true, deletionWins: true,
+      })
+      expect(plan.replayObjects.map((o) => [o.name, o.description])).toEqual([['marie-offline', 'paul']])
+    })
+
+    it('off (the resident replay): the old upsert-wins behaviour is unchanged', () => {
+      const plan = planEntityIntentReplay({
+        ...emptyReplayState, intents: neverSentEdit(), deletedObjectIds: new Set(['x']), witnessesReliable: true,
+      })
+      expect(plan.unTombObjectIds).toEqual(['x'])
+    })
+  })
+
+  it('in flight never hides a delete, nor an intent its batch already proves', () => {
+    const journal = new PendingEntityIntents()
+    journal.recordDelete(WS, 'object', 'd')
+    journal.recordUpsert(WS, 'object', 'w', obj('w', 'written'))
+    journal.markWritten(WS, 'object', ['w'], journal.revisionNow, 'batch-w')
+    const plan = planEntityIntentReplay({
+      ...emptyReplayState,
+      intents: journal.serialize(WS),
+      objectBatchIds: new Set(['batch-w']),
+      inFlightObjectIds: new Set(['d', 'w']),
+    })
+    expect(plan.replayDeleteObjectIds).toEqual(['d'])
+    expect(plan.satisfied.map((s) => s.id)).toEqual(['w'])
+    expect(plan.inFlight).toBe(0)
+  })
+})
+
 describe('splitResidentPlannableIntents — a delete never proves itself by absence', () => {
   const journalWith = (...records: Array<(j: PendingEntityIntents) => void>) => {
     const journal = new PendingEntityIntents()

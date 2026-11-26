@@ -3,6 +3,7 @@
     "bootFailed": {
       "title": "This landscape didn’t finish loading",
       "body": "The workspace was still syncing when the load gave up. Nothing was lost — try again, or reload the page.",
+      "unreachableBody": "The server could not be reached, and this device has no local copy of this landscape to open instead. Nothing was lost — try again once the server is back.",
       "action": "Try again"
     },
     "diagramNotFound": {

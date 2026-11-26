@@ -86,6 +86,7 @@ import type { WorkspaceKey } from '../rbac/docScope.js'
 import { sessionHoldsLifecycleLock, withLifecycleApplyLock } from './lifecycleApplyLock.js'
 import { enumerateMaintainableWorkspaces } from './maintainableWorkspaces.js'
 import { TOMBSTONE_LISTS, entryKey, hiddenListEntries } from './containerConflicts.js'
+import { readMetaUrl } from '../modelMetaUrls.js'
 
 export { TOMBSTONE_LISTS, hiddenListEntries }
 
@@ -237,7 +238,7 @@ export async function gatherContainerDocuments(
   const meta = await resolve(metaUrl)
   documents.push({ role: 'model-meta', url: metaUrl, doc: meta })
   for (const [field, role] of [['editsObjectShardUrl', 'object-head'], ['editsConnectionShardUrl', 'connection-head']] as const) {
-    const headUrl = urlOf(meta?.[field])
+    const headUrl = urlOf(readMetaUrl(meta, field))
     if (headUrl) documents.push({ role, url: headUrl, doc: await resolve(headUrl) })
   }
   return { documents, handleByUrl, monolith: false, rootShape: rootShape(root) }

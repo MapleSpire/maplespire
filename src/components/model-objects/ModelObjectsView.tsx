@@ -19,6 +19,7 @@ import type { TFunction } from 'i18next'
 import { useUIStore } from '../../stores/uiStore'
 import { useModelStore } from '../../stores/modelStore'
 import { useAuthStore } from '../../stores/authStore'
+import { useAutomergeStatus } from '../../stores/automergeStatusStore'
 import { getModelQuery } from '../../lib/modelQuery'
 import { cn } from '../../lib/utils'
 import {
@@ -81,7 +82,13 @@ export function ModelObjectsView() {
   const getDefaultDomain = useModelStore((s) => s.getDefaultDomain)
   // View-only session: creating objects/groups is a model write the sync gate
   // drops, so don't offer the Add control (server enforces regardless).
-  const canManage = !useModelStore((s) => s.workspaceReadOnly)
+  // Nor before the bridge has wired the store to this
+  // workspace's documents (`projectedWorkspace`). The canvas waits for
+  // `editReady`; this view did not, and an object added while the boot was
+  // still opening the active diagram reached no document — lost with the tab
+  // while the badge said "Synced".
+  const projected = useAutomergeStatus((s) => s.projectedWorkspace !== null)
+  const canManage = !useModelStore((s) => s.workspaceReadOnly) && projected
   const orgId = useAuthStore((s) => s.orgId)
 
   const [filterOpen, setFilterOpen] = useState(false)

@@ -78,7 +78,7 @@ async function startServer(
   }
   register(app)
   const server: Server = await new Promise((resolve) => {
-    const s = app.listen(0, () => resolve(s))
+    const s = app.listen(0, '127.0.0.1', () => resolve(s))
   })
   const port = (server.address() as AddressInfo).port
   return {
@@ -904,7 +904,7 @@ describe.skipIf(!TEST_DATABASE_URL)('platform routes (live Postgres)', () => {
       res.json({ isPlatformAdmin: req.auth?.isPlatformAdmin })
     })
     const server: Server = await new Promise((resolve) => {
-      const s = app.listen(0, () => resolve(s))
+      const s = app.listen(0, '127.0.0.1', () => resolve(s))
     })
     const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
     try {
@@ -1016,7 +1016,7 @@ describe.skipIf(!TEST_DATABASE_URL)('platform routes (live Postgres)', () => {
       registerAuthRoutes(app)
       app.get('/api/probe', (_req, res) => res.json({ ok: true }))
       const server: Server = await new Promise((resolve) => {
-        const s = app.listen(0, () => resolve(s))
+        const s = app.listen(0, '127.0.0.1', () => resolve(s))
       })
       try {
         const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
@@ -1451,7 +1451,7 @@ describe.skipIf(!TEST_DATABASE_URL)('platform routes (live Postgres)', () => {
       app.use(express.json())
       registerAuthRoutes(app)
       const server: Server = await new Promise((resolve) => {
-        const s = app.listen(0, () => resolve(s))
+        const s = app.listen(0, '127.0.0.1', () => resolve(s))
       })
       const port = (server.address() as AddressInfo).port
       const url = `http://127.0.0.1:${port}`

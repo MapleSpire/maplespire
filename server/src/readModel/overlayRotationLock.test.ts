@@ -22,6 +22,7 @@ import {
   overlayRotationLockMetricSamples,
   releaseOverlayRotationLock,
   reportOverlayRotationLockContended,
+  setOverlayRotationContendedListener,
   type OverlayRotationLockState,
 } from './overlayRotationLock.js'
 import { renderPrometheus } from '../runtime/metrics.js'
@@ -258,6 +259,24 @@ describe('releaseOverlayRotationLock', () => {
 
 describe('reportOverlayRotationLockContended', () => {
   beforeEach(() => { __resetOverlayRotationRefusalStreaks() })
+  afterEach(() => { setOverlayRotationContendedListener(null) })
+
+  it('the contended LISTENER hears every path but the compaction\'s own refusal, and a throwing listener never fails the report', () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    const heard: Array<{ path: string; landscapeId: string; versionId: string }> = []
+    setOverlayRotationContendedListener((detail) => { heard.push(detail) })
+    for (const path of ['rotate', 'recover-admitted', 'fold', 'compaction'] as const) {
+      reportOverlayRotationLockContended({ path, landscapeId: 'land', versionId: 'v', kind: 'object' })
+    }
+    expect(heard).toEqual([
+      { landscapeId: 'land', versionId: 'v', path: 'rotate' },
+      { landscapeId: 'land', versionId: 'v', path: 'recover-admitted' },
+      { landscapeId: 'land', versionId: 'v', path: 'fold' },
+    ])
+    setOverlayRotationContendedListener(() => { throw new Error('listener') })
+    expect(() => reportOverlayRotationLockContended({ path: 'rotate', landscapeId: 'land', versionId: 'v', kind: 'object' })).not.toThrow()
+    vi.restoreAllMocks()
+  })
 
   it('names the path, the workspace and the KEY it lost', async () => {
     // One contended rotation stalls the whole static projector's tick, so a

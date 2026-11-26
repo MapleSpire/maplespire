@@ -12,7 +12,7 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU Affero General Public License for more details.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { getModelQuery } from '../../lib/modelQuery'
 import type { C4Type } from '../../types'
 import type { ModelObjectFilter, ObjectExplorerPage, ObjectExplorerRow } from '../../lib/modelQuery/types'
@@ -377,19 +377,42 @@ export function useObjectExplorer({
   // A model/index revision is not a new user query. Revalidate the currently
   // loaded search or disclosure windows in the background so virtual scroll and
   // expanded chevrons do not collapse to page one during concurrent edits.
+  //
+  // Kicked from a MACROTASK, and coalesced: a refresh's first step sets
+  // state ("loading"). Started inside this
+  // passive effect, every commit of a store that keeps changing (thousands of
+  // objects created offline, 25 every 150 ms) scheduled an update from its
+  // own passive flush, and past 50 of them in a row React logged "Maximum
+  // update depth exceeded". Outside the flush, each burst of revisions also
+  // costs ONE refresh, not one per commit.
+  const refreshLatest = useRef({ loadSearch, loadTreePage, searchMode })
+  // Assigned in a layout effect, not during render (React 19's rules:
+  // no ref writes during render) — before the passive effect
+  // below arms the timer, so the timer still reads this commit's callbacks.
+  useLayoutEffect(() => {
+    refreshLatest.current = { loadSearch, loadTreePage, searchMode }
+  })
+  const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   useEffect(() => {
     if (Object.is(lastRefreshKey.current, refreshKey)) return
     lastRefreshKey.current = refreshKey
-    if (searchMode) {
-      if (searchPageRef.current.loaded) void loadSearch('refresh')
-      return
-    }
-    for (const [key, page] of Object.entries(treePagesRef.current)) {
-      if (page.loaded) void loadTreePage(parentForKey(key), 'refresh')
-    }
-  }, [loadSearch, loadTreePage, refreshKey, searchMode])
+    if (refreshTimer.current !== null) return
+    refreshTimer.current = setTimeout(() => {
+      refreshTimer.current = null
+      const latest = refreshLatest.current
+      if (latest.searchMode) {
+        if (searchPageRef.current.loaded) void latest.loadSearch('refresh')
+        return
+      }
+      for (const [key, page] of Object.entries(treePagesRef.current)) {
+        if (page.loaded) void latest.loadTreePage(parentForKey(key), 'refresh')
+      }
+    }, 0)
+  }, [refreshKey])
 
   useEffect(() => () => {
+    if (refreshTimer.current !== null) clearTimeout(refreshTimer.current)
+    refreshTimer.current = null
     searchController.current?.abort()
     pendingSearchRefresh.current = false
     pendingTreeRefreshes.current.clear()

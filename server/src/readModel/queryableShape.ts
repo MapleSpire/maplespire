@@ -12,6 +12,7 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU Affero General Public License for more details.
 
+import { lostMarkerOf } from './protocolParticipant.js'
 import type { Queryable } from './types.js'
 
 /** A `Queryable` that hands itself back — a pg `PoolClient`. */
@@ -88,6 +89,8 @@ export async function withAtomicStatements<T>(
     })
     throw error
   } finally {
-    client.release(rollbackFailure)
+    // A lost protocol marker destroys the connection as well
+    // (`protocolParticipant.ts`, A LOST MARKER ENDS THE CONNECTION).
+    client.release(rollbackFailure ?? lostMarkerOf(client))
   }
 }

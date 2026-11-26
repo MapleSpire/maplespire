@@ -45,6 +45,8 @@ import type { OverlayCollection } from './overlayHistoryProtocol.js'
 import type { WorkspaceKey } from './projector.js'
 import type { ReleasableQueryable } from './queryableShape.js'
 import type { Queryable } from './types.js'
+import { readMetaUrl, readMetaUrls, writeMetaUrls, type MetaUrlListField } from '../modelMetaUrls.js'
+import { modelEpochForwardPending } from './modelEpochStore.js'
 
 /**
  * Ordinary CHAIN FOLD, the writer (G4-16b phase 4, step 3).
@@ -147,6 +149,8 @@ export type OrdinaryChainFoldSkip =
    * attaching (a product just published, say) are watched. Worth retrying,
    * unlike the two above, which wait for the next rotation. */
   | 'sources-not-settled'
+  /** G4-16f (design R4-a): a model epoch forward journal is open. */
+  | 'epoch-forward-pending'
 
 export interface OrdinaryChainFoldPlanInput {
   /** ModelMeta's read order for the kind (`objectShardUrls`). */
@@ -204,25 +208,60 @@ export function planOrdinaryChainFold(input: OrdinaryChainFoldPlanInput): Ordina
   return { fold: [], skippedReason: 'no-foldable-run' }
 }
 
-/** Where the contiguous run `sources` starts in `list`, or -1 when they are
- * not all there, contiguous, in order, or `product` is already listed. Pure. */
+/** `list` deduplicated, the FIRST occurrence kept — how every reader orders
+ * a list that holds a url twice (`overlaySegmentUrls`, the canonical read).
+ * Two writers rewriting a list in place at once can leave a duplicate
+ * (G4-16f): read raw, one inside a run made the fold refuse it until the next
+ * publish normalised the list. Pure. */
+const firstOccurrences = (list: readonly string[]): string[] => [...new Set(list)]
+
+/** Where the contiguous run `sources` starts in `list` read DEDUPLICATED
+ * (first occurrence kept), or -1 when they are not all there, contiguous, in
+ * order, or `product` is already listed. The index is in the deduplicated
+ * view. Pure. */
 export function foldedRunIndex(list: readonly string[], sources: readonly string[], product: string): number {
-  const at = list.indexOf(sources[0]!)
-  if (at < 0 || list.includes(product)) return -1
+  const view = firstOccurrences(list)
+  const at = view.indexOf(sources[0]!)
+  if (at < 0 || view.includes(product)) return -1
   for (let offset = 0; offset < sources.length; offset += 1) {
-    if (list[at + offset] !== sources[offset]) return -1
+    if (view[at + offset] !== sources[offset]) return -1
   }
   return at
 }
 
-/** `list` with the run replaced by `product` at its slot, or null. Pure. */
+/** `list` (deduplicated, first kept) with the run replaced by `product` at
+ * its slot, or null. Pure. */
 export function substituteFoldedRun(
   list: readonly string[],
   sources: readonly string[],
   product: string,
 ): string[] | null {
-  const at = foldedRunIndex(list, sources, product)
-  return at < 0 ? null : [...list.slice(0, at), product, ...list.slice(at + sources.length)]
+  const view = firstOccurrences(list)
+  const at = foldedRunIndex(view, sources, product)
+  return at < 0 ? null : [...view.slice(0, at), product, ...view.slice(at + sources.length)]
+}
+
+/**
+ * Replace the run `sources` by `product` IN `list`, a live ModelMeta list,
+ * in place: the first occurrence of the run's first source becomes the
+ * product, every other occurrence of a source goes (later duplicates
+ * included). Read deduplicated (first kept), the result is exactly
+ * {@link substituteFoldedRun}'s. Refuses (false, nothing written) where that
+ * one refuses. In place, never assigned whole: a client's concurrent push
+ * into the list survives. Synchronous; inside the ModelMeta `change`.
+ */
+export function spliceFoldedRunInPlace(list: string[], sources: readonly string[], product: string): boolean {
+  // The same view the caller checked (`listOf`: strings only).
+  if (foldedRunIndex(list.filter((url): url is string => typeof url === 'string'), sources, product) < 0) return false
+  const first = list.indexOf(sources[0]!)
+  const sourceSet = new Set(sources)
+  // From the end, so the indices still to visit do not move; `first` itself
+  // is before every one of them.
+  for (let index = list.length - 1; index > first; index -= 1) {
+    if (sourceSet.has(list[index]!)) list.splice(index, 1)
+  }
+  list.splice(first, 1, product)
+  return true
 }
 
 type MetaLike = Record<string, unknown>
@@ -231,8 +270,35 @@ const fieldsOf = (collection: OverlayCollection) => collection === 'object'
   ? { shards: 'objectShardUrls', overlay: 'editsObjectShardUrls', current: 'editsObjectShardUrl', entities: 'objects' } as const
   : { shards: 'connectionShardUrls', overlay: 'editsConnectionShardUrls', current: 'editsConnectionShardUrl', entities: 'connections' } as const
 
-const listOf = (meta: MetaLike | undefined, field: string): string[] =>
-  Array.isArray(meta?.[field]) ? (meta![field] as unknown[]).filter((url): url is string => typeof url === 'string') : []
+/** Every element of the ruling field (text or scalar), unreadable ones
+ * included as `invalid:` strings, positions kept — what is WRITTEN back. */
+const fullListOf = (meta: MetaLike | undefined, field: MetaUrlListField): string[] => readMetaUrls(meta, field) ?? []
+
+/** The READABLE elements only — what the run checks see. An unreadable
+ * element (null, a corrupt value) is skipped, as the raw `typeof === 'string'`
+ * filter skipped it before the scalar URL fields, so it cannot break a run's contiguity
+ * (`foldedRunIndex`). */
+const listOf = (meta: MetaLike | undefined, field: MetaUrlListField): string[] =>
+  fullListOf(meta, field).filter((url) => !url.startsWith('invalid:'))
+
+/** {@link spliceFoldedRunInPlace} on a ModelMeta URL list: checked on the
+ * readable elements ({@link listOf}, as the live-list splice always was),
+ * spliced on a copy of the FULL ruling list (unreadable elements left where
+ * they are), written back by `writeMetaUrls` — the sources deleted from the
+ * end, the product at the first source's slot, nothing else re-created.
+ * Synchronous; inside the ModelMeta `change`. */
+export function spliceFoldedRunInMeta(meta: MetaLike, field: MetaUrlListField, sources: readonly string[], product: string): boolean {
+  if (foldedRunIndex(listOf(meta, field), sources, product) < 0) return false
+  const next = [...fullListOf(meta, field)]
+  const first = next.indexOf(sources[0]!)
+  const sourceSet = new Set(sources)
+  for (let index = next.length - 1; index > first; index -= 1) {
+    if (sourceSet.has(next[index]!)) next.splice(index, 1)
+  }
+  next.splice(first, 1, product)
+  writeMetaUrls(meta, field, next)
+  return true
+}
 
 const sameHeads = (left: readonly string[], right: readonly string[]): boolean => {
   const a = [...left].sort()
@@ -258,6 +324,12 @@ export interface FoldOrdinaryChainArgs {
   mayWrite: () => boolean
   /** Is this listed segment ATTACHED by the projector (watched)? */
   watched: (url: string) => boolean
+  /** A listed segment the projector PARKED as a sealed product (G4-16f):
+   * sealed, so never foldable, and not resident — the plan skips it without
+   * resolving it (resolving would load it back, one storage read and one
+   * synchronous wasm load per parked product, on every pass, only to count
+   * its entities). Default: none. */
+  parked?: (url: string) => boolean
   /** Fence and plane, read from the database before anything is written. */
   assertAuthority: () => Promise<void>
   /** A pooled client: the lock is session-scoped and the record is committed on it. */
@@ -333,14 +405,17 @@ export async function foldOrdinaryChain(args: FoldOrdinaryChainArgs): Promise<Fo
    * check to the change; splices in place (see the header). */
   const publish = (sources: string[], productUrl: string): boolean => {
     const meta = args.meta.doc()
-    const current = meta?.[fields.current]
+    const current = readMetaUrl(meta, fields.current)
     if (typeof current !== 'string' || sources.includes(current) || current === productUrl) return false
-    const shardsAt = foldedRunIndex(listOf(meta, fields.shards), sources, productUrl)
-    const overlayAt = foldedRunIndex(listOf(meta, fields.overlay), sources, productUrl)
-    if (shardsAt < 0 || overlayAt < 0) return false
+    // Both lists checked before either is written (read deduplicated, first
+    // kept: a duplicate left by two concurrent in-place rewrites does not
+    // stall the fold), then both spliced in place in ONE change, at the
+    // physical slot of the run's first source (`spliceFoldedRunInPlace`).
+    if (foldedRunIndex(listOf(meta, fields.shards), sources, productUrl) < 0
+      || foldedRunIndex(listOf(meta, fields.overlay), sources, productUrl) < 0) return false
     args.meta.change((doc) => {
-      (doc[fields.shards] as string[]).splice(shardsAt, sources.length, productUrl)
-      ;(doc[fields.overlay] as string[]).splice(overlayAt, sources.length, productUrl)
+      spliceFoldedRunInMeta(doc, fields.shards, sources, productUrl)
+      spliceFoldedRunInMeta(doc, fields.overlay, sources, productUrl)
     })
     return true
   }
@@ -356,6 +431,9 @@ export async function foldOrdinaryChain(args: FoldOrdinaryChainArgs): Promise<Fo
       return { outcome: 'lock-refused', state: lock }
     }
     if (!args.mayWrite()) return { outcome: 'not-owner' }
+    // G4-16f (design R4-a): an OPEN model epoch forward journal may name a
+    // head this fold would supersede; it lives seconds, so the next pass folds.
+    if (await modelEpochForwardPending(client, args.key)) return { outcome: 'skipped', reason: 'epoch-forward-pending' }
 
     // Step 3a: the recorded folds ModelMeta does not list and whose product
     // was never folded again (its row still `retired`): a crash, or a
@@ -478,7 +556,7 @@ export async function foldOrdinaryChain(args: FoldOrdinaryChainArgs): Promise<Fo
     const meta = args.meta.doc()
     const shardUrls = listOf(meta, fields.shards)
     const overlayUrls = listOf(meta, fields.overlay)
-    const currentUrl = typeof meta?.[fields.current] === 'string' ? meta[fields.current] as string : undefined
+    const currentUrl = readMetaUrl(meta, fields.current)
     const overlaySet = new Set(overlayUrls)
     const samples = new Map<string, { documentId: DocumentId; doc: Record<string, unknown>; entities: number; forwardedHeads: string[] | null }>()
     const unsettled = new Set<string>()
@@ -487,6 +565,9 @@ export async function foldOrdinaryChain(args: FoldOrdinaryChainArgs): Promise<Fo
       const documentId = documentIdOf(url)
       const row = documentId ? rows.get(retirementKey(args.collection, documentId)) : undefined
       if (row?.status !== 'retired' || !row.retirementHeads) continue
+      // Parked sealed: never a candidate (`entityCountOf` >= the ceiling), and
+      // not pending either — it never settles into one.
+      if (args.parked?.(url)) continue
       // Still being attached: pending, like an unsettled head.
       if (!args.watched(url)) { unsettled.add(url); continue }
       const segment = await args.segment(url)
@@ -527,7 +608,7 @@ export async function foldOrdinaryChain(args: FoldOrdinaryChainArgs): Promise<Fo
     builtProduct = product.documentId
 
     // Step 5.
-    const currentNow = args.meta.doc()?.[fields.current]
+    const currentNow = readMetaUrl(args.meta.doc(), fields.current)
     const currentDocumentId = typeof currentNow === 'string' ? documentIdOf(currentNow) : null
     if (!args.mayWrite() || !currentDocumentId) {
       return { outcome: 'superseded', productUrl: product.url, productDocumentId: product.documentId, stage: 'before-record' }

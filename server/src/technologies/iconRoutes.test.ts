@@ -27,7 +27,7 @@ describe('paged icon catalog routes', () => {
     const app = express()
     registerTechnologyRoutes(app, {} as Pool)
     server = await new Promise((resolve) => {
-      const listener = app.listen(0, () => resolve(listener))
+      const listener = app.listen(0, '127.0.0.1', () => resolve(listener))
     })
     url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
   })

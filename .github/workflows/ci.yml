@@ -271,6 +271,32 @@ jobs:
         working-directory: server
         run: npm run qa:eviction-fire-drill
 
+      # T-SUM-0. The one BROWSER suite CI runs: a diagram created on a summary
+      # workspace must be visible to another user's cold profile, on a seeded
+      # performance fixture AND on an ordinary workspace promoted through the
+      # route. The harness owns its stack (its own database on this job's
+      # Postgres service, server 3587, client 5587) and judges Playwright's JSON
+      # report itself: a skip or a retry is RED. `ci-local-parity.test.mjs`
+      # requires this step because `ci:local` runs it.
+      - name: Install Chromium for the summary e2e
+        if: always()
+        run: npx playwright install --with-deps chromium
+
+      - name: Summary visibility e2e (Playwright, two arms, real server)
+        if: always()
+        run: npm run e2e:summary-visibility
+
+      - name: Keep the summary e2e logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: summary-e2e-logs
+          path: |
+            reports/e2e-summary-visibility/
+            !reports/e2e-summary-visibility/*/client-*/
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: Upload test reports
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

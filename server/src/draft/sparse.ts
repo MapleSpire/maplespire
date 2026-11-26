@@ -36,6 +36,7 @@ import {
   type SparseDraftManifest,
 } from './manifest.js'
 import { findReadyDocument } from '../automergeRepoCompat.js'
+import { withMetaUrlView } from '../modelMetaUrls.js'
 
 type Json = Record<string, unknown>
 
@@ -562,7 +563,8 @@ export async function materializeSparseDraftModels(
   const theirs = emptyModel()
   const parent = { landscapeId, versionId: parentVersionId }
   const root = (await find<SparseRootLike>(repo, draftRootUrl)).doc()!
-  const meta = (await find<MetaLike>(repo, root.modelMetaUrl!)).doc()!
+  // The ruling URL values, plain strings.
+  const meta = withMetaUrlView((await find<MetaLike>(repo, root.modelMetaUrl!)).doc()!)
 
   const draftObjects = await overlayValues(repo, meta.editsObjectShardUrls ?? meta.objectShardUrls ?? [], 'objects')
   const draftConnections = await overlayValues(repo, meta.editsConnectionShardUrls ?? meta.connectionShardUrls ?? [], 'connections')

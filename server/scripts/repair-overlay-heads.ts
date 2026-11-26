@@ -41,6 +41,7 @@ import { Repo, isValidAutomergeUrl, type AutomergeUrl } from '@automerge/automer
 import { PostgresStorageAdapter } from '../src/automergeStorage.js'
 import { initSchema, pool } from '../src/db.js'
 import { OVERLAY_WRITE_HEAD_VERSION } from '../src/modelMeta.js'
+import { appendMetaUrl, readMetaUrl, readMetaUrls, writeMetaUrl } from '../src/modelMetaUrls.js'
 
 interface MetaShape {
   objectShardUrls?: string[]
@@ -100,15 +101,17 @@ async function main(): Promise<void> {
   // segments that may hold uncompacted edits (the repair would cause the loss
   // it repairs). That shape belongs to repair-performance-overlay-heads-style
   // handling; refuse it.
-  const needObject = !meta.editsObjectShardUrl || !isValidAutomergeUrl(meta.editsObjectShardUrl)
-  const needConnection = !meta.editsConnectionShardUrl || !isValidAutomergeUrl(meta.editsConnectionShardUrl)
+  const objectHeadUrl = readMetaUrl(meta, 'editsObjectShardUrl')
+  const connectionHeadUrl = readMetaUrl(meta, 'editsConnectionShardUrl')
+  const needObject = !objectHeadUrl || !isValidAutomergeUrl(objectHeadUrl)
+  const needConnection = !connectionHeadUrl || !isValidAutomergeUrl(connectionHeadUrl)
   if (!needObject && !needConnection) {
     console.log('[repair] both overlay write heads already present — nothing to do')
     await repo.shutdown()
     return
   }
-  if ((needObject && (meta.editsObjectShardUrls?.length ?? 0) > 0)
-    || (needConnection && (meta.editsConnectionShardUrls?.length ?? 0) > 0)) {
+  if ((needObject && (readMetaUrls(meta, 'editsObjectShardUrls')?.length ?? 0) > 0)
+    || (needConnection && (readMetaUrls(meta, 'editsConnectionShardUrls')?.length ?? 0) > 0)) {
     throw new Error(
       'a collection has overlay segments but no current head (dangling-pointer shape); '
       + 'refusing to replace its segment list — those segments may hold uncompacted edits',
@@ -141,18 +144,14 @@ async function main(): Promise<void> {
   // forkRoot remaps heads by POSITION there (see modelMeta.ts:withHeadLast).
   metaHandle.change((m) => {
     if (objectShard) {
-      if (!m.objectShardUrls) m.objectShardUrls = []
-      if (!m.objectShardUrls.includes(objectShard.url)) m.objectShardUrls.push(objectShard.url)
-      m.editsObjectShardUrl = objectShard.url
-      if (!m.editsObjectShardUrls) m.editsObjectShardUrls = []
-      if (!m.editsObjectShardUrls.includes(objectShard.url)) m.editsObjectShardUrls.push(objectShard.url)
+      appendMetaUrl(m, 'objectShardUrls', objectShard.url)
+      writeMetaUrl(m, 'editsObjectShardUrl', objectShard.url)
+      appendMetaUrl(m, 'editsObjectShardUrls', objectShard.url)
     }
     if (connectionShard) {
-      if (!m.connectionShardUrls) m.connectionShardUrls = []
-      if (!m.connectionShardUrls.includes(connectionShard.url)) m.connectionShardUrls.push(connectionShard.url)
-      m.editsConnectionShardUrl = connectionShard.url
-      if (!m.editsConnectionShardUrls) m.editsConnectionShardUrls = []
-      if (!m.editsConnectionShardUrls.includes(connectionShard.url)) m.editsConnectionShardUrls.push(connectionShard.url)
+      appendMetaUrl(m, 'connectionShardUrls', connectionShard.url)
+      writeMetaUrl(m, 'editsConnectionShardUrl', connectionShard.url)
+      appendMetaUrl(m, 'editsConnectionShardUrls', connectionShard.url)
     }
     m.editsOverlayWriteHeadVersion = OVERLAY_WRITE_HEAD_VERSION
   })

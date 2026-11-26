@@ -169,3 +169,10 @@ export const useAuthStore = create<AuthStoreState>((set) => ({
 
   markSessionEnded: (reason) => set({ sessionEnded: reason }),
 }))
+
+// T-DIAGDEF-2: the workspace-access probe answers for 15 s, keyed
+// by workspace only; a sign-in without a page load (dev/password login) must
+// not read the previous identity's answer.
+useAuthStore.subscribe((state, previous) => {
+  if (state.user?.id !== previous.user?.id || state.orgId !== previous.orgId) api.forgetWorkspaceAccessProbes()
+})

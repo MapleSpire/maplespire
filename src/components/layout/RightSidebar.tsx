@@ -96,6 +96,7 @@ import { SegmentedTabs } from '../ui/SegmentedTabs'
 import { Switch } from '../ui/switch'
 import { FieldRow } from './FieldRow'
 import { ContainsField, UsageFields } from './EntityUsageFields'
+import { OverrideFieldMarkers } from './EpochOverrideMarkers'
 import { TagPicker } from '../tags/TagPicker'
 import { resolveLowerRouting } from '../../lib/diagrams/lowerRouting'
 import {
@@ -890,6 +891,7 @@ export function RightSidebar() {
               rows={2}
               className="w-full text-[15px] font-semibold text-fg leading-tight bg-transparent border-0 p-0 focus:outline-none focus:ring-1 focus:ring-accent rounded px-1 -ml-1 placeholder:text-fg-subtle placeholder:font-normal disabled:opacity-50 resize-none"
             />
+            <OverrideFieldMarkers entityId={selectedConnection.id} collection="connections" />
           </div>
           {/* Connection Details */}
           <div className="flex-1 overflow-y-auto p-4 space-y-4">
@@ -1193,6 +1195,8 @@ export function RightSidebar() {
                 </div>
               </div>
             </div>
+            {/* Out of the icon + name row: on the inspector's own left edge. */}
+            <OverrideFieldMarkers entityId={selected.id} collection="objects" />
           </div>
 
           <ShapeIconPickerModal

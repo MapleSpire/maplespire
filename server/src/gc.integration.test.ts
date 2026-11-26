@@ -79,6 +79,10 @@ describe.skipIf(!TEST_DATABASE_URL)('fenced global Automerge GC', () => {
         PRIMARY KEY (landscape_id, version_id, document_id)
       )
     `)
+    // The sweep deletes from these too (G4-16f); their rows are covered by
+    // gc.ordinaryHeads.integration.test.ts, over the real schema.
+    await db.pool.query(`CREATE TABLE read_model_adopt_watermarks (document_id TEXT PRIMARY KEY)`)
+    await db.pool.query(`CREATE TABLE read_model_sealed_product_extracts (product_document_id TEXT PRIMARY KEY)`)
     await ensureMaintenanceSchema(db.pool)
     repo = new Repo({ network: [] })
   })

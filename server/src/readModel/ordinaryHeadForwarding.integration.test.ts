@@ -27,6 +27,7 @@ import type { WorkspaceKey } from './projector.js'
 import { projectionMutexKey } from './projectionAuthority.js'
 import { withReadModelProjectionTransaction } from './projectionTransaction.js'
 import { guardIdleClientErrors } from '../db/poolErrorGuard.js'
+import { protocolFixtureDb, protocolFixtureQuery } from '../testing/protocolFixture.js'
 import { AutomergeResidencyLeases } from '../automergeResidency.js'
 
 /**
@@ -146,7 +147,7 @@ async function rotate<T extends ObjHead | ConnHead>(
   await child.whenReady()
   await ws.repo.flush([child.documentId])
   if (row !== 'none') {
-    await recordOrdinaryHeadRetirement(pool!, WS, {
+    await recordOrdinaryHeadRetirement(protocolFixtureDb(pool!), WS, {
       collection,
       documentId: old.documentId,
       retirementHeads: row === 'retired' ? A.getHeads(old.doc() as A.Doc<unknown>) : null,
@@ -438,7 +439,7 @@ suite('ordinary head forwarding (phase 2) — projector + PostgreSQL', () => {
       stop()
       // The durable state a crash after the flush and before the commit
       // leaves: the current head carries the forward, the row does not.
-      await pool!.query(
+      await protocolFixtureQuery(pool!,
         'UPDATE read_model_ordinary_head_retirements SET forwarded_heads = NULL WHERE document_id = $1',
         [ws.retired.documentId],
       )
@@ -752,30 +753,30 @@ suite('ordinary head forwarding (phase 2) — projector + PostgreSQL', () => {
   })
 
   it('commitForwardedHeads is a compare-and-set on the value the forward started from', async () => {
-    await recordOrdinaryHeadRetirement(pool!, WS, {
+    await recordOrdinaryHeadRetirement(protocolFixtureDb(pool!), WS, {
       collection: 'object', documentId: 'R', retirementHeads: ['b', 'a'], status: 'retired',
     })
     // A second record never moves H_r.
-    expect(await recordOrdinaryHeadRetirement(pool!, WS, {
+    expect(await recordOrdinaryHeadRetirement(protocolFixtureDb(pool!), WS, {
       collection: 'object', documentId: 'R', retirementHeads: ['z'], status: 'retired',
     })).toBe(false)
-    expect(await commitForwardedHeads(pool!, WS, 'object', 'R', ['stale'], ['c'])).toBe(false)
+    expect(await commitForwardedHeads(protocolFixtureDb(pool!), WS, 'object', 'R', ['stale'], ['c'])).toBe(false)
     expect(await forwardedHeadsOf('R')).toBeNull()
-    expect(await commitForwardedHeads(pool!, WS, 'object', 'R', null, ['d', 'c'])).toBe(true)
+    expect(await commitForwardedHeads(protocolFixtureDb(pool!), WS, 'object', 'R', null, ['d', 'c'])).toBe(true)
     expect(await forwardedHeadsOf('R')).toEqual(['c', 'd'])
-    expect(await commitForwardedHeads(pool!, WS, 'object', 'R', null, ['e'])).toBe(false)
-    expect(await commitForwardedHeads(pool!, WS, 'object', 'R', ['c', 'd'], ['e'])).toBe(true)
+    expect(await commitForwardedHeads(protocolFixtureDb(pool!), WS, 'object', 'R', null, ['e'])).toBe(false)
+    expect(await commitForwardedHeads(protocolFixtureDb(pool!), WS, 'object', 'R', ['c', 'd'], ['e'])).toBe(true)
     expect(await forwardedHeadsOf('R')).toEqual(['e'])
     const row = (await pool!.query<{ retirement_heads: string[] }>(
       'SELECT retirement_heads FROM read_model_ordinary_head_retirements WHERE document_id = $1', ['R'],
     )).rows[0]
     expect(row.retirement_heads).toEqual(['a', 'b'])
     // A row that is no longer `retired` is never advanced.
-    await pool!.query(
+    await protocolFixtureQuery(pool!,
       `UPDATE read_model_ordinary_head_retirements SET status = 'admitted', retirement_heads = NULL
        WHERE document_id = 'R'`,
     )
-    expect(await commitForwardedHeads(pool!, WS, 'object', 'R', ['e'], ['f'])).toBe(false)
+    expect(await commitForwardedHeads(protocolFixtureDb(pool!), WS, 'object', 'R', ['e'], ['f'])).toBe(false)
     expect(await forwardedHeadsOf('R')).toEqual(['e'])
     // `retired` without H_r is refused by the table itself.
     await expect(pool!.query(
@@ -817,7 +818,7 @@ suite('ordinary head forwarding (phase 2) — projector + PostgreSQL', () => {
       await truncateUnderProjectionMutex('read_model_overlay_batch_acks, read_model_ordinary_head_retirements, read_model_projection_state')
       const ws = await workspace({ forwardedBatchIds: ['stray'] })
       if (withRow) {
-        await recordOrdinaryHeadRetirement(pool!, WS, {
+        await recordOrdinaryHeadRetirement(protocolFixtureDb(pool!), WS, {
           collection: 'object', documentId: 'unrelated', retirementHeads: ['00'], status: 'retired',
         })
       }

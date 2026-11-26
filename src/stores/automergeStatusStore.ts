@@ -16,6 +16,11 @@ import { create } from 'zustand'
 
 export type AutomergeStatus = 'connecting' | 'saving' | 'ready' | 'offline' | 'error'
 
+/** What an `'error'` is known to be about, when the bridge knows
+ * (T-DIAGDEF-2 B): `server-unreachable` — the boot needed the server (no
+ * local copy of the workspace) and no answer came. */
+export type AutomergeErrorCause = 'server-unreachable'
+
 /** Why a repoint HELD this tab instead of letting it follow
  * (`workspaceRepointNotice`). Unsaved work is not a reason any more: it is
  * carried into the new default (bridge.ts `onWorkspaceBound`). */
@@ -69,6 +74,8 @@ interface AutomergeStatusState {
    */
   projectedWorkspace: string | null
   error: string | null
+  /** Set with `error` by `setStatus`; null when the cause is not known. */
+  errorCause?: AutomergeErrorCause | null
   /**
    * True while THIS session serves the cached-root boot fallback: the server
    * did not materialize the workspace in time and the bridge re-entered from
@@ -114,7 +121,7 @@ interface AutomergeStatusState {
   transportEpoch: number
   /** The bridge saw the transport go from down to up. */
   noteTransportRestored: () => void
-  setStatus: (status: AutomergeStatus, error?: string | null) => void
+  setStatus: (status: AutomergeStatus, error?: string | null, errorCause?: AutomergeErrorCause | null) => void
   setBootFallbackActive: (active: boolean) => void
   /** The bridge saw the workspace contract change mid-session — ask for a reload. */
   markWorkspaceContractStale: () => void
@@ -161,15 +168,16 @@ export const useAutomergeStatus = create<AutomergeStatusState>((set) => ({
   editReady: false,
   projectedWorkspace: null,
   error: null,
+  errorCause: null,
   bootFallbackActive: false,
   workspaceContractStale: false,
   workspaceRepointNotice: null,
   transportEpoch: 0,
   noteTransportRestored: () => set((prev) => ({ transportEpoch: prev.transportEpoch + 1 })),
-  setStatus: (status, error = null) =>
+  setStatus: (status, error = null, errorCause = null) =>
     // `ready` latches on once we've projected; it never drops back to false when
     // the connection blips (the app keeps working offline against local data).
-    set((prev) => ({ status, ready: prev.ready || status === 'ready', error })),
+    set((prev) => ({ status, ready: prev.ready || status === 'ready', error, errorCause })),
   setBootFallbackActive: (active) => set({ bootFallbackActive: active }),
   markWorkspaceContractStale: () => set({ workspaceContractStale: true }),
   clearWorkspaceContractStale: () => set({ workspaceContractStale: false }),
@@ -195,6 +203,7 @@ export const useAutomergeStatus = create<AutomergeStatusState>((set) => ({
     editReady: false,
     projectedWorkspace: null,
     error: null,
+    errorCause: null,
     bootFallbackActive: false,
     // A switch re-boots the bridge, so the next session decides its own
     // contract; carrying the stale marker across would ask for a reload the new

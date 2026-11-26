@@ -20,6 +20,7 @@ import 'dotenv/config'
 import { Repo, isValidAutomergeUrl, type AutomergeUrl } from '@automerge/automerge-repo'
 import { PostgresStorageAdapter } from '../src/automergeStorage.js'
 import { pool } from '../src/db.js'
+import { readMetaUrls } from '../src/modelMetaUrls.js'
 
 const landscapeId = process.argv[2]
 const versionId = process.argv[3]
@@ -54,8 +55,8 @@ for (const v of rows) {
   console.log(`  modelUrl=${modelUrl || '(empty)'}  modelMetaUrl=${modelMetaUrl ?? '(unset)'}  registryShards=${shardUrls.length}`)
   if (modelMetaUrl && isValidAutomergeUrl(modelMetaUrl)) {
     const meta = await readDoc(repo, modelMetaUrl)
-    const os = (meta?.objectShardUrls as string[]) ?? []
-    const cs = (meta?.connectionShardUrls as string[]) ?? []
+    const os = readMetaUrls(meta, 'objectShardUrls') ?? []
+    const cs = readMetaUrls(meta, 'connectionShardUrls') ?? []
     console.log(`  meta: objectShards=${os.length} connectionShards=${cs.length}`)
     let objects = 0
     for (const u of os) { const d = await readDoc(repo, u); objects += Object.keys((d?.objects as object) ?? {}).length }

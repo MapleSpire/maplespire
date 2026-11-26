@@ -437,10 +437,14 @@ async function main(): Promise<void> {
             repo: repo!,
             rootUrl,
             db: db!.pool,
+            connect: () => db!.pool.connect(),
             fleet: {
               isResident: (key) => fleet!.isResident(key),
-              ensure: (key) => fleet!.ensure(key),
+              // The options pass through: the pass re-attaches `{ adopt: false }`,
+              // the only start a compaction window admits (T-VANISH).
+              ensure: (key, options) => fleet!.ensure(key, options),
               release: (key, reason) => fleet!.release(key, reason),
+              endCompactionWindow: (key) => fleet!.endCompactionWindow(key),
               residentProjectorInstanceId: (key) => fleet!.residentProjectorInstanceId(key) ?? null,
             },
             ownership: { owns: () => true },

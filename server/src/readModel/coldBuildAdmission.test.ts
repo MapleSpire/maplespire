@@ -94,6 +94,42 @@ describe('ColdBuildAdmission', () => {
     await running
     expect(admission.snapshot()).toMatchObject({ stopped: true, active: 0, queued: 0, cancelled: 1 })
   })
+
+  it('(C6-2b) a queued job whose signal aborts LEAVES the queue at once (no position held, never started); a running one is unaffected; an aborted signal is refused up front', async () => {
+    const admission = new ColdBuildAdmission({ maxConcurrent: 1, maxQueued: 1 })
+    const active = deferred<void>()
+    const running = new AbortController()
+    const p1 = admission.run(() => active.promise, { signal: running.signal })
+    const queued = new AbortController()
+    const never = vi.fn(async () => undefined)
+    const p2 = admission.run(never, { signal: queued.signal })
+    expect(admission.snapshot()).toMatchObject({ queued: 1 })
+    queued.abort(new Error('test: released'))
+    await expect(p2).rejects.toThrow('test: released')
+    expect(admission.snapshot()).toMatchObject({ active: 1, queued: 0, cancelled: 1 })
+    // The freed position is usable at once.
+    const p3 = admission.run(async () => 'third')
+    running.abort()
+    active.resolve()
+    await p1
+    expect(await p3).toBe('third')
+    expect(never).not.toHaveBeenCalled()
+    const done = new AbortController()
+    done.abort(new Error('test: already'))
+    await expect(admission.run(never, { signal: done.signal })).rejects.toThrow('test: already')
+  })
+
+  it('(C6-2b) exemptFromQueueLimit queues past maxQueued; others are still refused', async () => {
+    const admission = new ColdBuildAdmission({ maxConcurrent: 1, maxQueued: 0 })
+    const active = deferred<void>()
+    const p1 = admission.run(() => active.promise)
+    await expect(admission.run(async () => 'refused')).rejects.toBeInstanceOf(ColdBuildQueueFullError)
+    const exempt = admission.run(async () => 'exempt', { exemptFromQueueLimit: true })
+    expect(admission.snapshot()).toMatchObject({ queued: 1, rejected: 1 })
+    active.resolve()
+    await p1
+    expect(await exempt).toBe('exempt')
+  })
 })
 
 describe('coldBuildAdmissionConfig', () => {

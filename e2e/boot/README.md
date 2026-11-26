@@ -50,6 +50,18 @@ resident store + server-side Postgres read model) and prove every CRUD action
    its Postgres data dir and reseed); each fork is a superset of its source,
    so the suite stays correct in between.
 
+   **`summary-workspace-diagram-visible.spec.ts` has its own harness** (T-SUM-0,
+   21/11/2026): `npm run e2e:summary-visibility` builds a stack, seeds a
+   fixture and promotes an ordinary workspace through the route, runs the spec
+   with two users and refuses a skip. It runs in `ci:local` and in `ci.yml`.
+   `node scripts/e2e-summary-visibility.mjs --suite=offline` runs
+   `summary-promotion-offline.spec.ts` (writes made offline during a
+   promotion; not in CI, for its cost).
+   `--suite=switch-down` runs `workspace-switch-server-down.spec.ts` (a
+   workspace switch with the stack's server stopped, or not answering, then
+   restarted; not in CI): the spec drives the server through a control
+   endpoint only that suite opens.
+
 4. **`summary-workspace-functional.spec.ts` needs a SUMMARY workspace, declared
    by name.** It ports the eleven functional controls of the summary-workspace
    migration that used to live in uncommitted scratchpad probes. Without `E2E_SUMMARY_LANDSCAPE` it skips

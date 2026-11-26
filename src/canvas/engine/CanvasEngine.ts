@@ -228,6 +228,24 @@ export interface CanvasViewportInsets {
 /** The narrowest span, in CSS pixels, a fit still frames between the panels;
  *  below it the panels are ignored on that axis (see visibleCanvasRect). */
 const MIN_FIT_SPAN = 320
+/** A frame slower than this coalesces the next data paints (`scheduleDataRender`)… */
+export const DATA_RENDER_SLOW_FRAME_MS = 50
+/** …to at most one per twice its duration, at most this far apart. */
+export const DATA_RENDER_MAX_GAP_MS = 1_000
+
+/** The `--color-override-outline` design token (light and dark themes both
+ * define it), read once per theme: `getComputedStyle` is not run per frame. */
+const OVERRIDE_OUTLINE_FALLBACK = '#7C3AED'
+let overrideOutlineCache: { theme: string; color: string } | null = null
+function overrideOutlineColor(): string {
+  if (typeof document === 'undefined') return OVERRIDE_OUTLINE_FALLBACK
+  const theme = document.documentElement.getAttribute('data-theme') ?? ''
+  if (overrideOutlineCache?.theme !== theme) {
+    const color = getComputedStyle(document.documentElement).getPropertyValue('--color-override-outline').trim()
+    overrideOutlineCache = { theme, color: color || OVERRIDE_OUTLINE_FALLBACK }
+  }
+  return overrideOutlineCache.color
+}
 
 /** One cubic-Bézier segment of a (possibly multi-segment) connection path. */
 interface CubicSeg {
@@ -535,6 +553,7 @@ export class CanvasEngine {
   private labelReach = { x: 0, y: 0 }
   /** Objects with at least one detail, reference, or parent diagram. */
   private relatedDiagramObjectIds = new Set<string>()
+  private overrideHighlightIds = new Set<string>()
   // Object/group id -> connections touching it (registered under both endpoints).
   // Replaces per-object O(connections) adjacency scans. Rebuilt in setData().
   private adjacencyMap = new Map<string, Connection[]>()
@@ -1092,7 +1111,36 @@ export class CanvasEngine {
       connections: connections.length,
       groups: groups.length,
     })
-    this.scheduleRender()
+    this.scheduleDataRender()
+  }
+
+  /**
+   * A NEW DATA set is drawn at most
+   * once per twice the last frame's duration when that frame was slow. A
+   * diagram of ~3 100 shapes takes 300–600 ms a frame to fill; three people
+   * editing it put a new data set here every ~40 ms, and every one was a full
+   * repaint — the tab's main thread busy 138 s of 150 (353 long tasks), its
+   * own requests answered seconds late (measured on a fresh stack whose only
+   * change was the diagram grown from 8 to 3 108 shapes: 0 hops in 3, against
+   * 6 in 6 at 8 shapes). The data is in the engine at once (hit tests,
+   * gestures read it); only the PAINT is coalesced, and an interaction's own
+   * render (`scheduleRender`) is never delayed. A fast frame changes nothing.
+   */
+  private lastFrameMs = 0
+  private lastFrameEndedAt = 0
+  private dataRenderTimer: ReturnType<typeof setTimeout> | null = null
+  private scheduleDataRender() {
+    const gap = this.lastFrameMs > DATA_RENDER_SLOW_FRAME_MS ? Math.min(DATA_RENDER_MAX_GAP_MS, this.lastFrameMs * 2) : 0
+    const wait = this.lastFrameEndedAt + gap - performance.now()
+    if (wait <= 0) {
+      this.scheduleRender()
+      return
+    }
+    if (this.dataRenderTimer) return
+    this.dataRenderTimer = setTimeout(() => {
+      this.dataRenderTimer = null
+      this.scheduleRender()
+    }, wait)
   }
 
   setRelatedDiagramObjectIds(objectIds: ReadonlySet<string>) {
@@ -1102,6 +1150,22 @@ export class CanvasEngine {
     ) return
     this.relatedDiagramObjectIds = new Set(objectIds)
     this.scheduleRender()
+  }
+
+  /** G4-16f "Show in diagram": the objects whose offline edit the
+   * current epoch overrode get a view-only outline (no document change). */
+  setOverrideHighlightIds(objectIds: ReadonlySet<string>) {
+    if (
+      objectIds.size === this.overrideHighlightIds.size
+      && [...objectIds].every((id) => this.overrideHighlightIds.has(id))
+    ) return
+    this.overrideHighlightIds = new Set(objectIds)
+    this.scheduleRender()
+  }
+
+  /** Read-only probe for e2e: which objects carry the override outline. */
+  overrideHighlighted(): string[] {
+    return [...this.overrideHighlightIds]
   }
 
   setReadonly(value: boolean) {
@@ -1815,6 +1879,8 @@ export class CanvasEngine {
     this.animEffects = []
     this.animLayersValid = false
     cancelAnimationFrame(this.rafId)
+    if (this.dataRenderTimer) clearTimeout(this.dataRenderTimer)
+    this.dataRenderTimer = null
     cancelIconCatalogWait(this.onIconCatalogReady)
     if (this.interactionTimeoutId) clearTimeout(this.interactionTimeoutId)
     if (this.wheelTimeoutId) clearTimeout(this.wheelTimeoutId)
@@ -3149,6 +3215,8 @@ export class CanvasEngine {
       const finishFrame = startClientTimelineMeasure('canvas.frame', { animated: needsAnim })
       this.render()
       const frameDurationMs = performance.now() - frameStartedAt
+      this.lastFrameMs = frameDurationMs
+      this.lastFrameEndedAt = performance.now()
       if (this.frameQuality.record(frameDurationMs)) {
         markClientTimeline('canvas.quality.changed', {
           degraded: this.frameQuality.isDegraded(),
@@ -3469,6 +3537,12 @@ export class CanvasEngine {
     }
 
     this.renderSmartGuides(ctx)
+
+    // G4-16f: the overridden-edit highlight, in its own pass above the
+    // objects so focus / tag dimming never fades it.
+    if (this.overrideHighlightIds.size > 0) {
+      this.renderOverrideHighlights(ctx, visibleObjects, visibleConnections)
+    }
 
     // Shape hover anchors (hidden in readonly mode)
     if (!this.readonly && !this.isAnchorDragging && !this.draggingId && !this.draggingGroupId && !this.draggingConnEndpoint) {
@@ -5470,6 +5544,71 @@ export class CanvasEngine {
     const hitTop = bounds.y + 2
     const hitBottom = bounds.y + 22
     return worldX >= hitLeft && worldX <= hitRight && worldY >= hitTop && worldY <= hitBottom
+  }
+
+  /**
+   * The view-only highlight of the overridden offline edits (G4-16f): a
+   * dashed outline 10 px around each object, a History
+   * corner badge so it never relies on colour alone, and a dashed trace over
+   * each affected connection. Full opacity; line width, dash and badge are
+   * divided by the zoom so they read the same at any scale.
+   */
+  private renderOverrideHighlights(ctx: CanvasRenderingContext2D, objects: readonly C4Object[], connections: readonly Connection[]) {
+    const color = overrideOutlineColor()
+    const k = 1 / Math.max(0.05, this.viewport.scale)
+    ctx.save()
+    ctx.globalAlpha = 1
+    ctx.shadowColor = 'transparent'
+    ctx.shadowBlur = 0
+    ctx.strokeStyle = color
+    ctx.lineWidth = 2 * k
+    ctx.setLineDash([6 * k, 4 * k])
+    for (const conn of connections) {
+      if (!this.overrideHighlightIds.has(conn.id)) continue
+      const geom = this.getConnectionGeometry(conn)
+      if (!geom || geom.segments.length === 0) continue
+      this.traceConnectionPath(ctx, geom)
+      ctx.stroke()
+    }
+    const gap = 10
+    for (const obj of objects) {
+      if (!this.overrideHighlightIds.has(obj.id)) continue
+      const { x, y } = obj.position
+      const { width: w, height: h } = obj.size
+      ctx.setLineDash([6 * k, 4 * k])
+      ctx.beginPath()
+      ctx.roundRect(x - gap, y - gap, w + 2 * gap, h + 2 * gap, 8 + gap)
+      ctx.stroke()
+      // Corner badge: a filled disc with the History glyph, on the outline's
+      // top-left corner.
+      const radius = 9 * k
+      const cx = x - gap
+      const cy = y - gap
+      ctx.setLineDash([])
+      ctx.fillStyle = color
+      ctx.beginPath()
+      ctx.arc(cx, cy, radius, 0, Math.PI * 2)
+      ctx.fill()
+      this.renderHistoryIcon(ctx, cx, cy, radius * 1.3, this.skin.canvas.bg)
+    }
+    ctx.restore()
+  }
+
+  /** lucide "history" (24×24), stroked at `size` centred on (cx, cy). */
+  private renderHistoryIcon(ctx: CanvasRenderingContext2D, cx: number, cy: number, size: number, color: string) {
+    ctx.save()
+    ctx.strokeStyle = color
+    ctx.lineWidth = 2.5
+    ctx.lineCap = 'round'
+    ctx.lineJoin = 'round'
+    ctx.setLineDash([])
+    const scale = size / 24
+    ctx.translate(cx - 12 * scale, cy - 12 * scale)
+    ctx.scale(scale, scale)
+    ctx.stroke(new Path2D('M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8'))
+    ctx.stroke(new Path2D('M3 3v5h5'))
+    ctx.stroke(new Path2D('M12 7v5l4 2'))
+    ctx.restore()
   }
 
   private renderLinkIcon(ctx: CanvasRenderingContext2D, cx: number, cy: number, size: number, color: string) {

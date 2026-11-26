@@ -81,7 +81,11 @@ const BOUNDED_LABEL_KEYS: ReadonlyMap<string, string> = new Map([
     + 'aiToolRegistry().get() resolved it, and today only the three AI_TOOL_DOORS reach it'],
   ['collection', 'the two ordinary head collections, object and connection'],
   ['trigger', 'the four rotation triggers: actors, changes, both, unknown'],
-  ['caller', 'the eleven projector load paths of documentLoadTelemetry.ts DOCUMENT_LOAD_CALLERS, a closed const tuple'],
+  ['caller', 'the twelve projector load paths of documentLoadTelemetry.ts DOCUMENT_LOAD_CALLERS, a closed const tuple'],
+  ['index', 'the two trigram index names of redundantIndexDropRetry.ts RETRIED_TRIGRAM_INDEXES (the 0006 drop), a closed list'],
+  ['le', 'a histogram bucket bound drawn from a closed const tuple (epochHopTelemetry.ts LATCH_HOLD_BUCKETS, ten bounds)'],
+  ['branch', 'the three refusing branches of the absence clause (health.ts absenceProofMetricSamples): zero, exact, fallback'],
+  ['recovery', 'the two static recoveries of staticDeltaProjector.ts staticRecoveryBackoffMetricSamples, written as literals: withdrawn_reopen, zero_sweep'],
 ])
 
 /**
@@ -93,18 +97,23 @@ const BOUNDED_LABEL_KEYS: ReadonlyMap<string, string> = new Map([
  * read at its call site, not inferred from the key.
  */
 const BOUNDED_SHORTHAND_LABELS: ReadonlyMap<string, string> = new Map([
+  ['branch', 'health.ts absenceProofMetricSamples maps over the literal 3-tuple [zero, exact, fallback]: 3 series, never a document or workspace identity'],
   ['code', 'index.ts maps storageWriteCeilingCounts(), which iterates STORAGE_WRITE_CEILING_CODES (a closed 3-tuple of SQLSTATEs) and zero-fills each: the count is fixed at 3, never an observed error code'],
   ['state', 'index.ts maps over a literal 5-tuple of divergence outcomes; placementProposerHealth '
     + 'maps over the closed PROPOSER_HEALTH_STATES tuple (13 states), never an observed identity'],
   ['outcome', 'placementProposerHealth iterates its fixed results record: admitted, already-admitted, '
-    + 'refused and unknown. Updates only increment one of those four ProposalWriteResult discriminants'],
+    + 'refused and unknown. Updates only increment one of those four ProposalWriteResult discriminants; '
+    + 'epochHopTelemetry.ts maps over EPOCH_LATCH_OUTCOMES (a literal 5-tuple) and DURABLE_HEADS_EPOCH_OUTCOMES '
+    + '(a literal 4-tuple), never an observed value'],
+  ['le', 'epochHopTelemetry.ts maps over LATCH_HOLD_BUCKETS, the literal 10-tuple of histogram bounds '
+    + '(0.01 … 5, +Inf): 10 series, never an observed duration'],
   ['status', 'health.ts emptyCounts() zero-fills all 7 ReadModelWorkspaceStatus values and '
     + 'getFleetReadModelStatusCounts only overwrites keys already present, so the entry count '
     + 'is fixed at 7 whatever the fleet contains'],
   ['phase', 'schedulerHeartbeat emits only the CURRENT phase, drawn from a fixed 5-phase enumeration; '
     + 'documentLoadTelemetry.ts maps over DOCUMENT_LOAD_PHASES, the literal 2-tuple [attach, steady]'],
-  ['caller', 'documentLoadTelemetry.ts maps over DOCUMENT_LOAD_CALLERS, a literal 11-tuple of projector load '
-    + 'paths, inside the DOCUMENT_LOAD_PHASES map: 22 series, zero-filled; never a document or workspace identity'],
+  ['caller', 'documentLoadTelemetry.ts maps over DOCUMENT_LOAD_CALLERS, a literal 12-tuple of projector load '
+    + 'paths, inside the DOCUMENT_LOAD_PHASES map: 24 series, zero-filled; never a document or workspace identity'],
   ['reason', 'ownershipMetrics iterates SYNC_CELL_OWNERSHIP_LOSS_REASONS, a closed six-member tuple; '
     + 'no workspace key or arbitrary error message enters this label'],
   ['tool', 'aiToolCallRelay.ts maps over relayedByTool, a Map whose keys are bumped only with '
@@ -114,6 +123,8 @@ const BOUNDED_SHORTHAND_LABELS: ReadonlyMap<string, string> = new Map([
     + "['object', 'connection']; never a workspace or document identity"],
   ['trigger', 'ordinaryRotationTelemetry.ts maps over TRIGGERS, a literal 4-tuple of rotation '
     + 'triggers (actors, changes, both, unknown) inside the KINDS map: 8 series at most'],
+  ['index', 'redundantIndexDropRetry.ts maps over Object.entries(snapshot.states), whose keys are set only from '
+    + 'the `indexes` list (RETRIED_TRIGRAM_INDEXES, two names) and never from a catalog row: 4 series'],
 ])
 
 /**
@@ -213,6 +224,13 @@ describe('D13 — every metric label is bounded', () => {
     expect(isBoundedCellIdentity({ ...site, file: 'index.ts' })).toBe(false)
     expect(isBoundedCellIdentity({ ...site, shorthand: true })).toBe(false)
   })
+  it('G4-16j: the stuck-roll gauges carry NO label — the workspace they are about goes in the log line', async () => {
+    const source = await readFile(path.join(SRC, 'readModel', 'epochStuckRows.ts'), 'utf8')
+    expect(source).toContain("name: 'maplespire_model_epoch_rows_stuck_repointing'")
+    expect(source).not.toMatch(/labels\s*:/)
+    expect(source).toContain('model_epoch.roll_stuck_repointing')
+  })
+
   it('the scan finds the label sites at all', async () => {
     // The vacuity control. A scan that matched nothing would make both
     // assertions below pass over an empty set.

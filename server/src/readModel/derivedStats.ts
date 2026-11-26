@@ -14,6 +14,8 @@
 
 import type { WorkspaceKey } from './projector.js'
 import type { Queryable } from './types.js'
+import { timedPhase, type RowWriteTimings } from './rowWriteTimings.js'
+import { isPool } from './queryableShape.js'
 
 type WorkspaceCount =
   | 'object_count'
@@ -337,25 +339,189 @@ export async function rebuildWorkspaceStats(
   )
 }
 
+/** What `rebuildReadModelDerivedStats` analyzes before its aggregates. */
+export const DERIVED_STATS_ANALYZED_TABLES = [
+  'ro_objects', 'ro_connections', 'ro_groups', 'ro_diagrams',
+  'ro_diagram_objects', 'ro_diagram_groups', 'ro_diagram_connections', 'ro_connection_flows',
+] as const
+
+/**
+ * How long a cold build will wait for an ANALYZE lock before giving up on the
+ * optimisation and building with the slow plan.
+ *
+ * Generous ON PURPOSE, and the arithmetic is the justification rather than a
+ * round number — measured for `ro_objects` before the reparent of
+ * `coldBuildReadModelByDeltas`: the only thing that holds this lock is another
+ * cold build's ANALYZE, held to its commit, about the length of one build
+ * (~7 s at 12 000 objects). Skipping cost ~19 s of reparent there, so waiting
+ * was the better trade at any value under that. The bulk cold build has no
+ * reparent; its one ANALYZE (`rebuildReadModelDerivedStats`) keeps the same
+ * ceiling, unmeasured for what a skip costs it. What the ceiling buys is not
+ * speed — it is that the wait is FINITE.
+ */
+export const ANALYZE_LOCK_WAIT_MS = 15_000
+
+export interface AnalyzeCeilingOptions {
+  /** Receives `tables` when the ANALYZE was skipped at its ceiling. */
+  skipped?: string[]
+  /** The per-lock ceiling, ms (default `ANALYZE_LOCK_WAIT_MS`). */
+  lockWaitMs?: number
+}
+
+/** `lock_not_available`: what `lock_timeout` raises when it expires. */
+const LOCK_NOT_AVAILABLE = '55P03'
+
+/**
+ * `ANALYZE <tables>`, BOUNDED, degrading to the slow plan rather than waiting.
+ * Returns whether it ran.
+ *
+ * The bound is the whole point of this function existing instead of one inline
+ * statement. Measured against a real Postgres (on `ro_objects`):
+ *
+ *  - `ANALYZE` takes `ShareUpdateExclusiveLock` on the table and HOLDS IT TO
+ *    COMMIT (still present two statements later). The `ro_*` tables carry
+ *    every workspace's rows side by side, so this is a CROSS-WORKSPACE lock;
+ *  - it does NOT conflict with ordinary DML — a rival INSERT ran in 3 ms — so
+ *    delta projections, and every other writer of these tables, are unaffected;
+ *  - it DOES conflict with another `ANALYZE` (and with VACUUM and DDL): the
+ *    rival aborted at its ceiling. So two cold builds of DIFFERENT workspaces
+ *    serialize here, and nothing else was serializing them — the projection
+ *    mutex is per-workspace.
+ *
+ * And that matters because of where it sits: `withReadModelProjectionTransaction`
+ * sets `lock_timeout = 0` immediately after taking the mutex, deliberately, so
+ * that a static publish's `overlay-rotation` wait is not re-timed. That disarm
+ * assumes everything after the mutex is a per-workspace ROW lock; this
+ * statement is a cross-workspace TABLE lock, so it would inherit an unbounded
+ * wait inside a held mutex. Hence the SAVEPOINT and the ceiling here rather
+ * than reliance on the caller's.
+ *
+ * THE CEILING IS PER LOCK WAIT, not per statement: `lock_timeout` bounds
+ * each single lock acquisition (PostgreSQL's definition of the setting), and
+ * `ANALYZE t1, …, tN` acquires its N table locks one after another. So one
+ * wait is at most the ceiling, but the statement can wait up to N times it
+ * when each table is released just before its own ceiling — with the eight
+ * `DERIVED_STATS_ANALYZED_TABLES` and 15 s, about 120 s inside the mutex in
+ * the worst case (derived from the setting's definition, not measured).
+ *
+ * ONLY `lock_not_available` (55P03, the ceiling expiring) is a skip: it is
+ * the one failure this function exists to absorb. Anything else — a cancel
+ * or `statement_timeout` (57014), a lost connection, a permission error — is
+ * rethrown after the savepoint is rolled back (so the caller's transaction,
+ * and its `lock_timeout`, are as they were before the call). If that
+ * ROLLBACK itself fails, its error is thrown with the original as `cause`.
+ *
+ * THAT IS A BEHAVIOUR CHANGE, and on purpose: before it this
+ * function caught EVERY error and degraded, so a deadlock (40P01), a cancel
+ * (`pg_cancel_backend`, 57014) or a `statement_timeout` during the ANALYZE
+ * cost a skipped ANALYZE and the cold build went on. Now each of those FAILS
+ * THE COLD BUILD: the error leaves `rebuildReadModelDerivedStats`, the
+ * build's transaction rolls back (the previous rows stay), and the failure is
+ * recorded as any failed build is (`consecutive_failures`, the next attempt).
+ * A cancel is an operator or a timeout asking the work to stop, and neither
+ * it nor a deadlock is the bounded lock wait this function exists to absorb;
+ * absorbing them here would hide both behind a "slow plan" log line.
+ *
+ * A skipped ANALYZE is correct, just slow: the statements after it plan on
+ * stale statistics. It is logged, and pushed to `options.skipped` (the
+ * cold build's `analyzeSkippedTables` / `derivedAnalyzeSkipped`), because a
+ * cold build silently taking much longer is the kind of thing nobody ever
+ * finds.
+ */
+export async function analyzeWithinCeiling(
+  tx: Queryable,
+  key: WorkspaceKey,
+  tables: readonly string[],
+  options: AnalyzeCeilingOptions = {},
+): Promise<boolean> {
+  // A POOL (`isPool`) is no caller's transaction — a test or the seed calling
+  // `rebuildReadModelDerivedStats` outside one: the ANALYZE runs in its own
+  // autocommit statement, holds its locks for that statement only and inside
+  // no mutex, as it always has; a SAVEPOINT or a `SET LOCAL` there would be
+  // refused, or land on whichever connection the pool hands out.
+  const lockWaitMs = options.lockWaitMs ?? ANALYZE_LOCK_WAIT_MS
+  // REFUSED, not clamped: `lock_timeout = '0ms'` means NO ceiling, so a 0 or
+  // a negative that reached the SET would silently turn the bound off, and
+  // the previous `Math.max(1, …)` turned NaN into `'NaNms'` (refused by
+  // PostgreSQL only at the SET) and any fraction or typo into a value nobody
+  // asked for. An integer in [1, 2^31 - 1] (the setting's own range) or a throw.
+  if (!Number.isInteger(lockWaitMs) || lockWaitMs < 1 || lockWaitMs > 2_147_483_647) {
+    throw new RangeError(`analyzeWithinCeiling: lockWaitMs must be an integer number of ms in [1, 2147483647], got ${String(lockWaitMs)}`)
+  }
+  if (isPool(tx)) {
+    await tx.query(`ANALYZE ${tables.join(', ')}`)
+    return true
+  }
+  // Restored afterwards on both returning paths: on the success path the
+  // `SET LOCAL` below is still in force and would re-time every later lock
+  // of the caller's transaction (see the disarm in `projectionTransaction.ts`);
+  // on the skip path `ROLLBACK TO SAVEPOINT` has already undone it, so the
+  // restore is redundant there and harmless. Restoring the CALLER'S value
+  // (not a constant 0) keeps any caller that set its own ceiling on it.
+  const prior = await tx.query<{ lock_timeout: string }>(`SELECT current_setting('lock_timeout') AS lock_timeout`)
+  // A SAVEPOINT because a failed statement ABORTS the whole transaction, and
+  // this one is allowed to fail — it is an optimisation, not a write.
+  await tx.query('SAVEPOINT read_model_analyze')
+  let ran = true
+  try {
+    await tx.query(`SET LOCAL lock_timeout = '${lockWaitMs}ms'`)
+    await tx.query(`ANALYZE ${tables.join(', ')}`)
+    await tx.query('RELEASE SAVEPOINT read_model_analyze')
+  } catch (error) {
+    try {
+      await tx.query('ROLLBACK TO SAVEPOINT read_model_analyze')
+      await tx.query('RELEASE SAVEPOINT read_model_analyze')
+    } catch (rollbackError) {
+      // The cause is the ANALYZE failure ON PURPOSE (it is what went wrong
+      // first); the rollback's own error is carried in the message.
+      throw new Error(
+        `[read-model] ROLLBACK TO SAVEPOINT read_model_analyze failed (${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}) `
+        + `after ANALYZE ${tables.join(', ')} failed; the original error is the cause`,
+        // eslint-disable-next-line preserve-caught-error
+        { cause: error },
+      )
+    }
+    if ((error as { code?: unknown } | null)?.code !== LOCK_NOT_AVAILABLE) throw error
+    ran = false
+    options.skipped?.push(...tables)
+    console.warn(
+      `[read-model] could not ANALYZE ${tables.join(', ')} for ${key.landscapeId}/${key.versionId}: a lock wait `
+      + `exceeded ${lockWaitMs} ms (another cold build's ANALYZE, an autovacuum or a migration holds it). `
+      + 'Building with stale planner statistics — correct, but slower:',
+      error,
+    )
+  }
+  await tx.query(`SELECT set_config('lock_timeout', $1, true)`, [prior.rows[0]?.lock_timeout ?? '0'])
+  return ran
+}
+
 export async function rebuildReadModelDerivedStats(
   db: Queryable,
   key: WorkspaceKey,
   orgId: string | null = null,
+  timings?: RowWriteTimings,
+  analyze: AnalyzeCeilingOptions = {},
 ): Promise<void> {
   // A cold build/full sync may have inserted hundreds of thousands of source
   // rows in the current transaction. Give PostgreSQL real cardinalities before
   // planning the bulk aggregate joins; without this, the default estimates can
   // turn a 30k-row rebuild into a multi-minute nested-loop plan.
-  await db.query(`ANALYZE ro_objects, ro_connections, ro_groups, ro_diagrams,
-    ro_diagram_objects, ro_diagram_groups, ro_diagram_connections, ro_connection_flows`)
+  //
+  // BOUNDED (G4-16f C7): these tables hold every workspace's rows, so this
+  // is a cross-workspace lock taken inside the caller's projection mutex —
+  // `analyzeWithinCeiling` says why it must not wait unboundedly, and what
+  // a skipped ANALYZE costs (the same stats, just slower to compute).
+  await timedPhase(timings, 'derivedAnalyzeMs', () => analyzeWithinCeiling(db, key, DERIVED_STATS_ANALYZED_TABLES, analyze))
   const params = [key.landscapeId, key.versionId]
-  await db.query(`DELETE FROM ro_diagram_summaries WHERE landscape_id = $1 AND version_id = $2`, params)
-  await db.query(`DELETE FROM ro_connection_stats WHERE landscape_id = $1 AND version_id = $2`, params)
-  await db.query(`DELETE FROM ro_object_child_stats WHERE landscape_id = $1 AND version_id = $2`, params)
-  await refreshDiagramSummaries(db, key)
-  await refreshConnectionStats(db, key)
-  await refreshObjectChildStats(db, key)
-  await rebuildWorkspaceStats(db, key, orgId)
+  await timedPhase(timings, 'derivedDeletesMs', async () => {
+    await db.query(`DELETE FROM ro_diagram_summaries WHERE landscape_id = $1 AND version_id = $2`, params)
+    await db.query(`DELETE FROM ro_connection_stats WHERE landscape_id = $1 AND version_id = $2`, params)
+    await db.query(`DELETE FROM ro_object_child_stats WHERE landscape_id = $1 AND version_id = $2`, params)
+  })
+  await timedPhase(timings, 'diagramSummariesMs', () => refreshDiagramSummaries(db, key))
+  await timedPhase(timings, 'connectionStatsMs', () => refreshConnectionStats(db, key))
+  await timedPhase(timings, 'childStatsMs', () => refreshObjectChildStats(db, key))
+  await timedPhase(timings, 'workspaceStatsMs', () => rebuildWorkspaceStats(db, key, orgId))
 }
 
 export async function upsertDecisionRecords(

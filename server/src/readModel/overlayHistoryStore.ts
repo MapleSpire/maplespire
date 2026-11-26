@@ -319,6 +319,24 @@ export async function overlaySegmentBase(
   return rows[0]?.last_projected_snapshot
 }
 
+/**
+ * The last PROJECTED snapshot of each listed segment — the in-memory baseline
+ * the static projector restores (`objectSegments` / `connectionSegments`).
+ *
+ * A row at `last_projected_revision = 0` with the `'{}'` snapshot is NOT
+ * returned (T-SUM-0b). `last_projected_snapshot` is `NOT NULL DEFAULT '{}'`,
+ * and three bookkeeping writers insert rows without one: the rotation's child
+ * row, `synchronizeOverlayHead` and `synchronizeOverlaySegments`. Read back,
+ * such a row claims "projected, and EMPTY" for a segment nobody projected.
+ * Measured on a stack: the retired CONNECTION head
+ * of a workspace promoted to the static plane got exactly that row from
+ * `synchronizeOverlayHead` (the ModelMeta pass the OBJECT rotation triggers
+ * runs before the connection head rotates) and was restored as `{}` while
+ * its document held 3 connections. Leaving it out makes it a HOLE, which
+ * the projector fills from the document itself (`materialiseOverlaySegments`). A segment genuinely
+ * recorded empty at revision 0 is re-read once from its document, at the cost
+ * of one resolution, and gets the same `{}` back.
+ */
 export async function overlaySegmentSnapshots(
   db: Queryable,
   key: WorkspaceKey,
@@ -334,7 +352,8 @@ export async function overlaySegmentSnapshots(
      FROM read_model_overlay_segments
      WHERE landscape_id = $1 AND version_id = $2 AND collection = $3
        AND document_id = ANY($4::text[])
-       AND last_projected_snapshot IS NOT NULL`,
+       AND last_projected_snapshot IS NOT NULL
+       AND NOT (last_projected_revision = 0 AND last_projected_snapshot = '{}'::jsonb)`,
     [key.landscapeId, key.versionId, collection, [...new Set(documentIds)]],
   )
   return new Map(rows.map((row) => [row.document_id, row.last_projected_snapshot ?? {}]))

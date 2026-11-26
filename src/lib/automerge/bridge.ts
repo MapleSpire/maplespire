@@ -12,9 +12,9 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU Affero General Public License for more details.
 
-import type { AutomergeUrl, DocHandle, DocumentId } from '@automerge/automerge-repo'
+import type { AutomergeUrl, DocHandle, DocHandleChangePayload, DocumentId } from '@automerge/automerge-repo'
 import { isValidAutomergeUrl } from '@automerge/automerge-repo'
-import { getHeads } from '@automerge/automerge'
+import { decodeChange, getActorId, getAllChanges, getHeads } from '@automerge/automerge'
 import { useModelStore } from '../../stores/modelStore'
 import { undoHistory } from '../history/undoHistory'
 import { useAutomergeStatus } from '../../stores/automergeStatusStore'
@@ -38,6 +38,7 @@ import {
   routeWorkspaceNetwork,
   activeDocumentShare,
   prepareDocumentRequest,
+  releaseDocumentRequest,
   cachedRootUrlFor,
   lastAttemptedRootUrlFor,
   preferCachedRootForNextResolve,
@@ -65,6 +66,10 @@ import {
   type WorkspaceBinding,
 } from './workspaceBinding'
 import { applyCollectionReconcile, planCollectionReconcile, reconcile, reconcileIsNoop } from './reconcile'
+import { clearedOverlayEditsToRestore, mergeStoredRescues, rescuePatch, storeForm, type StoredOverlayRescue } from './overlayClearRescue'
+import { ResidentPendingWrites } from './residentPendingWrites'
+import { createResidentDebtDriver, type ResidentDebtAttempt, type ResidentDebtDriver, type ResidentDebtDriverState } from './residentDebtDriver'
+import { BootLocalEdits } from './bootLocalEdits'
 import {
   COLLECTION_SCHEMAS,
   CONNECTION_SCHEMA,
@@ -118,8 +123,10 @@ import { scheduleDeferredOverlayHydration } from './deferredOverlayHydration'
 import { runDiagramFirstPaintPipeline, waitForVisualCommit } from './diagramOpenPipeline'
 import { persistentSlicesChanged } from './persistentSlices'
 import { resolveReadyHandleWithRetry } from './handleRetry'
-import { isRetryableDocumentResolutionError } from './documentResolution'
-import { shouldFallBackToCachedRoot } from './rootFetchPolicy'
+import {
+  DocumentPermanentlyUnavailableError, DocumentTemporarilyUnavailableError, isRetryableDocumentResolutionError,
+} from './documentResolution'
+import { shouldFallBackToCachedRoot, WorkspaceRootUnreachableError } from './rootFetchPolicy'
 import { GroupEditOverlay } from './groupEditOverlay'
 import { LocalDiagramHold } from './localDiagramHold'
 import { UnpublishedDiagramDocs } from './unpublishedDiagramDocs'
@@ -138,15 +145,31 @@ import {
 import { overlayRecordsToReseed } from './decisionRecordOverlayReseed'
 import { markClientTimeline, startClientTimelineMeasure } from '../observability/clientTimeline'
 import { PlacementWriteScheduler, type WriteKind } from './placementWriteScheduler'
+import { createEpochHop, type EpochHop, type EpochHopOptions, type EpochHopPorts, type HopAcknowledgement, type HopDocumentHeads, type RetainToken } from './epochHop'
+import {
+  ANSWER_EXPIRED, ANSWER_REFUSED, createRepointProbeScheduler, EPOCH_LINEAGE_KEY, EPOCH_LINK_GONE, holdsTargets, hopUnaccounted, isExpiredSession, isPermanentRefusal,
+  lifecycleFlushPlan, nextEpochCapability, predecessorIdOf, repointAction, retryUntilAnswered, UNMINTED_RETRY_DELAYS_MS,
+  walkEpochLineage, withLineageLinks, type EpochLineage,
+} from './epochBridgeRules'
+import { runAtomically, unpublishedShards, withCarried } from './epochSwap'
+import { collectRetiredDifferences, type RetiredExport } from './epochRetiredDiff'
+import { loadRetiredExport, mergeRetiredExports, persistRetiredExport } from './epochRetiredExportStore'
+import { useEpochHopStore } from '../../stores/epochHopStore'
 import {
   acknowledgeDurableDocumentHeads,
   changeWithDurabilityTracking as changeAndTrack,
   DurableHeadLedger,
+  type DurableHeadSnapshot,
   durableConnectionStatus,
   mergeDurableHeadSnapshots,
   pendingDurabilityDebts,
   setLocalDocumentChangeListener,
+  setEpochCapabilityListener,
+  withChangeMessage,
 } from './durableSync'
+import { installEpochOverrides, refreshOverrides } from './epochOverridesController'
+import { isReapplyMessage } from './epochOverrides'
+import { useEpochOverridesStore } from '../../stores/epochOverridesStore'
 import {
   applyDurableVerdicts,
   DeniedDocumentRecovery,
@@ -251,6 +274,7 @@ import type {
   Tag,
   DecisionRecord,
 } from '../../types'
+import { appendMetaUrl, readMetaUrl, readMetaUrls, withMetaUrlView, writeMetaUrls } from './modelMetaUrls'
 
 /**
  * The bridge between the Zustand model store (which the canvas/UI read & write)
@@ -308,12 +332,82 @@ let activeChangeHandler: (() => void) | null = null
 // reports `ready`, and with a non-empty one it does the acknowledgement it was
 // always going to do.
 const writeScheduler = new PlacementWriteScheduler(() => {
+  // The epoch hop's latch (`epochHop.ts`, step 4): writes are PAUSED between the one
+  // flush it runs and the swap. A request in that window is remembered and
+  // re-armed on resume, so it lands on whichever epoch is current then.
+  if (writesPausedByHop) {
+    writeDeferredByHop = true
+    writesDeferredByLatch += 1
+    return
+  }
   try {
     flushWrite()
   } finally {
     scheduleDurableAcknowledgement(0)
+    armHeldDeletionRetry()
   }
 })
+
+/**
+ * T-DIAGDEF-2: the debt the badge now counts for a WHOLE-MODEL
+ * diagram delete no document holds (`pendingDurabilityCount`) needs an engine
+ * of its own: the hold is released only by a flush that finds the registry
+ * complete, and nothing asked for one when the missing shard came back —
+ * Saving until some unrelated edit. A flush that leaves held deletions arms
+ * one more write, backing off from 2 s to 30 s; any flush re-evaluates, and
+ * none is armed under boot-from-server (its intent journal has its own
+ * replays) or a frozen contract (no write can express it; the banner asks
+ * for the reload).
+ */
+const HELD_DELETION_RETRY_MIN_MS = 2_000
+const HELD_DELETION_RETRY_MAX_MS = 30_000
+let heldDeletionRetryTimer: ReturnType<typeof setTimeout> | null = null
+let heldDeletionRetryMs = HELD_DELETION_RETRY_MIN_MS
+/** Retries fired this EPISODE (from a held deletion until none is held, or
+ * the session ends), and whether its 30 s cadence was reported. */
+let heldDeletionRetriesFired = 0
+let heldDeletionRetryCeilingReported = false
+
+function clearHeldDeletionRetry(): void {
+  if (heldDeletionRetryTimer) clearTimeout(heldDeletionRetryTimer)
+  heldDeletionRetryTimer = null
+  heldDeletionRetryMs = HELD_DELETION_RETRY_MIN_MS
+  heldDeletionRetriesFired = 0
+  heldDeletionRetryCeilingReported = false
+}
+
+/** TEST-ONLY: the held-deletion retry's state. Production never calls this. */
+export function __heldDeletionRetryForTest(): { armed: boolean; nextDelayMs: number; fired: number } {
+  return { armed: heldDeletionRetryTimer !== null, nextDelayMs: heldDeletionRetryMs, fired: heldDeletionRetriesFired }
+}
+
+function armHeldDeletionRetry(): void {
+  if (!started || bfsActive || workspaceContractStale || localDiagramHold.heldDeletions === 0) {
+    clearHeldDeletionRetry()
+    return
+  }
+  if (heldDeletionRetryTimer) return
+  const epoch = durableAckEpoch
+  const delay = heldDeletionRetryMs
+  heldDeletionRetryMs = Math.min(heldDeletionRetryMs * 2, HELD_DELETION_RETRY_MAX_MS)
+  // Reported once an episode when the cadence reaches its ceiling: a shard
+  // that stays unresolved keeps this at one cheap flush every 30 s, for as
+  // long as the badge says Saving — never silently.
+  if (delay === HELD_DELETION_RETRY_MAX_MS && !heldDeletionRetryCeilingReported) {
+    heldDeletionRetryCeilingReported = true
+    console.warn(`[bridge] ${localDiagramHold.heldDeletions} diagram delete(s) no registry shard could express yet; `
+      + `retrying every ${HELD_DELETION_RETRY_MAX_MS / 1000} s while the badge shows them unsaved`)
+  }
+  heldDeletionRetryTimer = setTimeout(() => {
+    heldDeletionRetryTimer = null
+    if (epoch !== durableAckEpoch || localDiagramHold.heldDeletions === 0) return
+    heldDeletionRetriesFired += 1
+    scheduleWrite('normal')
+  }, delay)
+}
+/** Set by the epoch hop's latch (`flushAndPauseWrites`), cleared by `resumeWrites`. */
+let writesPausedByHop = false
+let writeDeferredByHop = false
 let pendingNormalWrite = false
 /** Diagrams whose only pending durable change is a VIEW field
  * (`diagramViewWrite.ts`). Drained by flushWrite's targeted branch when the
@@ -324,6 +418,22 @@ let netCleanups: Array<() => void> = []
 let serverProjectionRequestSequence = 0
 let lastAppliedServerProjectionRequest = 0
 const durableHeads = new DurableHeadLedger()
+/** The debt of the last stopped session (see `stopBridge`), taken by the
+ * workspace switch that stopped it. */
+let stoppedSessionDebt: StoppedSessionDebt | null = null
+
+export interface StoppedSessionDebt {
+  ref: WorkspaceRef
+  documents: DurableHeadSnapshot[]
+}
+
+/** The documents the session `stopBridge` just ended still owed its server,
+ * with their frontiers — once: a second call answers null. */
+export function takeStoppedSessionDurableDebt(): StoppedSessionDebt | null {
+  const debt = stoppedSessionDebt
+  stoppedSessionDebt = null
+  return debt
+}
 /** Pointers held back until the server acknowledges the document they name
  *  (deferredReferences.ts). The waiters live for one session, like the ledger
  *  that feeds them; the queue is persisted per workspace and resumed at boot. */
@@ -367,7 +477,7 @@ let durableLedgerHydratedEpoch = -1
  *  workspace can move before the session stops: the auth-on rebound in
  *  startBridge's catch resolves (and activates) its fallback, THEN stops — and
  *  that stop wrote the failed workspace's ledger over the fallback's
- *  (reviewer lens probe, 2026-10-31). */
+ *  (found by a probe, 2026-10-31). */
 let durableLedgerStore: KvStore | null = null
 
 function durableLedgerHydrated(): boolean {
@@ -395,7 +505,7 @@ function queueDurableLedgerPersistence(): void {
         // A read then a write, not `store.update`: idb-keyval's update settles
         // only from its read's `onsuccess`, so a failed read left it — and this
         // chain, which the next boot's hydration awaits — pending for ever
-        // (reviewer lens, fake-indexeddb probe). The chain already serializes
+        // (seen with a fake-indexeddb probe). The chain already serializes
         // this tab's writes; across tabs the replace above is no more atomic.
         const persisted = await store.get<unknown>(DURABLE_HEAD_LEDGER_KEY)
         await store.set(DURABLE_HEAD_LEDGER_KEY, mergeDurableHeadSnapshots(persisted, snapshot))
@@ -485,7 +595,7 @@ function partitionDurableLedger(): void {
  * fork may then have copied. Replayed into the new version anyway, a creation
  * the fork carried and a colleague deleted there would come back — and where
  * deletes leave no tombstone (comments, groups, the resident replay) not even
- * the conflict-averse planner could tell (reviewer lens, 2026-10-31). So the
+ * the conflict-averse planner could tell (found 2026-10-31). So the
  * old version is ASKED, through the durable-heads endpoint, about each record's
  * carriers:
  *  - durable there → released: the old version has it, the fork may too, and
@@ -710,7 +820,7 @@ let sentReleaseInFlight = false
  * two latest (two captures of one local history, in an order neither journal
  * knows). Only what was marked BEFORE the request may be released by its
  * answer: a record marked during the round carries heads it never named
- * (reviewer lens, 2026-10-31). A carrier past the batch is simply not proved
+ * (found 2026-10-31). A carrier past the batch is simply not proved
  * this round. A failed round is retried with the next one: SENT is not a debt,
  * so nothing waits on it.
  */
@@ -786,6 +896,11 @@ async function runDurableAcknowledgement(): Promise<void> {
     const acknowledged = await acknowledgeDurableDocumentHeads(sent)
     if (epoch !== durableAckEpoch) return
     durableHeads.acknowledge(sent, acknowledged)
+    // The epoch an abandoned hop left the tab on is retired now — hop at once
+    // (the retired path exports).
+    if (epochHopAbandonedUrl !== null && heldEpochRetiredIn(acknowledged)) resumeAbandonedEpochHop()
+    // A retired document held in no epoch.
+    offerOrphanedRetiredLedger(acknowledged)
     // Any `durable` answer means the server holds the document (heads are
     // causal, so the frontier sent contains its creation) — which is all a held
     // pointer waits for, even if newer edits are still on their way.
@@ -853,12 +968,17 @@ async function runDurableAcknowledgement(): Promise<void> {
   }
 }
 
-function trackDurableHandle<T>(handle: DocHandle<T>): void {
+function trackDurableHandle<T>(handle: DocHandle<T>, localChange = false): void {
   const doc = handle.doc()
   if (!doc) return
   // Tagged with the workspace the document belongs to; an unknown one leaves
   // any earlier tag in place (`partitionDurableLedger` reads it).
-  durableHeads.mark(handle.documentId, getHeads(doc as never), documentsWorkspaceKey() ?? undefined)
+  // With the actor a LOCAL change was written under: the net filters a retired
+  // copy by the entry's own writers, never by the bounded actor journal. Any
+  // other mark (a creation, a resumed handle whose content an earlier page load
+  // wrote) leaves them unknown: nothing filtered.
+  durableHeads.mark(handle.documentId, getHeads(doc as never), documentsWorkspaceKey() ?? undefined,
+    localChange ? getActorId(doc as never) : undefined)
   activeDocumentShare.pin(handle.documentId, 'durability-pending')
   queueDurableLedgerPersistence()
   if (syncTransportConnected) useAutomergeStatus.getState().setStatus('saving')
@@ -1240,6 +1360,302 @@ const modelShardChangeHandlers = new Map<string, () => void>()
  * an entity returns to the shard already holding it; never id-hash bucketed). */
 const shardIndexByObjectId = new Map<string, number>()
 const shardIndexByConnectionId = new Map<string, number>()
+
+/** The resident path's local writes no document holds yet, overlaid on every
+ * projection (`residentPendingWrites.ts`). Resident sharded mode only:
+ * boot-from-server journals them (`entityIntents.ts`). */
+const residentPendingWrites = new ResidentPendingWrites()
+
+/** The entity as the document it is routed to holds it (any shard otherwise). */
+function heldInShards(collection: 'objects' | 'connections', id: string): Record<string, unknown> | undefined {
+  const handles = (collection === 'objects' ? objectShardHandles : connectionShardHandles) as DocHandle<unknown>[]
+  const route = (collection === 'objects' ? shardIndexByObjectId : shardIndexByConnectionId).get(id)
+  const read = (h: DocHandle<unknown> | undefined) => ((h?.doc() as Record<string, Record<string, Record<string, unknown>> | undefined>)?.[collection])?.[id]
+  if (route !== undefined) {
+    const routed = read(handles[route])
+    if (routed) return routed
+  }
+  for (const h of handles) {
+    const found = read(h)
+    if (found) return found
+  }
+  return undefined
+}
+
+/**
+ * With or without epochs: the store is projected and the editor shown BEFORE
+ * the boot subscribes `onStoreChange` — it still awaits the active diagram
+ * (`switchActiveDiagram`) and its freshness. An edit in that window was noted
+ * by nothing and scheduled no write, and the write-guard baselines were then
+ * seeded from the store WITH it, so no later flush saw it either. Measured in a
+ * manual test: Paul's online rename of an object showed in his store, no
+ * document held it, the badge said "Synced", and the reload lost it (3 trials
+ * in 6, and 4 in 6 on an earlier build). The sample that named it: status `connecting`
+ * at the edit, `residentPendingWrites` 0, the shard untouched.
+ *
+ * So from the start of the boot, a LOCAL store change is noted as owed (the
+ * resident pending-writes overlay keeps it through the boot's projections), and the state
+ * before the first one is kept: the baselines are seeded from it, and the
+ * subscription then hands `onStoreChange` the whole difference, which writes
+ * it like any edit.
+ */
+let bootEditWatch: (() => void) | null = null
+/** The window's LOCAL edits, by entity. */
+let bootLocalEdits: BootLocalEdits | null = null
+/** The write-guard baselines were seeded for this boot window. */
+let bootBaselinesSeeded = false
+
+/**
+ * G4-16l: the session's owner of the resident debt, from `startBridge` to
+ * `stopBridge` — not the boot window's. Before it, the window's 200 ms retry
+ * and its `pagehide` listener were what drove the debt, and closing the window
+ * (a failed boot, a throw between the debt's note and its scheduled write) left
+ * an edit owed with nobody charged with writing it.
+ */
+let residentDebtDriver: ResidentDebtDriver | null = null
+/**
+ * Which path the driver's attempt takes. `boot`: from `watchBootEdits` until
+ * the session's subscription takes over — the boot window's model write, with
+ * its gates (`writesPausedByHop`, `residentStoreProjectsShards`); a boot that
+ * FAILED inside its window stays here, its window baselines seeded by its
+ * catch. `session`: from the boot's seeding of its write baselines (just
+ * before the subscription) on — ALWAYS the flush
+ * (`scheduleWrite`), the only writer that reads `workspaceContractStale`, so
+ * a failed boot past its window never writes over a contract latched stale.
+ * `null`: no session.
+ */
+let residentDebtWriter: 'boot' | 'session' | null = null
+
+function attemptResidentDebtWrite(): ResidentDebtAttempt {
+  if (residentDebtWriter === 'session') {
+    // A FULL write already planned is the one that pays the debt: requesting
+    // another would push its debounce back. A placement-only one would not
+    // write the model.
+    if (!writeScheduler.pending || !pendingNormalWrite) scheduleWrite('normal')
+    return 'deferred'
+  }
+  if (residentDebtWriter === 'boot') return writeBootModelNow() ? 'written' : 'refused'
+  return 'refused'
+}
+
+/**
+ * G4-16l, case 3: the failed boot's write of its window debt, which never
+ * throws (a throw from `writeModelShards` used to skip the rest of the catch —
+ * its cleanup, the cached-root fallback and the `error` status — and leave
+ * the loader on "connecting"). Not retried here: what stays owed is the
+ * driver's. Only while the window is open. The baselines are seeded
+ * from the window's base now, while it is still known — closing the window
+ * drops it, and a later seeding from the store would already hold her
+ * edit, which no flush would then write.
+ */
+function tryWriteBootDebt(): 'written' | 'refused' | 'failed' {
+  if (!bootEditWatch) return 'refused'
+  try {
+    if (residentPendingWrites.size > 0 && !bootBaselinesSeeded && bootLocalEdits) {
+      seedWriteBaselines(bootLocalEdits.base(useModelStore.getState()), true)
+      bootBaselinesSeeded = true
+    }
+    return writeBootModelNow() ? 'written' : 'refused'
+  } catch (error) {
+    console.error('Automerge bridge: the failed boot could not write its window edits now; they stay owed and are tried again', error)
+    return 'failed'
+  }
+}
+
+/**
+ * TEST SEAM (G4-16l): one synchronous throw at a named site, the next time it
+ * runs. Inert in production: nothing outside a test arms it, and an empty map
+ * is one size check per call.
+ */
+export type BridgeFaultSiteForTest = 'onStoreChangeAfterNote' | 'writeModelShards' | 'projectAll'
+const faultsOnceForTest = new Map<BridgeFaultSiteForTest, (() => void) | undefined>()
+export function __injectFaultOnceForTest(site: BridgeFaultSiteForTest | null, onFire?: () => void): void {
+  if (site === null) faultsOnceForTest.clear()
+  else faultsOnceForTest.set(site, onFire)
+}
+export function __armedFaultsForTest(): BridgeFaultSiteForTest[] {
+  return [...faultsOnceForTest.keys()]
+}
+function faultPointForTest(site: BridgeFaultSiteForTest): void {
+  if (faultsOnceForTest.size === 0 || !faultsOnceForTest.has(site)) return
+  const onFire = faultsOnceForTest.get(site)
+  faultsOnceForTest.delete(site)
+  onFire?.()
+  throw new Error(`injected fault (${site})`)
+}
+/** TEST SEAM (G4-16l): this session's debt driver (null: no session). */
+export function __residentDebtDriverForTest(): ResidentDebtDriver | null {
+  return residentDebtDriver
+}
+/** TEST SEAM (G4-16l, case 1): writes paused as a hop's latch pauses them,
+ * without a hop. Inert in production: nothing outside a test calls it. */
+export function __pauseWritesAsByHopForTest(paused: boolean): void {
+  writesPausedByHop = paused
+}
+
+function watchBootEdits(): void {
+  stopWatchingBootEdits()
+  bootLocalEdits = new BootLocalEdits()
+  bootBaselinesSeeded = false
+  residentDebtWriter = 'boot'
+  bootEditWatch = useModelStore.subscribe((state, previous) => {
+    if (applyingRemote) return
+    if (!bfsActive && sharded && modelMetaHandle) {
+      residentPendingWrites.note('objects', previous.objects as never, state.objects as never)
+      residentPendingWrites.note('connections', previous.connections as never, state.connections as never,
+        (c) => (c as unknown as Connection).kind === 'lower')
+      if (residentPendingWrites.size > 0) residentDebtDriver?.arm()
+    }
+    if (persistentSlicesChanged(state, previous)) bootLocalEdits?.note(previous as never, state as never)
+  })
+}
+
+/**
+ * The write-guard baselines (`lastModelSlices`, the per-shard slices) seeded
+ * from `base` — the store as the documents hold it, the boot window's local
+ * edits put back — so a write reconciles only the shards and the small
+ * collections those edits touched (when they were seeded only at the
+ * subscription, the first boot-window write reconciled EVERY shard, the
+ * O(model) walk measured at ~12 s for 15 000 objects, and the meta's small
+ * collections from a store whose ADR page may not be hydrated yet).
+ */
+function seedWriteBaselines(base: ReturnType<typeof useModelStore.getState>, shards: boolean): void {
+  const persisted0 = base.connections.filter((c) => c.kind !== 'lower')
+  lastModelSlices = {
+    objects: base.objects,
+    connections: persisted0,
+    groups: base.groups,
+    domains: base.domains,
+    tags: base.tags,
+    decisionRecords: base.decisionRecords,
+  }
+  // Per-shard write-guard baselines: partition the just-projected store exactly
+  // as writeModelShards will, so the first flush finds every shard unchanged.
+  if (shards) {
+    lastObjectShardSlices = partitionByShard(base.objects, shardIndexByObjectId, objectShardHandles.length)
+    lastConnectionShardSlices = partitionByShard(persisted0, shardIndexByConnectionId, connectionShardHandles.length)
+  }
+}
+
+/**
+ * The model half of a boot-window edit, written WITHOUT waiting for the boot
+ * to end (measured in a manual test: a device that edits offline while its boot still
+ * awaits the active diagram's freshness wrote nothing for seconds; the clear
+ * then reached it, the entity was absent from the merge until its fold
+ * product was followed, and the pending-write entry was dropped as "deleted remotely"
+ * — the edit was lost with no document ever holding it). Only the model
+ * shards (the rest of `flushWrite` waits for the boot), only while the store
+ * is the projection of the loaded shards (a reconcile from a store not
+ * projected yet would delete what it does not show).
+ *
+ * Driven by the session's `residentDebtDriver` (G4-16l; the window's own
+ * 50 ms then 200 ms timer before it): refused now — a hop's latch, a store not
+ * (or no longer) the projection of the loaded shards — it is tried again on
+ * the driver's backoff, past the window too when the boot failed inside it.
+ * `flushWrite`'s other gate, the promoted-contract latch
+ * (`workspaceContractStale`), is read here too: the boot installs
+ * `rootChangeHandler` shortly BEFORE its window closes, and a boot that failed
+ * inside its window has no root handler at all, so its writer also refuses a
+ * root that now says `registrySummaryOnly` — the base shards are the server's
+ * and fenced.
+ */
+/** The boot window's owed model writes, written now if they can be (no
+ * latch, the store the projection of the loaded shards); false: refused. */
+function writeBootModelNow(): boolean {
+  if (residentPendingWrites.size === 0) return true
+  if (writesPausedByHop || !residentStoreProjectsShards()) return false
+  if (workspaceContractStale || rootHandle?.doc()?.registrySummaryOnly === true) return false
+  const state = useModelStore.getState()
+  if (!bootBaselinesSeeded) {
+    // The window's base is gone (the window closed before any seeding): a
+    // seeding from the store would hold her edit and write nothing.
+    if (!bootLocalEdits) return false
+    seedWriteBaselines(bootLocalEdits.base(state), true)
+    bootBaselinesSeeded = true
+  }
+  writeModelShards(state.objects, state.connections.filter((c) => c.kind !== 'lower'), {
+    groups: state.groups, domains: state.domains, tags: state.tags, decisionRecords: state.decisionRecords,
+  })
+  releaseResidentPendingWrites()
+  return true
+}
+
+/**
+ * The page hidden or closed while the boot runs — before `wireConnectionStatus`
+ * installs the session's own lifecycle listeners — runs the lifecycle flush
+ * too: an edit made in the boot window is otherwise lost with the tab
+ * (measured in a manual test: a device that edits, reconnects and closes
+ * while its boot still awaits the active diagram's freshness).
+ *
+ * G4-16l: the listener is the debt driver's, installed with the session and
+ * removed only when `wireConnectionStatus` installs the session's own (one
+ * owner of the lifecycle at a time, so no double flush) or by `stopBridge`.
+ * A failed boot keeps it: its catch used to remove it, and an edit its write
+ * refused then had nothing to write it before the tab went away.
+ */
+function watchBootLifecycle(): void {
+  residentDebtDriver?.installLifecycle()
+}
+
+/**
+ * The watch removed, and the window's local edits handed back (null: none).
+ * Called by the boot that installed it only once that boot has checked it is
+ * not superseded (a superseded boot taking it would take the NEXT boot's
+ * window); a stop or a new watch removes it. G4-16l: it cancels nothing on the
+ * debt's side — what is owed stays the session driver's.
+ */
+function stopWatchingBootEdits(): BootLocalEdits | null {
+  if (bootEditWatch) bootEditWatch()
+  bootEditWatch = null
+  const edits = bootLocalEdits
+  bootLocalEdits = null
+  return edits && edits.size > 0 ? edits : null
+}
+
+/** The resident sharded store is the projection of the shard documents as
+ * they are now (nothing has changed in them since `projectAll` merged them). */
+function residentStoreProjectsShards(): boolean {
+  if (bfsActive || !sharded || !modelMetaHandle) return false
+  if (lastObjectShardDocs.length === 0 || lastObjectShardDocs.length !== objectShardHandles.length) return false
+  return sameRefs(objectShardHandles.map((h) => h.doc()), lastObjectShardDocs)
+    && sameRefs(connectionShardHandles.map((h) => h.doc()), lastConnectionShardDocs)
+}
+
+function releaseResidentPendingWrites(): void {
+  if (residentPendingWrites.size === 0) return
+  residentPendingWrites.release('objects', (id) => heldInShards('objects', id))
+  residentPendingWrites.release('connections', (id) => heldInShards('connections', id))
+  armAbsentReleaseTimer()
+}
+
+/**
+ * An entity edited here that stayed absent past its grace is released when the
+ * grace ENDS, not at the next projection or write — in a quiet workspace there
+ * may be none, and the badge would say "Saving" until then. The durability
+ * check that follows lets it say "Synced" again.
+ */
+let absentReleaseTimer: ReturnType<typeof setTimeout> | null = null
+let absentReleaseAt = 0
+
+function armAbsentReleaseTimer(): void {
+  const deadline = residentPendingWrites.nextAbsentDeadline()
+  if (deadline === null) return
+  if (absentReleaseTimer && absentReleaseAt <= deadline) return
+  if (absentReleaseTimer) clearTimeout(absentReleaseTimer)
+  absentReleaseAt = deadline
+  const session = durableAckEpoch
+  absentReleaseTimer = setTimeout(() => {
+    absentReleaseTimer = null
+    if (session !== durableAckEpoch) return
+    releaseResidentPendingWrites()
+    scheduleDurableAcknowledgement(0)
+  }, Math.max(0, deadline - Date.now()) + 5)
+}
+
+function stopAbsentReleaseTimer(): void {
+  if (absentReleaseTimer) clearTimeout(absentReleaseTimer)
+  absentReleaseTimer = null
+}
 /** Read-skip caches: re-merge object/connection shards only when a shard doc ref
  * changed; small collections come from the meta doc (per-key via lastModelColl). */
 let lastObjectShardDocs: unknown[] = []
@@ -1329,7 +1745,18 @@ let placementIntentsHydrated = false
 /** The ONE sum all three 'ready'-producing badge sites go through. */
 function pendingDurabilityCount(): number {
   return pendingDurabilityDebts({
-    durableHeadCount: durableHeads.size,
+    // A rescue still owed is an edit the server does not show yet — never
+    // "Synced" over it. Nor over a local write no document holds yet.
+    // T-DIAGDEF-2: nor over a WHOLE-MODEL diagram delete no document holds yet.
+    // That plane journals no delete intent (`captureExplicitDeletes` is
+    // boot-from-server only; the whole-model branch clears the intent and
+    // counts on the registry write), so when the write cannot express it — a
+    // registry shard unresolved at the flush, a frozen contract —
+    // `LocalDiagramHold` is the only record of it, until a complete registry no
+    // longer lists the id (`retirePendingLocalDiagrams`). Boot-from-server
+    // counts the same delete through its entity-intent journal.
+    durableHeadCount: durableHeads.size + pendingOverlayRescues.size + residentPendingWrites.size
+      + (bfsActive ? 0 : localDiagramHold.heldDeletions),
     durableLedgerHydrated: durableLedgerHydrated(),
     writeSchedulerPending: writeScheduler.pending,
     entityIntentCount: pendingEntityIntents.pendingCount(workspaceRefKey(currentRef)),
@@ -1433,6 +1860,19 @@ const unTombConnections = new Set<string>()
  */
 const tombstoneDiagrams = new Set<string>()
 const unTombDiagrams = new Set<string>()
+/**
+ * SESSION-CREATED diagrams whose removal `writeSummaryLocalRegistry` expressed
+ * in the write-head shard (T-DIAGDEF (1)). Their deletion is as durable as a
+ * tombstone — the write head is the one document that listed them — but it is
+ * deliberately NOT a tombstone (`planDiagramTombstones` defers them), so
+ * `tombstoneDiagrams` drops them at that moment. Published to the store with
+ * the tombstones (`publishDiagramTombstones`): the summary Diagrams page is
+ * served by the SERVER and its one removal signal is the store's
+ * `deletedDiagramIds`, so without this the card of a diagram created and
+ * deleted in the same session stayed until a reload. Session state only (the
+ * server row is gone with the head entry); an id created again leaves it.
+ */
+const retiredSessionDiagramIds = new Set<string>()
 const decisionRecordPageBaseline = new Map<string, DecisionRecord>()
 // Small-collections write guard (boot-from-server): groups/domains/tags/decisionRecords are
 // RESIDENT (s.* = the full set, projected from ModelMeta), so they're written back to
@@ -1492,9 +1932,36 @@ const ECHO_SUPPRESS_MS = 200
  * render re-fetch that can clobber an in-flight edit; the normal path re-projects
  * synchronously with no clobber, so it's never suppressed. */
 function reprojectFromChange(): void {
+  lastModelActivityAt = Date.now()
   if (bfsActive && Date.now() < suppressEchoUntil) return
+  // Not inside a hop's latch. Measured on an aged stack (a diagram of ~3 000
+  // shapes, two other tabs writing every 120 ms), each remote change
+  // re-projected the store and redrew the whole canvas: the hopping tab's main
+  // thread was busy 100 % of the time (CPU profile: 68 % in the canvas render
+  // loop), its 50 ms timer late by more than 200 ms four ticks in five, and the
+  // latch's acknowledgement — answered by the server in 3–8 ms — resolved
+  // 1.1–1.5 s after it was sent: no latch (2 s) ever settled, 0 hops in 5.
+  // Input is blocked during the latch and the swap projects everything at its
+  // end; the remote changes that arrive meanwhile are projected ONCE, right
+  // after the latch.
+  if (hopLatched()) {
+    if (!reprojectDeferredByLatch) {
+      reprojectDeferredByLatch = true
+      reprojectionsDeferredByLatch += 1
+      outsideHopLatch(() => { reprojectDeferredByLatch = false; withRemote(projectAll) })
+    }
+    return
+  }
   withRemote(projectAll)
+  // A rescued overlay value whose entity is projected again now.
+  if (pendingOverlayRescues.size > 0) setTimeout(() => outsideHopLatch(applyPendingOverlayRescues), 0)
 }
+let reprojectDeferredByLatch = false
+/** When the model last changed here — a change handler re-projected, or a
+ * local write (a starved hop waits for a quiet moment). */
+let lastModelActivityAt = 0
+/** Probe: latches during which remote changes waited for the latch's end. */
+let reprojectionsDeferredByLatch = 0
 
 /** Array → id-keyed map (the reconcile target shape). */
 function byIdMap<T extends { id: string }>(items: readonly T[]): Record<string, T> {
@@ -1612,6 +2079,9 @@ function attachShardListener(handle: DocHandle<RegistryShard>): void {
   const handler = (): void => {
     scheduleDiagramAbsenceSweep()
     reprojectFromChange()
+    // T-DIAGDEF-2: a shard moving is the likeliest moment a held
+    // whole-model delete can be expressed — at once, not at the next retry.
+    if (!bfsActive && !workspaceContractStale && localDiagramHold.heldDeletions > 0) scheduleWrite('normal')
   }
   shardChangeHandlers.set(handle.url, handler)
   handle.on('change', handler)
@@ -1649,11 +2119,180 @@ async function syncShardHandles(): Promise<void> {
 
 // ── sharded model helpers ──────────────────────────────────────────────────────
 
+/** Probe: overlay entries written back after a compaction's clear that never saw
+ * their last edit. */
+let overlayClearRescues = 0
+
+/** Is `url` an edits-overlay segment of the current meta (a write head included)? */
+function isOverlaySegmentUrl(url: string): boolean {
+  const meta = modelMetaHandle?.doc()
+  if (!meta) return false
+  return [
+    ...(readMetaUrls(meta, 'editsObjectShardUrls') ?? []), ...(readMetaUrls(meta, 'editsConnectionShardUrls') ?? []),
+    readMetaUrl(meta, 'editsObjectShardUrl'), readMetaUrl(meta, 'editsConnectionShardUrl'),
+  ].includes(url)
+}
+
+/**
+ * With or without epochs (`overlayClearRescue.ts`): a REMOTE change deleted an
+ * overlay entry that held an edit its author never saw — her offline edit,
+ * inside an entry the compaction cleared meanwhile. Her value is applied again
+ * AS AN EDIT of the entity where it lives now (`applyPendingOverlayRescues`),
+ * once the projection shows it again: the compaction folded the entry into a
+ * base shard, which may come AFTER the overlay segment in the meta's order and
+ * so outrank anything written back into the segment (measured: 40 of 68 written
+ * back there stayed hidden until the next compaction folded them). An entity
+ * tombstoned here (a real delete) is left deleted.
+ */
+function rescueClearedOverlayEdits(handle: DocHandle<unknown>, payload: DocHandleChangePayload<unknown>): void {
+  if (!payload.patches.some((p) => p.action === 'del' && p.path.length === 2)) return
+  if (!isOverlaySegmentUrl(handle.url)) return
+  const restore = clearedOverlayEditsToRestore(payload.patchInfo.before as never, payload.patchInfo.after as never, payload.patches)
+  if (restore.length === 0) return
+  const upserts: PendingOverlayRescue[] = []
+  const replaced: PendingOverlayRescue[] = []
+  for (const r of restore) {
+    const key = `${r.collection}:${r.id}`
+    const earlier = pendingOverlayRescues.get(key)
+    if (earlier) replaced.push(earlier)
+    const entry = { collection: r.collection, id: r.id, value: storeForm(r.value), seen: storeForm(r.seen), since: Date.now() }
+    pendingOverlayRescues.set(key, entry)
+    upserts.push(entry)
+  }
+  persistOverlayRescues(upserts, replaced)
+  markClientTimeline('overlay.clear-rescue-pending', { document: handle.documentId, entries: restore.length })
+  armOverlayRescueAttempt(0)
+}
+
+/**
+ * Lost overlay values waiting to be applied again, in store form.
+ * PERSISTED in the workspace's KV the moment they are found — a reload, a
+ * closed tab, a base copy slow to arrive no longer lose them — read back at
+ * boot, and counted as a durability debt (the badge says "Saving", not
+ * "Synced") until an attempt finds nothing owed: her fields are in the
+ * documents, or a later write superseded them, or the entity was tombstoned.
+ * The browser that never comes back is the server's (G4-16k).
+ */
+type PendingOverlayRescue = StoredOverlayRescue
+const pendingOverlayRescues = new Map<string, PendingOverlayRescue>()
+/** Whether this session has READ the persisted rescues. Until it has, its memory
+ * is a subset of them, so a write may only add: the removals it owes wait here,
+ * and are written once the read is in: a persisted mirror written from memory
+ * before memory has READ it deletes it. */
+let overlayRescuesHydrated = false
+let overlayRescueRemovalsOwed: PendingOverlayRescue[] = []
+const OVERLAY_RESCUES_KEY = 'overlay-clear-rescues:v1'
+/** How long a rescue waits for its entity (its folded copy still syncing). */
+const OVERLAY_RESCUE_WAIT_MS = 7 * 24 * 60 * 60_000
+/** Between two attempts while any is owed. */
+const OVERLAY_RESCUE_RETRY_MS = 2_000
+let overlayRescueTimer: ReturnType<typeof setTimeout> | null = null
+let overlayRescuePersistence: Promise<void> = Promise.resolve()
+
+/**
+ * Write THIS tab's changes into the persisted rescues: its findings added, the
+ * findings it finished removed — one atomic read-modify-write of the key
+ * (`mergeStoredRescues`), never its memory written over what another tab, or
+ * the previous session, stored. Before this session has read the key, removals
+ * wait.
+ */
+function persistOverlayRescues(upserts: readonly PendingOverlayRescue[], removals: readonly PendingOverlayRescue[]): void {
+  const store = durableLedgerStore ?? workspaceKvStore()
+  let removing = [...removals]
+  if (!overlayRescuesHydrated) {
+    overlayRescueRemovalsOwed.push(...removing)
+    removing = []
+  }
+  if (upserts.length === 0 && removing.length === 0) return
+  const adding = [...upserts]
+  overlayRescuePersistence = overlayRescuePersistence.catch(() => undefined).then(async () => {
+    await store.update<PendingOverlayRescue[]>(OVERLAY_RESCUES_KEY, (stored) => mergeStoredRescues(stored, adding, removing))
+  }).catch((error) => { console.warn('overlay rescues could not be persisted', error) })
+}
+
+/** Boot: the rescues an earlier session (or another tab) found and did not
+ * finish. One already in memory — found live while the read ran — is kept
+ * (never replaced by its stored copy); one this session finished meanwhile is
+ * not taken back. Then the removals owed since the boot are written. */
+async function hydrateOverlayRescues(epoch: number, store: KvStore): Promise<void> {
+  const stored = await store.get<unknown>(OVERLAY_RESCUES_KEY).catch(() => undefined)
+  if (epoch !== durableAckEpoch) return
+  const finished = new Set(overlayRescueRemovalsOwed.map((r) => `${r.collection}:${r.id}:${r.since}`))
+  for (const entry of mergeStoredRescues(stored, [], [])) {
+    const key = `${entry.collection}:${entry.id}`
+    if (finished.has(`${key}:${entry.since}`)) continue
+    if (!pendingOverlayRescues.has(key)) pendingOverlayRescues.set(key, entry)
+  }
+  overlayRescuesHydrated = true
+  const owed = overlayRescueRemovalsOwed
+  overlayRescueRemovalsOwed = []
+  if (owed.length > 0) persistOverlayRescues([], owed)
+  if (pendingOverlayRescues.size > 0) armOverlayRescueAttempt(0)
+}
+
+function armOverlayRescueAttempt(ms: number): void {
+  if (overlayRescueTimer) return
+  const session = durableAckEpoch
+  overlayRescueTimer = setTimeout(() => {
+    overlayRescueTimer = null
+    if (session !== durableAckEpoch) return
+    outsideHopLatch(applyPendingOverlayRescues)
+  }, ms)
+}
+
+/** Apply each pending rescue whose entity the documents hold again, the
+ * fields `rescuePatch` says are still owed, as an edit written where the
+ * entity lives now; dropped (and unpersisted) once nothing is owed. */
+function applyPendingOverlayRescues(): void {
+  if (pendingOverlayRescues.size === 0) return
+  const state = useModelStore.getState()
+  const now = Date.now()
+  let objectsInDocs: Record<string, unknown> | null = null
+  let connectionsInDocs: Record<string, unknown> | null = null
+  const finished: PendingOverlayRescue[] = []
+  for (const [key, rescue] of pendingOverlayRescues) {
+    const objects = rescue.collection === 'objects'
+    const tombstoned = (objects ? tombstoneObjects : tombstoneConnections).has(rescue.id)
+    if (tombstoned || now - rescue.since > OVERLAY_RESCUE_WAIT_MS) {
+      pendingOverlayRescues.delete(key)
+      finished.push(rescue)
+      continue
+    }
+    // The entity as the DOCUMENTS hold it (not as the store shows it), merged
+    // as the projection merges them.
+    if (objects) objectsInDocs ??= mergeObjectShards(objectShardHandles.map((h) => h.doc() ?? { objects: {} })) as Record<string, unknown>
+    else connectionsInDocs ??= mergeConnectionShards(connectionShardHandles.map((h) => h.doc() ?? { connections: {} })) as Record<string, unknown>
+    const inDocs = (objects ? objectsInDocs : connectionsInDocs)![rescue.id] as Record<string, unknown> | undefined
+    const inStore = (objects ? state.objects : state.connections).find((e) => e.id === rescue.id) as Record<string, unknown> | undefined
+    if (!inDocs || !inStore) continue
+    const patch = rescuePatch(rescue.value as Record<string, unknown>, rescue.seen as Record<string, unknown>, inDocs, inStore)
+    if (!patch) {
+      pendingOverlayRescues.delete(key)
+      finished.push(rescue)
+      continue
+    }
+    // Outside the undo history: a Ctrl+Z right after she reconnects must not
+    // take her offline value away again. Still a local edit: written,
+    // journaled, acknowledged like any other. Kept pending until an attempt
+    // finds it in the documents.
+    undoHistory.suppress(() => {
+      if (objects) state.updateObject(rescue.id, patch as never)
+      else state.updateConnection(rescue.id, patch as never)
+    })
+    overlayClearRescues += 1
+  }
+  if (finished.length > 0) persistOverlayRescues([], finished)
+  if (pendingOverlayRescues.size > 0) armOverlayRescueAttempt(OVERLAY_RESCUE_RETRY_MS)
+}
+
 /** Attach a change listener to a meta/object/connection shard handle (idempotent). */
 function attachModelShardListener(handle: DocHandle<unknown>): void {
   if (modelShardChangeHandlers.has(handle.url)) return
   activeDocumentShare.pin(handle.documentId, 'model-shard')
-  const handler = () => {
+  const handler = (payload?: DocHandleChangePayload<unknown>) => {
+    // An edit the overlay compaction's clear never saw is written back, before
+    // the re-projection shows its loss.
+    if (payload && handle !== modelMetaHandle) rescueClearedOverlayEdits(handle, payload)
     // A warm browser can resolve its cached ModelMeta before selective sync
     // merges a server-side write-head rotation/repair. Hydrate the newly
     // published current heads as soon as that small control document changes.
@@ -1668,6 +2307,8 @@ function attachModelShardListener(handle: DocHandle<unknown>): void {
     // produce a local intent — it IS the tombstone — so nothing is journaled.
     if (handle === modelMetaHandle && registrySummaryOnly) adoptRemoteDiagramTombstones()
     reprojectFromChange()
+    // A shard the meta lists now (a compaction's new base shard) is projected.
+    if (handle === modelMetaHandle) followListedModelShards()
   }
   modelShardChangeHandlers.set(handle.url, handler)
   handle.on('change', handler)
@@ -1699,7 +2340,8 @@ function attachOverlayChangeListener(
   kind: 'object' | 'connection',
 ): void {
   if (overlayChangeHandlers.has(handle.url)) return
-  const handler = () => {
+  const handler = (payload?: DocHandleChangePayload<unknown>) => {
+    if (payload) rescueClearedOverlayEdits(handle as DocHandle<unknown>, payload)
     if (kind === 'object') rebuildEffectiveObjectOverlay(handle as DocHandle<ObjectShard>)
     else rebuildEffectiveConnectionOverlay(handle as DocHandle<ConnectionShard>)
     reprojectFromChange()
@@ -1738,8 +2380,19 @@ async function ensureModelSharded(): Promise<boolean> {
 
   if (root.modelMetaUrl && isValidAutomergeUrl(root.modelMetaUrl)) {
     modelMetaHandle = await findModelMetaHandle(root.modelMetaUrl)
-    const meta = modelMetaHandle.doc()
-    if (!meta) return false
+    // The epoch this session booted on: a root repointing away from it
+    // starts the live hop (step 1, `maybeStartEpochHop`).
+    bootedMetaUrl = root.modelMetaUrl
+    await hydrateEpochKnowledge(modelMetaHandle)
+    // A retired export an earlier session neither exported nor dismissed is
+    // offered again. A KV read, in the background: never on the path to the
+    // first render. Only on a workspace with epochs (none can be retired
+    // elsewhere: flag off reads nothing).
+    if (epochCapability) void raisePersistedRetiredExport()
+    const metaDoc = modelMetaHandle.doc()
+    if (!metaDoc) return false
+    // The ruling URL values as plain strings (`modelMetaUrls.ts`).
+    const meta = withMetaUrlView(metaDoc)
     // Write-head boot guard: a sharded root does not guarantee a USABLE write path.
     // With unusable heads, boot-from-server accepts every edit and can persist
     // none of it (the "born-broken" shape). When the
@@ -1849,7 +2502,1206 @@ async function ensureModelSharded(): Promise<boolean> {
   attachModelShardListener(modelMetaHandle as DocHandle<unknown>)
   for (const h of objectShardHandles) attachModelShardListener(h as DocHandle<unknown>)
   for (const h of connectionShardHandles) attachModelShardListener(h as DocHandle<unknown>)
+  // Listed between the list's read and the listener's attach.
+  followListedModelShards()
   return true
+}
+
+// ── THE LIVE EPOCH HOP: the ports (G4-16f; state machine in epochHop.ts) ──
+//
+// The server periodically recreates the ModelMeta and the base shards without
+// history (an epoch) and repoints `root.modelMetaUrl`; late writes on the
+// superseded documents are forwarded. An open tab follows the repoint LIVE
+// (design point 4): the root handler starts the hop, which loads the new epoch
+// in the background, then swaps under one bounded latch once the old
+// documents' paused heads are acknowledged `durable && forwarded`.
+
+interface EpochHandles {
+  metaUrl: string
+  meta: DocHandle<ModelMeta>
+  objects: DocHandle<ObjectShard>[]
+  connections: DocHandle<ConnectionShard>[]
+}
+
+/** The ModelMeta URL this session projects (booted on, or hopped to). */
+let bootedMetaUrl: string | null = null
+let epochHop: EpochHop | null = null
+/** The handles the running hop loaded (step 3): the retired export reads them. */
+let hopLoaded: EpochHandles | null = null
+/** The old epoch's documents, between the swap and `retainOld`. */
+let swappedOut: DocHandle<unknown>[] | null = null
+/** Every ModelMeta this session hopped away from: a held pointer recorded
+ * against one of them is written to the current meta (`writeHeldReference`). */
+const supersededMetaDocumentIds = new Set<DocumentId>()
+/** Retained old sets, attached and SYNCING (pinned) until forwarded. */
+const retainedEpochSets = new Map<RetainToken, DocHandle<unknown>[]>()
+let retainedEpochSeq = 0
+let epochHopRetryTimer: ReturnType<typeof setTimeout> | null = null
+/** Probe: swaps that found a write deferred by their latch. */
+let deferredWritesAtSwap = 0
+/** Probe: write requests the latch deferred. */
+let writesDeferredByLatch = 0
+/** The retired documents the running hop collected (step 6). */
+let retiredEpochDocumentIds: DocumentId[] = []
+/** Model shards THIS browser created (overflow) or resumed as held: never an
+ * epoch's base shard, always carried across a swap until the new meta lists
+ * them (a pointer written to the OLD meta during the latch would
+ * otherwise drop the shard's objects from the screen). */
+const locallyCreatedModelShardUrls = new Set<string>()
+/** The documents the running hop's acknowledgements named as
+ * SUPERSEDED epoch documents (`forwarded` present, `forwardPending` or
+ * `epochRetired`). One of this browser's own shards among them was CUT by
+ * the roll — a full roll recreates every base shard of the list, the
+ * browser's overflow ones included (X → X′ in place): it is retained and
+ * forwarded like the epoch's other documents, never carried over its copy. */
+const hopLateSources = new Set<string>()
+/** Whether this workspace has (or may get) epochs — the server
+ * says so on each durable acknowledgement, an epoch ModelMeta says so by its
+ * `modelEpoch` hint. Sticky per workspace (KV). Gates the hop, the actor
+ * journal's persistence and the override review. */
+let epochCapability = false
+/** Where the capability came from (probe): the KV, the meta's mark, or an ack. */
+let epochCapabilityFrom: 'kv' | 'meta' | 'ack' | null = null
+/** ModelMetas this browser has booted on in this workspace (KV):
+ * a held pointer recorded against one of them — a shard created offline on
+ * an epoch that has since been superseded — is published to the current meta
+ * after a reload, instead of being given up. */
+const EPOCH_CAPABILITY_KEY = 'epoch-capability:v1'
+const EPOCH_RETAINED_ROLE = 'epoch-retained'
+/** Boot-from-server reads for the override review: bounded. */
+const EPOCH_FETCH_MAX = 200
+const EPOCH_FETCH_CONCURRENCY = 8
+/** The hop's event timeline (probe `hopTrace`): latch, flush, asks, targets. */
+const hopTrace: Array<Record<string, unknown>> = []
+const HOP_TRACE_MAX = 400
+const EPOCH_HOP_RETRY_MS = 10_000
+/** A hop that gave up on the S7 proof (`epoch_hop.s7_unproven`) is started again
+ * on this slow timer — the roll stopped between S6b and S7 is resumed by the
+ * server's next pass, and the root (which already names the new meta) never
+ * changes again to restart it — and at once when the durable ledger answers one
+ * of the held epoch's documents `epochRetired` (retention reached the epoch the
+ * tab still writes: the retired path offers those edits as an export). */
+export const EPOCH_HOP_ABANDONED_RETRY_MS = 10 * 60_000
+let epochHopAbandonedRetryMs = EPOCH_HOP_ABANDONED_RETRY_MS
+/** The url of the hop that gave up on S7, until it is started again. */
+let epochHopAbandonedUrl: string | null = null
+let epochHopAbandonedTimer: ReturnType<typeof setTimeout> | null = null
+export function __setEpochHopAbandonedRetryForTest(ms: number | null): void {
+  epochHopAbandonedRetryMs = ms ?? EPOCH_HOP_ABANDONED_RETRY_MS
+  epochHopAbandonedDelayMs = epochHopAbandonedRetryMs
+}
+/** Start the abandoned hop again (the timer fired, or the ledger saw its
+ * epoch retired). */
+function heldEpochRetiredIn(answers: readonly unknown[]): boolean {
+  const held = new Set(heldEpochDocuments().map((h) => h.documentId as string))
+  return answers.some((a) => {
+    const answer = a as { documentId?: unknown; epochRetired?: unknown }
+    return answer.epochRetired === true && typeof answer.documentId === 'string' && held.has(answer.documentId)
+  })
+}
+function resumeAbandonedEpochHop(): void {
+  if (epochHopAbandonedTimer) clearTimeout(epochHopAbandonedTimer)
+  epochHopAbandonedTimer = null
+  if (epochHopAbandonedUrl === null) return
+  epochHopAbandonedUrl = null
+  epochHopAbandonedDelayMs = epochHopAbandonedRetryMs
+  maybeStartEpochHop()
+}
+
+/** The timer does not restart the hop blind — a roll still stopped between S6b
+ * and S7 would cost ten more latches (input blocked up to 2 s each) every
+ * cycle, for ever. ONE acknowledgement, no latch, about the old meta: restarted
+ * only when it proves S7 (`forwarded` or `epochRetired` present); otherwise the
+ * timer is armed again, its delay doubled (10, 20, 40… min, at most 160). */
+let epochHopAbandonedDelayMs = EPOCH_HOP_ABANDONED_RETRY_MS
+const EPOCH_HOP_ABANDONED_RETRY_MAX_MS = 160 * 60_000
+function armAbandonedEpochHopTimer(): void {
+  if (epochHopAbandonedTimer) clearTimeout(epochHopAbandonedTimer)
+  epochHopAbandonedTimer = setTimeout(() => { epochHopAbandonedTimer = null; void probeAbandonedEpochHop() }, epochHopAbandonedDelayMs)
+}
+async function probeAbandonedEpochHop(): Promise<void> {
+  const session = durableAckEpoch
+  const meta = modelMetaHandle
+  if (epochHopAbandonedUrl === null || !meta) return
+  const heads = documentHeads(meta as DocHandle<unknown>)
+  let proven = false
+  if (heads) {
+    const answers = await acknowledgeDurableDocumentHeads([{ documentId: heads.documentId as DocumentId, heads: heads.heads }]).catch(() => [])
+    const answer = answers.find((a) => a.documentId === heads.documentId) as Record<string, unknown> | undefined
+    proven = answer !== undefined && ('forwarded' in answer || answer.epochRetired === true)
+  }
+  if (session !== durableAckEpoch || epochHopAbandonedUrl === null || modelMetaHandle !== meta) return
+  if (proven) { resumeAbandonedEpochHop(); return }
+  epochHopAbandonedDelayMs = Math.min(epochHopAbandonedDelayMs * 2, Math.max(EPOCH_HOP_ABANDONED_RETRY_MAX_MS, epochHopAbandonedRetryMs))
+  armAbandonedEpochHopTimer()
+}
+const DURABLE_HEADS_BATCH = 64
+
+function documentHeads(handle: DocHandle<unknown>): HopDocumentHeads | null {
+  const doc = handle.doc()
+  if (!doc) return null
+  const heads = getHeads(doc as never)
+  return heads.length > 0 ? { documentId: handle.documentId, heads } : null
+}
+
+/** The OLD epoch's documents this tab holds: the meta and the base shards its
+ * meta lists — not an overflow shard this tab created whose pointer is still
+ * held (it is not an epoch document; the swap carries it). */
+function heldEpochDocuments(): DocHandle<unknown>[] {
+  if (!modelMetaHandle) return []
+  const meta = modelMetaHandle.doc()
+  const view = meta ? withMetaUrlView(meta) : undefined
+  const listed = new Set([...(view?.objectShardUrls ?? []), ...(view?.connectionShardUrls ?? [])])
+  return [
+    modelMetaHandle as DocHandle<unknown>,
+    ...[...objectShardHandles, ...connectionShardHandles].filter((h) => listed.has(h.url)) as DocHandle<unknown>[],
+  ]
+}
+
+function reattachOverlaySegmentListeners(): void {
+  for (const h of editsObjectSegmentHandles) attachOverlayChangeListener(h, 'object')
+  for (const h of editsConnectionSegmentHandles) attachOverlayChangeListener(h, 'connection')
+}
+
+/** Partition the just-projected store as the resident write path will, so the
+ * first flush after a swap finds every shard unchanged (the boot seed's rule). */
+function reseedResidentWriteBaselines(): void {
+  const s = useModelStore.getState()
+  const persisted = s.connections.filter((c) => c.kind !== 'lower')
+  lastModelSlices = {
+    objects: s.objects, connections: persisted, groups: s.groups, domains: s.domains, tags: s.tags, decisionRecords: s.decisionRecords,
+  }
+  if (!bfsActive) {
+    lastObjectShardSlices = partitionByShard(s.objects, shardIndexByObjectId, objectShardHandles.length)
+    lastConnectionShardSlices = partitionByShard(persisted, shardIndexByConnectionId, connectionShardHandles.length)
+  }
+}
+
+function resetModelShardProjectionCaches(): void {
+  for (const k of MODEL_KEYS) delete lastModelColl[k]
+  lastObjectShardDocs = []
+  lastConnectionShardDocs = []
+  lastObjectShardSlices = []
+  lastConnectionShardSlices = []
+}
+
+/** BOOT-FROM-SERVER tombstones after a swap: the new meta's, plus every delete
+ * still journaled (not yet seen durable). Not the old session set whole: the
+ * roll rides a compaction that CLEARS folded tombstones, and re-adding them
+ * would re-append every one to the new meta. */
+function hydrateTombstonesFrom(meta: ModelMeta): void {
+  const journaled = pendingEntityIntents.pending(workspaceRefKey(currentRef)).filter((intent) => intent.op === 'delete')
+  tombstoneObjects.clear()
+  tombstoneConnections.clear()
+  for (const id of meta.deletedObjectIds ?? []) tombstoneObjects.add(id)
+  for (const id of meta.deletedConnectionIds ?? []) tombstoneConnections.add(id)
+  for (const intent of journaled) {
+    if (intent.kind === 'object') tombstoneObjects.add(intent.id)
+    else if (intent.kind === 'connection') tombstoneConnections.add(intent.id)
+  }
+  for (const id of meta.deletedDiagramIds ?? []) tombstoneDiagrams.add(id)
+  publishDiagramTombstones()
+}
+
+/** A shard THIS browser created (or resumed as held) that the server did not
+ * name a late source: the swap carries it. The `hopLateSources` test is
+ * equivalent for `verdictOf`'s exemption (a late source has an epoch row, so
+ * `forwarded`, and is never exempted) but not for the swap's carry, where it
+ * is what keeps a shard the roll cut from being carried over its copy. */
+function isOwnCarriedShard(h: DocHandle<unknown>): boolean {
+  return locallyCreatedModelShardUrls.has(h.url) && !hopLateSources.has(h.documentId)
+}
+
+/**
+ * Random-id shards the swap carried that the OLD meta listed — their pointer
+ * written there offline — and the new meta does not. When the old meta was
+ * RETIRED by then, nothing forwards that pointer: the server never claims the
+ * shard, and its author alone sees its objects. Their queued `unminted` entry
+ * is asked about (`serverHoldsShard`, again until answered): UNKNOWN to the
+ * server, the pointer is written into the CURRENT meta (as the boot's resume of
+ * an unlisted entry does) and the entry dequeued once durable. HELD — an
+ * ordinary document the old meta's pointer got claimed, whose forward adopts it
+ * — it stays carried, as before. A late source is never carried, so never asked
+ * here. Only once the predecessor walk reaches the entry's holder from the new
+ * meta — a repoint to another lineage publishes nothing.
+ *
+ * When the old meta was RETIRED (the hop's retired path), no forward will ever
+ * adopt its pointer, so HELD as a plain claim (durable, no epoch row: not a
+ * shard a full roll cut, which answers `forwarded` or `epochRetired`) is
+ * written into the current meta too. And a carried shard with NO queued
+ * `unminted` entry is decided the same way: a MINTED shard (AUTH on) whose held
+ * pointer the reconnect wrote into the old meta during the hop, its entry
+ * dequeued then — before, nothing ever wrote it into the current meta, and its
+ * objects left her screen at the next reload (2 088 → 2 048).
+ */
+/** Probe: `<shard>:<step>` of each carried decision. Bounded. */
+const carriedDecisions: string[] = []
+function noteCarried(shard: string, step: string): void {
+  carriedDecisions.push(`${shard}:${step}`)
+  if (carriedDecisions.length > 64) carriedDecisions.splice(0, carriedDecisions.length - 64)
+}
+
+async function decideCarriedUnminted(prevMetaId: DocumentId, handles: DocHandle<unknown>[], prevMetaRetired = false): Promise<void> {
+  const session = durableAckEpoch
+  for (const h of handles) noteCarried(h.documentId, 'swap')
+  const byUrl = new Map<string, DocHandle<unknown>>(handles.map((h) => [h.url as string, h]))
+  const booted = documentsWorkspaceKey()
+  const listed = (await deferredReferences.list().catch(() => [] as DeferredReference[])).filter((r) =>
+    r.unminted === true && isModelShardReferenceField(r.field) && byUrl.has(r.url)
+    && (r.workspace === undefined || booted === null || r.workspace === booted))
+  // A carried shard with no queued entry, decided only behind a RETIRED old
+  // meta (a live one's forward adopts it).
+  const entered = new Set(listed.map((r) => r.url))
+  const unqueued: DeferredReference[] = prevMetaRetired
+    ? handles.filter((h) => !entered.has(h.url)).map((h) => ({
+      holderDocumentId: prevMetaId,
+      field: connectionShardHandles.some((c) => c.url === h.url) ? 'connectionShardUrls' : 'objectShardUrls',
+      url: h.url, unminted: true, ...workspaceTag(),
+    }))
+    : []
+  for (const r of unqueued) noteCarried(byUrl.get(r.url)!.documentId, 'unqueued')
+  const queued = [...listed, ...unqueued]
+  const meta = modelMetaHandle
+  if (queued.length === 0 || session !== durableAckEpoch || !meta) { for (const h of handles) noteCarried(h.documentId, 'no-entry'); return }
+  const accepted = (r: DeferredReference) => r.holderDocumentId === prevMetaId || supersededMetaDocumentIds.has(r.holderDocumentId as DocumentId)
+  // The walk loads the metas between (from the server: this tab never saw
+  // them) under ONE budget; one cut short — a server slow to give them right
+  // after a roll — is walked again on the unminted question's schedule (the
+  // links it learned are persisted, so each try goes further), never given
+  // up for the session on one try.
+  for (let attempt = 0; !supersededMetaDocumentIds.has(prevMetaId); attempt += 1) {
+    if (attempt > unmintedRetryDelaysMs.length) { for (const h of handles) noteCarried(h.documentId, 'walk-undecided'); return }
+    if (attempt > 0) {
+      // Settled by the stop too:
+      // a cancelled timer left this promise pending for ever.
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(() => { unmintedRetryTimers.delete(timer); unmintedWaitResolvers.delete(resolve); resolve() }, unmintedRetryDelaysMs[attempt - 1])
+        unmintedRetryTimers.add(timer)
+        unmintedWaitResolvers.add(resolve)
+      })
+    }
+    if (session !== durableAckEpoch || modelMetaHandle !== meta) return
+    await extendPredecessorChain(meta).catch(() => false)
+    if (session !== durableAckEpoch || modelMetaHandle !== meta) return
+  }
+  for (const reference of queued.filter(accepted)) {
+    const handle = byUrl.get(reference.url)!
+    noteCarried(handle.documentId, 'asked')
+    const decide = (verdict: ShardVerdict | 'claimed') => outsideHopLatch(() => {
+      noteCarried(handle.documentId, verdict)
+      // `claimed` (a plain claim, asked only behind a retired old meta): no
+      // forward will adopt the old meta's pointer, so it is written here.
+      const write = verdict === 'unknown' || verdict === 'claimed'
+      if (session !== durableAckEpoch || !write || !projectedModelShardUrls().has(handle.url)) return
+      const written = writeHeldReference(reference, session)
+      noteCarried(handle.documentId, written ? 'written' : 'not-written')
+      if (written) {
+        // Claimable only now. While nothing the server reads named it, every
+        // re-presentation of X was refused and its budget may be spent (seen
+        // in one e2e run in four: never claimed, the entry queued for good):
+        // a NEW episode, presented again at once.
+        deniedRecovery.noteAcknowledged(handle.documentId)
+        resetDocumentSyncState(repo, handle.documentId)
+      }
+      // Redundant within a session whose boot resumed the entry (its own
+      // dequeue waits for the same durability); kept for an entry the boot did
+      // not settle (a later resume path).
+      dequeueOnceDurable(handle, reference, session)
+      markClientTimeline('workspace.held-shards.carried-published', { shard: handle.documentId })
+    })
+    void serverHoldsShard(handle, reference, undefined, prevMetaRetired).then((verdict) => {
+      if (verdict === ANSWER_REFUSED) return
+      if (unanswered(verdict)) askUnmintedUntilAnswered(handle, reference, session, decide, verdict, prevMetaRetired)
+      else decide(verdict)
+    })
+  }
+}
+
+/** Step 4's swap, ATOMIC (`runAtomically`): on any failure the old epoch is
+ * re-attached and re-projected, never a tab with no epoch. */
+async function swapEpoch(next: EpochHandles, retired: readonly string[] = []): Promise<void> {
+  const prevMeta = modelMetaHandle
+  if (!prevMeta) throw new Error('epoch hop: no ModelMeta to swap from')
+  // A write requested DURING the latch (not by input, which is blocked — by
+  // code: a replay, an assistant action): the store holds it and the swap's
+  // `projectAll` is about to replace the store from the new documents. Write
+  // it to the OLD epoch first: those documents are retained until their
+  // current heads are forwarded, so it reaches the new epoch, never lost.
+  if (writeDeferredByHop) deferredWritesAtSwap += 1
+  if (writeDeferredByHop) {
+    writeDeferredByHop = false
+    writesPausedByHop = false
+    try {
+      writeScheduler.request('normal')
+      writeScheduler.flushNow()
+    } finally {
+      writesPausedByHop = true
+    }
+  }
+  const prevObjects = objectShardHandles
+  const prevConnections = connectionShardHandles
+  const prevUrl = bootedMetaUrl
+  const prevTombstones = { objects: [...tombstoneObjects], connections: [...tombstoneConnections], diagrams: [...tombstoneDiagrams] }
+  const prevDoc = prevMeta.doc()
+  const prevView = prevDoc ? withMetaUrlView(prevDoc) : undefined
+  // Overflow shards this tab created: carried, so their objects never leave
+  // the screen (and are written to after the swap) — whether their pointer
+  // is still held (unlisted) or was written to the OLD meta during the latch
+  // (listed there, not yet adopted by the new one).
+  // NOT one the server named a late source — the roll cut it
+  // and recreated it in the new list; carried, it would win the routing over
+  // its copy and the next flush would empty the copy.
+  const isOwn = isOwnCarriedShard
+  const cutOwn = [...prevObjects, ...prevConnections]
+    .filter((h) => locallyCreatedModelShardUrls.has(h.url) && hopLateSources.has(h.documentId)).map((h) => h.url)
+  const carriedObjects = withCarried(
+    unpublishedShards(prevObjects, prevView?.objectShardUrls ?? []),
+    prevObjects.filter((h) => isOwn(h as DocHandle<unknown>)))
+  const carriedConnections = withCarried(
+    unpublishedShards(prevConnections, prevView?.connectionShardUrls ?? []),
+    prevConnections.filter((h) => isOwn(h as DocHandle<unknown>)))
+  const oldDocuments = heldEpochDocuments().filter((h) => !isOwn(h))
+  const restoreTombstones = () => {
+    tombstoneObjects.clear(); for (const id of prevTombstones.objects) tombstoneObjects.add(id)
+    tombstoneConnections.clear(); for (const id of prevTombstones.connections) tombstoneConnections.add(id)
+    tombstoneDiagrams.clear(); for (const id of prevTombstones.diagrams) tombstoneDiagrams.add(id)
+  }
+  try {
+    runAtomically([
+      {
+        // Pinned BEFORE the detach (which unpins 'model-shard'): the old
+        // documents never stop syncing — they are RETAINED until forwarded.
+        name: 'retain-pin',
+        run: () => { for (const h of oldDocuments) activeDocumentShare.pin(h.documentId, EPOCH_RETAINED_ROLE) },
+        undo: () => { for (const h of oldDocuments) activeDocumentShare.unpin(h.documentId, EPOCH_RETAINED_ROLE) },
+      },
+      {
+        name: 'detach',
+        run: () => { detachAllModelShardListeners(); detachAllOverlayChangeListeners() },
+        undo: () => {
+          attachModelShardListener(prevMeta as DocHandle<unknown>)
+          for (const h of prevObjects) attachModelShardListener(h as DocHandle<unknown>)
+          for (const h of prevConnections) attachModelShardListener(h as DocHandle<unknown>)
+          reattachOverlaySegmentListeners()
+        },
+      },
+      {
+        name: 'assign',
+        run: () => {
+          modelMetaHandle = next.meta
+          objectShardHandles = bfsActive ? [] : withCarried(next.objects, carriedObjects)
+          connectionShardHandles = bfsActive ? [] : withCarried(next.connections, carriedConnections)
+          bootedMetaUrl = next.metaUrl
+          const meta = next.meta.doc()
+          if (bfsActive && meta) hydrateTombstonesFrom(meta)
+        },
+        undo: () => {
+          modelMetaHandle = prevMeta
+          objectShardHandles = prevObjects
+          connectionShardHandles = prevConnections
+          bootedMetaUrl = prevUrl
+          restoreTombstones()
+        },
+      },
+      {
+        name: 'attach',
+        run: () => {
+          attachModelShardListener(next.meta as DocHandle<unknown>)
+          for (const h of objectShardHandles) attachModelShardListener(h as DocHandle<unknown>)
+          for (const h of connectionShardHandles) attachModelShardListener(h as DocHandle<unknown>)
+          reattachOverlaySegmentListeners()
+        },
+        undo: () => { detachAllModelShardListeners(); detachAllOverlayChangeListeners() },
+      },
+      {
+        name: 'project',
+        run: () => {
+          resetModelShardProjectionCaches()
+          withRemote(projectAll)
+          reseedResidentWriteBaselines()
+        },
+        undo: () => { resetModelShardProjectionCaches() },
+      },
+    ], (step, error) => console.error(`epoch hop: undo of ${step} failed`, error))
+  } catch (error) {
+    // Rolled back: re-project the old epoch so the store matches what is attached.
+    try { withRemote(projectAll); reseedResidentWriteBaselines() } catch (reprojectError) {
+      console.error('epoch hop: re-projection of the old epoch after a failed swap failed', reprojectError)
+    }
+    throw error
+  }
+  // The meta just left, IF it is the new one's epoch predecessor: a pointer
+  // held on it is resumed into the new meta. A repoint to another lineage (a
+  // repair, the slim script, a reseed) is followed, but never resurrects a
+  // pointer held on the meta it left. A cut shard of this browser's is an epoch
+  // document like the others now.
+  for (const url of cutOwn) locallyCreatedModelShardUrls.delete(url)
+  const nextPredecessor = predecessorIdOf(next.meta.doc())
+  if (nextPredecessor === prevMeta.documentId) supersededMetaDocumentIds.add(prevMeta.documentId)
+  // The link is persisted (a reload walks it without a load).
+  void persistEpochLineage([[next.meta.documentId, nextPredecessor ?? '']])
+  swappedOut = oldDocuments
+  // An own random-id shard the OLD meta listed (written there offline) and the
+  // new one does not — nothing forwards the old meta's pointer when that meta
+  // was retired — is decided against the new meta in the background.
+  const nextDoc = next.meta.doc()
+  const nextView = nextDoc ? withMetaUrlView(nextDoc) : undefined
+  const nextListed = new Set([...(nextView?.objectShardUrls ?? []), ...(nextView?.connectionShardUrls ?? [])])
+  const prevListed = new Set([...(prevView?.objectShardUrls ?? []), ...(prevView?.connectionShardUrls ?? [])])
+  const writtenIntoOld = [...carriedObjects, ...carriedConnections]
+    .filter((h) => prevListed.has(h.url) && !nextListed.has(h.url) && !provisionalModelShardUrls.has(h.url)) as DocHandle<unknown>[]
+  // On the retired path, the old meta's pointers are forwarded by no one.
+  // Told by the machine with the swap (the verdict's retired ids),
+  // not read from a global another step resets.
+  const prevMetaRetired = retired.includes(prevMeta.documentId)
+  if (writtenIntoOld.length > 0) void decideCarriedUnminted(prevMeta.documentId, writtenIntoOld, prevMetaRetired)
+  // Boot-from-server: re-run the overlay heads against the new meta (a roll
+  // carries them; a repair may not), then the server render.
+  if (bfsActive) scheduleOverlayHydration()
+  // What a compaction listed in the new meta between the load and the swap.
+  followListedModelShards()
+  checkHopAccountedLater()
+  markClientTimeline('workspace.epoch.swapped', { metaUrl: next.metaUrl })
+  // The batch re-apply is offered after the hop too, whenever the route
+  // returns rows.
+  void refreshOverrides()
+}
+
+// ── BATCH RE-APPLY: the bridge's ports (G4-16f; controller in
+// epochOverridesController.ts) ──────────────────────────────────────────────
+
+/** The Automerge actors this browser profile wrote with (whose override
+ * rows it is offered): an actor is per page load × document handle, so they are recorded
+ * at the write boundary and persisted, a reload keeping its offline edits'
+ * actors visible to the override route. */
+const localActorIds = new Set<string>()
+const LOCAL_ACTORS_KEY = 'epoch-actors:v1'
+const LOCAL_ACTORS_MAX = 256
+let localActorsPersist: { timer: ReturnType<typeof setTimeout>; store: KvStore } | null = null
+let uninstallEpochOverrides: (() => void) | null = null
+/** The boot has read the actor journal: the review may be installed. */
+let overridesReady = false
+
+/** One acknowledgement at boot, so the server can say whether this workspace
+ * has epochs before any write asks it. Offline: later acks will. */
+async function probeEpochCapability(): Promise<void> {
+  try {
+    // Inside the try: a meta that is not (yet) an Automerge document makes
+    // `getHeads` throw, and a boot probe must never leak a rejection.
+    const heads = modelMetaHandle ? documentHeads(modelMetaHandle as DocHandle<unknown>) : null
+    if (!heads) return
+    await acknowledgeDurableDocumentHeads([{ documentId: heads.documentId as DocumentId, heads: heads.heads }])
+  } catch { /* offline, refused or not loaded: the next acknowledgement says it */ }
+}
+
+/** The capability probes a repoint sends while the capability is unknown
+ * (`createRepointProbeScheduler`, `epochBridgeRules.ts`): one series per
+ * repoint target, stopped when the capability comes or the root goes back. */
+const repointProbes = createRepointProbeScheduler({
+  wanted: () => {
+    const url = rootHandle?.doc()?.modelMetaUrl
+    return started && !epochCapability && !!url && url !== bootedMetaUrl
+  },
+  probe: () => { void probeEpochCapability() },
+  setTimer: (fn, ms) => setTimeout(fn, ms),
+  clearTimer: (timer) => clearTimeout(timer as ReturnType<typeof setTimeout>),
+})
+
+function probeCapabilityForRepoint(target: string): void {
+  repointProbes.schedule(target)
+}
+
+function stopRepointProbes(): void {
+  repointProbes.stop()
+}
+
+/** Write the actor list now, to the workspace store it was recorded for. */
+function persistLocalActorsNow(): void {
+  const pending = localActorsPersist
+  if (!pending) return
+  clearTimeout(pending.timer)
+  localActorsPersist = null
+  const session = [...localActorIds]
+  // MERGED with what is stored: this may run before the boot's hydration has
+  // read the list, and replacing it would hide earlier offline edits' actors.
+  // In ONE atomic update: two tabs persisting in the same window would
+  // otherwise each read the old list and the last write would drop the other
+  // tab's actor — whose override rows would never be offered.
+  void pending.store.update<string[]>(LOCAL_ACTORS_KEY, (stored) =>
+    [...new Set([...(Array.isArray(stored) ? stored : []), ...session])].slice(-LOCAL_ACTORS_MAX))
+    .catch((error) => { console.warn('epoch override actors could not be persisted', error) })
+}
+
+function recordLocalActor(handle: DocHandle<unknown>): void {
+  const doc = handle.doc()
+  if (!doc) return
+  const actor = getActorId(doc as never)
+  if (localActorIds.has(actor)) return
+  localActorIds.add(actor)
+  // Persisted ALWAYS (a design commitment): an edit made offline
+  // before a workspace's FIRST roll is overridden by that roll, and its
+  // review rows are keyed by this actor — kept in memory only, the next
+  // session (another actor) would never be offered them. Bounded
+  // (LOCAL_ACTORS_MAX), one debounced KV write per new actor.
+  if (localActorsPersist) return
+  localActorsPersist = { timer: setTimeout(persistLocalActorsNow, 250), store: workspaceKvStore() }
+}
+
+async function hydrateLocalActors(): Promise<void> {
+  const stored = await workspaceKvStore().get<string[]>(LOCAL_ACTORS_KEY).catch(() => undefined)
+  for (const actor of Array.isArray(stored) ? stored : []) if (typeof actor === 'string' && /^[0-9a-f]{2,128}$/.test(actor)) localActorIds.add(actor)
+}
+
+/** Every document this tab projects the model from, the overlay heads included. */
+function modelDocumentsHeld(): DocHandle<unknown>[] {
+  const handles = [
+    modelMetaHandle, ...objectShardHandles, ...connectionShardHandles,
+    editsObjectShardHandle, editsConnectionShardHandle, ...editsObjectSegmentHandles, ...editsConnectionSegmentHandles,
+  ].filter((h): h is NonNullable<typeof h> => h !== null) as DocHandle<unknown>[]
+  return [...new Map(handles.map((h) => [h.documentId, h])).values()]
+}
+
+/** The changes, in the projected documents, whose message matches. */
+function changesWithMessage(match: (message: string) => boolean): Array<{ documentId: string; actor: string }> {
+  const found: Array<{ documentId: string; actor: string }> = []
+  for (const handle of modelDocumentsHeld()) {
+    const doc = handle.doc()
+    if (!doc) continue
+    for (const raw of getAllChanges(doc as never)) {
+      const change = decodeChange(raw)
+      if (change.message && match(change.message)) found.push({ documentId: handle.documentId, actor: change.actor })
+    }
+  }
+  return found
+}
+
+/** The documents the tagged flush running now has changed. */
+let taggedCarriers: Set<string> | null = null
+
+/** Whether none of `documentIds` is still owed to the server. */
+function carriersDurable(documentIds: readonly string[]): boolean {
+  const owed = new Set(durableHeads.snapshot().map((e) => e.documentId as string))
+  return documentIds.every((id) => !owed.has(id))
+}
+
+function installEpochOverridePorts(): () => void {
+  return installEpochOverrides({
+    // The profile's journal read AGAIN at each refresh — the design's "actors
+    // this browser profile has used". A tab read it at boot only, so the rows
+    // of an actor another open tab of Marie recorded since were never offered
+    // here. Signed in, the server adds every actor the user's tabs asked with
+    // (other devices included).
+    actorIds: async () => {
+      await hydrateLocalActors()
+      return [...localActorIds]
+    },
+    // Signed in, a device that never wrote asks too — the server lists the rows
+    // of the actors her other devices recorded. Installed only on a workspace
+    // with epochs: flag off, never.
+    signedIn: async () => {
+      const { useAuthStore } = await import('../../stores/authStore')
+      const auth = useAuthStore.getState()
+      return Boolean(auth.config && auth.config.stage !== 'off' && auth.user)
+    },
+    // A re-apply during a hop (latch, paused or deferred writes, or a hop in
+    // flight) is refused: its flush could land on the epoch being left.
+    writable: () => !writesPausedByHop && !writeDeferredByHop && (epochHop?.state().phase ?? 'idle') === 'idle',
+    flushPending: () => writeScheduler.flushNow(),
+    flushTagged(message) {
+      // The store edit armed the write (onStoreChange); run it NOW, inside
+      // the message scope, so every change it makes carries the batch id —
+      // and collect WHICH documents those are: durability is asked of them.
+      scheduleWrite('normal')
+      const carriers = new Set<string>()
+      taggedCarriers = carriers
+      try {
+        withChangeMessage(message, () => writeScheduler.flushNow())
+      } finally {
+        taggedCarriers = null
+      }
+      return [...carriers]
+    },
+    async whenDurable(carriers, timeoutMs) {
+      const deadline = Date.now() + timeoutMs
+      while (Date.now() < deadline) {
+        // Only the batch's own carriers, never the whole ledger.
+        if (!writesPausedByHop && !writeDeferredByHop && carriersDurable(carriers)) return true
+        scheduleDurableAcknowledgement(0)
+        await new Promise((resolve) => setTimeout(resolve, 250))
+      }
+      return false
+    },
+    changesWithMessage: (match) => changesWithMessage(match),
+    carriersDurable,
+    // A carrier the tab projects is read from its own handle: `syncedHandle`
+    // alone skipped one not yet synced, and the server was then asked about
+    // a subset of the batch's carriers.
+    carrierHeads: (documentIds) => documentIds
+      .map((id) => modelDocumentsHeld().find((h) => h.documentId === id) ?? syncedHandle(repo, id as DocumentId))
+      .map((handle) => (handle ? documentHeads(handle as DocHandle<unknown>) : null))
+      .filter((d): d is HopDocumentHeads => d !== null),
+    async serverHolds(heads) {
+      if (heads.length === 0) return false
+      const answers = await acknowledgeDurableDocumentHeads(heads.map((d) => ({ documentId: d.documentId as DocumentId, heads: d.heads })))
+      // A carrier whose epoch was RETIRED is no longer checked by the server —
+      // `'retired'`, never a plain "not held".
+      let retired = false
+      for (const d of heads) {
+        const answer = answers.find((a) => a.documentId === d.documentId) as { durable?: boolean; epochRetired?: boolean } | undefined
+        if (answer?.durable === true) continue
+        if (answer?.epochRetired === true) { retired = true; continue }
+        return false
+      }
+      return retired ? 'retired' : true
+    },
+    // Boot-from-server: the store is the diagram's window; an entity the
+    // window lacks is read from the server read model — BOUNDED: at most
+    // EPOCH_FETCH_MAX ids, EPOCH_FETCH_CONCURRENCY at a time.
+    fetchEntities: bfsActive
+      ? async (collection, ids) => {
+        const query = getModelQuery()
+        const out = new Map<string, Record<string, unknown>>()
+        const wanted = ids.slice(0, EPOCH_FETCH_MAX)
+        // Never silent: the rows past the bound show without
+        // their entity.
+        if (ids.length > EPOCH_FETCH_MAX) console.warn(`epoch overrides: ${ids.length - EPOCH_FETCH_MAX} ${collection} beyond the first ${EPOCH_FETCH_MAX} are not fetched`)
+        for (let i = 0; i < wanted.length; i += EPOCH_FETCH_CONCURRENCY) {
+          await Promise.all(wanted.slice(i, i + EPOCH_FETCH_CONCURRENCY).map(async (id) => {
+            const entity = collection === 'objects' ? await query.object(id)
+              : collection === 'connections' ? await query.connection(id) : await query.group(id)
+            if (entity) out.set(id, entity as unknown as Record<string, unknown>)
+          }))
+        }
+        return out
+      }
+      : undefined,
+    seedForEdit(collection, entity) {
+      if (collection === 'objects') seedObjectForEdit(entity as unknown as C4Object)
+      else if (collection === 'connections') seedConnectionForEdit(entity as unknown as Connection)
+    },
+  })
+}
+
+function plainDocument(handle: DocHandle<unknown> | null | undefined): Record<string, unknown> | null {
+  const doc = handle?.doc()
+  return doc ? JSON.parse(JSON.stringify(doc)) as Record<string, unknown> : null
+}
+
+function timelineDetail(event: Record<string, unknown>): Record<string, string | number | boolean | null> {
+  return Object.fromEntries(Object.entries(event).map(([key, value]) => [key,
+    value === null || ['string', 'number', 'boolean'].includes(typeof value) ? value as string | number | boolean | null : JSON.stringify(value)]))
+}
+
+/** Give back the 'model-shard' leases a hop's loads took, for the documents
+ * the tab does not project. */
+function releaseUnprojected(handles: EpochHandles): void {
+  const projected = new Set<string>([
+    ...(modelMetaHandle ? [modelMetaHandle.url] : []),
+    ...objectShardHandles.map((h) => h.url), ...connectionShardHandles.map((h) => h.url),
+  ])
+  for (const h of [handles.meta, ...handles.objects, ...handles.connections]) {
+    if (!projected.has(h.url)) releaseDocumentRequest(h.url, 'model-shard')
+  }
+}
+
+function epochHopPorts(): EpochHopPorts<EpochHandles> {
+  return {
+    async load(metaUrl, signal) {
+      hopLateSources.clear()
+      noteHopObjectsAtLoad()
+      const meta = await findModelMetaHandle(metaUrl)
+      if (signal.aborted) throw new DOMException('aborted', 'AbortError')
+      const doc = meta.doc()
+      if (!doc) throw new Error(`epoch hop: ModelMeta ${metaUrl} has no document`)
+      const view = withMetaUrlView(doc)
+      // Boot-from-server reads come from the server render: the meta only.
+      const objects = bfsActive ? [] : await getModelShardHandles<ObjectShard>(uniqueUrls(view.objectShardUrls))
+      const connections = bfsActive ? [] : await getModelShardHandles<ConnectionShard>(uniqueUrls(view.connectionShardUrls))
+      const loaded = { metaUrl, meta, objects, connections }
+      if (signal.aborted) { releaseUnprojected(loaded); throw new DOMException('aborted', 'AbortError') }
+      hopLoaded = loaded
+      return hopLoaded
+    },
+    drop(handles) {
+      // Never projected: its listeners were never attached, but the loads
+      // took a 'model-shard' lease each — given back, except for
+      // a document the tab projects anyway.
+      releaseUnprojected(handles)
+      if (hopLoaded === handles) hopLoaded = null
+    },
+    holdsTargets(handles, targets) {
+      const mine = new Map([handles.meta, ...handles.objects, ...handles.connections]
+        .map((h) => [h.documentId as string, () => (h as DocHandle<unknown>).doc()]))
+      return holdsTargets(mine, targets)
+    },
+    stillWanted: (metaUrl) => rootHandle?.doc()?.modelMetaUrl === metaUrl,
+    oldHeads: () => heldEpochDocuments().map(documentHeads).filter((d): d is HopDocumentHeads => d !== null),
+    carried: () => new Set(heldEpochDocuments().filter(isOwnCarriedShard).map((h) => h.documentId as string)),
+    oldMetaDocumentId: () => (modelMetaHandle ? String(modelMetaHandle.documentId) : null),
+    async acknowledge(documents, signal, options) {
+      const out: HopAcknowledgement[] = []
+      for (let i = 0; i < documents.length; i += DURABLE_HEADS_BATCH) {
+        const batch = documents.slice(i, i + DURABLE_HEADS_BATCH).map((d) => ({ documentId: d.documentId as DocumentId, heads: d.heads }))
+        out.push(...(await acknowledgeDurableDocumentHeads(batch, { signal, ...(options?.latch ? { latch: true } : {}) })) as HopAcknowledgement[])
+      }
+      for (const answer of out as Array<HopAcknowledgement & Record<string, unknown>>) {
+        if ('forwarded' in answer || answer.forwardPending === true || answer.epochRetired === true) hopLateSources.add(answer.documentId)
+      }
+      return out
+    },
+    blockInput: () => useEpochHopStore.getState().setLatched(true),
+    unblockInput: () => useEpochHopStore.getState().setLatched(false),
+    async flushAndPauseWrites() {
+      writeScheduler.flushNow()
+      writesPausedByHop = true
+    },
+    resumeWrites() {
+      writesPausedByHop = false
+      if (writeDeferredByHop) {
+        writeDeferredByHop = false
+        writeScheduler.request('normal')
+      }
+      // The adoptions and unloads the latch held back.
+      runAfterLatch()
+    },
+    swap: swapEpoch,
+    // A starved hop latches in a quiet moment.
+    quietForMs: () => Date.now() - lastModelActivityAt,
+    retainOld(documents) {
+      const keep = new Set(documents.map((d) => d.documentId))
+      const all = swappedOut ?? []
+      swappedOut = null
+      hopLoaded = null
+      // A RETIRED document (not in `documents`) will never be forwarded:
+      // holding it buys nothing.
+      for (const h of all) if (!keep.has(h.documentId)) activeDocumentShare.unpin(h.documentId, EPOCH_RETAINED_ROLE)
+      retainedEpochSeq += 1
+      retainedEpochSets.set(retainedEpochSeq, all.filter((h) => keep.has(h.documentId)))
+      return retainedEpochSeq
+    },
+    retainedHeads: (token) => (retainedEpochSets.get(token) ?? []).map(documentHeads).filter((d): d is HopDocumentHeads => d !== null),
+    releaseOld(token) {
+      for (const h of retainedEpochSets.get(token) ?? []) activeDocumentShare.unpin(h.documentId, EPOCH_RETAINED_ROLE)
+      retainedEpochSets.delete(token)
+    },
+    collectRetiredDiff(retired): RetiredExport {
+      retiredEpochDocumentIds = retired.map((id) => id as DocumentId)
+      const ids = new Set(retired)
+      const loaded = hopLoaded
+      return noteHopExported({
+        version: 1,
+        metaUrl: loaded?.metaUrl ?? '',
+        collectedAt: new Date().toISOString(),
+        differences: collectRetiredDifferences({
+          retiredMeta: modelMetaHandle && ids.has(modelMetaHandle.documentId) ? plainDocument(modelMetaHandle as DocHandle<unknown>) : null,
+          retiredObjectShards: objectShardHandles.filter((h) => ids.has(h.documentId)).map((h) => plainDocument(h as DocHandle<unknown>)),
+          retiredConnectionShards: connectionShardHandles.filter((h) => ids.has(h.documentId)).map((h) => plainDocument(h as DocHandle<unknown>)),
+          // Boot-from-server loads no base shard of the new epoch, so absence
+          // cannot be told.
+          currentShardsUnknown: bfsActive,
+          current: {
+            meta: plainDocument(loaded?.meta as DocHandle<unknown> | undefined),
+            objects: mergeObjectShards((loaded?.objects ?? []).map((h) => h.doc() ?? { objects: {} })) as Record<string, unknown>,
+            connections: mergeConnectionShards((loaded?.connections ?? []).map((h) => h.doc() ?? { connections: {} })) as Record<string, unknown>,
+          },
+        }),
+      })
+    },
+    showRetired(diff) {
+      // Persisted, merged with one already shown, until "Export" or a confirmed
+      // "×". Exported: the retired documents are no longer owed to the server
+      // (they never will be durable), so they stop holding the badge — once the
+      // export is PERSISTED (forgotten in the same turn, a crash during the
+      // write lost both, as the unlisted path, which waits for `safe`, does
+      // not). A write that FAILED forgets them too — a private window has no
+      // IndexedDB, the export is shown for the session, and owed for ever they
+      // held the badge at "Saving" and were asked about every 750 ms. Only a
+      // write still RUNNING keeps them owed.
+      const retired = retiredEpochDocumentIds
+      retiredEpochDocumentIds = []
+      const session = durableAckEpoch
+      void offerRetiredExport(diff as RetiredExport).then(() => {
+        if (session !== durableAckEpoch) return
+        durableHeads.forget(retired)
+        queueDurableLedgerPersistence()
+        scheduleDurableAcknowledgement(0)
+      })
+    },
+    log(event) {
+      markClientTimeline(String(event.event), timelineDetail(event))
+      // Diagnostics (B1 convergence): the hop's own timeline, wall-clock so
+      // it lines up with the server's trigger trace. Bounded.
+      hopTrace.push({ t: Date.now(), ...event })
+      if (hopTrace.length > HOP_TRACE_MAX) hopTrace.splice(0, hopTrace.length - HOP_TRACE_MAX)
+      if (event.event === 'epoch_hop.s7_unproven') {
+        console.warn('[epoch hop] the old meta\'s supersession (S7) was never proven; this tab stays on its epoch and tries again later', event)
+        epochHopAbandonedUrl = typeof event.metaUrl === 'string' ? event.metaUrl : ''
+        armAbandonedEpochHopTimer()
+      }
+      if (event.event === 'epoch_hop.failed') {
+        console.warn('epoch hop failed; retrying', event)
+        if (epochHopRetryTimer) clearTimeout(epochHopRetryTimer)
+        epochHopRetryTimer = setTimeout(() => { epochHopRetryTimer = null; maybeStartEpochHop() }, EPOCH_HOP_RETRY_MS)
+      }
+    },
+  }
+}
+
+/** Step 1, DETECT: called from the root handler. The root changes only by
+ * sync, so this only fires online. Any repoint — a roll, the slim script, a
+ * degenerate-root repair — is followed the same way (as the server's
+ * projector follows it). */
+function maybeStartEpochHop(): void {
+  if (!started || !sharded || !modelMetaHandle || !bootedMetaUrl) return
+  const url = rootHandle?.doc()?.modelMetaUrl
+  if (!url || !isValidAutomergeUrl(url)) return
+  // Back to the booted meta: a hop running towards another one is
+  // cancelled, never swapped. Elsewhere — a design decision: followed only on
+  // a workspace with epochs. A flag-off repoint (degenerate-root repair, the
+  // slim script) leaves no forward journal behind it, so "durable on the old
+  // meta" would not mean "in the new one"; such a tab keeps its booted meta
+  // until reload, the pre-epoch behaviour (`repointAction`).
+  const action = repointAction({ bootedMetaUrl, rootMetaUrl: url, capability: epochCapability })
+  if (action === 'cancel') { epochHop?.cancel(); return }
+  // Capability unknown (a tab booted before the first roll, idle since): ask,
+  // a few times — the repoint can reach the tab before the roll that made it
+  // has marked the workspace on the server (whose "no epochs" answer is
+  // memoized up to 60 s). A `true` answer comes back through
+  // `noteEpochCapability`, which calls this again.
+  if (action === 'probe') { probeCapabilityForRepoint(url); return }
+  if (action !== 'start') return
+  if (!epochHop) epochHop = createEpochHop(epochHopPorts(), epochHopOptionsForTest)
+  epochHop.start(url)
+}
+
+/** Tests only: the hop machine's timings (latch, backoff, S7 bound). */
+let epochHopOptionsForTest: EpochHopOptions | undefined
+export function __setEpochHopOptionsForTest(options: EpochHopOptions | null): void {
+  epochHopOptionsForTest = options ?? undefined
+}
+
+/** The server or the ModelMeta says this workspace has epochs:
+ * sticky per workspace; the actor journal starts persisting, the override
+ * review is installed, a pending repoint is followed. */
+function noteEpochCapability(epochs: boolean): void {
+  // Sticky: a `false` never downgrades a known `true`.
+  const next = nextEpochCapability(epochCapability, epochs)
+  if (!started || next === epochCapability) return
+  epochCapability = next
+  epochCapabilityFrom = 'ack'
+  void workspaceKvStore().set(EPOCH_CAPABILITY_KEY, true).catch(() => undefined)
+  if (localActorIds.size > 0 && !localActorsPersist) {
+    localActorsPersist = { timer: setTimeout(persistLocalActorsNow, 0), store: workspaceKvStore() }
+  }
+  if (!uninstallEpochOverrides && overridesReady) uninstallEpochOverrides = installEpochOverridePorts()
+  // The boot raises a persisted retired export only when the capability is
+  // known then; learned here (its KV write had failed), it is raised now.
+  void raisePersistedRetiredExport()
+  maybeStartEpochHop()
+}
+
+/** The persisted epoch lineage's key: per CONCRETE workspace, so a fork or
+ * another version never shares its links. */
+function epochLineageKey(): string {
+  const workspace = documentsWorkspaceKey()
+  return workspace ? `${EPOCH_LINEAGE_KEY}:${workspace}` : EPOCH_LINEAGE_KEY
+}
+
+/** Persist lineage links, merged atomically with what other tabs wrote. */
+async function persistEpochLineage(links: ReadonlyArray<readonly [string, string]>): Promise<void> {
+  if (links.length === 0) return
+  await workspaceKvStore().update<EpochLineage>(epochLineageKey(), (stored) => withLineageLinks(stored, links))
+    .catch((error) => { console.warn('epoch lineage could not be persisted', error) })
+}
+
+/** Walk `meta`'s predecessors (persisted lineage first, then `load`), learn
+ * the links found, and accept their metas as holders of held pointers. */
+async function walkPredecessors(meta: DocHandle<ModelMeta>, load: (url: string) => Promise<unknown>): Promise<boolean> {
+  const stored = await workspaceKvStore().get<unknown>(epochLineageKey()).catch(() => undefined)
+  const { chain, learned, complete } = await walkEpochLineage({
+    current: meta.doc(), currentId: meta.documentId, lineage: withLineageLinks(stored, []), load,
+  })
+  await persistEpochLineage(learned)
+  for (const id of chain) if (id !== meta.documentId) supersededMetaDocumentIds.add(id as DocumentId)
+  return complete
+}
+
+/** A held pointer names a meta the lineage does not reach — walk again, LOADING
+ * the missing predecessor metas, their leases given back. Two rolls the tab
+ * never saw, then a reload: E(n)'s predecessor E(n−1) was never booted here.
+ * Run in the BACKGROUND after the first render, under ONE budget for the whole
+ * walk (PREDECESSOR_WALK_BUDGET_MS). True when the walk decided (reached the
+ * chain's end). */
+async function extendPredecessorChain(meta: DocHandle<ModelMeta>, budgetMs = predecessorWalkBudgetMs): Promise<boolean> {
+  const deadline = Date.now() + budgetMs
+  return walkPredecessors(meta, async (url) => {
+    const local = syncedHandle(repo, url.slice('automerge:'.length) as DocumentId)
+    if (local?.isReady()) return local.doc()
+    // From the SERVER (it was never here): the boot resolution of a meta,
+    // bounded by what is LEFT of the walk's budget — less a reserve for the
+    // authoritative question below (a meta the server stays SILENT about ran
+    // the whole budget out, and the walk could never decide).
+    const left = deadline - Date.now() - Math.min(PREDECESSOR_QUESTION_RESERVE_MS, budgetMs / 3)
+    if (deadline - Date.now() <= 0) return undefined
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      const handle = await Promise.race([
+        findModelMetaHandle(url),
+        new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new PredecessorTimeoutError(url)), Math.max(0, left)) }),
+      ])
+      return handle.doc()
+    } catch (error) {
+      // GONE (deleted by the server's GC) is a decision; the budget running
+      // out, or nobody to ask, is not: only on an answer that is
+      // AUTHORITATIVE.
+      if (await predecessorGone(error, url, deadline - Date.now())) return EPOCH_LINK_GONE
+      throw error
+    } finally {
+      clearTimeout(timer)
+      if (url !== modelMetaHandle?.url) releaseDocumentRequest(url as AutomergeUrl, 'model-shard')
+    }
+  })
+}
+
+/** The walk's own deadline for one predecessor's load (not the repo's). */
+class PredecessorTimeoutError extends Error {
+  constructor(url: string) { super(`epoch predecessor ${url} not resolved in time`); this.name = 'PredecessorTimeoutError' }
+}
+
+/** Kept out of a predecessor's load for the `epochRetired` question: at
+ * most a third of the walk's budget. */
+const PREDECESSOR_QUESTION_RESERVE_MS = 3_000
+
+/** Boots, with the server reachable, whose walk never decided an entry set
+ * aside for it: past this many, the entry is given up (otherwise it was
+ * walked again at every boot, for ever). Counted apart from
+ * the entry (`UNDECIDED_WALKS_KEY`), offline boots never. */
+const UNDECIDED_WALK_LIMIT = 10
+const UNDECIDED_WALKS_KEY = 'epoch-undecided-walks:v1'
+/** The running walk's question about a predecessor got an answer at all… */
+let predecessorQuestionAnswered = false
+/** …and one said a predecessor is NOT retired. */
+let predecessorAnsweredLive = false
+
+/** Count one more undecided walk for `references` (url → boots), and give up
+ * those that reach the limit; `decided` clears their counts. */
+async function noteUndecidedWalks(references: readonly DeferredReference[], decided: boolean): Promise<void> {
+  if (references.length === 0) return
+  const reached: DeferredReference[] = []
+  await workspaceKvStore().update<Record<string, number>>(UNDECIDED_WALKS_KEY, (old) => {
+    const next = { ...(old && typeof old === 'object' ? old : {}) }
+    for (const reference of references) {
+      if (decided) { delete next[reference.url]; continue }
+      const count = (next[reference.url] ?? 0) + 1
+      if (count >= UNDECIDED_WALK_LIMIT) { reached.push(reference); delete next[reference.url] } else next[reference.url] = count
+    }
+    return next
+  }).catch(() => undefined)
+  for (const reference of reached) {
+    console.warn(`held ${reference.field} entry ${reference.url}: its holder ${reference.holderDocumentId} was not reached in ${UNDECIDED_WALK_LIMIT} boots with the server reachable; given up`)
+    await deferredReferences.remove(reference).catch(() => undefined)
+  }
+}
+
+/** Test hook: the bound's counter. */
+export const __noteUndecidedWalksForTest = noteUndecidedWalks
+
+/** A well-formed head the server cannot hold: the durable-heads route needs
+ * one per document, and `epochRetired` is read from the epoch rows, not
+ * from the heads (`durableHeads.ts`). */
+const NO_SUCH_HEAD = '0'.repeat(64)
+
+/** Whether a predecessor meta's load failed because the meta is GONE —
+ * decided only on an answer that says so: a deleted or invalid document
+ * (`DocumentPermanentlyUnavailableError`), or "unavailable" when the SERVER,
+ * asked about that meta, answers `epochRetired` (its `retired` row outlives
+ * GC, `modelEpochRetire.ts`). "Unavailable" alone — a sync peer connected or
+ * not — covers a server slow to load from storage, a meta outside the shared
+ * scope for a moment, a cell hand-over: it decides nothing, so a live
+ * predecessor answering it three boots in a row no longer gives its entries
+ * up. */
+async function predecessorGone(error: unknown, url: string, leftMs: number): Promise<boolean> {
+  if (error instanceof DocumentPermanentlyUnavailableError) return true
+  // A load the server stayed silent about is asked about like an "unavailable"
+  // one.
+  const unavailable = error instanceof DocumentTemporarilyUnavailableError || error instanceof PredecessorTimeoutError
+  if (!unavailable || leftMs <= 0) return false
+  const documentId = url.slice('automerge:'.length) as DocumentId
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), Math.min(leftMs, unmintedAckTimeoutMs))
+  try {
+    const answers = await acknowledgeDurableDocumentHeads([{ documentId, heads: [NO_SUCH_HEAD] }], { signal: controller.signal })
+    const answer = answers.find((a) => a.documentId === documentId) as { epochRetired?: unknown } | undefined
+    // The server answered the round (an offline boot never gets here)…
+    predecessorQuestionAnswered = true
+    // …and, NOT retired: a live meta it is slow to give — the walk's
+    // undecided bound does not count this boot (it is not gone).
+    if (answer && answer.epochRetired !== true) predecessorAnsweredLive = true
+    return answer?.epochRetired === true
+  } catch {
+    return false
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/** Boot: the epoch knowledge of this workspace — the sticky
+ * capability, and the ModelMetas this browser has booted on, which a held
+ * pointer may name after a roll and a reload. Bounded: every await here is a
+ * KV read; a failure leaves the knowledge empty (the old behaviour). */
+async function hydrateEpochKnowledge(meta: DocHandle<ModelMeta>): Promise<void> {
+  const capability = await workspaceKvStore().get<boolean>(EPOCH_CAPABILITY_KEY).catch(() => undefined)
+  // The metas a held pointer may name are the current meta's EPOCH PREDECESSORS
+  // (its `epochPredecessorRef` chain), not every meta this browser once booted:
+  // a repoint to another lineage or another version never resurrects a shard
+  // abandoned there. Walked through the PERSISTED lineage (every link this
+  // browser booted, swapped or loaded), and the metas this tab holds in memory
+  // — no request here; a held pointer that needs a link nobody here has seen
+  // loads it (`extendPredecessorChain`, at the resume).
+  supersededMetaDocumentIds.clear()
+  await walkPredecessors(meta, async (url) => {
+    const handle = syncedHandle(repo, url.slice('automerge:'.length) as DocumentId)
+    return handle?.isReady() ? handle.doc() : undefined
+  })
+  const markedEpoch = typeof (meta.doc() as { modelEpoch?: unknown } | undefined)?.modelEpoch === 'number'
+  epochCapability = capability === true || markedEpoch
+  epochCapabilityFrom = capability === true ? 'kv' : markedEpoch ? 'meta' : null
+}
+
+function stopEpochHop(): void {
+  stopRepointProbes()
+  if (epochHopRetryTimer) clearTimeout(epochHopRetryTimer)
+  epochHopRetryTimer = null
+  if (epochHopAbandonedTimer) clearTimeout(epochHopAbandonedTimer)
+  epochHopAbandonedTimer = null
+  epochHopAbandonedUrl = null
+  epochHopAbandonedDelayMs = epochHopAbandonedRetryMs
+  ledgerRetiredOffered.clear()
+  epochHop?.stop()
+  epochHop = null
+  for (const handles of retainedEpochSets.values()) {
+    for (const h of handles) activeDocumentShare.unpin(h.documentId, EPOCH_RETAINED_ROLE)
+  }
+  retainedEpochSets.clear()
+  // Pinned for a swap and never handed to `retainOld`.
+  for (const h of swappedOut ?? []) activeDocumentShare.unpin(h.documentId, EPOCH_RETAINED_ROLE)
+  swappedOut = null
+  if (hopLoaded) releaseUnprojected(hopLoaded)
+  hopLoaded = null
+  bootedMetaUrl = null
+  retiredEpochDocumentIds = []
+  supersededMetaDocumentIds.clear()
+  locallyCreatedModelShardUrls.clear()
+  hopLateSources.clear()
+  pendingSetAside = null
+  cancelUnmintedRetries()
+  hopObjectsAtLoad = null
+  hopExportedIds = new Set()
+  hopUnaccountedObjects.length = 0
+  followingModelShardUrls.clear()
+  stopFollowRepresentations()
+  provisionalModelShardUrls.clear()
+  afterLatch = []
+  // The projection it queued is dropped with `afterLatch`; left true, no later
+  // latch — this session's or the next one's — would queue one again.
+  reprojectDeferredByLatch = false
+  // In memory only: the persisted copy waits for this workspace's next boot.
+  pendingOverlayRescues.clear()
+  // The next session reads the key again before it may remove from it; a
+  // removal this one still owed is left to that read (the entry comes back,
+  // finds nothing owed, and leaves).
+  overlayRescuesHydrated = false
+  overlayRescueRemovalsOwed = []
+  // The overlay of owed local writes is cleared by `stopBridge` AFTER its
+  // lifecycle flush: that flush reads it as a debt.
+  if (overlayRescueTimer) clearTimeout(overlayRescueTimer)
+  overlayRescueTimer = null
+  epochCapability = false
+  epochCapabilityFrom = null
+  // A write the latch deferred is re-armed: the lifecycle flush
+  // that follows in `stopBridge` then writes it.
+  writesPausedByHop = false
+  if (writeDeferredByHop) writeScheduler.request('normal')
+  writeDeferredByHop = false
+  useEpochHopStore.getState().reset()
+}
+
+/** Read-only probe (dev `window.__epochHop`, e2e assertions). */
+/** The held-pointer queue of this workspace, for the e2e (an `unminted` entry
+ * must leave it once the server holds the shard). */
+export async function epochDeferredQueueProbe(): Promise<DeferredReference[]> {
+  return deferredReferences.list().catch(() => [])
+}
+
+export function epochHopProbe(objectId?: string): {
+  bootedMetaUrl: string | null; state: unknown; retainedSets: number; retainedDocuments: string[]
+  objectShards: string[]; objectInShards?: unknown[]; writesDeferredByLatch: number; deferredWritesAtSwap: number
+  heldHeads: HopDocumentHeads[]; retainedPins: number; hopTrace: Array<Record<string, unknown>>
+  epochCapability: boolean; epochCapabilityFrom: string | null; durablePending: string[]
+  predecessorMetas: string[]; repointProbePending: boolean; lineageKey: string
+  unmintedRetriesPending: number; provisionalShards: string[]; connectionShards: string[]
+  metaObjectShardUrls: string[]; carriedDecisions: string[]; hopUnaccountedObjects: string[]; followFailures: string[]; followRepresentations: number; reprojectionsDeferredByLatch: number; overlayClearRescues: number
+  followRepresentWaits: number[]; overlayRescuesPending: number; residentPendingWrites: number
+  residentDebt: (ResidentDebtDriverState & { writer: 'boot' | 'session' | null }) | null
+  bootEditWatchActive: boolean; bridgeStarted: boolean
+  objectInDocuments?: string[]; editsHeads?: Array<string | null>
+} {
+  return {
+    bootedMetaUrl,
+    epochCapability,
+    epochCapabilityFrom,
+    hopTrace: [...hopTrace],
+    // How many documents hold the `epoch-retained` pin (a retained set must
+    // keep syncing until it is forwarded).
+    retainedPins: activeDocumentShare.snapshot().byRole[EPOCH_RETAINED_ROLE] ?? 0,
+    heldHeads: heldEpochDocuments().map(documentHeads).filter((d): d is HopDocumentHeads => d !== null),
+    writesDeferredByLatch,
+    deferredWritesAtSwap,
+    state: epochHop?.state() ?? { phase: 'idle' },
+    retainedSets: retainedEpochSets.size,
+    retainedDocuments: [...retainedEpochSets.values()].flat().map((h) => h.documentId),
+    objectShards: objectShardHandles.map((h) => h.documentId),
+    // What the durable ledger still owes the server.
+    durablePending: durableHeads.snapshot().map(({ documentId }) => documentId as string),
+    // The metas a held pointer may name (the epoch predecessors), and
+    // whether a capability probe is pending.
+    predecessorMetas: [...supersededMetaDocumentIds],
+    repointProbePending: repointProbes.pending(),
+    // Where the lineage is persisted (tests preload it).
+    lineageKey: epochLineageKey(),
+    // The armed questions about random-id shards (none after a
+    // stop), and the shards shown while they wait for an answer.
+    unmintedRetriesPending: unmintedRetryTimers.size,
+    provisionalShards: [...provisionalModelShardUrls],
+    connectionShards: connectionShardHandles.map((h) => h.documentId),
+    // What the current meta lists, and the carried pointers this session asked
+    // about and wrote.
+    metaObjectShardUrls: (() => { const doc = modelMetaHandle?.doc(); return doc ? (readMetaUrls(doc, 'objectShardUrls') ?? []) : [] })(),
+    carriedDecisions: [...carriedDecisions],
+    // The hop's invariant alerts.
+    hopUnaccountedObjects: [...hopUnaccountedObjects],
+    // The follow's failed urls.
+    followFailures: followFailureProbe(),
+    followRepresentations,
+    reprojectionsDeferredByLatch,
+    overlayClearRescues,
+    followRepresentWaits: [...followRepresentWaits],
+    overlayRescuesPending: pendingOverlayRescues.size,
+    residentPendingWrites: residentPendingWrites.size,
+    // G4-16l: the debt's owner, the boot window, and whether a boot runs.
+    residentDebt: residentDebtDriver ? { ...residentDebtDriver.state(), writer: residentDebtWriter } : null,
+    bootEditWatchActive: bootEditWatch !== null,
+    bridgeStarted: started,
+    ...(objectId ? { objectInShards: objectShardHandles.map((h) => (h.doc()?.objects as Record<string, unknown> | undefined)?.[objectId] ?? null) } : {}),
+    // Which held document — the overlay heads included — holds the object, and
+    // what the meta names as its heads.
+    ...(objectId ? {
+      objectInDocuments: modelDocumentsHeld()
+        .filter((h) => ((h.doc() as { objects?: Record<string, unknown> } | undefined)?.objects ?? {})[objectId] !== undefined)
+        .map((h) => h.documentId as string),
+      editsHeads: (() => { const doc = modelMetaHandle?.doc(); return doc ? [readMetaUrl(doc, 'editsObjectShardUrl') ?? null, ...(readMetaUrls(doc, 'editsObjectShardUrls') ?? [])] : [] })(),
+    } : {}),
+  }
 }
 
 /**
@@ -1907,17 +3759,44 @@ export function projectDecisionRecordPage(
 
 /** Rebuild id → shard-index from loaded shard CONTENTS (the authoritative source
  * for stable routing). Cheap O(model) map fill; runs only when a shard doc changed. */
-function rebuildObjectRoute(docs: (ObjectShard | undefined)[]): void {
-  shardIndexByObjectId.clear()
-  for (let i = 0; i < docs.length; i++) {
-    for (const id of Object.keys(docs[i]?.objects ?? {})) shardIndexByObjectId.set(id, i)
+function rebuildObjectRoute(docs: (ObjectShard | undefined)[], listed: readonly boolean[] = []): void {
+  rebuildRoute(shardIndexByObjectId, docs.map((d) => d?.objects), listed)
+}
+function rebuildConnectionRoute(docs: (ConnectionShard | undefined)[], listed: readonly boolean[] = []): void {
+  rebuildRoute(shardIndexByConnectionId, docs.map((d) => d?.connections), listed)
+}
+
+/**
+ * id → shard index, from the shards' contents: among the shards the meta
+ * LISTS, the last one holding an id wins (list order is precedence). In
+ * defence: a shard the meta does not list (carried, or loaded from
+ * the held queue) never takes an id a listed shard holds — a recreated copy
+ * (X′) must not be routed past, or it looks empty and the next flush empties
+ * it. `listed[i]` absent: listed.
+ */
+function rebuildRoute(route: Map<string, number>, collections: Array<Record<string, unknown> | undefined>, listed: readonly boolean[]): void {
+  route.clear()
+  for (let i = 0; i < collections.length; i++) {
+    if (listed[i] === false) continue
+    for (const id of Object.keys(collections[i] ?? {})) route.set(id, i)
+  }
+  for (let i = 0; i < collections.length; i++) {
+    if (listed[i] !== false) continue
+    for (const id of Object.keys(collections[i] ?? {})) if (!route.has(id)) route.set(id, i)
   }
 }
-function rebuildConnectionRoute(docs: (ConnectionShard | undefined)[]): void {
-  shardIndexByConnectionId.clear()
-  for (let i = 0; i < docs.length; i++) {
-    for (const id of Object.keys(docs[i]?.connections ?? {})) shardIndexByConnectionId.set(id, i)
-  }
+
+/** Per held shard, whether the current meta lists it. */
+function listedInMeta(handles: readonly DocHandle<unknown>[], field: 'objectShardUrls' | 'connectionShardUrls'): boolean[] {
+  const doc = modelMetaHandle?.doc()
+  const urls = new Set(doc ? readMetaUrls(doc, field) ?? [] : [])
+  return handles.map((h) => urls.has(h.url))
+}
+
+/** Merge order with the unlisted shards FIRST: the merge's later-wins makes a
+ * listed shard's copy of an id the projected one. */
+function listedLast<T>(docs: readonly T[], listed: readonly boolean[]): T[] {
+  return [...docs.filter((_, i) => listed[i] === false), ...docs.filter((_, i) => listed[i] !== false)]
 }
 
 /**
@@ -1935,9 +3814,16 @@ function reconcileModelShardBucket(
   handle: DocHandle<ObjectShard> | DocHandle<ConnectionShard>,
   key: 'objects' | 'connections',
   bucket: readonly { id: string }[],
+  /** In defence: ids this (unlisted) shard holds but that are
+   * routed to a LISTED shard — left as they are, never deleted here (a delete
+   * in a superseded shard is forwarded into the current epoch's copy). */
+  keepForeign?: (id: string) => boolean,
 ): void {
   const target = byIdMap(bucket) as Record<string, unknown>
   const materialized = (handle.doc() as unknown as Record<string, Record<string, unknown> | undefined> | undefined)?.[key]
+  if (keepForeign && materialized && typeof materialized === 'object' && !Array.isArray(materialized)) {
+    for (const [id, value] of Object.entries(materialized)) if (!(id in target) && keepForeign(id)) target[id] = value
+  }
   // Only a by-id MAP can be planned key by key; an array (a corrupt or
   // foreign shard) keeps the bare reconcile, an absent map is created.
   if (!materialized || typeof materialized !== 'object' || Array.isArray(materialized)) {
@@ -1957,6 +3843,13 @@ function reconcileModelShardBucket(
   })
 }
 
+/** The concrete workspace a new model-shard entry is recorded in, or nothing
+ * when the session cannot name it. */
+function workspaceTag(): { workspace?: string } {
+  const workspace = documentsWorkspaceKey()
+  return workspace ? { workspace } : {}
+}
+
 /** Write a new model shard's url into ModelMeta — at once for a random-id
  *  shard, after the server's acknowledgement for a minted one (see
  *  writeModelShards and deferredReferences.ts). */
@@ -1964,7 +3857,24 @@ function publishModelShardReference(field: 'objectShardUrls' | 'connectionShardU
   if (!modelMetaHandle) return
   if (!isMintedDocumentId(handle.documentId)) {
     changeAndTrack(modelMetaHandle, (m) => {
-      m[field].push(handle.url)
+      // Through `modelMetaUrls.ts`, text or scalar by the marker.
+      writeMetaUrls(m, field, [...(readMetaUrls(m, field) ?? []), handle.url])
+    })
+    // G4-16f: journaled too, until the server acknowledges the shard — written
+    // offline into a meta a roll then supersedes, the pointer would otherwise
+    // reach no tab booted after it. The first change's hash, read while the
+    // shard's history is this one creation — the resume asks about it.
+    const first = firstChangeHash(handle)
+    const reference: DeferredReference = {
+      holderDocumentId: modelMetaHandle.documentId, field, url: handle.url, unminted: true, ...workspaceTag(),
+      ...(first ? { firstChange: first } : {}),
+    }
+    const persisted = deferredReferences.add(reference).catch((error) => {
+      console.warn('random-id model-shard reference could not be journaled', error)
+    })
+    void serverDurability.wait(handle.documentId).then(async () => {
+      await persisted
+      await deferredReferences.remove(reference).catch(() => undefined)
     })
     return
   }
@@ -1972,6 +3882,7 @@ function publishModelShardReference(field: 'objectShardUrls' | 'connectionShardU
     holderDocumentId: modelMetaHandle.documentId,
     field,
     url: handle.url,
+    ...workspaceTag(),
   }
   const epoch = durableAckEpoch
   const persisted = deferredReferences.add(reference).catch((error) => {
@@ -2004,9 +3915,16 @@ function writeHeldReference(reference: DeferredReference, epoch: number): boolea
     return true
   }
   const meta = modelMetaHandle
-  if (!meta || meta.documentId !== reference.holderDocumentId) return false
+  // A held pointer recorded against a ModelMeta this session hopped AWAY from
+  // (a writer that bypasses flushWrite) lands in the CURRENT meta: that is
+  // where the forwarder's URL adoption would put it, without the round trip —
+  // and without depending on the old meta still being retained when the
+  // server's acknowledgement of the shard finally arrives.
+  const holderIsCurrent = meta?.documentId === reference.holderDocumentId
+    || (meta !== null && supersededMetaDocumentIds.has(reference.holderDocumentId as DocumentId))
+  if (!meta || !holderIsCurrent) return false
   changeAndTrack(meta, (m) => {
-    if (!m[field].includes(reference.url)) m[field].push(reference.url)
+    appendMetaUrl(m, field, reference.url)
   })
   return true
 }
@@ -2046,11 +3964,20 @@ async function resumeHeldReferences<T>(options: {
   queued: readonly DeferredReference[]
   accepts: (reference: DeferredReference) => boolean
   holderDocumentId: string
+  /** Another holder this workspace still answers for (a ModelMeta of an earlier
+   * epoch this browser booted on). */
+  acceptsHolder?: (holderDocumentId: string) => boolean
   holderName: string
   lost: string
   isPublished: (reference: DeferredReference) => boolean
   find: (url: string) => Promise<DocHandle<T>>
   onResumed: (reference: DeferredReference, handle: DocHandle<T>) => void
+  /** An entry whose holder is not (yet) accepted is kept for a
+   * later decision instead of being given up — true when it was. */
+  setAside?: (reference: DeferredReference) => boolean
+  /** The resume of a RANDOM-id entry (model shards only). */
+  resumeUnminted?: (reference: DeferredReference, published: boolean, epoch: number,
+    giveUp: (reference: DeferredReference, why: string, error?: unknown) => Promise<void>) => Promise<void>
 }): Promise<void> {
   // The session this resume belongs to, read BEFORE any await: a find can take
   // seconds, and a workspace switch in the meantime (stopBridge → startBridge)
@@ -2068,10 +3995,26 @@ async function resumeHeldReferences<T>(options: {
       : `retrying next boot (${failures}/${HELD_SHARD_RESUME_LIMIT})`
     console.warn(`held ${reference.field} entry ${reference.url} ${why}; ${verdict}`, error ?? '')
   }
+  const booted = documentsWorkspaceKey()
   await Promise.all(options.queued.filter(options.accepts).map(async (reference) => {
-    if (reference.holderDocumentId !== options.holderDocumentId) {
+    // The queue is namespaced by the workspace ALIAS, so a fork and its
+    // source share it, and a fork made by an earlier build still names its
+    // source's epoch metas as predecessors. An entry recorded for another
+    // CONCRETE workspace is never published here (entries of earlier builds
+    // carry no workspace). Nor COUNTED — it is not this workspace's to give up.
+    // The queue is per alias: three boots of a fork would otherwise drop its
+    // source's pointer, lost when the alias points back (a demote).
+    if (reference.workspace !== undefined && booted !== null && reference.workspace !== booted) return
+    if (reference.holderDocumentId !== options.holderDocumentId && !options.acceptsHolder?.(reference.holderDocumentId)) {
+      // A holder the boot's LOCAL lineage does not reach is set
+      // aside, not given up — the network walk, after the first render, decides.
+      if (options.setAside?.(reference)) return
       // Held for a holder this workspace no longer uses: nowhere to publish.
       await giveUp(reference, `was held for ${options.holderName} ${reference.holderDocumentId}, not ${options.holderDocumentId}`)
+      return
+    }
+    if (reference.unminted && options.resumeUnminted) {
+      await options.resumeUnminted(reference, options.isPublished(reference), epoch, giveUp)
       return
     }
     if (options.isPublished(reference)) {
@@ -2096,6 +4039,971 @@ async function resumeHeldReferences<T>(options: {
   }))
 }
 
+/** How long one question about a RANDOM-id shard waits for the server.
+ * Asked in the BACKGROUND: past it, the shard is shown provisionally and the
+ * question asked again. */
+const UNMINTED_ACK_TIMEOUT_MS = 3_000
+let unmintedAckTimeoutMs = UNMINTED_ACK_TIMEOUT_MS
+let unmintedRetryDelaysMs: readonly number[] = UNMINTED_RETRY_DELAYS_MS
+
+/** Test hook: the question's timeout and retry delays (null restores them). */
+export function __setUnmintedQuestionTimingForTest(timing: { timeoutMs?: number; retryDelaysMs?: readonly number[] } | null): void {
+  unmintedAckTimeoutMs = timing?.timeoutMs ?? UNMINTED_ACK_TIMEOUT_MS
+  unmintedRetryDelaysMs = timing?.retryDelaysMs ?? UNMINTED_RETRY_DELAYS_MS
+}
+
+/** What the server says of a random-id shard: it holds it as an ordinary or
+ * a live superseded document, it holds it as a RETIRED epoch document (it
+ * will never be durable again), or it does not know it. */
+type ShardVerdict = 'held' | 'retired' | 'unknown'
+
+/** The hash of a document's first change, or nothing for an empty one. */
+function firstChangeHash(handle: DocHandle<unknown>): string | undefined {
+  const doc = handle.doc()
+  const first = doc ? getAllChanges(doc as never)[0] : undefined
+  return first ? decodeChange(first).hash : undefined
+}
+
+/**
+ * Whether the server already HOLDS a random-id shard. Such a
+ * document is claimed only through a pointer (deferredReferences.ts), so a
+ * server that holds it means some ModelMeta already named it — it is in the
+ * lineage (adopted, or cut by a full roll into a recreated copy). Asked
+ * about the shard's FIRST change, which every copy carries (recorded in the
+ * entry at the shard's creation): `durable` then means "claimed", whatever the
+ * server's copy lacks of later edits; `forwarded` or `forwardPending` means "a
+ * live superseded epoch document"; `epochRetired`, "a retired one". `null`: no
+ * answer (offline, timed out, a 5xx, no line for the shard); ANSWER_REFUSED: a
+ * 4xx, which asking again will not change.
+ */
+type ShardAnswer<V> = Promise<V | null | typeof ANSWER_REFUSED | typeof ANSWER_EXPIRED>
+function serverHoldsShard(handle: DocHandle<unknown>, reference: DeferredReference, timeoutMs?: number, claims?: false): ShardAnswer<ShardVerdict>
+function serverHoldsShard(handle: DocHandle<unknown>, reference: DeferredReference, timeoutMs: number | undefined, claims: boolean): ShardAnswer<ShardVerdict | 'claimed'>
+async function serverHoldsShard(
+  handle: DocHandle<unknown>,
+  reference: DeferredReference,
+  timeoutMs = unmintedAckTimeoutMs,
+  /** Tell a PLAIN claim (durable, no epoch row) apart, as `claimed`, from a live
+   * superseded epoch document. */
+  claims = false,
+): ShardAnswer<ShardVerdict | 'claimed'> {
+  const first = reference.firstChange ?? firstChangeHash(handle)
+  if (!first) return 'unknown'
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const answers = await acknowledgeDurableDocumentHeads(
+      [{ documentId: handle.documentId, heads: [first] }], { signal: controller.signal })
+    const answer = answers.find((a) => a.documentId === handle.documentId) as Record<string, unknown> | undefined
+    if (!answer) return null
+    if (answer.epochRetired === true) return 'retired'
+    if (claims && answer.durable === true && !('forwarded' in answer) && answer.forwardPending !== true) return 'claimed'
+    return answer.durable === true || 'forwarded' in answer || answer.forwardPending === true ? 'held' : 'unknown'
+  } catch (error) {
+    return isPermanentRefusal(error) ? ANSWER_REFUSED : isExpiredSession(error) ? ANSWER_EXPIRED : null
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/** No answer from the first question: asked again (an expired session
+ * counts towards its stop). */
+const unanswered = (verdict: unknown): verdict is null | typeof ANSWER_EXPIRED => verdict === null || verdict === ANSWER_EXPIRED
+
+/** The session's pending offline decisions, cancelled at stop. */
+const unmintedRetryTimers = new Set<ReturnType<typeof setTimeout>>()
+
+/** The waits of `decideCarriedUnminted`'s walk, resolved at stop. */
+const unmintedWaitResolvers = new Set<() => void>()
+
+function cancelUnmintedRetries(): void {
+  for (const timer of unmintedRetryTimers) clearTimeout(timer)
+  unmintedRetryTimers.clear()
+  for (const resolve of unmintedWaitResolvers) resolve()
+  unmintedWaitResolvers.clear()
+  for (const timer of hopAccountingTimers) clearTimeout(timer)
+  hopAccountingTimers.clear()
+  cancelFollowRetries()
+}
+
+/** Ask about `handle` again until the server answers (`retryUntilAnswered`:
+ * backed off, capped, stopped by a refusal or by the session's end). */
+function askUnmintedUntilAnswered<V extends ShardVerdict | 'claimed' = ShardVerdict>(handle: DocHandle<unknown>, reference: DeferredReference, epoch: number,
+  answered: (verdict: V) => void, first: null | typeof ANSWER_EXPIRED = null, claims = false): void {
+  retryUntilAnswered<V>({
+    // `claimed` comes only when `claims` was asked for, so only to a V that has it.
+    ask: () => serverHoldsShard(handle, reference, undefined, claims) as ShardAnswer<V>,
+    alive: () => epoch === durableAckEpoch,
+    answered,
+    setTimer: (fn, ms) => {
+      const timer = setTimeout(() => { unmintedRetryTimers.delete(timer); fn() }, ms)
+      unmintedRetryTimers.add(timer)
+    },
+  }, unmintedRetryDelaysMs, undefined, first === ANSWER_EXPIRED ? 1 : 0)
+}
+
+/** Random-id shards shown while the server has not said whether it holds
+ * them: projected (unlisted: they never take an id a listed shard holds),
+ * never the tab's own, and FULL for the write path — no new id is
+ * placed in a shard a late "held" would take off the screen. */
+const provisionalModelShardUrls = new Set<string>()
+
+/** The urls of the model shards the tab projects. */
+function projectedModelShardUrls(): Set<string> {
+  return new Set([...objectShardHandles, ...connectionShardHandles].map((h) => h.url))
+}
+
+/** The indices of `handles` that are provisional (`planShardAssignment`'s
+ * `closed`); nothing at all — no allocation — while none is. */
+function provisionalShardIndices(handles: readonly DocHandle<unknown>[]): Set<number> | undefined {
+  if (provisionalModelShardUrls.size === 0) return undefined
+  const closed = new Set<number>()
+  handles.forEach((h, i) => { if (provisionalModelShardUrls.has(h.url)) closed.add(i) })
+  return closed
+}
+
+/** Dequeue `reference` once the server acknowledges `handle`'s CURRENT heads
+ * (not merely its first change — a shard edited offline past the server's copy
+ * stays queued, so a later boot still sends those edits). Its 'model-shard'
+ * lease is then given back if the tab does not project it. */
+function dequeueOnceDurable(handle: DocHandle<unknown>, reference: DeferredReference, epoch: number): void {
+  trackDurableHandle(handle)
+  void serverDurability.wait(handle.documentId).then(async () => {
+    if (epoch !== durableAckEpoch) return
+    await deferredReferences.remove(reference).catch(() => undefined)
+    if (epoch === durableAckEpoch && !projectedModelShardUrls().has(handle.url)) {
+      releaseDocumentRequest(handle.url as AutomergeUrl, 'model-shard')
+    }
+  })
+}
+
+// ── Projection changes after the boot, outside a hop's latch ──
+
+/** Adoptions and unloads a hop's latch held back, run once it lifts. */
+let afterLatch: Array<() => void> = []
+
+function hopLatched(): boolean {
+  return writesPausedByHop || epochHop?.state().phase === 'latched'
+}
+
+/**
+ * Run a change of the projected shard set now — or, inside a hop's latch,
+ * once it lifts (after the swap when there is one). In the latch a flush only
+ * DEFERS the write (`writeScheduler`), so a projection would replace the
+ * store under a write made by code meanwhile, and the reseed would make that
+ * its baseline: the swap's deferred flush would then write a store without
+ * it. FIFO: what was held back runs before anything later.
+ */
+function outsideHopLatch(run: () => void): void {
+  if (hopLatched() || afterLatch.length > 0) {
+    afterLatch.push(run)
+    if (!hopLatched()) runAfterLatch()
+    return
+  }
+  run()
+}
+
+/** After `resumeWrites` — in a microtask, once the hop machine has left
+ * its `latched` state. */
+function runAfterLatch(): void {
+  if (afterLatch.length === 0) return
+  const session = durableAckEpoch
+  queueMicrotask(() => {
+    if (session !== durableAckEpoch || hopLatched()) return
+    const runs = afterLatch
+    afterLatch = []
+    for (const run of runs) outsideHopLatch(run)
+  })
+}
+
+/** Append held shards to the projection (a pending write flushed first, then
+ * attach → project → reseed): one handle per url, never one the tab projects. */
+function adoptModelShardsNow(objects: DocHandle<ObjectShard>[], connections: DocHandle<ConnectionShard>[],
+  /** Only a shard the CURRENT meta lists (the follow's path) — a load in flight
+   * across a swap never brings the old epoch's shard into the new one's
+   * projection, whatever its caller checked. */
+  options: { listedOnly?: boolean } = {}): void {
+  if (bfsActive) return
+  const seen = projectedModelShardUrls()
+  const listedDoc = options.listedOnly ? modelMetaHandle?.doc() : undefined
+  const listed = options.listedOnly
+    ? new Set(listedDoc ? [...(readMetaUrls(listedDoc, 'objectShardUrls') ?? []), ...(readMetaUrls(listedDoc, 'connectionShardUrls') ?? [])] : [])
+    : null
+  const fresh = <T>(handles: DocHandle<T>[]) => handles.filter((h) => (!listed || listed.has(h.url)) && !seen.has(h.url) && Boolean(seen.add(h.url)))
+  const newObjects = fresh(objects)
+  const newConnections = fresh(connections)
+  if (newObjects.length === 0 && newConnections.length === 0) return
+  // What the user typed meanwhile is written first: the reseed below takes the
+  // projected store as the shards' baseline.
+  writeScheduler.flushNow()
+  objectShardHandles.push(...newObjects)
+  connectionShardHandles.push(...newConnections)
+  for (const h of [...newObjects, ...newConnections]) attachModelShardListener(h as DocHandle<unknown>)
+  resetModelShardProjectionCaches()
+  withRemote(projectAll)
+  reseedResidentWriteBaselines()
+}
+
+/**
+ * The hop's invariant, checked — every object in the store when the hop started
+ * loading is, once it has swapped, either still in the store or a line of the
+ * retired export. One that is neither is reported (a warning, the timeline, the
+ * probe), never acted on: it is the alert that would have named the 58 objects
+ * a manual test lost (see `followListedModelShards`). Checked 5 s after the
+ * swap, so a shard the swap is still adopting (`followListedModelShards`) is
+ * not counted.
+ */
+let hopObjectsAtLoad: Set<string> | null = null
+let hopExportedIds: Set<string> = new Set()
+const hopUnaccountedObjects: string[] = []
+const hopAccountingTimers = new Set<ReturnType<typeof setTimeout>>()
+const HOP_ACCOUNTING_DELAY_MS = 5_000
+
+function noteHopObjectsAtLoad(): void {
+  hopObjectsAtLoad = new Set(useModelStore.getState().objects.map((o) => o.id))
+  hopExportedIds = new Set()
+}
+
+function noteHopExported<T extends { differences: ReadonlyArray<{ id: string }> }>(diff: T): T {
+  hopExportedIds = new Set(diff.differences.map((d) => d.id))
+  return diff
+}
+
+function checkHopAccountedLater(): void {
+  const before = hopObjectsAtLoad
+  const exported = hopExportedIds
+  hopObjectsAtLoad = null
+  hopExportedIds = new Set()
+  if (!before || before.size === 0) return
+  // `hopUnaccounted`: a delete in the new epoch, and boot-from-server, are not
+  // the hop's to account.
+  const afterSwap = new Set(useModelStore.getState().objects.map((o) => o.id))
+  const session = durableAckEpoch
+  const timer = setTimeout(() => {
+    hopAccountingTimers.delete(timer)
+    if (session !== durableAckEpoch) return
+    const now = new Set(useModelStore.getState().objects.map((o) => o.id))
+    const missing = hopUnaccounted({ before, afterSwap, now, exported, tombstones: tombstoneObjects, bootFromServer: bfsActive })
+    if (missing.length === 0) return
+    hopUnaccountedObjects.push(...missing.slice(0, 64))
+    if (hopUnaccountedObjects.length > 256) hopUnaccountedObjects.splice(0, hopUnaccountedObjects.length - 256)
+    console.warn('[epoch hop] objects in the store before the hop are neither projected nor exported after it', { count: missing.length, sample: missing.slice(0, 8) })
+    markClientTimeline('workspace.epoch.hop-unaccounted', { count: missing.length })
+  }, HOP_ACCOUNTING_DELAY_MS)
+  // Cleared with the session's other timers (`cancelUnmintedRetries`, at stop).
+  hopAccountingTimers.add(timer)
+}
+
+/** URLs `followListedModelShards` is resolving (never resolved twice at once). */
+const followingModelShardUrls = new Set<string>()
+
+/**
+ * The objects gone from the author's tab: project every model shard the CURRENT
+ * meta lists and the tab does not — resident path only (boot-from-server reads
+ * no base shard).
+ *
+ * The resident tab resolved its shard list once, at boot or at a hop's load.
+ * A compaction writes the CURRENT meta in place: it folds the overlay
+ * segments the tab writes into (they are listed among its object shards) and
+ * CLEARS them, placing a created entity in a base shard with room or, when
+ * none has, in a NEW base shard inserted into the list. The tab saw the clear
+ * (its objects left the segment) and never loaded the new shard: measured on
+ * the e2e stack, 56 of the 2 000 objects Marie created offline were then in
+ * neither her store nor her export, while the server served them (58 in
+ * the manual test that found it). Called on every change of the meta, after a swap (a
+ * compaction between the hop's load and its swap changes a meta no listener
+ * watched yet) and after the boot attaches. Adopted outside a hop's latch.
+ */
+function followListedModelShards(): void {
+  if (bfsActive || !modelMetaHandle) return
+  const meta = modelMetaHandle
+  const doc = meta.doc()
+  if (!doc) return
+  const view = withMetaUrlView(doc)
+  const projected = projectedModelShardUrls()
+  // A url given up is followed again at a change of the meta once
+  // FOLLOW_GIVEN_UP_REARM_MS have passed — a shard claimed minutes later
+  // reaches Paul's open tab without a reload.
+  const now = Date.now()
+  for (const [url, failure] of followFailures) {
+    if (failure.givenUpAt !== undefined && now - failure.givenUpAt >= followGivenUpRearmMs) followFailures.delete(url)
+  }
+  // A url that failed waits for ITS retry (or was given up), whatever changes
+  // the meta meanwhile.
+  const unprojected = (urls: readonly string[] | undefined) => uniqueUrls(urls)
+    .filter((url) => isValidAutomergeUrl(url) && !projected.has(url) && !followingModelShardUrls.has(url) && followFailures.get(url)?.blocked !== true)
+  const objects = unprojected(view.objectShardUrls)
+  const connections = unprojected(view.connectionShardUrls)
+  if (objects.length === 0 && connections.length === 0) return
+  const urls = [...objects, ...connections]
+  for (const url of urls) followingModelShardUrls.add(url)
+  const session = durableAckEpoch
+  // Per url: one shard listed but not served — an `unminted` pointer the server
+  // has not claimed yet — no longer holds back the others (a compaction's new
+  // base shard in the same diff).
+  const resolveEach = <T>(list: string[]) => Promise.allSettled(list.map(async (url) => {
+    // With or without epochs: a shard another client just created is asked for
+    // here as soon as the meta names it — often before the server holds it or
+    // has admitted it. The server's verdict is then cached per (document, peer)
+    // and the client's sync state believes its first frame is still awaiting a
+    // reply: it never asks again, the find's ceilings only re-await
+    // (`handleRetry`), and Paul's open tab went without Marie's new shard for
+    // the spec's 120 s (3 runs in 6). Every FOLLOW_FIND_REPRESENT_MS without an
+    // answer the document is presented again (`resetDocumentSyncState`: a fresh
+    // request), bounded.
+    //
+    // Only on a real signal — the server said `doc-unavailable`, or sent
+    // NOTHING for the document since it was last presented — and spaced
+    // exponentially (4, 8, 16 … 30 s): a large shard still arriving on a slow
+    // link is never reset under its own transfer. And bound to the session: a
+    // stop (or a workspace change) ends it.
+    const documentId = url.slice('automerge:'.length) as DocumentId
+    const stopRepresenting = representUnansweredFind(documentId, session)
+    try {
+      const [handle] = await getModelShardHandles<T>([url])
+      if (!handle) throw new Error(`model shard ${url} not resolved`)
+      return handle
+    } finally {
+      stopRepresenting()
+    }
+  }))
+  void (async () => {
+    try {
+      const [objectResults, connectionResults] = await Promise.all([
+        resolveEach<ObjectShard>(objects), resolveEach<ConnectionShard>(connections),
+      ])
+      const ready = <T>(results: PromiseSettledResult<DocHandle<T>>[]) =>
+        results.flatMap((r) => (r.status === 'fulfilled' ? [r.value] : []))
+      const objectHandles = ready(objectResults)
+      const connectionHandles = ready(connectionResults)
+      const failed = [...objects.filter((_, i) => objectResults[i]!.status === 'rejected'),
+        ...connections.filter((_, i) => connectionResults[i]!.status === 'rejected')]
+      // A failed load took its lease too (`prepareDocumentRequest`).
+      for (const url of failed) releaseDocumentRequest(url as AutomergeUrl, 'model-shard')
+      if (session !== durableAckEpoch) return
+      if (failed.length > 0) {
+        console.warn(`[bridge] ${failed.length} model shard(s) the meta lists could not be loaded; retried with a backoff`)
+        for (const url of failed) scheduleFollowRetry(url, session)
+      }
+      const giveBack = () => {
+        const kept = projectedModelShardUrls()
+        for (const h of [...objectHandles, ...connectionHandles]) if (!kept.has(h.url)) releaseDocumentRequest(h.url, 'model-shard')
+      }
+      for (const h of [...objectHandles, ...connectionHandles]) followFailures.delete(h.url)
+      if (objectHandles.length === 0 && connectionHandles.length === 0) return
+      markClientTimeline('workspace.model-shards.followed', { objects: objectHandles.length, connections: connectionHandles.length, failed: failed.length })
+      outsideHopLatch(() => {
+        // The meta replaced meanwhile (a hop swapped), and
+        // `adoptModelShardsNow` takes only what the CURRENT meta lists.
+        if (session === durableAckEpoch && modelMetaHandle === meta) adoptModelShardsNow(objectHandles, connectionHandles, { listedOnly: true })
+        // Not adopted (the session or the meta gone, or not listed any
+        // more): the leases go back.
+        if (session === durableAckEpoch) giveBack()
+      })
+    } finally {
+      for (const url of urls) followingModelShardUrls.delete(url)
+    }
+  })()
+}
+
+/** The follow's retries per url — backed off, BOUNDED (given up for the session
+ * after the last delay: a later boot loads the shard), cancelled at stop. */
+const FOLLOW_RETRY_DELAYS_MS: readonly number[] = [2_000, 5_000, 15_000, 30_000, 60_000]
+let followRetryDelaysMs: readonly number[] = FOLLOW_RETRY_DELAYS_MS
+/** Per url that failed: the attempts spent, and whether it waits (`timer`)
+ * or was given up (`blocked` without a timer). A url retried by its timer is
+ * unblocked for that one pass. */
+const followFailures = new Map<string, { attempts: number; timer: ReturnType<typeof setTimeout> | null; blocked: boolean; givenUpAt?: number }>()
+/** How long a given-up url stays given up before a change of the meta follows it
+ * again. */
+export const FOLLOW_GIVEN_UP_REARM_MS = 5 * 60_000
+/** A follow's find unanswered this long is presented again, at most
+ * FOLLOW_FIND_REPRESENT_MAX times. */
+export const FOLLOW_FIND_REPRESENT_MS = 4_000
+export const FOLLOW_FIND_REPRESENT_MAX = 15
+/** The spacing's ceiling: 4, 8, 16, then every 30 s (60 s left a shard admitted
+ * late — AUTH on — four presentations in two minutes). */
+export const FOLLOW_FIND_REPRESENT_MAX_DELAY_MS = 30_000
+let followFindRepresentMs = FOLLOW_FIND_REPRESENT_MS
+let followFindRepresentMaxDelayMs = FOLLOW_FIND_REPRESENT_MAX_DELAY_MS
+/** Probe: how many times the follow presented a document again. */
+let followRepresentations = 0
+let followNetworkSignalWarned = false
+/** Probe: the wait before each presentation, in order (bounded). */
+const followRepresentWaits: number[] = []
+/** The armed re-presentations: the bridge's stop ends them. */
+const followRepresentStops = new Set<() => void>()
+export function __setFollowFindRepresentForTest(ms: number | null, maxDelayMs: number | null = null): void {
+  followFindRepresentMs = ms ?? FOLLOW_FIND_REPRESENT_MS
+  followFindRepresentMaxDelayMs = maxDelayMs ?? FOLLOW_FIND_REPRESENT_MAX_DELAY_MS
+  followRepresentWaits.length = 0
+}
+
+/**
+ * Present `documentId` again while its find stays unanswered,
+ * on a signal only: at each tick, when the server said `doc-unavailable`
+ * for it or sent nothing for it since the last presentation. A tick that
+ * heard frames waits (the transfer is under way). At most
+ * FOLLOW_FIND_REPRESENT_MAX presentations, spaced exponentially; nothing
+ * once the session ended. Returns the stop (the find settled).
+ */
+function representUnansweredFind(documentId: DocumentId, session: number): () => void {
+  let presented = 0
+  let delay = followFindRepresentMs
+  let heard = false
+  let unavailable = false
+  let timer: ReturnType<typeof setTimeout> | null = null
+  let stopped = false
+  const network = repo.networkSubsystem as unknown as {
+    on?: (event: 'message', listener: (message: { documentId?: unknown; type?: unknown }) => void) => void
+    off?: (event: 'message', listener: (message: { documentId?: unknown; type?: unknown }) => void) => void
+  } | undefined
+  const onMessage = (message: { documentId?: unknown; type?: unknown }) => {
+    if (message.documentId !== documentId) return
+    if (message.type === 'doc-unavailable') unavailable = true
+    // A sync frame (the document's data on its way); remote-heads and
+    // ephemeral traffic say nothing about this request.
+    else if (message.type === 'sync') heard = true
+  }
+  network?.on?.('message', onMessage)
+  // Without the event API the signal is gone and only the spacing remains —
+  // said once, not silently.
+  if (typeof network?.on !== 'function' && !followNetworkSignalWarned) {
+    followNetworkSignalWarned = true
+    console.warn('[bridge] the network subsystem emits no `message` events: a follow re-presents on its timer alone')
+  }
+  const holdsData = () => {
+    try {
+      const doc = syncedHandle(repo, documentId)?.doc()
+      return !!doc && getHeads(doc as never).length > 0
+    } catch {
+      return false
+    }
+  }
+  const stop = () => {
+    stopped = true
+    if (timer) { clearTimeout(timer); timer = null }
+    followRepresentStops.delete(stop)
+    network?.off?.('message', onMessage)
+  }
+  followRepresentStops.add(stop)
+  const arm = () => {
+    timer = setTimeout(() => {
+      timer = null
+      if (stopped) return
+      if (session !== durableAckEpoch) { stop(); return }
+      if (heard && !unavailable && holdsData()) {
+        // Frames arrived for it since the last presentation, and data with
+        // them: its transfer is under way, not unanswered. (A sync frame that
+        // brought NOTHING — the server's empty answer — is no transfer:
+        // measured once in the AUTH-on suite, Paul's tab held its presentations
+        // for 120 s on such answers.)
+        heard = false
+        arm()
+        return
+      }
+      presented += 1
+      followRepresentations += 1
+      // Probe: the wait that preceded each presentation — the spacing a test
+      // asserts without timing the machine.
+      followRepresentWaits.push(delay)
+      if (followRepresentWaits.length > 64) followRepresentWaits.splice(0, followRepresentWaits.length - 64)
+      heard = false
+      unavailable = false
+      resetDocumentSyncState(repo, documentId)
+      if (presented >= FOLLOW_FIND_REPRESENT_MAX) { stop(); return }
+      delay = Math.min(delay * 2, followFindRepresentMaxDelayMs)
+      arm()
+    }, delay)
+  }
+  arm()
+  return stop
+}
+
+function stopFollowRepresentations(): void {
+  for (const stop of [...followRepresentStops]) stop()
+}
+let followGivenUpRearmMs = FOLLOW_GIVEN_UP_REARM_MS
+
+/** Test hook: the follow's retry delays (null restores them). */
+export function __setFollowRetryDelaysForTest(delays: readonly number[] | null, givenUpRearmMs: number | null = null): void {
+  followRetryDelaysMs = delays ?? FOLLOW_RETRY_DELAYS_MS
+  followGivenUpRearmMs = givenUpRearmMs ?? FOLLOW_GIVEN_UP_REARM_MS
+}
+
+/** Probe: the follow's failed urls, as `<url>:<attempts>[:given-up]`. */
+function followFailureProbe(): string[] {
+  return [...followFailures].map(([url, f]) => `${url}:${f.attempts}${f.blocked && !f.timer ? ':given-up' : ''}`)
+}
+
+function scheduleFollowRetry(url: string, session: number): void {
+  const failure = followFailures.get(url) ?? { attempts: 0, timer: null, blocked: true }
+  followFailures.set(url, failure)
+  failure.blocked = true
+  if (failure.timer) return
+  if (failure.attempts >= followRetryDelaysMs.length) {
+    failure.givenUpAt ??= Date.now()
+    markClientTimeline('workspace.model-shards.follow-given-up', { url })
+    return
+  }
+  const delay = followRetryDelaysMs[failure.attempts]!
+  failure.attempts += 1
+  failure.timer = setTimeout(() => {
+    failure.timer = null
+    if (session !== durableAckEpoch) return
+    failure.blocked = false
+    followListedModelShards()
+  }, delay)
+}
+
+function cancelFollowRetries(): void {
+  for (const failure of followFailures.values()) if (failure.timer) clearTimeout(failure.timer)
+  followFailures.clear()
+}
+
+/** One held shard, by its reference's field. */
+function adoptHeldShardNow(reference: DeferredReference, handle: DocHandle<unknown>): void {
+  if (reference.field === 'objectShardUrls') adoptModelShardsNow([handle as DocHandle<ObjectShard>], [])
+  else adoptModelShardsNow([], [handle as DocHandle<ConnectionShard>])
+}
+
+/** The reverse: `handle` leaves the projection — a pending write flushed first,
+ * its listener detached (its lease is kept until `dequeueOnceDurable` gives it
+ * back), then project → reseed, so its ids no longer route there and what only
+ * it held leaves the screen. */
+function unloadModelShardNow(handle: DocHandle<unknown>): void {
+  if (bfsActive || !projectedModelShardUrls().has(handle.url)) return
+  writeScheduler.flushNow()
+  objectShardHandles = objectShardHandles.filter((h) => h.url !== handle.url)
+  connectionShardHandles = connectionShardHandles.filter((h) => h.url !== handle.url)
+  const handler = modelShardChangeHandlers.get(handle.url)
+  if (handler) {
+    handle.off('change', handler)
+    modelShardChangeHandlers.delete(handle.url)
+  }
+  resetModelShardProjectionCaches()
+  withRemote(projectAll)
+  reseedResidentWriteBaselines()
+}
+
+/**
+ * A RETIRED random-id shard the booted meta does not list: its local copy may
+ * carry offline edits the server never received — a session closed offline past
+ * the retention — and a retired document is never forwarded again. Its entities
+ * that differ from the projection WITHOUT it (the current epoch's,
+ * `collectRetiredDifferences`) are offered in the `epoch-retired` banner,
+ * merged with an export already shown (one entry per entity, the one shown
+ * first kept). A pending write is flushed first, so what was typed into X while
+ * it was provisional is in the export. Nothing differs: nothing is shown.
+ *
+ * The export is PERSISTED before the shard is let go (`offerRetiredExport`);
+ * the promise says whether what only X held is now safe — the entry may leave
+ * the queue only then.
+ */
+function offerRetiredShardExport(reference: DeferredReference, handle: DocHandle<unknown>): Promise<boolean> {
+  writeScheduler.flushNow()
+  const objects = reference.field === 'objectShardUrls'
+  const others = <T>(handles: DocHandle<T>[]) => handles.filter((h) => h.url !== handle.url)
+  const differences = collectRetiredDifferences({
+    retiredMeta: null,
+    retiredObjectShards: objects ? [plainDocument(handle)] : [],
+    retiredConnectionShards: objects ? [] : [plainDocument(handle)],
+    current: {
+      meta: null,
+      objects: mergeObjectShards(others(objectShardHandles).map((h) => h.doc() ?? { objects: {} })) as Record<string, unknown>,
+      connections: mergeConnectionShards(others(connectionShardHandles).map((h) => h.doc() ?? { connections: {} })) as Record<string, unknown>,
+    },
+    // Boot-from-server holds no base shard, so "absent from the current epoch"
+    // cannot be told here.
+    currentShardsUnknown: bfsActive,
+  })
+  if (differences.length === 0) return Promise.resolve(true)
+  markClientTimeline('workspace.held-shards.retired-export', { shard: handle.documentId, differences: differences.length })
+  return offerRetiredExport({
+    version: 1,
+    metaUrl: modelMetaHandle?.url ?? '',
+    collectedAt: new Date().toISOString(),
+    differences,
+  })
+}
+
+/**
+ * The net: a document of the durable ledger — this browser wrote it and the
+ * server never acknowledged it — that the server answers RETIRED while the tab
+ * holds it in NO epoch: the hop that should have collected it never settled (it
+ * stayed in backoff, then the tab was reloaded onto the current epoch). Its
+ * local copy is the only place her edits live, and a retired document is never
+ * forwarded: its entities that differ from the current projection are offered
+ * in the `epoch-retired` banner, persisted, before it leaves the ledger. A
+ * retired META also brings the local copies of the shards it lists and the
+ * current meta does not (a shard created offline whose pointer only that meta
+ * held). Nothing during a hop (its own retired path collects), nothing for a
+ * document the tab holds.
+ */
+const ledgerRetiredOffered = new Set<string>()
+/** Ids the net is reading or offering now (one pass per id at a time). */
+const ledgerRetiredInFlight = new Set<string>()
+/** How long the net waits for a local copy (IndexedDB) before it leaves the
+ * document for the next round. */
+const LEDGER_RETIRED_READ_MS = 5_000
+
+/** The local copy of `id`, read from this browser's storage, within a bound;
+ * null when it is not readable now (left for the next round). */
+async function readLocalCopy(id: string, role: 'durability-pending' | 'model-shard'): Promise<DocHandle<unknown> | null> {
+  const synced = syncedHandle(repo, id as DocumentId)
+  if (synced?.isReady()) return synced as DocHandle<unknown>
+  const url = `automerge:${id}`
+  if (!isValidAutomergeUrl(url)) return null
+  prepareDocumentRequest(url, role)
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    const handle = await Promise.race([
+      repo.find<unknown>(url as AutomergeUrl).then(async (h) => { await h.whenReady(); return h }),
+      new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), LEDGER_RETIRED_READ_MS) }),
+    ]).catch(() => null)
+    return handle && handle.isReady() && handle.doc() ? handle : null
+  } finally {
+    if (timer) clearTimeout(timer)
+    if (role === 'model-shard') releaseDocumentRequest(url as AutomergeUrl, role)
+  }
+}
+
+/** The keys, per top-level collection (`objects`, `connections`, `groups`, …),
+ * of the entities that changes by THIS browser's actors touched — the net
+ * offers only those, not everything others changed since. Null — nothing
+ * filtered — when the document holds NO change by one of those actors: an edit
+ * made under an actor nobody recorded must not be filtered out and then
+ * forgotten.
+ *
+ * The actors are the ledger ENTRY's own writers
+ * (`DurableHeadLedger.writersOf`), not the actor journal — that journal keeps
+ * the last 256 actors, and an edit made under one it evicted was filtered out,
+ * then forgotten. Everything the server has not acknowledged was written under
+ * one of the entry's writers; unknown writers (an entry persisted before them,
+ * a creation, a resumed handle) filter nothing. */
+function locallyTouchedKeys(handle: DocHandle<unknown>, writers: ReadonlySet<string> | null | undefined): Map<string, Set<string>> | null {
+  if (!writers || writers.size === 0) return null
+  const doc = handle.doc()
+  if (!doc) return null
+  /** objId → [collection, entity key | null (the collection map itself)] */
+  const owner = new Map<string, [string, string | null]>()
+  const touched = new Map<string, Set<string>>()
+  let anyLocal = false
+  for (const raw of getAllChanges(doc as never)) {
+    const change = decodeChange(raw)
+    const local = writers.has(change.actor)
+    if (local) anyLocal = true
+    change.ops.forEach((op, index) => {
+      const at = op.obj === '_root' ? null : owner.get(op.obj)
+      const key = typeof op.key === 'string' ? op.key : null
+      // Ownership of the object an op creates: a collection under the root,
+      // an entity under a collection, a part under an entity.
+      if (op.action.startsWith('make')) {
+        const created = `${change.startOp + index}@${change.actor}`
+        if (op.obj === '_root' && key) owner.set(created, [key, null])
+        else if (at) owner.set(created, [at[0], at[1] ?? key])
+      }
+      if (!local || !at) return
+      const entity = at[1] ?? key
+      if (!entity) return
+      const set = touched.get(at[0]) ?? new Set<string>()
+      set.add(entity)
+      touched.set(at[0], set)
+    })
+  }
+  return anyLocal ? touched : null
+}
+
+const COLLECTION_OF_KIND: Record<string, string> = {
+  object: 'objects', connection: 'connections', group: 'groups', domain: 'domains', tag: 'tagSnapshots', tagSnapshot: 'tagSnapshots', decisionRecord: 'decisionRecords',
+}
+
+function offerOrphanedRetiredLedger(answers: readonly unknown[]): void {
+  if (!epochCapability || !sharded || !modelMetaHandle) return
+  if (epochHop && epochHop.state().phase !== 'idle' && epochHop.state().phase !== 'retired') return
+  const held = new Set<string>([
+    ...heldEpochDocuments().map((h) => h.documentId as string),
+    ...[...objectShardHandles, ...connectionShardHandles].map((h) => h.documentId as string),
+    ...[...retainedEpochSets.values()].flat().map((h) => h.documentId as string),
+  ])
+  const orphaned = answers.flatMap((a) => {
+    const answer = a as { documentId?: unknown; epochRetired?: unknown }
+    const id = typeof answer.documentId === 'string' ? answer.documentId : null
+    return id && answer.epochRetired === true && !held.has(id) && !ledgerRetiredOffered.has(id) && !ledgerRetiredInFlight.has(id) ? [id] : []
+  })
+  if (orphaned.length === 0) return
+  for (const id of orphaned) ledgerRetiredInFlight.add(id)
+  // Out of the acknowledgement loop: reads, merges and the diff run on
+  // their own task.
+  setTimeout(() => {
+    void collectOrphanedRetired(orphaned).finally(() => { for (const id of orphaned) ledgerRetiredInFlight.delete(id) })
+  }, 0)
+}
+
+/**
+ * ONLY what was read is offered and forgotten. A document whose local copy is
+ * not ready yet (the boot's `repo.find` still running, the ack sent with the
+ * ledger's heads) is read here within a bound; one still unreadable — or a
+ * retired meta one of whose unlisted shards is — stays in the ledger, not
+ * marked, for the next round. Before, it was marked offered and forgotten
+ * unread: her offline edits named by nothing any more.
+ */
+async function collectOrphanedRetired(orphaned: readonly string[]): Promise<void> {
+  const session = durableAckEpoch
+  const meta = modelMetaHandle
+  if (!meta) return
+  const currentDoc = meta.doc()
+  const currentView = currentDoc ? withMetaUrlView(currentDoc) : { objectShardUrls: [], connectionShardUrls: [] }
+  const currentlyListed = new Set([...(currentView.objectShardUrls ?? []), ...(currentView.connectionShardUrls ?? [])])
+  const objectShards: Array<Record<string, unknown> | null> = []
+  const connectionShards: Array<Record<string, unknown> | null> = []
+  let retiredMeta: Record<string, unknown> | null = null
+  const touched = new Map<string, Set<string>>()
+  let filterable = true
+  const seen = new Set<string>()
+  const read: string[] = []
+  const addRead = (handle: DocHandle<unknown>, id: string) => {
+    const doc = plainDocument(handle)
+    if (!doc || seen.has(id)) return
+    seen.add(id)
+    const keys = locallyTouchedKeys(handle, durableHeads.writersOf(id as DocumentId))
+    if (keys === null) filterable = false
+    else for (const [collection, set] of keys) touched.set(collection, new Set([...(touched.get(collection) ?? []), ...set]))
+    if ('objectShardUrls' in doc || 'connectionShardUrls' in doc) retiredMeta ??= doc
+    else if (doc.objects && typeof doc.objects === 'object') objectShards.push(doc)
+    else if (doc.connections && typeof doc.connections === 'object') connectionShards.push(doc)
+  }
+  for (const id of orphaned) {
+    const handle = await readLocalCopy(id, 'durability-pending')
+    if (session !== durableAckEpoch) return
+    if (!handle) continue
+    const doc = handle.doc() as Record<string, unknown> | undefined
+    if (doc && ('objectShardUrls' in doc || 'connectionShardUrls' in doc)) {
+      // Its shards the current meta does not list: all of them read, or the
+      // meta waits for the next round.
+      const view = withMetaUrlView(doc as unknown as ModelMeta)
+      const shards: Array<[DocHandle<unknown>, string]> = []
+      let complete = true
+      for (const url of [...(view.objectShardUrls ?? []), ...(view.connectionShardUrls ?? [])]) {
+        if (!isValidAutomergeUrl(url) || currentlyListed.has(url)) continue
+        const shardId = url.slice('automerge:'.length)
+        const shard = await readLocalCopy(shardId, 'model-shard')
+        if (!shard) { complete = false; break }
+        shards.push([shard, shardId])
+      }
+      if (session !== durableAckEpoch) return
+      if (!complete) continue
+      addRead(handle, id)
+      for (const [shard, shardId] of shards) addRead(shard, shardId)
+    } else {
+      addRead(handle, id)
+    }
+    read.push(id)
+  }
+  if (read.length === 0 || session !== durableAckEpoch || modelMetaHandle !== meta) return
+  for (const id of read) ledgerRetiredOffered.add(id)
+  const all = collectRetiredDifferences({
+    retiredMeta,
+    retiredObjectShards: objectShards,
+    retiredConnectionShards: connectionShards,
+    currentShardsUnknown: bfsActive,
+    current: {
+      meta: plainDocument(meta as DocHandle<unknown>),
+      objects: mergeObjectShards(objectShardHandles.map((h) => h.doc() ?? { objects: {} })) as Record<string, unknown>,
+      connections: mergeConnectionShards(connectionShardHandles.map((h) => h.doc() ?? { connections: {} })) as Record<string, unknown>,
+    },
+  })
+  // Only what her own changes touched; everything when her actors are unknown.
+  const differences = filterable
+    ? all.filter((d) => touched.get(COLLECTION_OF_KIND[d.kind] ?? '')?.has(d.id) === true)
+    : all
+  markClientTimeline('epoch.ledger-retired', { documents: read.length, differences: differences.length })
+  const forget = () => {
+    if (session !== durableAckEpoch) return
+    durableHeads.forget(read.map((id) => id as DocumentId))
+    // The acknowledgement round unpinned 'durability-pending' BEFORE this (the
+    // entry was still owed then), and `readLocalCopy` pinned it again; owed by
+    // nothing now, no round will unpin it — the retired copy stayed shared and
+    // synced all session.
+    for (const id of read) activeDocumentShare.unpin(id as DocumentId, 'durability-pending')
+    queueDurableLedgerPersistence()
+  }
+  if (differences.length === 0) { forget(); return }
+  const persisted = await offerRetiredExport({ version: 1, metaUrl: meta.url, collectedAt: new Date().toISOString(), differences })
+  // Owed until the export is PERSISTED: unpersisted (a private
+  // window), the export is shown for this session and the ledger still owes
+  // the documents, so the next boot offers them again.
+  if (persisted) forget()
+}
+
+/**
+ * Show a retired export in the `epoch-retired` banner, merged with one
+ * already shown (one line per entity, the one shown first kept), after
+ * PERSISTING it merged with what an earlier session left
+ * (`epochRetiredExportStore.ts`): it stays until the user exports or dismisses
+ * it, and the boot raises the banner again from it. True once it is persisted;
+ * shown either way (a failed write keeps it in memory, and the caller keeps
+ * what it would have let go).
+ */
+async function offerRetiredExport(next: RetiredExport): Promise<boolean> {
+  const session = durableAckEpoch
+  const show = (exported: RetiredExport) => {
+    if (session !== durableAckEpoch) return
+    const store = useEpochHopStore.getState()
+    store.showRetired(mergeRetiredExports(store.retired, exported))
+  }
+  try {
+    show(await persistRetiredExport(next))
+    return true
+  } catch (error) {
+    console.warn('the retired export could not be persisted; it is shown for this session only', error)
+    show(next)
+    return false
+  }
+}
+
+/** Boot: the banner raised again from the export an earlier session persisted
+ * and the user neither exported nor dismissed. */
+async function raisePersistedRetiredExport(): Promise<void> {
+  const session = durableAckEpoch
+  const saved = await loadRetiredExport()
+  if (!saved || session !== durableAckEpoch) return
+  const store = useEpochHopStore.getState()
+  store.showRetired(mergeRetiredExports(saved, store.retired ?? saved))
+}
+
+/**
+ * The resume of one RANDOM-id model-shard pointer. The pointer was written at once when the
+ * shard was created; the entry only says "not yet acknowledged". Nothing of
+ * it is on the boot's critical path: the server is asked in
+ * the background, before anything is written again.
+ *
+ * `published`: the booted meta (an older epoch's) lists the shard and this
+ * boot loaded it — this browser's own, which a hop carries unless the server
+ * calls it a late source (`swapEpoch`). Shown already; the answer only
+ * decides the dequeue: once its current heads are durable, or at once when
+ * it is RETIRED (it never will be).
+ *
+ * Not published (`resumeUnlistedUnminted`): not loaded by the boot.
+ */
+async function resumeUnmintedModelShard(
+  reference: DeferredReference,
+  published: boolean,
+  epoch: number,
+  find: (url: string) => Promise<DocHandle<unknown>>,
+  giveUp: (reference: DeferredReference, why: string, error?: unknown) => Promise<void>,
+): Promise<void> {
+  if (!published) {
+    void resumeUnlistedUnminted(reference, epoch, find, giveUp)
+    return
+  }
+  let handle: DocHandle<unknown>
+  try {
+    handle = await find(reference.url)
+  } catch {
+    // The boot loaded it from its meta: nothing to count against the entry.
+    return
+  }
+  if (epoch !== durableAckEpoch) return
+  locallyCreatedModelShardUrls.add(reference.url)
+  const settle = (verdict: ShardVerdict) => {
+    if (epoch !== durableAckEpoch) return
+    if (verdict === 'retired') void deferredReferences.remove(reference).catch(() => undefined)
+    else dequeueOnceDurable(handle, reference, epoch)
+  }
+  void serverHoldsShard(handle, reference).then((verdict) => {
+    if (verdict === ANSWER_REFUSED) return
+    if (unanswered(verdict)) askUnmintedUntilAnswered(handle, reference, epoch, settle, verdict)
+    else settle(verdict)
+  })
+}
+
+/**
+ * A random-id shard the booted meta does not list, decided in the
+ * BACKGROUND, its projection changes outside a hop's latch:
+ *  - the server does NOT know it: no meta it saw names it. Written into the
+ *    current meta, adopted as the tab's own, dequeued once durable;
+ *  - it HOLDS it (`held`, or `retired`): a meta named it already. Never
+ *    written again — a full roll may have recreated it (X → X′ in place),
+ *    and X appended to the current meta would win over X′ for every reader
+ *    and mask every edit made since. Adopted only if the current meta lists
+ *    it (the adoption landed during the boot); otherwise not projected —
+ *    taken OFF the screen if it was shown provisionally. Dequeued once its
+ *    current heads are durable (its offline edits reach the
+ *    server, which forwards them into X′), at once when RETIRED;
+ *  - NO ANSWER (offline, timed out, refused): shown PROVISIONALLY so its
+ * author sees it — never the tab's own, closed to new ids — and asked again
+ * (`askUnmintedUntilAnswered`); a refusal is not
+ *    asked again this session.
+ */
+async function resumeUnlistedUnminted(
+  reference: DeferredReference,
+  epoch: number,
+  find: (url: string) => Promise<DocHandle<unknown>>,
+  giveUp: (reference: DeferredReference, why: string, error?: unknown) => Promise<void>,
+): Promise<void> {
+  let handle: DocHandle<unknown>
+  try {
+    handle = await find(reference.url)
+  } catch (error) {
+    await giveUp(reference, 'could not be loaded from this browser', error)
+    return
+  }
+  if (epoch !== durableAckEpoch) return
+  const listedNow = () => {
+    const doc = modelMetaHandle?.doc()
+    return doc ? (readMetaUrls(doc, reference.field as 'objectShardUrls' | 'connectionShardUrls') ?? []).includes(reference.url) : false
+  }
+  const settle = (verdict: ShardVerdict) => outsideHopLatch(() => {
+    if (epoch !== durableAckEpoch) return
+    provisionalModelShardUrls.delete(handle.url)
+    if (verdict === 'unknown') {
+      writeHeldReference(reference, epoch)
+      locallyCreatedModelShardUrls.add(handle.url)
+      adoptHeldShardNow(reference, handle)
+      dequeueOnceDurable(handle, reference, epoch)
+      return
+    }
+    let safe: Promise<boolean> = Promise.resolve(true)
+    if (listedNow()) {
+      locallyCreatedModelShardUrls.add(handle.url)
+      adoptHeldShardNow(reference, handle)
+    } else {
+      locallyCreatedModelShardUrls.delete(handle.url)
+      // A RETIRED X is never forwarded — what only its local copy holds is
+      // offered as the retired export (the hop's step 6) BEFORE it leaves the
+      // screen and its entry the queue.
+      if (verdict === 'retired') safe = offerRetiredShardExport(reference, handle)
+      unloadModelShardNow(handle)
+    }
+    if (verdict === 'held') { dequeueOnceDurable(handle, reference, epoch); return }
+    // RETIRED: never durable again (the hop's `showRetired` rule) — out of the
+    // durability ledger and its pin, or the badge stays "Saving" and the round
+    // asks about it every 750 ms for the whole session.
+    durableHeads.forget([handle.documentId])
+    activeDocumentShare.unpin(handle.documentId, 'durability-pending')
+    queueDurableLedgerPersistence()
+    scheduleDurableAcknowledgement(0)
+    if (!projectedModelShardUrls().has(handle.url)) releaseDocumentRequest(handle.url as AutomergeUrl, 'model-shard')
+    // Dequeued only once the export is persisted — a reload before "Export"
+    // then raises the banner again from the KV store; a failed write leaves the
+    // entry for the next boot to ask again.
+    void safe.then((persisted) => {
+      if (persisted) void deferredReferences.remove(reference).catch(() => undefined)
+    })
+  })
+  // No session test here: every way on (settle, the provisional show, the
+  // retries) tests it itself.
+  const first = await serverHoldsShard(handle, reference)
+  if (first !== ANSWER_REFUSED && !unanswered(first)) { settle(first); return }
+  outsideHopLatch(() => {
+    if (epoch !== durableAckEpoch) return
+    provisionalModelShardUrls.add(handle.url)
+    adoptHeldShardNow(reference, handle)
+  })
+  if (unanswered(first)) askUnmintedUntilAnswered(handle, reference, epoch, settle, first)
+}
+
 /**
  * Boot half of the held model-shard pointers: shards this browser created
  * whose url the ModelMeta does not carry yet. They are loaded locally (their
@@ -2114,36 +5022,137 @@ async function resumeDeferredModelShardReferences(
   meta: DocHandle<ModelMeta>,
   loaded: ReadonlySet<string>,
 ): Promise<{ objects: DocHandle<ObjectShard>[]; connections: DocHandle<ConnectionShard>[] }> {
-  const resumed = { objects: [] as DocHandle<ObjectShard>[], connections: [] as DocHandle<ConnectionShard>[] }
+  pendingSetAside = null
   let queued: DeferredReference[]
   try {
     queued = await deferredReferences.list()
   } catch (error) {
     console.warn('deferred model-shard references could not be read', error)
-    return resumed
+    return { objects: [], connections: [] }
   }
+  // The boot walks the LOCAL lineage only (hydrateEpochKnowledge). A pointer
+  // held on a meta it does not reach (rolls this browser never saw) is SET
+  // ASIDE — neither given up nor counted — and resumed after the first render,
+  // once the network walk has decided (`resumeSetAsideModelShards`).
+  const setAside: DeferredReference[] = []
+  const resumed = await resumeModelShardEntries(meta, queued, loaded, setAside)
+  pendingSetAside = setAside.length > 0 ? { meta, references: setAside, loaded, session: durableAckEpoch } : null
+  return resumed
+}
+
+/** The entries the boot set aside for the background walk. */
+let pendingSetAside: { meta: DocHandle<ModelMeta>; references: DeferredReference[]; loaded: ReadonlySet<string>; session: number } | null = null
+
+/** The whole network walk of the predecessors costs at most this. */
+const PREDECESSOR_WALK_BUDGET_MS = 10_000
+let predecessorWalkBudgetMs = PREDECESSOR_WALK_BUDGET_MS
+
+/** Test hook: the walk's budget (null restores the default). */
+export function __setPredecessorWalkBudgetForTest(ms: number | null): void {
+  predecessorWalkBudgetMs = ms ?? PREDECESSOR_WALK_BUDGET_MS
+}
+
+/**
+ * After the first render: walk the predecessors over the network — ONE budget
+ * for the whole walk — then resume the entries the boot set aside, and adopt
+ * their shards into the projection (a write flushed first, then the swap's
+ * assign → attach → project → reseed). An entry still not reached is counted
+ * towards its give-up only when the walk DECIDED (it reached the chain's end);
+ * a walk cut short by the budget or the network leaves it for the next boot,
+ * uncounted.
+ */
+async function resumeSetAsideModelShards(): Promise<void> {
+  const pending = pendingSetAside
+  pendingSetAside = null
+  if (!pending || pending.session !== durableAckEpoch) return
+  let decided = false
+  predecessorAnsweredLive = false
+  predecessorQuestionAnswered = false
+  try {
+    decided = await extendPredecessorChain(pending.meta)
+  } catch (error) {
+    console.warn('epoch predecessors could not be walked', error)
+  }
+  if (pending.session !== durableAckEpoch) return
+  // A hop swapped during the walk. The entries are resumed against the meta
+  // projected NOW — when the meta left is its predecessor (a repoint to another
+  // lineage resurrects nothing: left for the next boot, uncounted) — instead of
+  // being dropped for the session.
+  const meta = modelMetaHandle
+  if (!meta) return
+  if (meta !== pending.meta && !supersededMetaDocumentIds.has(pending.meta.documentId)) return
+  const loaded = meta === pending.meta ? pending.loaded : projectedModelShardUrls()
+  const stillAside: DeferredReference[] = []
+  const resumed = await resumeModelShardEntries(meta, pending.references, loaded, decided ? undefined : stillAside)
+  if (pending.session !== durableAckEpoch) return
+  // A bound and an outcome for an entry no walk ever decides — counted only
+  // when the server answered the walk's question and said of no predecessor
+  // that it is live (an offline boot, or a live meta slow to load, decides
+  // nothing about it).
+  if (decided) void noteUndecidedWalks(pending.references, true)
+  else if (predecessorQuestionAnswered && !predecessorAnsweredLive) void noteUndecidedWalks(stillAside, false)
+  adoptLateHeldModelShards(resumed.objects, resumed.connections)
+  markClientTimeline('workspace.held-shards.resumed-late', { resumed: resumed.objects.length + resumed.connections.length, decided, aside: stillAside.length })
+}
+
+/** Held shards found after the boot join the projection — appended after the
+ * tab's shards, as the boot appends its held ones — once no hop latch is up,
+ * and never twice. */
+function adoptLateHeldModelShards(objects: DocHandle<ObjectShard>[], connections: DocHandle<ConnectionShard>[]): void {
+  const session = durableAckEpoch
+  outsideHopLatch(() => {
+    if (session === durableAckEpoch) adoptModelShardsNow(objects, connections)
+  })
+}
+
+async function resumeModelShardEntries(
+  meta: DocHandle<ModelMeta>,
+  queued: DeferredReference[],
+  loaded: ReadonlySet<string>,
+  setAside?: DeferredReference[],
+): Promise<{ objects: DocHandle<ObjectShard>[]; connections: DocHandle<ConnectionShard>[] }> {
+  const resumed = { objects: [] as DocHandle<ObjectShard>[], connections: [] as DocHandle<ConnectionShard>[] }
   const doc = meta.doc()
   // Creation order: the handles are appended after the published ones, and the
   // parallel resume completes in any order.
   const order = new Map(queued.map((reference, index) => [reference, index]))
   const objects: Array<[number, DocHandle<ObjectShard>]> = []
   const connections: Array<[number, DocHandle<ConnectionShard>]> = []
+  const onResumed = (reference: DeferredReference, handle: DocHandle<unknown>) => {
+    locallyCreatedModelShardUrls.add(handle.url)
+    const index = order.get(reference) ?? 0
+    if (reference.field === 'objectShardUrls') objects.push([index, handle as DocHandle<ObjectShard>])
+    else connections.push([index, handle as DocHandle<ConnectionShard>])
+  }
+  const find = (url: string) => findHeldModelShardHandle<unknown>(url)
   await resumeHeldReferences<unknown>({
     queued,
+    setAside: setAside ? (reference) => { setAside.push(reference); return true } : undefined,
+    resumeUnminted: (reference, published, epoch, giveUp) =>
+      resumeUnmintedModelShard(reference, published, epoch, find, giveUp),
     accepts: (reference) => isModelShardReferenceField(reference.field),
     holderDocumentId: meta.documentId,
+    // A pointer held against an earlier epoch's ModelMeta (a shard created
+    // offline, then a roll, then a reload) is published to the
+    // CURRENT meta — where the forwarder's URL adoption would have put it.
+    acceptsHolder: (holder) => supersededMetaDocumentIds.has(holder as DocumentId),
     holderName: 'ModelMeta',
     lost: 'its objects are lost to this workspace',
     isPublished: (reference) => {
       const field = reference.field as 'objectShardUrls' | 'connectionShardUrls'
-      return Boolean(doc?.[field]?.includes(reference.url)) || loaded.has(reference.url)
+      // Through `modelMetaUrls.ts`, never the raw field (G4-16f): on a
+      // scalar-ruled ModelMeta — every epoch meta — the raw text
+      // field is the frozen mirror, which never names a shard published
+      // after the epoch's birth, so a held pointer would be re-published.
+      // Published AND loaded by this boot. In the meta but NOT loaded — the
+      // server adopted the shard from the old meta while this tab was
+      // booting (measured in the two-roll e2e: the adoption landed between
+      // the boot's shard load and this resume) — it is resumed all the same:
+      // loaded here, its pointer write a deduplicated no-op.
+      return loaded.has(reference.url) && (readMetaUrls(doc, field) ?? []).includes(reference.url)
     },
-    find: (url) => findHeldModelShardHandle<unknown>(url),
-    onResumed: (reference, handle) => {
-      const index = order.get(reference) ?? 0
-      if (reference.field === 'objectShardUrls') objects.push([index, handle as DocHandle<ObjectShard>])
-      else connections.push([index, handle as DocHandle<ConnectionShard>])
-    },
+    find,
+    onResumed,
   })
   const byOrder = (a: [number, unknown], b: [number, unknown]) => a[0] - b[0]
   resumed.objects = objects.sort(byOrder).map(([, handle]) => handle)
@@ -2224,24 +5233,29 @@ function writeModelShards(
   small: { groups: Group[]; domains: Domain[]; tags: Tag[]; decisionRecords: DecisionRecord[] }
 ): void {
   if (!modelMetaHandle) return
+  faultPointForTest('writeModelShards')
 
   // Objects ──────────────────────────────────────────────────────────────────
   const objPlan = planShardAssignment(
     objects.map((o) => o.id),
     shardIndexByObjectId,
     objectShardHandles.length,
-    MODEL_SHARD_SIZE
+    MODEL_SHARD_SIZE,
+    provisionalShardIndices(objectShardHandles as DocHandle<unknown>[]),
   )
   while (objectShardHandles.length < objPlan.shardCount) {
     const h = trackCreatedHandle(createObjectShardHandle({ objects: {} }))
+    locallyCreatedModelShardUrls.add(h.url)
     objectShardHandles.push(h)
     attachModelShardListener(h as DocHandle<unknown>)
     publishModelShardReference('objectShardUrls', h)
   }
   const objBuckets = partitionByShard(objects, objPlan.route, objectShardHandles.length)
+  const objListed = listedInMeta(objectShardHandles as DocHandle<unknown>[], 'objectShardUrls')
   for (let i = 0; i < objBuckets.length; i++) {
     if (!sameRefs(objBuckets[i], lastObjectShardSlices[i] ?? [])) {
-      reconcileModelShardBucket(objectShardHandles[i], 'objects', objBuckets[i])
+      reconcileModelShardBucket(objectShardHandles[i], 'objects', objBuckets[i],
+        objListed[i] === false ? (id) => { const at = objPlan.route.get(id); return at !== undefined && at !== i } : undefined)
       lastObjectShardSlices[i] = objBuckets[i]
     }
   }
@@ -2253,18 +5267,22 @@ function writeModelShards(
     connections.map((c) => c.id),
     shardIndexByConnectionId,
     connectionShardHandles.length,
-    MODEL_SHARD_SIZE
+    MODEL_SHARD_SIZE,
+    provisionalShardIndices(connectionShardHandles as DocHandle<unknown>[]),
   )
   while (connectionShardHandles.length < connPlan.shardCount) {
     const h = trackCreatedHandle(createConnectionShardHandle({ connections: {} }))
+    locallyCreatedModelShardUrls.add(h.url)
     connectionShardHandles.push(h)
     attachModelShardListener(h as DocHandle<unknown>)
     publishModelShardReference('connectionShardUrls', h)
   }
   const connBuckets = partitionByShard(connections, connPlan.route, connectionShardHandles.length)
+  const connListed = listedInMeta(connectionShardHandles as DocHandle<unknown>[], 'connectionShardUrls')
   for (let i = 0; i < connBuckets.length; i++) {
     if (!sameRefs(connBuckets[i], lastConnectionShardSlices[i] ?? [])) {
-      reconcileModelShardBucket(connectionShardHandles[i], 'connections', connBuckets[i])
+      reconcileModelShardBucket(connectionShardHandles[i], 'connections', connBuckets[i],
+        connListed[i] === false ? (id) => { const at = connPlan.route.get(id); return at !== undefined && at !== i } : undefined)
       lastConnectionShardSlices[i] = connBuckets[i]
     }
   }
@@ -2310,8 +5328,8 @@ function writeModelShards(
  * accumulated meanwhile (they sit durably in editsObjects/Connections until then).
  */
 function orderedObjectOverlayUrls(meta: ModelMeta | undefined): string[] {
-  const urls = [...(meta?.editsObjectShardUrls ?? [])].filter(isValidAutomergeUrl)
-  const current = meta?.editsObjectShardUrl
+  const urls = [...(readMetaUrls(meta, 'editsObjectShardUrls') ?? [])].filter(isValidAutomergeUrl)
+  const current = readMetaUrl(meta, 'editsObjectShardUrl')
   if (current && isValidAutomergeUrl(current)) {
     const index = urls.indexOf(current)
     if (index >= 0) urls.splice(index, 1)
@@ -2321,8 +5339,8 @@ function orderedObjectOverlayUrls(meta: ModelMeta | undefined): string[] {
 }
 
 function orderedConnectionOverlayUrls(meta: ModelMeta | undefined): string[] {
-  const urls = [...(meta?.editsConnectionShardUrls ?? [])].filter(isValidAutomergeUrl)
-  const current = meta?.editsConnectionShardUrl
+  const urls = [...(readMetaUrls(meta, 'editsConnectionShardUrls') ?? [])].filter(isValidAutomergeUrl)
+  const current = readMetaUrl(meta, 'editsConnectionShardUrl')
   if (current && isValidAutomergeUrl(current)) {
     const index = urls.indexOf(current)
     if (index >= 0) urls.splice(index, 1)
@@ -3116,6 +6134,19 @@ async function maybeReplayEntityIntents(options?: { withoutHandles?: boolean }):
     }
     const witnessObjectIds: string[] = []
     const witnessConnectionIds: string[] = []
+    // T-SUM-2b: the batch of every stamped upsert the loaded segments do not
+    // carry. The server is asked whether it ever received it — the only proof
+    // left once a rotation, a fold or a compaction took the segment out of
+    // sight, and the one that stops a replay from undoing what followed the
+    // write (a colleague's deletion: the entity came back, measured on both
+    // planes, T-SUM-2b).
+    const witnessBatchIds = new Set<string>()
+    // Captured with `intents`: an id dirty NOW is skipped below, so it must
+    // stay in flight for the planner even if a write consumes it during the
+    // witness awaits (its captured record still names the old batch, and its
+    // overlay value was never read — replaying it then would be blind).
+    const dirtyObjectsAtStart = new Set(dirtyObjectIds)
+    const dirtyConnectionsAtStart = new Set(dirtyConnectionIds)
     for (const intent of intents) {
       if (intent.op !== 'upsert') {
         // A delete's "gone from the model" condition reads these maps too;
@@ -3132,6 +6163,10 @@ async function maybeReplayEntityIntents(options?: { withoutHandles?: boolean }):
       }
       const batchIds = intent.kind === 'object' ? objectBatchIds : connectionBatchIds
       if (intent.writtenInBatchId && batchIds.has(intent.writtenInBatchId)) continue
+      // Its value already waits for this session's next write (the planner's
+      // `inFlight`): no question to ask about it.
+      if ((intent.kind === 'object' ? dirtyObjectsAtStart : dirtyConnectionsAtStart).has(intent.id)) continue
+      if (intent.writtenInBatchId && serverWitness) witnessBatchIds.add(intent.writtenInBatchId)
       if (intent.kind === 'object') {
         const value = effectiveObjectOverlay.get(intent.id)
         if (value) currentObjects.set(intent.id, value)
@@ -3152,20 +6187,25 @@ async function maybeReplayEntityIntents(options?: { withoutHandles?: boolean }):
     // projector's last coherent snapshot may simply not contain a durably
     // written entity yet.
     const WITNESS_CHUNK = 500
+    const askBatchIds = [...witnessBatchIds]
+    const landedBatchIds = new Set<string>()
     for (
       let offset = 0;
       witnessesReliable
-        && (offset < witnessObjectIds.length || offset < witnessConnectionIds.length);
+        && (offset < witnessObjectIds.length || offset < witnessConnectionIds.length || offset < askBatchIds.length);
       offset += WITNESS_CHUNK
     ) {
       const result = await witnessed(fetchDurabilityWitness(
         witnessJournal,
         witnessObjectIds.slice(offset, offset + WITNESS_CHUNK),
         witnessConnectionIds.slice(offset, offset + WITNESS_CHUNK),
+        askBatchIds.slice(offset, offset + WITNESS_CHUNK),
       ))
       if (!result) break // witnessed() has already flipped witnessesReliable
       for (const [id, object] of result.objects) currentObjects.set(id, object)
       for (const [id, connection] of result.connections) currentConnections.set(id, connection)
+      // A positive fact, like presence: usable whatever the freshness says.
+      for (const batchId of result.landedBatchIds) landedBatchIds.add(batchId)
       // The write-checkpoint gate (an ORDER, not a status): presence stays
       // usable regardless, but ABSENCE proves only when every durable arrival
       // predates the last completed projection server-side.
@@ -3173,6 +6213,14 @@ async function maybeReplayEntityIntents(options?: { withoutHandles?: boolean }):
     }
     if (epoch !== durableAckEpoch) return
     const meta = modelMetaHandle?.doc()
+    const live = new Map(pendingEntityIntents.pending(workspaceKey).map((intent) => [`${intent.kind}:${intent.id}`, intent]))
+    const changedSinceCapture = (kind: 'object' | 'connection'): string[] => intents
+      .filter((intent) => intent.kind === kind && intent.op === 'upsert')
+      .filter((intent) => {
+        const now = live.get(`${intent.kind}:${intent.id}`)
+        return now !== undefined && (now.revision !== intent.revision || now.writtenInBatchId !== intent.writtenInBatchId)
+      })
+      .map((intent) => intent.id)
     const plan = planEntityIntentReplay({
       intents,
       currentObjects,
@@ -3182,6 +6230,14 @@ async function maybeReplayEntityIntents(options?: { withoutHandles?: boolean }):
       deletedObjectIds: new Set(meta?.deletedObjectIds ?? []),
       deletedConnectionIds: new Set(meta?.deletedConnectionIds ?? []),
       witnessesReliable,
+      landedBatchIds,
+      // Dirty at the start (skipped above), dirty now, or re-recorded or
+      // re-stamped since the capture (edited — and possibly already written —
+      // during the witness awaits): the captured record is older than what
+      // the session holds, and replaying it would write it over the newer one.
+      inFlightObjectIds: new Set([...dirtyObjectsAtStart, ...dirtyObjectIds, ...changedSinceCapture('object')]),
+      inFlightConnectionIds: new Set([...dirtyConnectionsAtStart, ...dirtyConnectionIds, ...changedSinceCapture('connection')]),
+      deletionWins: true,
     })
     if (plan.satisfied.length) {
       // Batch/overlay proofs were read from handle.doc() — RAM. A mid-session
@@ -3203,6 +6259,12 @@ async function maybeReplayEntityIntents(options?: { withoutHandles?: boolean }):
       markReplayedSent(workspaceKey, plan.satisfied, sentWorkspace, carriers as DocumentId[], epoch)
       persistEntityIntentsNow(workspaceKvStore(), workspaceKey)
     }
+    // Not silent: these are the user's intents, deliberately not replayed
+    // because a durable deletion wins over them (T-SUM-2b).
+    if (plan.droppedDeleted > 0) {
+      markClientTimeline('entity-intents.replay-dropped-deleted', { dropped: plan.droppedDeleted })
+      console.warn(`entity intent replay: ${plan.droppedDeleted} edit(s) of entities deleted since were not replayed (a durable deletion wins)`)
+    }
     const replayCount = plan.replayObjects.length + plan.replayConnections.length
       + plan.replayDeleteObjectIds.length + plan.replayDeleteConnectionIds.length
     if (replayCount === 0) {
@@ -3213,6 +6275,7 @@ async function maybeReplayEntityIntents(options?: { withoutHandles?: boolean }):
       replayed: replayCount,
       satisfied: plan.satisfied.length,
       deferred: plan.deferred,
+      inFlight: plan.inFlight,
     })
     for (const id of plan.replayDeleteObjectIds) {
       tombstoneObjects.add(id)
@@ -3357,7 +6420,8 @@ async function maybeReplayEntityIntentsResident(): Promise<void> {
     // whose doc() is still undefined means the overlay state is UNKNOWN — that
     // must refuse, not pass: this guard carries the whole pass's safety, and
     // "unresolved" declared "inert" is its open-mode failure.
-    const meta = modelMetaHandle?.doc()
+    const metaDoc = modelMetaHandle?.doc()
+    const meta = metaDoc ? withMetaUrlView(metaDoc) : undefined
     if (modelMetaHandle && !meta) {
       markClientTimeline('entity-intents.resident-replay.refused', {
         reason: 'ModelMeta unresolved; overlay state unknown',
@@ -4139,7 +7203,8 @@ function detectEdits(): void {
   // not just its last keystrokes.
   let newIntentKey = false
   for (const o of s.objects) {
-    if (tombstoneObjects.delete(o.id)) { lastWrittenObj.delete(o.id); unTombObjects.add(o.id) } // re-added → un-delete
+    const reAddedObject = tombstoneObjects.delete(o.id)
+    if (reAddedObject) { lastWrittenObj.delete(o.id); unTombObjects.add(o.id) } // re-added → un-delete
     // A merely-hydrated off-window entity (seeded for edit) keeps its baseline ref until
     // the user actually changes it (immer then gives it a new ref). Skip the unchanged
     // baseline so browsing off-window objects doesn't write no-op copies into the overlay.
@@ -4157,12 +7222,17 @@ function detectEdits(): void {
         workspaceKey, 'object', o.id, o,
         renderedObjects.get(o.id) ?? hydratedForEdit.get(o.id) ?? lastWrittenObj.get(o.id),
       )
+      // T-SUM-2b: the one upsert a replay may still lift a tombstone for.
+      if (reAddedObject) pendingEntityIntents.markReAdded(workspaceKey, 'object', o.id)
       intentsRecorded = true
+    } else if (reAddedObject) {
+      pendingEntityIntents.markReAdded(workspaceKey, 'object', o.id)
     }
   }
   for (const c of s.connections) {
     if (c.kind === 'lower') continue
-    if (tombstoneConnections.delete(c.id)) { lastWrittenConn.delete(c.id); unTombConnections.add(c.id) }
+    const reAddedConnection = tombstoneConnections.delete(c.id)
+    if (reAddedConnection) { lastWrittenConn.delete(c.id); unTombConnections.add(c.id) }
     if (hydratedConnForEdit.get(c.id) === c) continue
     if (renderedConnections.get(c.id) !== c && editsConnections.get(c.id) !== c) {
       editsConnections.set(c.id, c)
@@ -4172,7 +7242,10 @@ function detectEdits(): void {
         workspaceKey, 'connection', c.id, c,
         renderedConnections.get(c.id) ?? hydratedConnForEdit.get(c.id) ?? lastWrittenConn.get(c.id),
       )
+      if (reAddedConnection) pendingEntityIntents.markReAdded(workspaceKey, 'connection', c.id)
       intentsRecorded = true
+    } else if (reAddedConnection) {
+      pendingEntityIntents.markReAdded(workspaceKey, 'connection', c.id)
     }
   }
   // Journal the four ModelMeta small-collection families. Same
@@ -4535,6 +7608,7 @@ function adoptRemoteDiagramTombstones(): void {
  * projection, not a user edit. */
 function publishDiagramTombstones(): void {
   const next = [...tombstoneDiagrams]
+  for (const id of retiredSessionDiagramIds) if (!tombstoneDiagrams.has(id)) next.push(id)
   const current = useModelStore.getState().deletedDiagramIds
   if (current.length === next.length && next.every((id, index) => current[index] === id)) return
   withRemote(() => useModelStore.setState({ deletedDiagramIds: next }))
@@ -4574,11 +7648,15 @@ function buildDiagramsArray(): Diagram[] {
 }
 
 function retirePendingLocalDiagrams(): void {
-  if (localDiagramHold.size === 0) return
+  if (localDiagramHold.size === 0 && localDiagramHold.heldDeletions === 0) return
   const metas = registrySummaryOnly
     ? summaryRegistryMetas()
     : mergeShards(shardHandles.map((h) => h.doc() ?? { diagrams: {} }))
-  localDiagramHold.retire(metas.map((meta) => meta.id), useModelStore.getState().diagrams)
+  // A held deletion is released by ABSENCE, so only from a registry whose every
+  // shard has materialized (the replay's and the ack's completeness rule).
+  // The summary window filters its own tombstones (`summaryRegistryMetas`).
+  const registryComplete = registrySummaryOnly || shardHandles.every((h) => h.doc() !== undefined)
+  localDiagramHold.retire(metas.map((meta) => meta.id), useModelStore.getState().diagrams, registryComplete)
 }
 
 // ── boot-from-server (step 2c) ─────────────────────────────────────────────────
@@ -4936,6 +8014,7 @@ function resetProjectionCache(): void {
 
 function projectAll(): void {
   if (!rootHandle) return
+  faultPointForTest('projectAll')
   // Boot-from-server (step 2c): the model shards aren't loaded (and the monolith
   // modelHandle isn't either), so the shard-merge below would wipe the store to
   // empty. Any caller (meta/registry change, root change) instead re-projects the
@@ -4986,18 +8065,24 @@ function projectAll(): void {
     // cheap Object.assign union — the expensive proxy walk is gone from the WRITE.
     const objDocs = objectShardHandles.map((h) => h.doc())
     if (!sameRefs(objDocs, lastObjectShardDocs)) {
-      patch.objects = Object.values(mergeObjectShards(objDocs.map((d) => d ?? { objects: {} })))
-      rebuildObjectRoute(objDocs)
+      const listed = listedInMeta(objectShardHandles as DocHandle<unknown>[], 'objectShardUrls')
+      // The local writes no document holds yet stay.
+      patch.objects = residentPendingWrites.overlay('objects',
+        Object.values(mergeObjectShards(listedLast(objDocs, listed).map((d) => d ?? { objects: {} }))) as C4Object[])
+      rebuildObjectRoute(objDocs, listed)
       lastObjectShardDocs = objDocs
     }
     const connDocs = connectionShardHandles.map((h) => h.doc())
     if (!sameRefs(connDocs, lastConnectionShardDocs)) {
-      patch.connections = Object.values(
-        mergeConnectionShards(connDocs.map((d) => d ?? { connections: {} }))
-      )
-      rebuildConnectionRoute(connDocs)
+      const listed = listedInMeta(connectionShardHandles as DocHandle<unknown>[], 'connectionShardUrls')
+      patch.connections = residentPendingWrites.overlay('connections', Object.values(
+        mergeConnectionShards(listedLast(connDocs, listed).map((d) => d ?? { connections: {} }))
+      ) as Connection[])
+      rebuildConnectionRoute(connDocs, listed)
       lastConnectionShardDocs = connDocs
     }
+    // An owed edit whose entity this merge no longer holds: released when its grace ends.
+    armAbsentReleaseTimer()
     // Small collections live inline on the meta doc — per-key ref skip (reusing
     // lastModelColl) exactly as the monolith path does.
     const meta = modelMetaHandle.doc() as unknown as Record<string, Record<string, unknown>> | undefined
@@ -5517,6 +8602,8 @@ function withoutDerivedConnectionIds(ids: string[]): string[] {
 function captureSummaryLocalDiagram(diagram: Diagram): void {
   if (!registrySummaryOnly || docUrlById.has(diagram.id)) return
   summaryLocalDiagramIds.add(diagram.id)
+  // Created again (an undo of the delete): no longer a retired id.
+  if (retiredSessionDiagramIds.delete(diagram.id)) publishDiagramTombstones()
   const docUrl = ensureDiagramDoc(diagram)
   upsertSummaryRegistryWindow(
     buildMeta(
@@ -5583,6 +8670,10 @@ function writeSummaryLocalRegistry(
       // growth for nothing, and a second truth about the same removal.
       tombstoneDiagrams.delete(id)
       unTombDiagrams.delete(id)
+      // …but NOT the published deletion: the server-paged list hides a card
+      // only behind the store's `deletedDiagramIds` (T-DIAGDEF (1)).
+      retiredSessionDiagramIds.add(id)
+      publishDiagramTombstones()
       summaryLocalDiagramIds.delete(id)
       serverRegistryDiagrams = serverRegistryDiagrams.filter((candidate) => candidate.id !== id)
       serverDiagramBootstraps.delete(id)
@@ -5866,6 +8957,8 @@ function flushWrite(): void {
         tags: state.tags,
         decisionRecords: state.decisionRecords,
       })
+      // What the documents hold now leaves the overlay.
+      releaseResidentPendingWrites()
     } else if (modelHandle) {
       const modelUnchanged =
         lastModelSlices !== null &&
@@ -6384,7 +9477,7 @@ async function sweepAbsentDiagramIntents(): Promise<void> {
         // The side memo keeps the id PROVABLE for a retry: without it a
         // failed witness flush would leave the intents journaled while the
         // cleanup below removed the very membership the planner's summary
-        // filter requires — a session-permanent wedge (adversarial, MAJOR).
+        // filter requires — a session-permanent wedge.
         summaryRetiredDiagramIds.add(entry.diagramId)
         summaryLocalDiagramIds.delete(entry.diagramId)
         serverRegistryDiagrams = serverRegistryDiagrams.filter((candidate) => candidate.id !== entry.diagramId)
@@ -6678,7 +9771,7 @@ function documentsWorkspaceKey(): string | null {
  * A flush that completes after its session ENDED marks nothing: the intents
  * stay PENDING, and the next session's replay plans them against its own
  * witnesses. Marked SENT under the old tag they would miss that session's
- * requeue — a FOLLOW's lifecycle flush lands just after it (reviewer lens,
+ * requeue — a FOLLOW's lifecycle flush lands just after it (found
  * 2026-10-31) — and sit uncounted while the badge said Synced.
  */
 function markIntentsSent(
@@ -6700,7 +9793,7 @@ function markIntentsSent(
  * a local fact, and the journal must not lose an intention on a local fact: a
  * tab reopened offline from the cached root replays, finds the value in the
  * old version's local copy, and an outright ack there was the original loss
- * again once the default moved (architect lens, 2026-10-31).
+ * again once the default moved (found 2026-10-31).
  */
 function markReplayedSent(
   workspaceKey: string,
@@ -6779,11 +9872,43 @@ function acknowledgeEntityIntentBatch(
 
 function flushPendingWritesForLifecycle(): void {
   const workspaceKey = workspaceRefKey(currentRef)
-  const hadPending = writeScheduler.pending
-    || pendingPlacementIntents.hasPending(workspaceKey)
-    || pendingEntityIntents.hasPending(workspaceKey)
-  if (!hadPending) return
-  writeScheduler.flushNow()
+  // A write the hop's latch deferred is still the user's: on a
+  // pagehide during the latch it is written NOW — to the epoch the tab still
+  // holds, which is retained and forwarded — then the latch's pause resumes
+  // (`lifecycleFlushPlan`).
+  const residentDebt = residentPendingWrites.size > 0
+  const plan = lifecycleFlushPlan({
+    pausedByHop: writesPausedByHop,
+    deferredByHop: writeDeferredByHop,
+    pending: writeScheduler.pending
+      || pendingPlacementIntents.hasPending(workspaceKey)
+      || pendingEntityIntents.hasPending(workspaceKey)
+      // A page hidden with a local write no document holds yet writes it now,
+      // before the reload.
+      || residentDebt,
+  })
+  if (!plan.flush) return
+  // A debt no write is scheduled for — an edit made while the boot ran, before
+  // `onStoreChange` was subscribed, and a stop (a workspace switch, a remount)
+  // before the boot ended — is written now. Only while the store projects every
+  // loaded shard as it is: the write reconciles each shard to the store's slice
+  // of it, so a store not projected yet would delete what it does not show.
+  if (residentDebt && !writeScheduler.pending && residentStoreProjectsShards()) {
+    pendingNormalWrite = true
+    writeScheduler.request('normal')
+  }
+  if (plan.liftPause) {
+    writesPausedByHop = false
+    writeDeferredByHop = false
+    try {
+      if (plan.requestDeferred) writeScheduler.request('normal')
+      writeScheduler.flushNow()
+    } finally {
+      writesPausedByHop = true
+    }
+  } else {
+    writeScheduler.flushNow()
+  }
   void flushPlacementIntentPersistence(workspaceKvStore(), workspaceKey).catch((error) => {
     console.warn('pending placement lifecycle persistence failed', error)
   })
@@ -6814,6 +9939,32 @@ function onStoreChange(state: ModelStoreSnapshot, previous: ModelStoreSnapshot):
   }
   const diagramSwitched = state.currentDiagramId !== previous.currentDiagramId
   const durableSlicesChanged = persistentSlicesChanged(state, previous)
+  // A LOCAL write of the resident sharded path is owed until a document holds
+  // it (boot-from-server journals its own).
+  if (!bfsActive && sharded && modelMetaHandle) {
+    residentPendingWrites.note('objects', previous.objects as never, state.objects as never)
+    residentPendingWrites.note('connections', previous.connections as never, state.connections as never,
+      (c) => (c as unknown as Connection).kind === 'lower')
+  }
+  // G4-16l, case 2: a throw between the note above and the write scheduled
+  // below left the debt owed and unscheduled — at the boot's replay of her
+  // window edits, and in the steady state alike — until a later edit; a
+  // reload lost it. The finally hands it to the session's driver, and lets
+  // the throw go on (never masked).
+  try {
+    faultPointForTest('onStoreChangeAfterNote')
+    scheduleStoreChangeWrites(state, previous, diagramSwitched, durableSlicesChanged)
+  } finally {
+    if (residentPendingWrites.size > 0) residentDebtDriver?.arm()
+  }
+}
+
+function scheduleStoreChangeWrites(
+  state: ModelStoreSnapshot,
+  previous: ModelStoreSnapshot,
+  diagramSwitched: boolean,
+  durableSlicesChanged: boolean,
+): void {
   const explicitDeletesChanged = state.pendingDeletedObjectIds !== previous.pendingDeletedObjectIds
     || state.pendingDeletedConnectionIds !== previous.pendingDeletedConnectionIds
     || state.pendingDeletedGroupIds !== previous.pendingDeletedGroupIds
@@ -6828,6 +9979,13 @@ function onStoreChange(state: ModelStoreSnapshot, previous: ModelStoreSnapshot):
     for (const diagram of localDiagramHold.noteCreated(state.diagrams, previous.diagrams)) {
       if (registrySummaryOnly) captureSummaryLocalDiagram(diagram)
     }
+  }
+  // …and the deleted one, the same window the other way round: deleting the
+  // OPEN diagram switches the active diagram below, whose first paint rebuilds
+  // the list from registry metas the flush has not touched yet (T-DIAGDEF (2)).
+  // Every mode, before the bfs/whole-model split clears the intents.
+  if (state.pendingDeletedDiagramIds !== previous.pendingDeletedDiagramIds) {
+    localDiagramHold.noteDeleted(state.pendingDeletedDiagramIds)
   }
   // Selection, hover and other transient UI updates must not look like edits,
   // scan the resident model, reset the write debounce or touch Automerge.
@@ -7072,7 +10230,7 @@ function onWorkspaceBound(bound: WorkspaceBinding, defer: () => void): void {
   // The fallback rule applies only to the version whose root failed: a repoint
   // to some OTHER version later in a fallback session (or a fallback that was
   // a slow server, not a repoint) follows like any other — the flag lasts the
-  // whole session (reviewer lens, 2026-10-29). Unknown (a server that reported
+  // whole session (found 2026-10-29). Unknown (a server that reported
   // no key) counts as that version: holding is the side that cannot loop.
   const retriesFailedRoot = bootFallback
     && (bootFallbackFailedVersionId === null || bootFallbackFailedVersionId === bound.versionId)
@@ -7149,6 +10307,9 @@ function onWorkspaceBound(bound: WorkspaceBinding, defer: () => void): void {
  * durability. Connected traffic can produce "Saving"; only the durable-heads
  * acknowledgement may produce "Synced" while local heads are pending. */
 function wireConnectionStatus(): void {
+  // The session's own lifecycle listeners take over from the debt driver's
+  // (G4-16l: one owner of the lifecycle at a time).
+  residentDebtDriver?.uninstallLifecycle()
   const { setStatus } = useAutomergeStatus.getState()
   // Reach a CONNECTED state on any sync traffic, not just the 'peer' event. automerge-repo does NOT
   // re-fire 'peer' on a WS reconnect to the same server (its own NetworkSubsystem flags it:
@@ -7402,8 +10563,47 @@ export async function startBridge(ref: WorkspaceRef = DEFAULT_WORKSPACE_REF): Pr
   // that may be perfectly healthy.
   deniedRecovery.clear()
   setSyncTransportConnected(false)
-  setLocalDocumentChangeListener((handle) => trackDurableHandle(handle))
+  setLocalDocumentChangeListener((handle) => {
+    lastModelActivityAt = Date.now()
+    trackDurableHandle(handle, true)
+    recordLocalActor(handle)
+    taggedCarriers?.add(handle.documentId)
+  })
+  // Only answers about THIS session's workspace, compared when
+  // each answer arrives: the session's parameters move from the `current`
+  // alias to the concrete version once it is bound, so a value captured here
+  // would never match again (seen in e2e: no tab ever learned the capability).
+  setEpochCapabilityListener((epochs, params) => { if (params === withWorkspaceParams('')) noteEpochCapability(epochs) })
+  if (import.meta.env?.DEV && typeof window !== 'undefined') {
+    ;(window as unknown as { __epochHop?: typeof epochHopProbe }).__epochHop = epochHopProbe
+    ;(window as unknown as { __epochDeferredQueue?: typeof epochDeferredQueueProbe }).__epochDeferredQueue = epochDeferredQueueProbe
+    ;(window as unknown as { __epochOverrides?: unknown }).__epochOverrides = {
+      refresh: () => refreshOverrides(),
+      rows: () => useEpochOverridesStore.getState().rows.map((r) => ({ id: r.id, entityId: r.entityId, path: r.path })),
+      checked: () => [...useEpochOverridesStore.getState().checked],
+      pulled: () => [...useEpochOverridesStore.getState().pulled],
+      lastBatch: () => useEpochOverridesStore.getState().lastBatch,
+      actorIds: () => [...localActorIds],
+      changesWithBatch: (batchId: string) => changesWithMessage((message) => isReapplyMessage(message, batchId)),
+    }
+  }
   started = true
+  // G4-16l: the session's owner of the resident debt, until `stopBridge`. A
+  // driver a failed boot left running (no stop in between) ends here; its
+  // session token would refuse it anyway.
+  residentDebtDriver?.stop()
+  residentDebtDriver = createResidentDebtDriver({
+    owed: () => residentPendingWrites.size > 0,
+    attempt: attemptResidentDebtWrite,
+    onLifecycle: flushPendingWritesForLifecycle,
+    // Taken now (this session's `durableAckEpoch`), compared at every attempt.
+    sessionToken: () => durableAckEpoch,
+  })
+  // Every local edit of this boot is seen, and written if the page goes
+  // away before the boot ends. Taken back only by this boot, past its
+  // `superseded()` check.
+  watchBootEdits()
+  watchBootLifecycle()
   currentRef = ref
   serverProjectionRequestSequence = 0
   lastAppliedServerProjectionRequest = 0
@@ -7420,9 +10620,11 @@ export async function startBridge(ref: WorkspaceRef = DEFAULT_WORKSPACE_REF): Pr
   // must be before any socket of this session can hand them to the server (see
   // `hydrateDurableLedger`). The read used to overlap the route.
   await durableHydration
+  // The overlay rescues an earlier session left.
+  void hydrateOverlayRescues(durableAckEpoch, ledgerStore)
   // A superseded boot must not route: the transport is module state, and the
   // live boot may still be reading ITS ledger, with nothing withheld yet
-  // (reviewer lens, 2026-10-31).
+  // (found 2026-10-31).
   if (superseded()) return
   // A root handle can remain cached after visiting this workspace, while the
   // single Repo transport has since been routed to another workspace. Resolving
@@ -7488,7 +10690,7 @@ export async function startBridge(ref: WorkspaceRef = DEFAULT_WORKSPACE_REF): Pr
   // `lastServerProjectionGeneration` above the cached version's, so that
   // version's SSE events (which carry a generation) would be ignored by
   // `scheduleLiveSyncRefresh` until an untyped trigger — sync traffic, the 60 s
-  // timer — refreshed anyway (lens review 2026-10-28, N3). The open fetches
+  // timer — refreshed anyway. The open fetches
   // both after the root instead, when the reads name the cached root's
   // version; the cost is the parallelism, on a boot that has already spent its
   // resolution budget.
@@ -7661,6 +10863,13 @@ export async function startBridge(ref: WorkspaceRef = DEFAULT_WORKSPACE_REF): Pr
     // without this the synchronous materialization + projectAll below would run
     // before any frame is drawn and the user would stare at a blank screen.
     await new Promise((resolve) => setTimeout(resolve, 0))
+    // A boot superseded during the awaits above stops before it shards the
+    // model (`modelMetaHandle`, the shard handles and their listeners are the
+    // next session's to set).
+    if (superseded()) {
+      finishBoot({ superseded: true })
+      return
+    }
 
     // The demo of a fresh install is written by the SERVER into the default
     // workspace before it publishes the root (server/src/demoSeed.ts). A browser
@@ -7724,6 +10933,11 @@ export async function startBridge(ref: WorkspaceRef = DEFAULT_WORKSPACE_REF): Pr
     if (!sharded) bfsActive = false
     const bootFromServer = bfsActive
     await Promise.all([placementHydration, overlayBatchHydration])
+    // …and before it projects the store or opens a diagram for that session.
+    if (superseded()) {
+      finishBoot({ superseded: true })
+      return
+    }
     if (bootFromServer) {
       if (registrySummaryOnly) {
         let requestedId = await takeParkedInitialDiagram(
@@ -7823,6 +11037,10 @@ export async function startBridge(ref: WorkspaceRef = DEFAULT_WORKSPACE_REF): Pr
         parkedAtChoice,
         (id) => initialDiagrams.some((d) => d.id === id),
       )
+      if (superseded()) {
+        finishBoot({ superseded: true })
+        return
+      }
     }
     // While the registry verdict is out, open nothing: taking the default pick
     // here (the store is populated on a resident boot) is exactly losing the
@@ -7844,6 +11062,16 @@ export async function startBridge(ref: WorkspaceRef = DEFAULT_WORKSPACE_REF): Pr
       status.markEditReady()
     }
 
+    // A boot superseded while it awaited the active diagram stops HERE.
+    // Everything below installs module state the boot that replaced it owns —
+    // the store subscription, the root and model listeners, the write-guard
+    // baselines, and the boot-edit watch whose window holds the user's edits
+    // made since.
+    if (superseded()) {
+      finishBoot({ superseded: true })
+      return
+    }
+
     // Non-BFS boots drain the crash journal through the RESIDENT write path
     // (P1bis): intents captured under an earlier boot-from-server session of
     // this workspace cannot drain through an overlay flush that a resident
@@ -7853,6 +11081,9 @@ export async function startBridge(ref: WorkspaceRef = DEFAULT_WORKSPACE_REF): Pr
     if (!bootFromServer) void maybeReplayEntityIntentsResident()
 
     rootChangeHandler = () => {
+      // G4-16f, hop step 1: a repointed `modelMetaUrl` starts the live hop,
+      // under every contract (summary roots included).
+      maybeStartEpochHop()
       if (registrySummaryOnly) {
         scheduleLiveSyncRefresh()
         return
@@ -7908,26 +11139,27 @@ export async function startBridge(ref: WorkspaceRef = DEFAULT_WORKSPACE_REF): Pr
     // The store now mirrors the docs (just projected), so the first store change
     // (a selection, the deferred roll-up, …) would otherwise schedule a no-op
     // O(model) reconcile (~12s at 15k). Seed the write-guard baseline so the first
-    // flushWrite skips; real edits diverge it and still persist.
+    // flushWrite skips; real edits diverge it and still persist. An edit made
+    // while the boot ran is NOT in the baseline — it is seeded from the state
+    // before it, and written just below. "Before it" is per ENTITY — the store
+    // now with only the window's local edits put back — so a remote projection
+    // that landed after her first edit is a baseline, never replayed as hers.
+    const bootEdits = stopWatchingBootEdits()
+    const bootEdited = bootEdits ? bootEdits.base(useModelStore.getState()) : null
     {
-      const s0 = useModelStore.getState()
-      const persisted0 = s0.connections.filter((c) => c.kind !== 'lower')
-      lastModelSlices = {
-        objects: s0.objects,
-        connections: persisted0,
-        groups: s0.groups,
-        domains: s0.domains,
-        tags: s0.tags,
-        decisionRecords: s0.decisionRecords,
-      }
-      // Per-shard write-guard baselines: partition the just-projected store exactly
-      // as writeModelShards will, so the first flush finds every shard unchanged.
-      // Skipped under boot-from-server (base shards are not loaded; edits go to
-      // bounded overlays and the active diagram document instead).
-      if (sharded && !bootFromServer) {
-        lastObjectShardSlices = partitionByShard(s0.objects, shardIndexByObjectId, objectShardHandles.length)
-        lastConnectionShardSlices = partitionByShard(persisted0, shardIndexByConnectionId, connectionShardHandles.length)
-      }
+      const s0 = bootEdited ?? useModelStore.getState()
+      // Per-shard baselines skipped under boot-from-server (base shards are
+      // not loaded; edits go to bounded overlays and the active diagram
+      // document instead).
+      seedWriteBaselines(s0, sharded && !bootFromServer)
+      // These ARE the boot's baselines — a later boot write (the failed boot's,
+      // below) must never re-seed them from a store that already holds an
+      // unwritten edit.
+      bootBaselinesSeeded = true
+      // G4-16l: from here the debt is the flush's to write — set with the
+      // baselines, not at the subscription below, so a throw in between does
+      // not leave a 'boot' writer whose window base is gone.
+      residentDebtWriter = 'session'
       // The small-collection capture baselines, seeded from the SAME
       // just-projected state, for the same reason as lastModelSlices — and
       // for a sharper one: before the first seed the diff treats
@@ -7945,6 +11177,23 @@ export async function startBridge(ref: WorkspaceRef = DEFAULT_WORKSPACE_REF): Pr
     }
 
     storeUnsub = useModelStore.subscribe(onStoreChange)
+    // The edits made during the boot, as one store change: noted, scheduled,
+    // written like any other.
+    if (bootEdited) onStoreChange(useModelStore.getState(), bootEdited)
+    // Held pointers on metas only the network can name — after
+    // the first render, in the background.
+    if (pendingSetAside) void resumeSetAsideModelShards()
+    // The batch re-apply — the actors this profile wrote with first,
+    // then the override rows for them (on boot, after a hop, periodically).
+    // Only on a workspace with epochs, and for THIS session (a switch during
+    // the read must not install the old one's).
+    const overridesSession = durableAckEpoch
+    void hydrateLocalActors().then(() => {
+      if (!started || overridesSession !== durableAckEpoch) return
+      overridesReady = true
+      if (epochCapability && !uninstallEpochOverrides) uninstallEpochOverrides = installEpochOverridePorts()
+      void probeEpochCapability()
+    })
     if (activeDiagramId && pendingPlacementIntents.hasPending(workspaceRefKey(currentRef), activeDiagramId)) {
       scheduleWrite('placement')
     }
@@ -8041,6 +11290,23 @@ export async function startBridge(ref: WorkspaceRef = DEFAULT_WORKSPACE_REF): Pr
     }
     started = false
     activeDocumentShare.endSession()
+    // A failed boot leaves no boot-edit watch behind (this boot is not
+    // superseded: checked just above). An edit made in the window before
+    // the failure is WRITTEN first. (Until G4-16l the cleanup
+    // also cancelled the window's retry and removed the only `pagehide`
+    // listener; both are the session driver's now, and stay.)
+    // Only while the window is still open.
+    // Past the subscription the edit is the flush's to write (it reads
+    // `workspaceContractStale`; this path does not), and a write here would
+    // seed its baselines from the store holding that edit, i.e. erase it.
+    // G4-16l, case 3: through a write that never throws — a throw there used
+    // to skip everything below and leave the loader on "connecting". What it
+    // could not write (refused, or failed) stays owed and is the session
+    // driver's: the window closes, the driver and its `pagehide` listener do
+    // not (case 1).
+    tryWriteBootDebt()
+    stopWatchingBootEdits()
+    if (residentPendingWrites.size > 0) residentDebtDriver?.arm()
     // A CONTRACT failure is terminal AND local. Every recovery
     // below — the cached-root re-entry and both rebounds — answers the question
     // "can this REFERENCE resolve?", and here it can: the root resolved, was
@@ -8092,6 +11358,23 @@ export async function startBridge(ref: WorkspaceRef = DEFAULT_WORKSPACE_REF): Pr
         bootFallbackReentryPending = true
         return startBridge(ref)
       }
+    }
+    // T-DIAGDEF-2 (B): the root request got NO answer and nothing local could
+    // stand in (`fetchRootUrl` already tried the cached root). That says
+    // nothing about the REFERENCE, so neither rebound below applies — and both
+    // would ask the same unreachable server again, with requests of no bound
+    // of their own: behind a server that accepts and never answers, the
+    // auth-on rebound's `listLandscapes` held the switch for good (measured:
+    // still loading 90 s after the click, `e2e/boot/workspace-switch-server-
+    // down.spec.ts`). An honest error, with its cause, ends the boot.
+    if (err instanceof WorkspaceRootUnreachableError) {
+      if (isFallbackReentry) {
+        abandonPreferredCachedRoot(ref)
+        forgetWorkspaceHandles(ref)
+      }
+      console.error('Automerge bridge failed to start:', err)
+      useAutomergeStatus.getState().setStatus('error', err.message, 'server-unreachable')
+      return
     }
     // A persisted/pinned ref can point at a version or draft whose root document no
     // longer exists — a draft merged or deleted on another device, or (in dev) a
@@ -8198,7 +11481,38 @@ export function stopBridge(): void {
   // workspace can be satisfied by a session that is being torn down.
   useAutomergeStatus.getState().clearWorkspaceProjection()
   disarmDeferredInitialPick()
-  flushPendingWritesForLifecycle()
+  // Before the lifecycle flush: a latch held now must not pause it.
+  stopEpochHop()
+  uninstallEpochOverrides?.()
+  uninstallEpochOverrides = null
+  overridesReady = false
+  setEpochCapabilityListener(null)
+  persistLocalActorsNow()
+  localActorIds.clear()
+  // G4-16l: a throw out of this flush (from `writeModelShards`, case 3's fault)
+  // used to abort the whole stop — the driver left running, the epoch not
+  // bumped, `started` left true so every later `startBridge` returned at once.
+  // Logged; the teardown goes on.
+  try {
+    flushPendingWritesForLifecycle()
+  } catch (error) {
+    console.error('Automerge bridge: the stop\'s lifecycle flush failed; the session is torn down anyway', error)
+  }
+  // Pre-existing, made visible: a debt the flush could not write (the store not
+  // the projection, a write that threw) is cleared below with the session, and
+  // lost.
+  if (residentPendingWrites.size > 0) {
+    console.warn(`Automerge bridge: ${residentPendingWrites.size} local edit(s) no document holds are dropped with the session`)
+  }
+  // G4-16l: the debt's driver ends with its session — after the lifecycle
+  // flush, before the debt is cleared (its timer and its listener with it).
+  residentDebtDriver?.stop()
+  residentDebtDriver = null
+  residentDebtWriter = null
+  // The stop's lifecycle flush wrote the store's local values; the overlay
+  // belongs to this session's projections.
+  residentPendingWrites.clear()
+  stopAbsentReleaseTimer()
   // AFTER the final lifecycle flush, never before: that flush legitimately
   // creates documents that must still be named with the OUTGOING workspace's
   // ids (mintedIdReserve's drainReserve contract).
@@ -8206,6 +11520,12 @@ export function stopBridge(): void {
   // Before the epoch moves: a session that has read the ledger writes it whole
   // here; after the bump the same call could only add to it.
   queueDurableLedgerPersistence()
+  // T-DIAGDEF: what this session still owes its server — the
+  // lifecycle flush above has just written into its documents whatever the
+  // write debounce held (a not-open diagram's delete, 150 ms) — handed to a
+  // workspace switch, which drains it on the OUTGOING transport before routing
+  // the socket away (`switchWorkspace.ts`, `workspaceSwitchDrain.ts`).
+  stoppedSessionDebt = { ref: currentRef, documents: durableHeads.snapshot() }
   durableAckEpoch += 1
   if (durableAckTimer) clearTimeout(durableAckTimer)
   durableAckTimer = null
@@ -8223,6 +11543,7 @@ export function stopBridge(): void {
   cancelDeferredOverlayHydration?.()
   cancelDeferredOverlayHydration = null
   writeScheduler.cancel()
+  clearHeldDeletionRetry()
   if (overlayAckTimer) clearTimeout(overlayAckTimer)
   overlayAckTimer = null
   void persistOverlayBatchJournal(workspaceKvStore(), workspaceRefKey(currentRef)).catch((error) => {
@@ -8255,6 +11576,7 @@ export function stopBridge(): void {
   pendingDurableDiagramDocs.clear()
   if (storeUnsub) storeUnsub()
   storeUnsub = null
+  stopWatchingBootEdits()
   if (rootHandle && rootChangeHandler) rootHandle.off('change', rootChangeHandler)
   rootChangeHandler = null
   if (modelHandle && modelChangeHandler) modelHandle.off('change', modelChangeHandler)
@@ -8332,6 +11654,7 @@ export function stopBridge(): void {
   unTombConnections.clear()
   tombstoneDiagrams.clear()
   unTombDiagrams.clear()
+  retiredSessionDiagramIds.clear()
   decisionRecordPageBaseline.clear()
   lastSmall = null
   smallCapture.reset()
@@ -8509,6 +11832,9 @@ if (import.meta.env.DEV && typeof window !== 'undefined') {
   // (deleteObject/deleteConnection/addGroup/addGroupToDiagram/deleteGroup/updateGroup/…)
   // for validating the boot-from-server write paths end-to-end.
   w.__modelStore = useModelStore
+  // DEV: the durability badge and the epoch hop's face (G4-16f e2e probes).
+  w.__automergeStatus = useAutomergeStatus
+  w.__epochHopStore = useEpochHopStore
   // DEV: the stores the ROUTE layer reads, from the app's own module instance.
   // A probe cannot get at these with `import('/src/stores/…')` from the console —
   // Vite resolves that specifier to a SECOND module instance whose state is all
@@ -8535,11 +11861,11 @@ if (import.meta.env.DEV && typeof window !== 'undefined') {
     metaDeletedObj: modelMetaHandle?.doc()?.deletedObjectIds ?? null,
     metaDeletedConn: modelMetaHandle?.doc()?.deletedConnectionIds ?? null,
     metaDeletedDiagram: modelMetaHandle?.doc()?.deletedDiagramIds ?? null,
-    metaObjShardCount: modelMetaHandle?.doc()?.objectShardUrls?.length ?? null,
-    metaConnShardCount: modelMetaHandle?.doc()?.connectionShardUrls?.length ?? null,
+    metaObjShardCount: readMetaUrls(modelMetaHandle?.doc(), 'objectShardUrls')?.length ?? null,
+    metaConnShardCount: readMetaUrls(modelMetaHandle?.doc(), 'connectionShardUrls')?.length ?? null,
     overlayWriteHeadVersion: modelMetaHandle?.doc()?.editsOverlayWriteHeadVersion ?? null,
-    objectOverlaySegmentCount: modelMetaHandle?.doc()?.editsObjectShardUrls?.length ?? 0,
-    connectionOverlaySegmentCount: modelMetaHandle?.doc()?.editsConnectionShardUrls?.length ?? 0,
+    objectOverlaySegmentCount: readMetaUrls(modelMetaHandle?.doc(), 'editsObjectShardUrls')?.length ?? 0,
+    connectionOverlaySegmentCount: readMetaUrls(modelMetaHandle?.doc(), 'editsConnectionShardUrls')?.length ?? 0,
     resolvedObjectOverlayHeads: editsObjectSegmentHandles.length,
     resolvedConnectionOverlayHeads: editsConnectionSegmentHandles.length,
     editsObj: editsObjects.size,

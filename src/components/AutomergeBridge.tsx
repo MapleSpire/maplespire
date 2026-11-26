@@ -14,7 +14,7 @@
 
 import { useEffect } from 'react'
 import { startBridge, stopBridge } from '../lib/automerge/bridge'
-import { currentWorkspaceRef, setActiveWorkspaceRef } from '../lib/automerge/workspace'
+import { currentWorkspaceRef, setActiveWorkspaceRef, workspaceRefEquals } from '../lib/automerge/workspace'
 import { resolveBootWorkspaceRef } from '../lib/automerge/bootRef'
 import { readUrlWorkspaceRef } from '../lib/automerge/urlRef'
 import { useAuthStore } from '../stores/authStore'
@@ -81,7 +81,15 @@ export function AutomergeBridge() {
       // this workspace AND the server enforces writes (stage 'on'). UX only —
       // the server's sync/REST write gates are the actual authority, so the
       // fail-open default inside workspaceAccess() is safe.
-      const access = user ? await workspaceAccess(ref.landscapeId, ref.versionId) : null
+      const access = user ? await workspaceAccess(ref.landscapeId, ref.versionId, {
+        // T-DIAGDEF-2 (B): failed open for want of an answer, a late one
+        // still locks the editor while this boot's workspace is the live one.
+        onLateAnswer: (late) => {
+          if (!cancelled && workspaceRefEquals(currentWorkspaceRef(), ref)) {
+            useModelStore.getState().setWorkspaceReadOnly(late.enforced && !late.canWrite)
+          }
+        },
+      }) : null
       if (cancelled) return
       useModelStore.getState().setWorkspaceReadOnly(!!access && access.enforced && !access.canWrite)
       await startBridge(ref)

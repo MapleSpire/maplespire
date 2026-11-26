@@ -20,6 +20,7 @@ import 'dotenv/config'
 import { isValidAutomergeUrl, Repo, type AutomergeUrl } from '@automerge/automerge-repo'
 import { PostgresStorageAdapter } from '../src/automergeStorage.js'
 import { initSchema, pool } from '../src/db.js'
+import { withMetaUrlView } from '../src/modelMetaUrls.js'
 import { ensureReadModelSchema } from '../src/readModel/schema.js'
 import {
   materializeAcknowledgedOverlayState,
@@ -71,7 +72,10 @@ async function main(): Promise<void> {
   const oldMetaHandle = await repo.find<PerformanceControlMetaInput>(oldMetaUrl as AutomergeUrl)
   await oldMetaHandle.whenReady()
 
-  const source = oldMetaHandle.doc() ?? {}
+  // A plain-string view under the OLD field names, without the scalar copies or
+  // the marker: every read below is of the RULING URLs, and the new ModelMeta
+  // seeded from this copy is born under text authority (no stale marker).
+  const source = withMetaUrlView(oldMetaHandle.doc() ?? {})
   let prunedObjectOverlays = 0
   let prunedConnectionOverlays = 0
   let prunedQualificationTombstones = 0

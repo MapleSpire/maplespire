@@ -91,6 +91,100 @@ describe('AutomergeResidencyLeases', () => {
     expect(repo.handles[kept.documentId]).toBe(kept)
   })
 
+  // T-ZEROWM-3: the eviction intent of a releasing
+  // owner survives an owner that only relinquishes — whatever the order.
+  describe('relinquish and the eviction intent', () => {
+    it('a lone relinquish leaves the document resident and unleased', async () => {
+      const repo = new Repo({ network: [] })
+      const handle = repo.create({ objects: { a: { id: 'a' } } })
+      const residency = new AutomergeResidencyLeases(repo)
+      residency.acquireTransient(handle, 'recovery', 'ls/v1')
+      expect(residency.relinquish(handle.documentId, 'recovery')).toBe(true)
+      await residency.drain()
+      expect(residency.isLeased(handle.documentId)).toBe(false)
+      expect(repo.handles[handle.documentId], 'still resident: nobody asked for its eviction').toBe(handle)
+      expect(residency.relinquish(handle.documentId, 'recovery'), 'not held any more').toBe(false)
+    })
+
+    it('a release while a transient owner holds it is REMEMBERED: the last relinquish evicts', async () => {
+      const repo = new Repo({ network: [] })
+      const handle = repo.create({ objects: { a: { id: 'a' } } })
+      const residency = new AutomergeResidencyLeases(repo)
+      residency.acquireTransient(handle, 'recovery', 'ls/v1')
+      residency.acquire(handle, 'retiring', 'ls/v1')
+      expect(residency.release(handle.documentId, 'retiring')).toBe(true)
+      await residency.drain()
+      expect(repo.handles[handle.documentId], 'control: the transient owner still holds it').toBe(handle)
+      residency.relinquish(handle.documentId, 'recovery')
+      await residency.drain()
+      expect(repo.handles[handle.documentId], 'the remembered eviction is carried out').toBeUndefined()
+    })
+
+    it('the same through releaseOwner and replaceOwner', async () => {
+      const repo = new Repo({ network: [] })
+      const a = repo.create({ objects: { a: { id: 'a' } } })
+      const b = repo.create({ objects: { b: { id: 'b' } } })
+      const residency = new AutomergeResidencyLeases(repo)
+      residency.acquireTransient(a, 'recovery-a', 'ls/v1')
+      residency.acquire(a, 'write-head', 'ls/v1')
+      residency.releaseOwner('write-head')
+      residency.acquireTransient(b, 'recovery-b', 'ls/v1')
+      residency.acquire(b, 'slot', 'ls/v1')
+      residency.replaceOwner(a, 'slot', 'ls/v1')
+      residency.relinquish(a.documentId, 'recovery-a')
+      residency.relinquish(b.documentId, 'recovery-b')
+      await residency.drain()
+      expect(repo.handles[b.documentId], 'replaceOwner moved the slot away: b goes').toBeUndefined()
+      // `a` was re-acquired by `slot` (an owner that keeps it): the intent of
+      // `write-head` is cleared, and `slot` still holds it.
+      expect(repo.handles[a.documentId]).toBe(a)
+      expect(residency.isLeased(a.documentId)).toBe(true)
+    })
+
+    it('an owner that wants it KEPT clears the intent; a transient one does not', async () => {
+      const repo = new Repo({ network: [] })
+      const kept = repo.create({ objects: { a: { id: 'a' } } })
+      const gone = repo.create({ objects: { b: { id: 'b' } } })
+      const residency = new AutomergeResidencyLeases(repo)
+      for (const handle of [kept, gone]) {
+        residency.acquireTransient(handle, 'recovery', 'ls/v1')
+        residency.acquire(handle, 'retiring', 'ls/v1')
+        residency.release(handle.documentId, 'retiring')
+      }
+      residency.acquire(kept, 'editor', 'ls/v1')
+      residency.acquireTransient(gone, 'sweep', 'ls/v1')
+      residency.relinquish(kept.documentId, 'recovery')
+      residency.relinquish(gone.documentId, 'recovery')
+      residency.relinquish(gone.documentId, 'sweep')
+      await residency.drain()
+      expect(repo.handles[kept.documentId], 'cleared by the keeping owner, which still holds it').toBe(kept)
+      expect(residency.isLeased(kept.documentId)).toBe(true)
+      expect(repo.handles[gone.documentId], 'kept by the transient owners, carried out by the last').toBeUndefined()
+      // The keeping owner leaving last by `release` evicts, as always.
+      residency.release(kept.documentId, 'editor')
+      await residency.drain()
+      expect(repo.handles[kept.documentId]).toBeUndefined()
+    })
+
+    it('the pairing is enforced: an owner taken by acquire that relinquishes leaves as by release', async () => {
+      const repo = new Repo({ network: [] })
+      const alone = repo.create({ objects: { a: { id: 'a' } } })
+      const shared = repo.create({ objects: { b: { id: 'b' } } })
+      const residency = new AutomergeResidencyLeases(repo)
+      residency.acquire(alone, 'keeper', 'ls/v1')
+      residency.acquire(shared, 'keeper', 'ls/v1')
+      residency.acquireTransient(shared, 'recovery', 'ls/v1')
+      residency.relinquish(alone.documentId, 'keeper')
+      residency.relinquish(shared.documentId, 'keeper')
+      await residency.drain()
+      expect(repo.handles[alone.documentId], 'evicted, as a release would').toBeUndefined()
+      expect(repo.handles[shared.documentId], 'control: the transient owner still holds it').toBe(shared)
+      residency.relinquish(shared.documentId, 'recovery')
+      await residency.drain()
+      expect(repo.handles[shared.documentId], 'the keeper\'s leaving was remembered as an eviction').toBeUndefined()
+    })
+  })
+
   it('never evicts the protected process root', async () => {
     const repo = new Repo({ network: [] })
     const root = repo.create({ modelUrl: '', shardUrls: [] as string[] })

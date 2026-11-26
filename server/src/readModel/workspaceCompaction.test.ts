@@ -14,7 +14,9 @@
 
 import { describe, it, expect, vi } from 'vitest'
 import { Repo, type DocHandle } from '@automerge/automerge-repo'
+import * as A from '@automerge/automerge'
 import { runWorkspaceCompaction, type WorkspaceCompactionDeps } from './workspaceCompaction.js'
+import { modelEpochConfig } from './modelEpochConfig.js'
 import type { Queryable } from './types.js'
 import type { WorkspaceKey } from './projector.js'
 
@@ -79,17 +81,84 @@ interface FakeDbOptions {
   /** Flips what the projection row reports after a re-attach, to model a stale
    *  row being healed. */
   onRefresh?: () => void
+  /** G4-16f guard (g): a model epoch forward journal is open. */
+  forwardJournalOpen?: boolean
+  /** Dismissed override rows (entity_id, path, late_value). */
+  declined?: Array<{ entity_id: string; path: string[]; late_value: unknown }>
 }
 
 /** Answers the only two statements this pass issues, and REFUSES anything else:
  *  a fake that quietly returns `{rows: []}` to an unexpected statement turns a
  *  new query into a silent false. It also asserts the workspace it was asked
  *  about — without that, pointing any call site at a different key is invisible. */
-function fakeDb(opts: FakeDbOptions): Queryable & { staticReads: () => number } {
+/** The statements `fakeDb` answered on the G4-16k scan table, in order. */
+const overlayScanStatements: string[] = []
+
+function fakeDb(opts: FakeDbOptions, scanRows = new Map<string, string[]>(),
+  scanLateSeen = new Map<string, Record<string, number>>()): Queryable & { staticReads: () => number } {
   let staticReads = 0
   return {
     staticReads: () => staticReads,
     async query<R extends Record<string, unknown>>(text: string, params?: unknown[]) {
+      // G4-16f guard (g): no epoch forward table in this fake — the pass reads
+      // "no journal open" and goes on. Asked before the workspace parameters:
+      // the existence probe has none.
+      // The per-pass gate (`modelEpochRowsExist`): the table, then "any row".
+      if (text.includes("'.read_model_model_epochs'") && !text.includes('epoch_docs')) {
+        return { rows: [{ present: opts.forwardJournalOpen ?? false }] as unknown as R[], rowCount: 1 }
+      }
+      if (text.includes('EXISTS (SELECT 1 FROM read_model_model_epochs WHERE')) {
+        expect(params, OTHER_KEY_PARAMS).toEqual([KEY.landscapeId, KEY.versionId])
+        return { rows: [{ any: true }] as unknown as R[], rowCount: 1 }
+      }
+      // The forwarder that runs before the guard: no published epoch here.
+      if (text.includes('FROM read_model_model_epochs') && text.includes("state = 'published'")) {
+        return { rows: [] as unknown as R[], rowCount: 0 }
+      }
+      if (text.includes("'.read_model_model_epoch_forwards'")) {
+        return { rows: [{ present: opts.forwardJournalOpen ?? false }] as unknown as R[], rowCount: 1 }
+      }
+      if (text.includes('FROM read_model_model_epoch_forwards')) {
+        expect(params, OTHER_KEY_PARAMS).toEqual([KEY.landscapeId, KEY.versionId])
+        return { rows: [{ open: true }] as unknown as R[], rowCount: 1 }
+      }
+      // The epoch override table, with the dismissed rows the test gives.
+      if (text.includes("'.read_model_model_epoch_overrides'")) {
+        return { rows: [{ present: (opts.declined ?? []).length > 0 }] as unknown as R[], rowCount: 1 }
+      }
+      if (text.includes('FROM read_model_model_epoch_overrides')) {
+        expect(params?.slice(0, 2), OTHER_KEY_PARAMS).toEqual([KEY.landscapeId, KEY.versionId])
+        // An unexpected statement must not be answered as "no row": the
+        // production step catches a throw here as a reported failure, which a
+        // test asserting "never written back" would read as a pass.
+        if (!text.includes("state IN ('dismissed', 'pending')")) throw new Error(`unexpected override statement: ${text}`)
+        const rows = (opts.declined ?? []).map((row) => ({ state: 'dismissed', ...row }))
+        return { rows: rows as unknown as R[], rowCount: rows.length }
+      }
+      // G4-16k: the rematerialization's scan store (`overlayClearScanStore`).
+      if (text.includes('read_model_overlay_clear_scans')) {
+        expect(params?.slice(0, 2), OTHER_KEY_PARAMS).toEqual([KEY.landscapeId, KEY.versionId])
+        const verb = text.trim().split(/\s+/)[0]
+        const collection = String(params?.[2])
+        overlayScanStatements.push(`${verb} ${collection}`)
+        // Keeps what was saved, as the table does (per fake: one workspace's
+        // run), in the order it was saved (the store reads oldest first).
+        if (verb === 'INSERT') {
+          const ids = params?.[3] as string[]
+          const heads = params?.[4] as string[]
+          const lateSeen = params?.[5] as string[]
+          ids.forEach((id, i) => {
+            scanRows.delete(`${collection}:${id}`)
+            scanRows.set(`${collection}:${id}`, heads[i].split(','))
+            scanLateSeen.set(`${collection}:${id}`, JSON.parse(lateSeen[i]) as Record<string, number>)
+          })
+          return { rows: [] as R[], rowCount: ids.length }
+        }
+        if (verb === 'DELETE') throw new Error('no segment is gone in this fake')
+        const rows = [...scanRows].filter(([k]) => k.startsWith(`${collection}:`))
+          .map(([k, h]) => ({ document_id: k.slice(collection.length + 1), scanned_heads: h, late_seen: scanLateSeen.get(k) ?? {} }))
+        return { rows: rows as unknown as R[], rowCount: rows.length }
+      }
       expect(params, OTHER_KEY_PARAMS).toEqual([KEY.landscapeId, KEY.versionId])
       if (text.includes('read_model_static_workspaces')) {
         staticReads += 1
@@ -115,6 +184,57 @@ function fakeDb(opts: FakeDbOptions): Queryable & { staticReads: () => number } 
       throw new Error(`workspaceCompaction issued an unexpected statement: ${text.slice(0, 80)}`)
     },
   }
+}
+
+/** The pooled clients the pass takes for its two `overlay-rotation:` keys
+ * (G4-16i), and the settle transaction it commits on them. Answers exactly
+ * the statements that path issues and REFUSES anything else, like `fakeDb`.
+ * `locked` decides each acquisition, in order (`true` when unset); every
+ * statement and every hand-back is recorded in `events`, in order. A workspace
+ * with no retirement rows: the settle commits having written nothing. */
+function fakeConnect(locked: boolean[] = [], events: string[] = [], fence: () => string | null = () => 'this-cell') {
+  let acquisitions = 0
+  const connect = async () => {
+    const id = `client${events.filter((event) => event.startsWith('connect ')).length + 1}`
+    events.push(`connect ${id}`)
+    return {
+      async query<R extends Record<string, unknown>>(text: string, params?: unknown[]) {
+        if (text.includes('pg_try_advisory_lock(')) {
+          const answer = locked[acquisitions] ?? true
+          acquisitions += 1
+          events.push(`${id} lock ${String(params?.[0])} ${answer}`)
+          return { rows: [{ locked: answer }] as unknown as R[], rowCount: 1 }
+        }
+        if (text.includes('pg_advisory_unlock(')) {
+          events.push(`${id} unlock ${String(params?.[0])}`)
+          return { rows: [{ released: true }] as unknown as R[], rowCount: 1 }
+        }
+        if (text.startsWith('BEGIN') || text === 'COMMIT' || text === 'ROLLBACK') {
+          events.push(`${id} ${text.split(';')[0]}`)
+          return { rows: [] as R[], rowCount: 0 }
+        }
+        expect(params?.slice(0, 2), OTHER_KEY_PARAMS).toEqual([KEY.landscapeId, KEY.versionId])
+        if (text.includes('read_model_static_workspaces') && text.includes('FOR KEY SHARE')) {
+          return { rows: [] as R[], rowCount: 0 }
+        }
+        // The settle's write fence: held by THIS cell's projector unless the
+        // test moved it.
+        if (text.includes('read_model_projection_state') && text.includes('FOR UPDATE')) {
+          events.push(`${id} fence`)
+          // `participant`: the connection's protocol version, which the
+          // assertion refuses below 2 (protocolParticipant.ts).
+          return { rows: [{ write_fence: fence(), participant: 2 }] as unknown as R[], rowCount: 1 }
+        }
+        if (text.includes('FROM read_model_ordinary_head_retirements')) {
+          events.push(`${id} rows`)
+          return { rows: [] as R[], rowCount: 0 }
+        }
+        throw new Error(`the rotation-key client got an unexpected statement: ${text.slice(0, 80)}`)
+      },
+      release(destroy?: Error | boolean) { events.push(`release ${id}${destroy ? ' destroyed' : ''}`) },
+    }
+  }
+  return { connect, events }
 }
 
 interface Fixture {
@@ -180,6 +300,8 @@ interface Spies {
   deps: WorkspaceCompactionDeps
   releases: () => number
   ensures: () => number
+  /** What each `ensure` was asked (G4-16f C6-2a: compaction never adopts). */
+  ensureOptions: () => unknown[]
   warnings: () => string[]
   keysSeen: () => string[]
 }
@@ -187,6 +309,7 @@ interface Spies {
 function spied(f: Fixture, db: Queryable, over: Partial<WorkspaceCompactionDeps> = {}): Spies {
   let releases = 0
   let ensures = 0
+  const ensureOptions: unknown[] = []
   const warnings: string[] = []
   const keysSeen: string[] = []
   const note = (key: WorkspaceKey) => { keysSeen.push(`${key.landscapeId}/${key.versionId}`) }
@@ -194,11 +317,12 @@ function spied(f: Fixture, db: Queryable, over: Partial<WorkspaceCompactionDeps>
     repo: f.repo,
     rootUrl: f.rootUrl,
     db,
+    connect: fakeConnect().connect,
     fleet: {
       isResident: (key) => { note(key); return true },
       // `true` is STATED: `false` means "attached nothing"
       // (`skipped_reattach_no_root`).
-      ensure: async (key) => { note(key); ensures += 1; return true },
+      ensure: async (key, options) => { note(key); ensureOptions.push(options); ensures += 1; return true },
       release: (key) => { note(key); releases += 1 },
       residentProjectorInstanceId: (key) => { note(key); return 'this-cell' },
     },
@@ -208,7 +332,10 @@ function spied(f: Fixture, db: Queryable, over: Partial<WorkspaceCompactionDeps>
     warn: (m) => { warnings.push(m) },
     ...over,
   }
-  return { deps, releases: () => releases, ensures: () => ensures, warnings: () => warnings, keysSeen: () => keysSeen }
+  return {
+    deps, releases: () => releases, ensures: () => ensures, ensureOptions: () => ensureOptions,
+    warnings: () => warnings, keysSeen: () => keysSeen,
+  }
 }
 
 /** Every fake was handed the workspace under test and no other. */
@@ -232,15 +359,63 @@ describe('runWorkspaceCompaction (T-28d)', () => {
       'a document was claimed for the wrong workspace').toEqual([`${KEY.landscapeId}/${KEY.versionId}`])
   })
 
+  it('G4-16k: the pass reads and records its overlay rematerialization scans for THIS workspace', async () => {
+    // Without the `clearScans` wiring every pass would read each segment's
+    // whole history, and a segment a singular-pointer meta forgets after its
+    // head rotates would never be scanned again.
+    overlayScanStatements.length = 0
+    const f = await fixture()
+    const s = spied(f, fakeDb({}))
+    await runWorkspaceCompaction(KEY, s.deps)
+    expect(overlayScanStatements).toEqual(['SELECT object', 'INSERT object', 'SELECT connection', 'INSERT connection'])
+  })
+
+  it('G4-16k: the production pass gives a late edit the browser\'s grace period (a day) before writing it back', async () => {
+    const f = await fixture()
+    const rows = new Map<string, string[]>()
+    const marie = A.clone(f.overlay.doc() as A.Doc<{ objects: Record<string, Obj> }>)
+    await runWorkspaceCompaction(KEY, spied(f, fakeDb({}, rows)).deps)
+    expect(f.overlay.doc()?.objects.o0).toBeUndefined()
+    const edited = A.change(marie, (d) => { d.objects.o0.name = 'hers-offline' })
+    f.overlay.update((doc) => A.merge(doc, edited))
+    await runWorkspaceCompaction(KEY, spied(f, fakeDb({}, rows)).deps)
+    expect(f.base.doc()?.objects.o0.name).toBe('A-edited')
+    // Control: with no grace, the same pass writes it back.
+    vi.stubEnv('OVERLAY_CLEAR_REMATERIALIZE_GRACE_MS', '0')
+    try {
+      await runWorkspaceCompaction(KEY, spied(f, fakeDb({}, rows)).deps)
+    } finally { vi.unstubAllEnvs() }
+    expect(f.base.doc()?.objects.o0.name).toBe('hers-offline')
+  })
+
+  it('the production pass never writes back a write she dismissed in the batch re-apply', async () => {
+    const f = await fixture()
+    const rows = new Map<string, string[]>()
+    const marie = A.clone(f.overlay.doc() as A.Doc<{ objects: Record<string, Obj> }>)
+    await runWorkspaceCompaction(KEY, spied(f, fakeDb({}, rows)).deps)
+    f.overlay.update((doc) => A.merge(doc, A.change(marie, (d) => { d.objects.o0.name = 'hers-offline' })))
+    const declined = [{ entity_id: 'o0', path: ['objects', 'o0', 'name'], late_value: 'hers-offline' }]
+    vi.stubEnv('OVERLAY_CLEAR_REMATERIALIZE_GRACE_MS', '0')
+    let outcome: Awaited<ReturnType<typeof runWorkspaceCompaction>>
+    try {
+      outcome = await runWorkspaceCompaction(KEY, spied(f, fakeDb({ declined }, rows)).deps)
+    } finally { vi.unstubAllEnvs() }
+    expect(f.base.doc()?.objects.o0.name).toBe('A-edited')
+    // Not written back BECAUSE it was declined — not because the step failed
+    // (a fake that threw on the query used to pass this test).
+    expect(outcome!.result.rematerializeFailed).toBeUndefined()
+  })
+
   it('ENSURES residency before folding when the workspace is not resident', async () => {
     // `isResident` is `() => true` everywhere else, so only this test exercises
     // the pre-fold `ensure`.
     const f = await fixture()
     let ensures = 0
+    const asked: unknown[] = []
     const s = spied(f, fakeDb({}), {
       fleet: {
         isResident: () => false,
-        ensure: async () => { ensures += 1 },
+        ensure: async (_key, options) => { asked.push(options); ensures += 1; return true },
         release: () => undefined,
         residentProjectorInstanceId: () => 'this-cell',
       },
@@ -248,6 +423,8 @@ describe('runWorkspaceCompaction (T-28d)', () => {
     await runWorkspaceCompaction(KEY, s.deps)
     // Once before the fold, once in the `finally`.
     expect(ensures, 'a non-resident workspace was compacted without being ensured first').toBe(2)
+    // G4-16f C6-2a: neither may ADOPT.
+    expect(asked).toEqual([{ adopt: false }, { adopt: false }])
   })
 
   it('CONTROL — folds BOTH collections and reports honest counts', async () => {
@@ -268,12 +445,108 @@ describe('runWorkspaceCompaction (T-28d)', () => {
     // Detach-then-re-attach actually happened.
     expect(s.releases(), 'the read plane was never detached before the writes').toBe(1)
     expect(s.ensures(), 'the read plane was never put back').toBe(1)
+    // G4-16f C6-2a: the re-attach is a cold build, never an adoption.
+    expect(s.ensureOptions()).toEqual([{ adopt: false }])
     expectOnlyTheKeyUnderTest(s)
 
     // The fold reached the OVERLAY documents by url, and the value moved.
     expect(f.base.doc()!.objects.o0.name).toBe('A-edited')
     expect(f.overlay.doc()!.objects.o0, 'the overlay was not cleared by a successful pass').toBeUndefined()
     expect(f.connBase.doc()!.connections.c0.toId).toBe('o9')
+  })
+
+  it('F1 — after a pass that applied, each base shard (both collections) is handed to the storage compaction, before the re-attach', async () => {
+    const f = await fixture()
+    const order: string[] = []
+    const compacted: Array<{ documentId: string; name: unknown }> = []
+    const s = spied(f, fakeDb({}), {
+      compactDocumentStorage: async (documentId, doc) => {
+        order.push('storage')
+        compacted.push({ documentId, name: (doc as { objects?: { o0?: { name?: unknown } } }).objects?.o0?.name })
+        return { outcome: 'compacted', rowsBefore: 3, removed: 3, kept: 0, snapshotOctets: 10, remembered: true, ms: 1 }
+      },
+    })
+    const ensure = s.deps.fleet.ensure
+    s.deps.fleet.ensure = async (key, options) => { order.push('ensure'); return ensure(key, options) }
+    const logs: string[] = []
+    s.deps.log = (m) => { logs.push(m) }
+    const outcome = await runWorkspaceCompaction(KEY, s.deps)
+    expect(outcome.result.skippedReason).toBeUndefined()
+    expect(compacted.map((c) => c.documentId).sort()).toEqual([String(f.base.documentId), String(f.connBase.documentId)].sort())
+    // The document handed over is the FOLDED one.
+    expect(compacted.find((c) => c.documentId === String(f.base.documentId))!.name).toBe('A-edited')
+    expect(order).toEqual(['storage', 'storage', 'ensure'])
+    const line = logs.map((m) => { try { return JSON.parse(m) } catch { return null } }).find((e) => e?.event === 'compaction.base_storage')
+    expect(line).toMatchObject({ mode: 'on', shards: 2, compacted: 2, failed: 0, removed: 6, remembered: 2 })
+  })
+
+  it('F1 — a PROMOTION to summary between two shards stops the storage compaction (stillOwnedAndOrdinary)', async () => {
+    const f = await fixture()
+    let calls = 0
+    const logs: string[] = []
+    const s = spied(f, fakeDb({ isStatic: () => calls > 0 }), {
+      compactDocumentStorage: async () => {
+        calls += 1
+        return { outcome: 'compacted', rowsBefore: 2, removed: 2, kept: 0, snapshotOctets: 1, remembered: true, ms: 0 }
+      },
+      log: (m) => { logs.push(m) },
+    })
+    await runWorkspaceCompaction(KEY, s.deps)
+    expect(calls).toBe(1)
+    const line = logs.map((m) => { try { return JSON.parse(m) } catch { return null } }).find((e) => e?.event === 'compaction.base_storage')
+    expect(line).toMatchObject({ compacted: 1, stopped: true })
+  })
+
+  it('F1 — AM_BASE_SHARD_STORAGE_COMPACTION=off compacts nothing and says so in the line', async () => {
+    const f = await fixture()
+    let calls = 0
+    const logs: string[] = []
+    const s = spied(f, fakeDb({}), {
+      baseShardStorageCompaction: 'off',
+      compactDocumentStorage: async () => { calls += 1; throw new Error('unreachable') },
+      log: (m) => { logs.push(m) },
+    })
+    const outcome = await runWorkspaceCompaction(KEY, s.deps)
+    expect(outcome.result.skippedReason).toBeUndefined()
+    expect(calls).toBe(0)
+    const line = logs.map((m) => { try { return JSON.parse(m) } catch { return null } }).find((e) => e?.event === 'compaction.base_storage')
+    expect(line).toMatchObject({ mode: 'off', shards: 2, compacted: 0 })
+  })
+
+  it('F1 — a storage compaction that THROWS is reported and the pass stands', async () => {
+    const f = await fixture()
+    const s = spied(f, fakeDb({}), {
+      compactDocumentStorage: async () => { throw new Error('pool refused') },
+    })
+    const outcome = await runWorkspaceCompaction(KEY, s.deps)
+    expect(outcome.result.skippedReason).toBeUndefined()
+    expect(outcome.result.objectsFolded).toBe(1)
+    expect(outcome.reattach).toBe('reattached')
+    expect(s.warnings().filter((w) => /base shard storage compaction failed .* pool refused/.test(w))).toHaveLength(2)
+  })
+
+  it('F1 — stops at the first sign the cell may not write, and never runs on a refused pass', async () => {
+    const f = await fixture()
+    let calls = 0
+    let owned = true
+    const s = spied(f, fakeDb({}), {
+      ownership: { owns: () => owned },
+      compactDocumentStorage: async () => {
+        calls += 1
+        owned = false
+        return { outcome: 'compacted', rowsBefore: 2, removed: 2, kept: 0, snapshotOctets: 1, remembered: false, ms: 0 }
+      },
+    })
+    await runWorkspaceCompaction(KEY, s.deps)
+    expect(calls).toBe(1)
+    // A pass refused before writing compacts nothing.
+    const g = await fixture()
+    let refusedCalls = 0
+    const r = spied(g, fakeDb({ attached: false }), {
+      compactDocumentStorage: async () => { refusedCalls += 1; throw new Error('unreachable') },
+    })
+    await runWorkspaceCompaction(KEY, r.deps)
+    expect(refusedCalls).toBe(0)
   })
 
   it('refuses when the projection has NOT acknowledged every observed generation', async () => {
@@ -451,11 +724,12 @@ describe('runWorkspaceCompaction (T-28d)', () => {
         }
       },
     }
+    const asked: unknown[] = []
     const s = spied(f, db, {
       fleet: {
         isResident: () => true,
         // The re-attach is what rewrites the row, and it reports success.
-        ensure: async () => { healed = true; return true },
+        ensure: async (_key, options) => { asked.push(options); healed = true; return true },
         release: () => undefined,
         residentProjectorInstanceId: () => 'this-cell',
       },
@@ -464,6 +738,9 @@ describe('runWorkspaceCompaction (T-28d)', () => {
     expect(outcome.result.skippedReason,
       'a stale row from this cell latched compaction off instead of healing').toBeUndefined()
     expect(outcome.result.objectsFolded).toBe(1)
+    // G4-16f C6-2a: the refresh (then the post-fold re-attach) never adopts —
+    // the refresh reads the acknowledgement the moment `ensure` returns.
+    expect(asked).toEqual([{ adopt: false }, { adopt: false }])
   })
 
   it('GUARD (b) — proceeds when the instance MATCHES (control)', async () => {
@@ -474,6 +751,22 @@ describe('runWorkspaceCompaction (T-28d)', () => {
     const outcome = await runWorkspaceCompaction(KEY, s.deps)
     expect(outcome.result.skippedReason).toBeUndefined()
     expect(outcome.result.objectsFolded).toBe(1)
+  })
+
+  it('GUARD (g), G4-16f R4-a — refuses while a model epoch forward journal is open: nothing detached, nothing written', async () => {
+    const f = await fixture()
+    // `modelEpochs` present, flag OFF: with epoch rows the guard holds under
+    // every value of the flag (absent, the pass issues no epoch statement).
+    const s = spied(f, fakeDb({ attached: true, observed: '5', projected: '5', projectorInstanceId: 'this-cell', forwardJournalOpen: true }), {
+      modelEpochs: {
+        config: modelEpochConfig({}), instanceId: 'this-cell',
+        withLifecycleLock: async () => ({ granted: false }),
+      },
+    })
+    const outcome = await runWorkspaceCompaction(KEY, s.deps)
+    expect(outcome.result.skippedReason).toBe('epoch_forward_pending')
+    expect(outcome.reattach).toBe('not_detached')
+    expect(f.changes(), 'the pass WROTE under an open journal').toBe(0)
   })
 
   it('GUARD (c) — names the outcome when the re-attach is SKIPPED while shutting down', async () => {
@@ -574,6 +867,149 @@ describe('runWorkspaceCompaction (T-28d)', () => {
     expect(outcome.reattach).toBe('skipped_reattach_failed')
   })
 
+  it('G4-16f — a FAILED re-attach (thrown, or attaching nothing) is handed to the retry, once, with its cause; a successful, a not-owned and a never-detached pass are not', async () => {
+    const f = await fixture()
+    const handed: Array<{ key: string; cause: string; reason: string }> = []
+    const onReadPlaneLeftDetached = (key: WorkspaceKey, cause: unknown, reason: string) => {
+      handed.push({ key: `${key.landscapeId}/${key.versionId}`, cause: String(cause), reason })
+    }
+    const fleet = (ensure: () => Promise<boolean>) => ({
+      isResident: () => true, ensure, release: () => undefined, residentProjectorInstanceId: () => 'this-cell',
+    })
+    const thrown = new Error('StoragePoolExhaustedError: could not get a permit for "unfenced-mutation"')
+    const threw = await runWorkspaceCompaction(KEY, spied(f, fakeDb({}), {
+      fleet: fleet(async () => { throw thrown }), onReadPlaneLeftDetached,
+    }).deps)
+    expect(threw.reattach).toBe('skipped_reattach_failed')
+    expect(handed).toEqual([{ key: `${KEY.landscapeId}/${KEY.versionId}`, cause: String(thrown), reason: 'reattach_failed' }])
+
+    handed.length = 0
+    const noRoot = await runWorkspaceCompaction(KEY, spied(await fixture(), fakeDb({}), {
+      fleet: fleet(async () => false), onReadPlaneLeftDetached,
+    }).deps)
+    expect(noRoot.reattach).toBe('skipped_reattach_no_root')
+    expect(handed.map((entry) => [entry.key, entry.reason])).toEqual([[`${KEY.landscapeId}/${KEY.versionId}`, 'no_root']])
+
+    handed.length = 0
+    const ok = await runWorkspaceCompaction(KEY, spied(await fixture(), fakeDb({}), { onReadPlaneLeftDetached }).deps)
+    expect(ok.reattach).toBe('reattached')
+    const never = await runWorkspaceCompaction(KEY, spied(await fixture(), fakeDb({ isStatic: true }), { onReadPlaneLeftDetached }).deps)
+    expect(never.reattach).toBe('not_detached')
+    expect(handed, 'a re-attach that worked, or a pass that never detached, is not handed over').toEqual([])
+  })
+
+  it('G4-16f — ownership lost at the re-attach is handed over as not_owned (dormant, retried once owned again); a shutdown is not handed over', async () => {
+    const handed: string[] = []
+    const onReadPlaneLeftDetached = (_key: WorkspaceKey, _cause: unknown, reason: string) => { handed.push(reason) }
+    let calls = 0
+    const notOwned = await runWorkspaceCompaction(KEY, spied(await fixture(), fakeDb({}), {
+      ownership: { owns: () => { calls += 1; return calls <= 4 } }, onReadPlaneLeftDetached,
+    }).deps)
+    expect(notOwned.reattach, 'the same ownership count as GUARD (c) above').toBe('skipped_not_owned')
+    expect(handed).toEqual(['not_owned'])
+
+    handed.length = 0
+    let down = false
+    const shutdown = await runWorkspaceCompaction(KEY, spied(await fixture(), fakeDb({}), {
+      fleet: {
+        isResident: () => true, ensure: async () => true,
+        release: (_key, reason) => { if (reason === 'compaction') down = true },
+        residentProjectorInstanceId: () => 'this-cell',
+      },
+      isShuttingDown: () => down,
+      onReadPlaneLeftDetached,
+    }).deps)
+    expect(shutdown.reattach).toBe('skipped_shutting_down')
+    expect(handed).toEqual([])
+  })
+
+  it('G4-16f — a thrown re-attach is classified: ProjectorOwnershipError → not_owned; a stop or a promotion is not handed over', async () => {
+    const { ProjectorOwnershipError, ProjectorStaticWorkspaceError } = await import('./projectorService.js')
+    const { ColdBuildAdmissionStoppedError } = await import('./coldBuildAdmission.js')
+    const cases: Array<[Error, string[]]> = [
+      [new ProjectorOwnershipError(), ['not_owned']],
+      [new ColdBuildAdmissionStoppedError(), []],
+      [new ProjectorStaticWorkspaceError(KEY), []],
+    ]
+    for (const [error, expected] of cases) {
+      const handed: string[] = []
+      const outcome = await runWorkspaceCompaction(KEY, spied(await fixture(), fakeDb({}), {
+        fleet: {
+          isResident: () => true, ensure: async (_key, options) => { if (options?.adopt === false) throw error; return true },
+          release: () => undefined, residentProjectorInstanceId: () => 'this-cell',
+        },
+        onReadPlaneLeftDetached: (_key, _cause, reason) => { handed.push(reason) },
+      }).deps)
+      expect(outcome.reattach, error.name).toBe('skipped_reattach_failed')
+      expect(handed, error.name).toEqual(expected)
+    }
+  })
+
+  it('G4-16f — the instance refresh (guard (b)) hands a failed re-attach to the retry, and a throwing hook does not break the pass', async () => {
+    const f = await fixture()
+    const handed: string[] = []
+    const outcome = await runWorkspaceCompaction(KEY, spied(f, fakeDb({ projectorInstanceId: 'another-cell' }), {
+      fleet: {
+        isResident: () => true,
+        ensure: async () => { throw new Error('StoragePoolExhaustedError') },
+        release: () => undefined,
+        residentProjectorInstanceId: () => 'this-cell',
+      },
+      onReadPlaneLeftDetached: (key, _cause, reason) => { handed.push(`${key.versionId}:${reason}`); throw new Error('the hook broke') },
+    }).deps)
+    expect(outcome.result.skippedReason).toBe('foreign_projector_instance')
+    expect(outcome.reattach).toBe('skipped_reattach_failed')
+    expect(handed).toEqual([`${KEY.versionId}:reattach_failed`])
+  })
+
+  it('G4-16f — the instance refresh that attaches NOTHING is handed over as no_root', async () => {
+    const handed: string[] = []
+    const outcome = await runWorkspaceCompaction(KEY, spied(await fixture(), fakeDb({ projectorInstanceId: 'another-cell' }), {
+      fleet: { isResident: () => true, ensure: async () => false, release: () => undefined, residentProjectorInstanceId: () => 'this-cell' },
+      onReadPlaneLeftDetached: (_key, _cause, reason) => { handed.push(reason) },
+    }).deps)
+    expect(outcome.result.skippedReason).toBe('foreign_projector_instance')
+    expect(handed).toEqual(['no_root'])
+  })
+
+  it('G4-16f — every re-attach the pass runs is WATCHED: the pass\'s and the instance refresh\'s, settled after the ensure', async () => {
+    const watched: string[] = []
+    const watchReattach = (key: WorkspaceKey) => { watched.push(`start:${key.versionId}`); return () => { watched.push(`end:${key.versionId}`) } }
+    let inFlight = false
+    const fleet = {
+      isResident: () => true,
+      ensure: async () => { inFlight = true; await Promise.resolve(); expect(watched.at(-1)).toBe(`start:${KEY.versionId}`); inFlight = false; return true },
+      release: () => undefined,
+      residentProjectorInstanceId: () => 'this-cell',
+    }
+    await runWorkspaceCompaction(KEY, spied(await fixture(), fakeDb({}), { fleet, watchReattach }).deps)
+    expect(watched).toEqual([`start:${KEY.versionId}`, `end:${KEY.versionId}`])
+    expect(inFlight).toBe(false)
+    watched.length = 0
+    await runWorkspaceCompaction(KEY, spied(await fixture(), fakeDb({ projectorInstanceId: 'another-cell' }), {
+      fleet: { ...fleet, ensure: async () => { throw new Error('x') } }, watchReattach,
+    }).deps)
+    expect(watched, 'the refresh is watched, and settled when it throws').toEqual([`start:${KEY.versionId}`, `end:${KEY.versionId}`])
+  })
+
+  it('G4-16f — the log says "rebuilt" only when the re-attach attached, and the HTTP body carries the re-attach outcome', async () => {
+    const { compactionHttpBody } = await import('./workspaceCompaction.js')
+    const logs: string[] = []
+    const failed = await runWorkspaceCompaction(KEY, spied(await fixture(), fakeDb({}), {
+      fleet: { isResident: () => true, ensure: async (_k, o) => { if (o?.adopt === false) throw new Error('StoragePoolExhaustedError'); return true }, release: () => undefined, residentProjectorInstanceId: () => 'this-cell' },
+      log: (m) => { logs.push(m) },
+    }).deps)
+    const folded = logs.find((m) => m.startsWith('[compaction] folded'))!
+    expect(folded).not.toContain('read model rebuilt')
+    expect(folded).toContain('read model NOT rebuilt: the read plane is detached (skipped_reattach_failed)')
+    expect(compactionHttpBody(failed)).toMatchObject({ objectsFolded: 1, reattach: 'skipped_reattach_failed' })
+
+    logs.length = 0
+    const ok = await runWorkspaceCompaction(KEY, spied(await fixture(), fakeDb({}), { log: (m) => { logs.push(m) } }).deps)
+    expect(logs.find((m) => m.startsWith('[compaction] folded'))).toContain('; read model rebuilt')
+    expect(compactionHttpBody(ok)).toMatchObject({ reattach: 'reattached' })
+  })
+
   it('a refusal BEFORE the detach reports `not_detached`, not a skipped re-attach', async () => {
     // The four shapes must stay distinguishable: never detached, detached and
     // put back, detached and left, detach-then-re-attach-threw. Collapsing the
@@ -584,5 +1020,204 @@ describe('runWorkspaceCompaction (T-28d)', () => {
     expect(outcome.result.skippedReason).toBe('summary_workspace')
     expect(outcome.reattach).toBe('not_detached')
     expect(s.releases()).toBe(0)
+  })
+
+  // ---- G4-16i guard (d): both overlay-rotation keys, by refusal ----
+  const OBJECT_KEY = `overlay-rotation:${KEY.landscapeId}:${KEY.versionId}:object`
+  const CONNECTION_KEY = `overlay-rotation:${KEY.landscapeId}:${KEY.versionId}:connection`
+
+  it('GUARD (d) — holds BOTH rotation keys while it writes, settles on them, and gives them back (connection first) BEFORE the re-attach', async () => {
+    const f = await fixture()
+    const events: string[] = []
+    const { connect } = fakeConnect([], events)
+    const s = spied(f, fakeDb({}), {
+      connect,
+      fleet: {
+        isResident: () => true,
+        ensure: async () => { events.push('ensure'); return true },
+        release: () => { events.push('release-projector') },
+        residentProjectorInstanceId: () => 'this-cell',
+      },
+    })
+    const outcome = await runWorkspaceCompaction(KEY, s.deps)
+    expect(outcome.result.skippedReason).toBeUndefined()
+    expect(outcome.result.objectsFolded).toBe(1)
+    expect(events).toEqual([
+      // Both keys BEFORE the detach.
+      'connect client1', `client1 lock ${OBJECT_KEY} true`,
+      'connect client2', `client2 lock ${CONNECTION_KEY} true`,
+      'release-projector',
+      // The settle of each collection, on its key's client, fence asserted
+      // (no rows: nothing written).
+      // The fence FIRST, before the first retirement row is read or locked
+      // (`adoptState.ts`, THE LOCK ORDER), held FOR UPDATE to COMMIT.
+      'client1 BEGIN', 'client1 fence', 'client1 rows', 'client1 COMMIT',
+      'client2 BEGIN', 'client2 fence', 'client2 rows', 'client2 COMMIT',
+      `client2 unlock ${CONNECTION_KEY}`, 'release client2',
+      `client1 unlock ${OBJECT_KEY}`, 'release client1',
+      'ensure',
+    ])
+  })
+
+  it('GUARD (f) — a write fence that MOVED after the detach (another cell\'s cold build) refuses the settle: nothing committed, ModelMeta not repointed', async () => {
+    const f = await fixture()
+    const events: string[] = []
+    const { connect } = fakeConnect([], events, () => 'another-cell')
+    const s = spied(f, fakeDb({}), { connect })
+    const meta = await f.repo.find<{ editsObjectShardUrl?: string }>(
+      (await f.repo.find<{ modelMetaUrl: string }>(f.rootUrl as never)).doc()!.modelMetaUrl as never)
+    const pointer = meta.doc()!.editsObjectShardUrl
+    await expect(runWorkspaceCompaction(KEY, s.deps)).rejects.toThrow(/write fence|write_fence|another-cell/)
+    expect(events.slice(events.indexOf('client1 BEGIN'))).toEqual(expect.arrayContaining(['client1 fence', 'client1 ROLLBACK']))
+    expect(events.indexOf('client1 ROLLBACK')).toBe(events.indexOf('client1 fence') + 1)
+    expect(events).not.toContain('client1 COMMIT')
+    expect(meta.doc()!.editsObjectShardUrl).toBe(pointer)
+    expect(s.ensures()).toBe(1) // detached, so put back
+  })
+
+  it('GUARD (c) — a release() that THROWS still gets the re-attach: the flag tracks "release was called"', async () => {
+    const f = await fixture()
+    const events: string[] = []
+    const s = spied(f, fakeDb({}), {
+      connect: fakeConnect([], events).connect,
+      fleet: {
+        isResident: () => true,
+        ensure: async () => { events.push('ensure'); return true },
+        release: () => { events.push('release-projector'); throw new Error('release blew up half-way') },
+        residentProjectorInstanceId: () => 'this-cell',
+      },
+    })
+    await expect(runWorkspaceCompaction(KEY, s.deps)).rejects.toThrow('release blew up half-way')
+    expect(f.changes()).toBe(0)
+    // Keys given back, THEN the re-attach.
+    const unlocked = events.filter((event) => event.includes(' unlock ')).length
+    expect(unlocked).toBe(2)
+    expect(events.at(-1)).toBe('ensure')
+    expect(events.indexOf('ensure')).toBeGreaterThan(events.lastIndexOf('release client1'))
+  })
+
+  it('GUARD (b), re-asked — a resident instance that MOVED while the keys were taken skips with nothing detached and the keys given back', async () => {
+    const f = await fixture()
+    const events: string[] = []
+    let resident = 'this-cell'
+    const { connect } = fakeConnect([], events)
+    const s = spied(f, fakeDb({}), {
+      // The instance is recycled during the acquisitions (the second connect).
+      connect: async () => {
+        const client = await connect()
+        if (events.filter((event) => event.startsWith('connect ')).length === 2) resident = 'recycled-instance'
+        return client
+      },
+      fleet: {
+        isResident: () => true,
+        ensure: async () => { events.push('ensure'); return true },
+        release: () => { events.push('release-projector') },
+        residentProjectorInstanceId: () => resident,
+      },
+    })
+    const outcome = await runWorkspaceCompaction(KEY, s.deps)
+    expect(outcome.result.skippedReason).toBe('foreign_projector_instance')
+    expect(outcome.reattach).toBe('not_detached')
+    expect(f.changes()).toBe(0)
+    expect(events).not.toContain('release-projector')
+    expect(events).not.toContain('ensure')
+    expect(events.filter((event) => event.includes(' unlock '))).toHaveLength(2)
+    expect(s.warnings().some((m) => m.includes('recycled-instance'))).toBe(true)
+  })
+
+  it.each([
+    ['object', [false], [`client1 lock ${OBJECT_KEY} false`, 'release client1']],
+    ['connection', [true, false], [
+      `client1 lock ${OBJECT_KEY} true`, 'connect client2', `client2 lock ${CONNECTION_KEY} false`, 'release client2',
+      `client1 unlock ${OBJECT_KEY}`, 'release client1',
+    ]],
+  ] as const)('GUARD (d) — a %s key held elsewhere skips the pass with NOTHING written, BEFORE any detach: no release, no cold build', async (kind, locked, tail) => {
+    const f = await fixture()
+    const events: string[] = []
+    const { connect } = fakeConnect([...locked], events)
+    const s = spied(f, fakeDb({}), {
+      connect,
+      fleet: {
+        isResident: () => true,
+        ensure: async () => { events.push('ensure'); return true },
+        release: () => { events.push('release-projector') },
+        residentProjectorInstanceId: () => 'this-cell',
+      },
+    })
+    const outcome = await runWorkspaceCompaction(KEY, s.deps)
+    expect(outcome.result.skippedReason).toBe('overlay_rotation_lock_contended')
+    expect(outcome.reattach).toBe('not_detached')
+    expect(f.changes()).toBe(0)
+    expect(f.overlay.doc()!.objects.o0.name).toBe('A-edited')
+    expect(events).toEqual(['connect client1', ...tail])
+    // ONE warning for the skip, naming the key.
+    expect(s.warnings().filter((m) => m.includes('overlay-rotation key'))).toHaveLength(1)
+    expect(s.warnings().some((m) => m.includes(kind) && m.includes('refused'))).toBe(true)
+  })
+
+  it('GUARD (d) — a THROW from the acquisition destroys that session, and nothing was detached', async () => {
+    const f = await fixture()
+    const events: string[] = []
+    const s = spied(f, fakeDb({}), {
+      connect: async () => {
+        events.push('connect')
+        return {
+          query: async () => { throw new Error('socket gone') },
+          release: (destroy?: Error | boolean) => { events.push(destroy ? 'release destroyed' : 'release') },
+        }
+      },
+      fleet: {
+        isResident: () => true,
+        ensure: async () => { events.push('ensure'); return true },
+        release: () => { events.push('release-projector') },
+        residentProjectorInstanceId: () => 'this-cell',
+      },
+    })
+    await expect(runWorkspaceCompaction(KEY, s.deps)).rejects.toThrow('socket gone')
+    expect(events).toEqual(['connect', 'release destroyed'])
+    expect(f.changes()).toBe(0)
+  })
+
+  // `acquireOverlayRotationLock` answers `unknown` when the statement returns no
+  // row at all (not a thrown error): neither "acquired" nor a definite "refused".
+  // Three states, one licence — only `acquired` writes, and `unknown` is paid for
+  // by destroying the session (the server may have granted the key).
+  it.each([
+    ['object', 0, ['connect client1', 'client1 unknown', 'release client1 destroyed']],
+    ['connection', 1, [
+      'connect client1', 'client1 ok', 'connect client2', 'client2 unknown',
+      'release client2 destroyed', `client1 unlock ${OBJECT_KEY}`, 'release client1',
+    ]],
+  ] as const)('GUARD (d) — an UNANSWERED %s acquisition (no row) skips the pass with nothing written and destroys that session', async (_kind, unknownAt, expected) => {
+    const f = await fixture()
+    const events: string[] = []
+    let acquisitions = 0
+    let clients = 0
+    const s = spied(f, fakeDb({}), {
+      connect: async () => {
+        const id = `client${++clients}`
+        events.push(`connect ${id}`)
+        return {
+          async query(text: string, params?: unknown[]) {
+            if (text.includes('pg_try_advisory_lock(')) {
+              const at = acquisitions++
+              if (at === unknownAt) { events.push(`${id} unknown`); return { rows: [], rowCount: 0 } }
+              events.push(`${id} ok`)
+              return { rows: [{ locked: true }], rowCount: 1 }
+            }
+            if (text.includes('pg_advisory_unlock(')) {
+              events.push(`${id} unlock ${String(params?.[0])}`)
+              return { rows: [{ released: true }], rowCount: 1 }
+            }
+            throw new Error(`unexpected statement after an unanswered acquisition: ${text.slice(0, 60)}`)
+          },
+          release(destroy?: Error | boolean) { events.push(`release ${id}${destroy ? ' destroyed' : ''}`) },
+        }
+      },
+    })
+    const outcome = await runWorkspaceCompaction(KEY, s.deps)
+    expect(outcome.result.skippedReason).toBe('overlay_rotation_lock_contended')
+    expect(f.changes()).toBe(0)
+    expect(events).toEqual(expected)
   })
 })

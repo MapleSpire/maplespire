@@ -57,8 +57,11 @@ export function registerMcpHttpRoutes(app: Express, deps: McpDeps): void {
   app.get('/.well-known/oauth-protected-resource', prMetadata)
   app.get('/.well-known/oauth-protected-resource/mcp', prMetadata)
 
+  // RETURNED, not `void`: the app holds a mutating handler's promise until it
+  // settles (`holdMutatingRoutes`) — an MCP tool
+  // call writes workspace documents.
   app.all('/mcp', (req, res) => {
-    void handleMcp(req, res, deps).catch((err) => {
+    return handleMcp(req, res, deps).catch((err) => {
       console.error('[mcp] request failed:', err)
       if (!res.headersSent) {
         res.status(500).json({

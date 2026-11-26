@@ -16,6 +16,7 @@
 import { cleanup, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { useAuthStore } from '../../stores/authStore'
+import { useAutomergeStatus } from '../../stores/automergeStatusStore'
 import { useModelStore } from '../../stores/modelStore'
 import { useUIStore } from '../../stores/uiStore'
 import { ModelObjectsView } from './ModelObjectsView'
@@ -38,7 +39,8 @@ vi.mock('../../lib/technologies/api', () => ({
 
 vi.mock('../layout/WorkspaceShell', () => ({
   WorkspaceShell: ({ pill, children }: { pill?: React.ReactNode; children: React.ReactNode }) => <>{pill}{children}</>,
-  WorkspacePill: ({ filter }: { filter: { panel: React.ReactNode } }) => <>{filter.panel}</>,
+  WorkspacePill: ({ filter, add }: { filter: { panel: React.ReactNode }; add?: { label: string; testId?: string } }) =>
+    <>{filter.panel}{add ? <button data-testid={add.testId}>{add.label}</button> : null}</>,
   PillFilterPopover: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
 }))
 
@@ -74,5 +76,17 @@ describe('ModelObjectsView team facets', () => {
     expect(await screen.findByText('team-off-window')).toBeTruthy()
     expect(screen.queryByText('team-window-only')).toBeNull()
     expect(mocks.modelObjectFacets).toHaveBeenCalledTimes(1)
+  })
+
+  it('offers no Add before the bridge has wired the store to this workspace\'s documents', async () => {
+    useModelStore.setState({ workspaceReadOnly: false })
+    useAutomergeStatus.setState({ projectedWorkspace: null })
+    const view = render(<ModelObjectsView />)
+    await screen.findByText('team-off-window')
+    expect(screen.queryByTestId('mo-add-object')).toBeNull()
+    view.unmount()
+    useAutomergeStatus.setState({ projectedWorkspace: 'default/current' })
+    render(<ModelObjectsView />)
+    expect(await screen.findByTestId('mo-add-object')).toBeTruthy()
   })
 })

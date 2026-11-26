@@ -13,7 +13,8 @@
 // GNU Affero General Public License for more details.
 
 import { describe, expect, it } from 'vitest'
-import { planOrdinaryChainFold, substituteFoldedRun } from './ordinaryChainFoldWriter.js'
+import * as A from '@automerge/automerge'
+import { foldedRunIndex, planOrdinaryChainFold, spliceFoldedRunInPlace, substituteFoldedRun } from './ordinaryChainFoldWriter.js'
 
 const plan = (overrides: Partial<Parameters<typeof planOrdinaryChainFold>[0]> = {}) => planOrdinaryChainFold({
   shardUrls: ['base', 'h0', 'h1', 'h2', 'h3', 'cur'],
@@ -117,5 +118,56 @@ describe('substituteFoldedRun', () => {
     ['the product already listed', ['P', 'h0', 'h1'], ['h0', 'h1']],
   ])('refuses %s (null)', (_label, list, sources) => {
     expect(substituteFoldedRun(list, sources, 'P')).toBeNull()
+  })
+
+  // G4-16f: two concurrent in-place rewrites can leave a url twice. Read
+  // first-occurrence-kept, a duplicate does not break a run (it used to: -1,
+  // the fold refused until the next publish normalised the list).
+  it.each([
+    ['a later duplicate of a source', ['b', 'h0', 'h1', 'c', 'h0'], ['h0', 'h1'], ['b', 'P', 'c']],
+    ['a duplicate of an earlier url inside the run', ['b', 'h0', 'b', 'h1', 'c'], ['h0', 'h1'], ['b', 'P', 'c']],
+    ['a duplicated source inside the run', ['b', 'h0', 'h0', 'h1', 'c'], ['h0', 'h1'], ['b', 'P', 'c']],
+  ])('reads the list deduplicated: %s', (_label, list, sources, expected) => {
+    expect(foldedRunIndex(list, sources, 'P')).toBe(1)
+    expect(substituteFoldedRun(list, sources, 'P')).toEqual(expected)
+  })
+})
+
+describe('spliceFoldedRunInPlace (G4-16f)', () => {
+  const splice = (initial: string[], sources: string[]) => {
+    let doc = A.from<{ list: string[] }>({ list: initial })
+    let done = false
+    doc = A.change(doc, (d) => { done = spliceFoldedRunInPlace(d.list, sources, 'P') })
+    return { done, list: [...doc.list] }
+  }
+
+  it.each([
+    [['b', 'h0', 'h1', 'c'], ['h0', 'h1']],
+    [['b', 'h0', 'h1', 'c', 'h0'], ['h0', 'h1']],
+    [['b', 'h0', 'b', 'h1', 'c'], ['h0', 'h1']],
+    [['b', 'h0', 'h0', 'h1', 'c'], ['h0', 'h1']],
+  ])('%j: read deduplicated, the result is substituteFoldedRun\'s, and no source is left', (initial, sources) => {
+    const { done, list } = splice(initial, sources)
+    expect(done).toBe(true)
+    expect([...new Set(list)]).toEqual(substituteFoldedRun(initial, sources, 'P'))
+    for (const source of sources) expect(list).not.toContain(source)
+  })
+
+  it('refuses where substituteFoldedRun refuses, and writes nothing', () => {
+    const { done, list } = splice(['b', 'h1', 'h0', 'c'], ['h0', 'h1'])
+    expect(done).toBe(false)
+    expect(list).toEqual(['b', 'h1', 'h0', 'c'])
+  })
+
+  it('in place: a concurrent push into the list survives the merge', () => {
+    const base = A.from<{ list: string[] }>({ list: ['b', 'h0', 'h1', 'c'] })
+    let server = A.clone(base, { actor: 'aa'.repeat(16) as A.ActorId })
+    let client = A.clone(base, { actor: 'bb'.repeat(16) as A.ActorId })
+    server = A.change(server, (d) => { spliceFoldedRunInPlace(d.list, ['h0', 'h1'], 'P') })
+    client = A.change(client, (d) => { d.list.push('new-base') })
+    const merged = A.merge(server, client)
+    expect(merged.list).toContain('new-base')
+    expect(merged.list).toContain('P')
+    expect(merged.list).not.toContain('h0')
   })
 })

@@ -12,8 +12,17 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU Affero General Public License for more details.
 
+import type { PoolClient } from 'pg'
 import type { Queryable } from './types.js'
+import { PROTOCOL_FENCE_ROWS_SETTING } from './health.js'
+import {
+  LOCK_ORDER_RULE_SINCE,
+  PARTICIPANT_VERSION_SQL,
+  PROTOCOL_TAG_PREFIX,
+  READ_MODEL_PROTOCOL_VERSION,
+} from './protocolParticipant.js'
 import { ensureSpotlightSchema } from './spotlightSql.js'
+import { ensureModelEpochSchema } from './modelEpochStore.js'
 
 /**
  * Create the read-model tables + indexes (idempotent). Full entity in `data`
@@ -27,8 +36,9 @@ import { ensureSpotlightSchema } from './spotlightSql.js'
  * so a future RLS policy on `ro_*` can filter by it directly, matching every
  * other resource table.
  *
- *  - ro_objects:     GIN(pg_trgm) on name/description/technology for substring
- *                    search; B-tree on (landscape_id, version_id, parent_id) /
+ *  - ro_objects:     GIN(pg_trgm) on lower(name) and on search_document (name,
+ *                    description and technology) for substring search;
+ *                    B-tree on (landscape_id, version_id, parent_id) /
  *                    (landscape_id, version_id, domain_id) for filters.
  *  - ro_connections: B-tree on (landscape_id, version_id, from_id) / (…, to_id)
  *                    for O(degree) adjacency fan-out within a workspace.
@@ -128,6 +138,16 @@ export async function ensureReadModelSchema(db: Queryable): Promise<void> {
       PRIMARY KEY (landscape_id, version_id, document_id)
     )
   `)
+  // G4-16f C6b: the heads of the revision the row's projection SAMPLED,
+  // written in the statement that writes the watermark (`arrivalWatermark.ts`,
+  // `replaceProjectedWatermarks`); NULL when the writer has none, and on
+  // every row written before the column. An adopter seeds a shard from the
+  // document AT these heads and refuses NULL. GUARDED: this table is written
+  // by every projection, and an unguarded ALTER would queue for ACCESS
+  // EXCLUSIVE on it at every boot.
+  if (!(await currentSchemaHasColumn(db, 'read_model_document_watermarks', 'projected_heads'))) {
+    await db.query(`ALTER TABLE read_model_document_watermarks ADD COLUMN IF NOT EXISTS projected_heads TEXT[]`)
+  }
   await db.query(`
     DO $$
     BEGIN
@@ -181,6 +201,28 @@ export async function ensureReadModelSchema(db: Queryable): Promise<void> {
     ADD COLUMN IF NOT EXISTS content_digest JSONB`)
   await db.query(`ALTER TABLE read_model_projection_state
     ADD COLUMN IF NOT EXISTS defect_count INTEGER`)
+  // `duplicate_id_count`: how many of `defect_count` are `duplicate-id`
+  // defects (an id dropped, the last occurrence kept — `lastOccurrenceById`),
+  // written with it and by the same full extractions. Kept apart so the
+  // unreadable-document gauge counts documents only
+  // (`fleetDefectSummary`). NULL on a row last stamped before it existed.
+  // `defect_count` itself still counts both, so every reader that refuses on
+  // `defect_count > 0` still refuses on a duplicate.
+  //
+  // `duplicate_ids_observed_at`: the `defects_observed_at` of the UPDATE that
+  // wrote `duplicate_id_count` (`stampProjectionIntegrity` sets both to the
+  // same `now()`). A writer that predates the column — the previous
+  // release's stamp, on a mixed-version fleet or after a rollback — rewrites `defect_count` and
+  // `defects_observed_at` and leaves these two alone, so the pair stops
+  // matching and every reader treats `duplicate_id_count` as unknown
+  // (`DUPLICATE_IDS_SQL`, projectionIntegrity.ts). No CHECK ties the
+  // columns together: that older UPDATE would then fail.
+  //
+  // One statement for both columns: each ALTER TABLE asks for ACCESS
+  // EXCLUSIVE even when the columns exist.
+  await db.query(`ALTER TABLE read_model_projection_state
+    ADD COLUMN IF NOT EXISTS duplicate_id_count INTEGER,
+    ADD COLUMN IF NOT EXISTS duplicate_ids_observed_at TIMESTAMPTZ`)
   await db.query(`ALTER TABLE read_model_projection_state
     ADD COLUMN IF NOT EXISTS defect_summary TEXT`)
   await db.query(`ALTER TABLE read_model_projection_state
@@ -422,6 +464,9 @@ export async function ensureReadModelSchema(db: Queryable): Promise<void> {
   `)
   await db.query(`CREATE INDEX IF NOT EXISTS idx_read_model_static_membership_deltas_generation
     ON read_model_static_membership_deltas (landscape_id, version_id, generation)`)
+  // T-DIAGDEF: the write-head partial index, PLAIN here
+  // only on an empty table; migration 0008 builds it CONCURRENTLY elsewhere.
+  await ensureStaticMembershipHeadIndexOnEmptyTable(db)
   await db.query(`
     CREATE TABLE IF NOT EXISTS read_model_diagram_render_generations (
       landscape_id      TEXT NOT NULL,
@@ -671,6 +716,31 @@ export async function ensureReadModelSchema(db: Queryable): Promise<void> {
   // The writer reads the LATEST fold of a kind on every pass.
   await db.query(`CREATE INDEX IF NOT EXISTS idx_read_model_ordinary_chain_folds_latest
     ON read_model_ordinary_chain_folds (landscape_id, version_id, collection, created_at DESC)`)
+  await ensureModelEpochSchema(db)
+  // G4-16k: where the compaction's rematerialization scan of each overlay
+  // segment stopped (`overlayClearRematerialize.ts`). Durable state, like the
+  // protocol tables (not dropped with the read model): losing a row makes the
+  // next pass read that segment's whole history again, and a field a
+  // colleague set back to the value the clear saw after the server wrote
+  // hers is then written again (a known gap: no test covers it).
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS read_model_overlay_clear_scans (
+      landscape_id   TEXT NOT NULL,
+      version_id     TEXT NOT NULL,
+      collection     TEXT NOT NULL CHECK (collection IN ('object', 'connection')),
+      document_id    TEXT NOT NULL,
+      scanned_heads  TEXT[] NOT NULL,
+      updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (landscape_id, version_id, collection, document_id)
+    )
+  `)
+  // The grace period runs from the
+  // SERVER's first sighting of each late change, never from its author's
+  // clock — recorded here, by change hash, while the change waits.
+  await db.query(`ALTER TABLE read_model_overlay_clear_scans ADD COLUMN IF NOT EXISTS late_seen JSONB NOT NULL DEFAULT '{}'::jsonb`)
+  // The late changes of a parked segment a pass already
+  // dealt with — the segment parks for one entry, not for all of them.
+  await db.query(`ALTER TABLE read_model_overlay_clear_scans ADD COLUMN IF NOT EXISTS done_changes TEXT[] NOT NULL DEFAULT '{}'`)
   // G4-16e: what WROTE a retirement row — `rotation` (the rotator,
   // `ordinaryHeadRotator.ts`) or `fold-product` (the fold record gives every
   // product a `retired` row so it can be folded again, `ordinaryChainFold.ts`).
@@ -686,6 +756,110 @@ export async function ensureReadModelSchema(db: Queryable): Promise<void> {
       WHERE row.origin IS NULL AND row.landscape_id = fold.landscape_id AND row.version_id = fold.version_id
         AND row.collection = fold.collection AND row.document_id = fold.product_document_id`)
   }
+  // G4-16f, the ADOPT plane: what a later attach could check instead of
+  // rebuilding. Written by the ordinary projector's fenced transactions only
+  // (`adoptState.ts`). Separate from `read_model_document_watermarks` on
+  // purpose: root, ModelMeta, registry shards and the monolith must never
+  // enter that table's EXACT freshness branch (the comment at the cold
+  // build's stamp in `projectorService.ts` says why). Zero is a stored
+  // refusal, exactly as there.
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS read_model_adopt_watermarks (
+      landscape_id     TEXT NOT NULL,
+      version_id       TEXT NOT NULL,
+      document_id      TEXT NOT NULL,
+      adopt_watermark  BIGINT NOT NULL CHECK (adopt_watermark >= 0),
+      updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (landscape_id, version_id, document_id)
+    )
+  `)
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS read_model_adopt_state (
+      landscape_id        TEXT NOT NULL,
+      version_id          TEXT NOT NULL,
+      format_version      INT NOT NULL,
+      org_id              TEXT,
+      topology_digest     TEXT NOT NULL,
+      retirements_digest  TEXT NOT NULL,
+      folds_digest        TEXT NOT NULL,
+      defects             INT NOT NULL CHECK (defects >= 0),
+      updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (landscape_id, version_id)
+    )
+  `)
+  // `defects` is the cold build's ModelDefect count — unreadable documents
+  // AND `duplicate-id` drops, as `defect_count` (the duplicates are not split
+  // out here: nothing reads this column yet, and a refusal keyed on it
+  // should refuse on both).
+  //
+  // ADOPT PLANE v2 (G4-16f C6b, `ADOPT_STATE_VERSION` in `adoptState.ts`):
+  // the fence binding, the topology as id lists (text[], order and
+  // duplicates kept), the seal and the posture. All nullable with no
+  // default: every row written before them reads NULL, which an adopter
+  // refuses (`adoptRefusal`). ONE statement, so the columns arrive together
+  // or not at all, GUARDED like the ALTERs above (an ALTER takes ACCESS
+  // EXCLUSIVE on every boot otherwise). No backfill and no ledger entry:
+  // NULL is the correct value for an old row.
+  if (!(await currentSchemaHasColumn(db, 'read_model_adopt_state', 'adopt_version'))) {
+    await db.query(`ALTER TABLE read_model_adopt_state
+      ADD COLUMN IF NOT EXISTS adopt_version INT,
+      ADD COLUMN IF NOT EXISTS fence_binding TEXT,
+      ADD COLUMN IF NOT EXISTS root_document_id TEXT,
+      ADD COLUMN IF NOT EXISTS meta_document_id TEXT,
+      ADD COLUMN IF NOT EXISTS object_shard_ids TEXT[],
+      ADD COLUMN IF NOT EXISTS connection_shard_ids TEXT[],
+      ADD COLUMN IF NOT EXISTS registry_shard_ids TEXT[],
+      ADD COLUMN IF NOT EXISTS sealed_ceiling INT,
+      ADD COLUMN IF NOT EXISTS posture TEXT`)
+  }
+  await ensureAdoptProtocolTriggers(db)
+  // G4-16f: a DERIVED, rebuildable cache of sealed fold products' entity maps
+  // (`sealedProductCache.ts`). A header names the exact durable row versions
+  // its entities were decoded from (`rows_digest`); a reader serves it only
+  // while the current rows have that digest. The cold build's DELETE does NOT
+  // touch these two tables (the documents stay the source; deleting the cache
+  // is always safe, keeping it across a cold build is the point).
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS read_model_sealed_product_extracts (
+      landscape_id         TEXT NOT NULL,
+      version_id           TEXT NOT NULL,
+      collection           TEXT NOT NULL CHECK (collection IN ('object', 'connection')),
+      product_document_id  TEXT NOT NULL,
+      rows_digest          TEXT NOT NULL,
+      heads                TEXT[] NOT NULL,
+      max_arrival_seq      BIGINT NOT NULL,
+      extraction_version   INT NOT NULL,
+      entity_count         INT NOT NULL CHECK (entity_count >= 0),
+      refused_reason       TEXT CHECK (refused_reason IN ('decode-refused', 'not-serializable', 'insert-refused')),
+      updated_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (landscape_id, version_id, collection, product_document_id)
+    )
+  `)
+  // A REFUSAL remembered against the exact rows it was decided on
+  // (`sealedProductCache.ts`, the writer): a header with `refused_reason` and
+  // no entities is never a hit, and the writer does not decode those rows
+  // again. Added to a table created earlier on this branch; GUARDED like the
+  // CHECKs above (an ALTER takes ACCESS EXCLUSIVE on every boot otherwise).
+  if (!(await currentSchemaHasColumn(db, 'read_model_sealed_product_extracts', 'refused_reason'))) {
+    await db.query(`ALTER TABLE read_model_sealed_product_extracts ADD COLUMN IF NOT EXISTS refused_reason TEXT
+      CHECK (refused_reason IN ('decode-refused', 'not-serializable', 'insert-refused'))`)
+  }
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS read_model_sealed_product_entities (
+      landscape_id         TEXT NOT NULL,
+      version_id           TEXT NOT NULL,
+      collection           TEXT NOT NULL,
+      product_document_id  TEXT NOT NULL,
+      entity_id            TEXT NOT NULL,
+      value                JSONB NOT NULL,
+      PRIMARY KEY (landscape_id, version_id, collection, product_document_id, entity_id),
+      FOREIGN KEY (landscape_id, version_id, collection, product_document_id)
+        REFERENCES read_model_sealed_product_extracts (landscape_id, version_id, collection, product_document_id)
+        ON DELETE CASCADE
+    )
+  `)
+  await db.query(`CREATE INDEX IF NOT EXISTS idx_read_model_sealed_product_entities_entity
+    ON read_model_sealed_product_entities (landscape_id, version_id, collection, entity_id)`)
   await db.query(`
     DELETE FROM read_model_static_document_queue queue
     USING read_model_static_documents document
@@ -778,8 +952,10 @@ export async function ensureReadModelSchema(db: Queryable): Promise<void> {
   await db.query(`CREATE INDEX IF NOT EXISTS idx_ro_objects_parent ON ro_objects (landscape_id, version_id, parent_id)`)
   await db.query(`CREATE INDEX IF NOT EXISTS idx_ro_objects_domain ON ro_objects (landscape_id, version_id, domain_id)`)
   await db.query(`CREATE INDEX IF NOT EXISTS idx_ro_objects_name_trgm ON ro_objects USING gin (lower(name) public.gin_trgm_ops)`)
-  await db.query(`CREATE INDEX IF NOT EXISTS idx_ro_objects_desc_trgm ON ro_objects USING gin (lower(description) public.gin_trgm_ops)`)
-  await db.query(`CREATE INDEX IF NOT EXISTS idx_ro_objects_tech_trgm ON ro_objects USING gin (lower(technology) public.gin_trgm_ops)`)
+  // No per-column trigram index on `lower(description)` / `lower(technology)`:
+  // `idx_ro_objects_search_trgm` below covers both through `search_document`,
+  // and `REDUNDANT_OBJECT_TRIGRAM_INDEXES` says what they cost and who drops
+  // them on a database that still has them.
   await db.query(`ALTER TABLE ro_objects
     ADD COLUMN IF NOT EXISTS normalized_name TEXT GENERATED ALWAYS AS (lower(name)) STORED`)
   await db.query(`ALTER TABLE ro_objects
@@ -808,6 +984,10 @@ export async function ensureReadModelSchema(db: Queryable): Promise<void> {
     )`)
   await db.query(`CREATE INDEX IF NOT EXISTS idx_ro_objects_search_trgm
     ON ro_objects USING gin (search_document public.gin_trgm_ops)`)
+  // `IF NOT EXISTS` looks at the name only: an INVALID index (a drop by the
+  // withdrawn 0007 cut off by its lock bound, or any interrupted CONCURRENTLY
+  // build) is kept as it is, and both readers silently lose it.
+  await warnIfSearchIndexInvalid(db)
   // The C4 parent with dangling links repaired to NULL: `parent_id` when that
   // parent row exists, else NULL. The Model Viewer's levels follow it — unlike
   // `effective_parent_id` it ignores Group membership, and unlike raw
@@ -1270,6 +1450,585 @@ export async function ensureReadModelSchema(db: Queryable): Promise<void> {
   }
 }
 
+/**
+ * The per-column trigram indexes `ensureReadModelSchema` used to create on
+ * `ro_objects`, made redundant by `idx_ro_objects_search_trgm`: the one search
+ * that could use them (`roSearch`, `RO_SEARCH_OBJECTS_SQL` in queries.ts) now
+ * prefilters on `search_document`. Measured 2026-11-08 on the 85 235-object
+ * corpus: inserting it into an empty clone of `ro_objects` took 16.0 s with
+ * every index and 9.4 s without these two.
+ */
+export const REDUNDANT_OBJECT_TRIGRAM_INDEXES = ['idx_ro_objects_desc_trgm', 'idx_ro_objects_tech_trgm'] as const
+
+/**
+ * Logs, loudly, an `idx_ro_objects_search_trgm` that exists but is INVALID
+ * (`NOT (indisvalid AND indisready)`). The baseline's `CREATE INDEX IF NOT
+ * EXISTS` skips it (the check is by name), no plan uses it, and nothing else
+ * repairs it — it is not on the 0006 retry's list, because this index is
+ * KEPT. Measured consequence when it is unusable: the readers' p95 150-190 ms
+ * at 20 searches/s on a 10-workspace database. Reported, not repaired: the repair,
+ * `REINDEX INDEX CONCURRENTLY`, is an operator's step outside any transaction
+ * and outside the boot (docs/schema-migrations.md). Returns whether it was
+ * invalid.
+ */
+export async function warnIfSearchIndexInvalid(
+  db: Queryable,
+  log: (line: string) => void = (line) => console.error(line),
+): Promise<boolean> {
+  const result = await db.query<{ valid: boolean }>(
+    `SELECT (x.indisvalid AND x.indisready) AS valid
+       FROM pg_index x JOIN pg_class c ON c.oid = x.indexrelid
+      WHERE c.relnamespace = current_schema()::regnamespace AND c.relname = 'idx_ro_objects_search_trgm'`,
+  )
+  // A connection that answers nothing (a test double) reports nothing.
+  if (result?.rows?.[0]?.valid !== false) return false
+  log(JSON.stringify({
+    event: 'read_model.search_index_invalid',
+    index: 'idx_ro_objects_search_trgm',
+    effect: 'roSearch and the object explorer filter ro_objects unindexed',
+    remedy: 'REINDEX INDEX CONCURRENTLY idx_ro_objects_search_trgm (docs/schema-migrations.md)',
+  }))
+  return true
+}
+
+/** Upper bound of one lock wait of the drop, ms; see `dropRedundantObjectTrigramIndexes`. */
+export const REDUNDANT_TRIGRAM_DROP_LOCK_WAIT_MS = 500
+/** Attempts per index and per boot, and the pause between two. */
+export const REDUNDANT_TRIGRAM_DROP_ATTEMPTS = 3
+export const REDUNDANT_TRIGRAM_DROP_RETRY_MS = 1_000
+
+/** `lock_not_available` (`lock_timeout` expired) and `deadlock_detected`. */
+const DEFERRABLE_DROP_FAILURES = new Set(['55P03', '40P01'])
+
+/**
+ * Drop `REDUNDANT_OBJECT_TRIGRAM_INDEXES` where they still exist. Run by the
+ * `0006-ro-objects-drop-redundant-trgm` migration (db/schemaMigrations.ts),
+ * which is non-transactional (`DROP INDEX CONCURRENTLY` is refused inside a
+ * transaction block) and REPEATABLE, so `client` must be in no transaction.
+ * Returns the indexes it had to leave for a later boot.
+ *
+ * CONCURRENTLY, never a plain `DROP INDEX`: the plain form takes ACCESS
+ * EXCLUSIVE on `ro_objects`, which every workspace shares, and while it waits
+ * for the longest transaction already on the table every new read and write
+ * of every workspace queues behind it. The concurrent form holds SHARE UPDATE
+ * EXCLUSIVE, which reads and DML do not conflict with, and waits for the
+ * transactions already holding a lock on the table rather than blocking the
+ * ones after them (both measured, with the plain form as the control, in
+ * `redundantTrigramIndexes.integration.test.ts`).
+ *
+ * BOUNDED, and a bounded failure is DEFERRED, not thrown. SHARE UPDATE
+ * EXCLUSIVE does conflict with `ANALYZE`, and a cold build runs a bounded
+ * `ANALYZE ro_objects` INSIDE its write transaction (`analyzeWithinCeiling`).
+ * Unbounded, the drop waits for that transaction while the transaction waits
+ * for the drop's lock: a deadlock, and PostgreSQL aborts whichever backend's
+ * `deadlock_timeout` expires first while the cycle exists. Measured
+ * (qa/g416f-trgm-drop-probe.mts, deadlock_timeout 1 s, four runs, the same
+ * outcome each time): the `ANALYZE` 200 ms after an unbounded drop began
+ * waiting → the DROP got 40P01; 1 500 ms after → the cold build's `ANALYZE`
+ * got 40P01, which `analyzeWithinCeiling` does not absorb, so that cold build
+ * fails. Each lock wait here is therefore bounded below the server's
+ * `deadlock_timeout` (`lock_timeout` = the smaller of
+ * `REDUNDANT_TRIGRAM_DROP_LOCK_WAIT_MS` and half of it), so the drop gives up
+ * before the detector can choose the cold build — measured with this function
+ * (one attempt, two runs) and the `ANALYZE` at 100, 300 and 1 500 ms: it ran each time,
+ * and the drop deferred. Both failures it can see
+ * are retried `REDUNDANT_TRIGRAM_DROP_ATTEMPTS` times and then left for the
+ * next boot (the migration is repeatable): a deferred drop costs what the
+ * index cost before, and failing the boot over an optimisation would cost
+ * far more. The same bound keeps a boot from waiting behind a long cold
+ * build or an idle-in-transaction session while it holds the migration key.
+ *
+ * A drop that fails part-way leaves the index INVALID but still maintained
+ * (`indisvalid` false, `indisready` true — measured by the same probe); the
+ * next `DROP INDEX CONCURRENTLY IF EXISTS` removes it (also measured). On a
+ * database without the indexes this is two catalog lookups.
+ *
+ * `lock_timeout` is a SESSION setting here (no transaction to scope it to),
+ * on a pooled connection, so the caller's value is restored before return.
+ * That is why `client` is ONE checked-out connection and not a `Queryable`: on
+ * a pool, the SET, the drops and the restore could each land on another
+ * connection, leaving the bound unset where it matters and the caller's value
+ * un-restored where it was changed.
+ */
+export async function dropRedundantObjectTrigramIndexes(
+  client: PoolClient,
+  options: { attempts?: number; retryMs?: number; log?: (line: string) => void } = {},
+): Promise<{ deferred: string[] }> {
+  const attempts = options.attempts ?? REDUNDANT_TRIGRAM_DROP_ATTEMPTS
+  const retryMs = options.retryMs ?? REDUNDANT_TRIGRAM_DROP_RETRY_MS
+  const log = options.log ?? ((line: string) => console.warn(line))
+  const { rows } = await client.query<{ lock_timeout: string; deadlock_ms: string }>(
+    `SELECT current_setting('lock_timeout') AS lock_timeout,
+            (SELECT setting FROM pg_settings WHERE name = 'deadlock_timeout') AS deadlock_ms`,
+  )
+  const prior = rows[0]!.lock_timeout
+  const waitMs = Math.max(1, Math.min(REDUNDANT_TRIGRAM_DROP_LOCK_WAIT_MS, Math.floor(Number(rows[0]!.deadlock_ms) / 2)))
+  const deferred: string[] = []
+  // When the work threw, a failing restore (an aborted transaction block, a
+  // lost connection) must not replace the error that explains it.
+  let failed = false
+  try {
+    await client.query(`SELECT set_config('lock_timeout', $1, false)`, [`${waitMs}ms`])
+    for (const index of REDUNDANT_OBJECT_TRIGRAM_INDEXES) {
+      for (let attempt = 1; ; attempt++) {
+        try {
+          await client.query(`DROP INDEX CONCURRENTLY IF EXISTS ${index}`)
+          break
+        } catch (error) {
+          const code = (error as { code?: string }).code
+          if (!code || !DEFERRABLE_DROP_FAILURES.has(code)) throw error
+          if (attempt >= attempts) {
+            deferred.push(index)
+            log(JSON.stringify({ event: 'read_model.redundant_trigram_drop_deferred', index, sqlstate: code, attempts, lockWaitMs: waitMs }))
+            break
+          }
+          await new Promise((resolve) => setTimeout(resolve, retryMs))
+        }
+      }
+    }
+  } catch (error) {
+    failed = true
+    throw error
+  } finally {
+    await client.query(`SELECT set_config('lock_timeout', $1, false)`, [prior]).catch((restoreError: unknown) => {
+      if (!failed) throw restoreError
+    })
+  }
+  return { deferred }
+}
+
+/**
+ * The write-head membership index (T-DIAGDEF):
+ * PARTIAL — `(landscape_id, version_id, entity_id) WHERE membership_kind =
+ * 'registry_shard_diagram'` — so it covers only the write-head rows (bounded
+ * by the diagrams ever created in heads), not every diagram membership of the
+ * table. Both readers use it: `diagramDocVerdict` (one entity) and the
+ * retired-row sweep (`GROUP BY entity_id` over a workspace), as checked with
+ * EXPLAIN.
+ */
+export const STATIC_MEMBERSHIP_HEAD_INDEX = 'idx_read_model_static_membership_deltas_head_entity'
+/** The FULL index the first version of 0008 built; dropped by the repeatable 0008. */
+export const STATIC_MEMBERSHIP_ENTITY_INDEX_V1 = 'idx_read_model_static_membership_deltas_entity'
+const STATIC_MEMBERSHIP_HEAD_INDEX_DDL = `ON read_model_static_membership_deltas (landscape_id, version_id, entity_id)
+    WHERE membership_kind = 'registry_shard_diagram'`
+
+/**
+ * WHERE THE INDEX IS BUILT, decided.
+ * `schemaMigrations.ts` says idempotent DDL belongs to the baseline module —
+ * and it is idempotent — but a plain `CREATE INDEX` on an EXISTING, large
+ * membership table takes a SHARE lock for the whole build and stops every
+ * static projection meanwhile (the 0006 lesson). And CONCURRENTLY under the
+ * migration key is no better for a boot: the first build reads the whole
+ * table twice while every other booting cell waits for the key. So:
+ *  - the baseline (`ensureReadModelSchema`) builds it PLAIN only on an EMPTY
+ *    table — a new database, an isolated test schema, a fresh seed — where the
+ *    lock costs nothing; unchanged;
+ *  - everywhere else it is built CONCURRENTLY in the BACKGROUND, after the
+ *    server is ready, outside the migration key
+ *    ({@link startStaticMembershipHeadIndexBuild}): one build at a time across
+ *    the cluster (a session advisory lock, tried, never waited for),
+ *    idempotent, bounded, logged; a boot never waits for it;
+ *  - migration `0008` is reduced to the CATALOGUE: it reads the index's state
+ *    and logs it, nothing more (it stays in the runner so a ledger that
+ *    recorded it is not read as "database ahead").
+ * NO READER DEPENDS ON IT FOR CORRECTNESS: `diagramDocVerdict`, the
+ * retired-row sweep and `reopenUnprojectedDiagramDocuments` return the same
+ * rows with or without it — it is only their cost.
+ *
+ * THIS FUNCTION never reports success over an index that
+ * is not VALID. A `CREATE INDEX CONCURRENTLY` cut by `lock_timeout` (55P03,
+ * waiting on an old snapshot) or a deadlock (40P01) leaves an INVALID index
+ * behind; `CREATE … IF NOT EXISTS` then does nothing and returned "built".
+ * Now after each failure the index's validity is RE-READ, an invalid one is
+ * dropped (bounded `DROP INDEX CONCURRENTLY`) before the retry, and once the
+ * attempts are spent anything but a VALID index is `deferred` and logged.
+ * The CREATE waits longer than the DROP (`createWaitMs`: 80 % of
+ * `deadlock_timeout` against the DROP's min(500 ms, half of it)) — still
+ * below the detector, so a build that meets a cold build's in-transaction
+ * `ANALYZE` gives up first rather than have the cold build chosen.
+ */
+export async function ensureStaticMembershipHeadIndex(
+  client: PoolClient,
+  options: { attempts?: number; retryMs?: number; log?: (line: string) => void; signal?: AbortSignal } = {},
+): Promise<{ deferred: string[]; valid: boolean }> {
+  const attempts = options.attempts ?? REDUNDANT_TRIGRAM_DROP_ATTEMPTS
+  const retryMs = options.retryMs ?? REDUNDANT_TRIGRAM_DROP_RETRY_MS
+  const log = options.log ?? ((line: string) => console.warn(line))
+  // A stopped build starts no further statement and
+  // sleeps no further retry (the statement in flight is cancelled by
+  // `StaticMembershipHeadIndexBuilder.stop`).
+  const signal = options.signal
+  const checkStopped = () => { if (signal?.aborted) throw new HeadIndexBuildStoppedError() }
+  const pause = (ms: number) => new Promise<void>((resolve) => {
+    if (signal?.aborted) { resolve(); return }
+    const timer = setTimeout(() => { signal?.removeEventListener('abort', onAbort); resolve() }, ms)
+    const onAbort = () => { clearTimeout(timer); resolve() }
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
+  const { rows } = await client.query<{ lock_timeout: string; deadlock_ms: string }>(
+    `SELECT current_setting('lock_timeout') AS lock_timeout,
+            (SELECT setting FROM pg_settings WHERE name = 'deadlock_timeout') AS deadlock_ms`,
+  )
+  const prior = rows[0]!.lock_timeout
+  const deadlockMs = Number(rows[0]!.deadlock_ms)
+  const dropWaitMs = Math.max(1, Math.min(REDUNDANT_TRIGRAM_DROP_LOCK_WAIT_MS, Math.floor(deadlockMs / 2)))
+  const createWaitMs = Math.max(dropWaitMs + 1, Math.floor(deadlockMs * 0.8))
+  const deferred: string[] = []
+  const setWait = (ms: number) => client.query(`SELECT set_config('lock_timeout', $1, false)`, [`${ms}ms`])
+  const validity = async (name: string): Promise<boolean | null> => {
+    const { rows: found } = await client.query<{ valid: boolean }>(
+      `SELECT index.indisvalid AS valid
+         FROM pg_index index
+         JOIN pg_class class ON class.oid = index.indexrelid
+        WHERE class.relname = $1 AND class.relnamespace = to_regnamespace(current_schema())`,
+      [name],
+    )
+    return found[0] ? found[0].valid : null
+  }
+  /** One statement under its wait; `false` on a deferrable lock failure. */
+  const attempt = async (statement: string, waitMs: number): Promise<{ ok: boolean; code?: string }> => {
+    checkStopped()
+    await setWait(waitMs)
+    try {
+      await client.query(statement)
+      return { ok: true }
+    } catch (error) {
+      checkStopped()
+      const code = (error as { code?: string }).code
+      if (!code || !DEFERRABLE_DROP_FAILURES.has(code)) throw error
+      return { ok: false, code }
+    }
+  }
+  let failed = false
+  try {
+    for (let tries = 1; ; tries++) {
+      const dropped = await attempt(`DROP INDEX CONCURRENTLY IF EXISTS ${STATIC_MEMBERSHIP_ENTITY_INDEX_V1}`, dropWaitMs)
+      if (dropped.ok) break
+      if (tries >= attempts) {
+        deferred.push(STATIC_MEMBERSHIP_ENTITY_INDEX_V1)
+        log(JSON.stringify({ event: 'read_model.static_membership_index_deferred', index: STATIC_MEMBERSHIP_ENTITY_INDEX_V1, sqlstate: dropped.code, attempts, lockWaitMs: dropWaitMs }))
+        break
+      }
+      await pause(retryMs)
+    }
+    let lastCode: string | undefined
+    for (let tries = 1; tries <= attempts; tries++) {
+      // An INVALID index first goes (`IF NOT EXISTS` would keep it and every
+      // reader would silently go without it — the lesson of the kept search index).
+      if ((await validity(STATIC_MEMBERSHIP_HEAD_INDEX)) === false) {
+        const dropped = await attempt(`DROP INDEX CONCURRENTLY IF EXISTS ${STATIC_MEMBERSHIP_HEAD_INDEX}`, dropWaitMs)
+        if (!dropped.ok) { lastCode = dropped.code; await pause(retryMs); continue }
+      }
+      const created = await attempt(
+        `CREATE INDEX CONCURRENTLY IF NOT EXISTS ${STATIC_MEMBERSHIP_HEAD_INDEX} ${STATIC_MEMBERSHIP_HEAD_INDEX_DDL}`, createWaitMs)
+      if (created.ok && (await validity(STATIC_MEMBERSHIP_HEAD_INDEX)) === true) break
+      lastCode = created.code
+      if (tries < attempts) await pause(retryMs)
+    }
+    checkStopped()
+    const valid = (await validity(STATIC_MEMBERSHIP_HEAD_INDEX)) === true
+    if (!valid) {
+      deferred.push(STATIC_MEMBERSHIP_HEAD_INDEX)
+      log(JSON.stringify({
+        event: 'read_model.static_membership_index_deferred', index: STATIC_MEMBERSHIP_HEAD_INDEX,
+        sqlstate: lastCode ?? null, state: (await validity(STATIC_MEMBERSHIP_HEAD_INDEX)) === false ? 'invalid' : 'absent',
+        attempts, lockWaitMs: createWaitMs,
+      }))
+    }
+    return { deferred, valid }
+  } catch (error) {
+    failed = true
+    throw error
+  } finally {
+    await client.query(`SELECT set_config('lock_timeout', $1, false)`, [prior]).catch((restoreError: unknown) => {
+      if (!failed) throw restoreError
+    })
+  }
+}
+
+/** The cluster-wide key of the background build (a session advisory lock,
+ * TRIED: a cell that finds it held lets the holder build). */
+const STATIC_MEMBERSHIP_HEAD_INDEX_BUILD_KEY ='maplespire:read-model:static-membership-head-index'
+
+/** How often a build that did not end on a VALID index
+ * (skipped, deferred, failed) is tried again. */
+export const STATIC_MEMBERSHIP_HEAD_INDEX_RETRY_MS = 60 * 60 * 1_000
+/** How long a shutdown waits for a stopped build. */
+export const STATIC_MEMBERSHIP_HEAD_INDEX_STOP_MS = 1_000
+
+export type StaticMembershipHeadIndexBuildOutcome = 'built' | 'already-valid' | 'deferred' | 'skipped' | 'failed' | 'stopped'
+
+export class HeadIndexBuildStoppedError extends Error {
+  constructor() {
+    super('static membership head index build stopped')
+    this.name = 'HeadIndexBuildStoppedError'
+  }
+}
+
+export interface StaticMembershipHeadIndexBuildOptions {
+  attempts?: number
+  retryMs?: number
+  log?: (line: string) => void
+}
+
+interface HeadIndexBuildControl {
+  signal?: AbortSignal
+  /** The build's connection and its backend pid once known; null once it is
+   * given back. */
+  onSession?: (session: { client: PoolClient; pid: number } | null) => void
+  /** True once {@link StaticMembershipHeadIndexBuilder.stop} destroyed the
+   * connection itself (it must not be released a second time). */
+  destroyed?: () => boolean
+}
+
+/**
+ * ONE background attempt: one across the cluster
+ * (`pg_try_advisory_lock` on its own connection; a held key means another cell
+ * builds: skipped, logged), idempotent (a valid index: two catalogue reads),
+ * bounded ({@link ensureStaticMembershipHeadIndex}), logged
+ * (`read_model.static_membership_index_build`). Never rejects.
+ *
+ * The connection goes back to the pool only when the
+ * session is known clean. A build that FAILED, or an unlock that failed,
+ * DESTROYS it (`release(error)`): the session ends, and its advisory lock with
+ * it — before, `release()` returned to the pool an idle session that could
+ * still hold the key, and every later attempt, in every cell, was `skipped`
+ * for as long as that connection lived. A STOPPED build destroys it too
+ * (the process is leaving; no unlock round trip).
+ */
+async function buildStaticMembershipHeadIndexOnce(
+  pool: { connect(): Promise<PoolClient> },
+  options: StaticMembershipHeadIndexBuildOptions,
+  control: HeadIndexBuildControl = {},
+): Promise<StaticMembershipHeadIndexBuildOutcome> {
+  const log = options.log ?? ((line: string) => console.warn(line))
+  const key = STATIC_MEMBERSHIP_HEAD_INDEX_BUILD_KEY
+  const signal = control.signal
+  const checkStopped = () => { if (signal?.aborted) throw new HeadIndexBuildStoppedError() }
+  const startedAt = Date.now()
+  let client: PoolClient | null = null
+  let locked = false
+  let failure: Error | undefined
+  try {
+    client = await pool.connect()
+    checkStopped()
+    const { rows: backend } = await client.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')
+    control.onSession?.({ client, pid: backend[0]!.pid })
+    checkStopped()
+    const { rows } = await client.query<{ locked: boolean }>(
+      'SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked', [key],
+    )
+    locked = rows[0]?.locked === true
+    if (!locked) {
+      log(JSON.stringify({ event: 'read_model.static_membership_index_build', outcome: 'skipped', reason: 'another cell builds it' }))
+      return 'skipped'
+    }
+    const { rows: before } = await client.query<{ valid: boolean }>(
+      `SELECT index.indisvalid AS valid FROM pg_index index JOIN pg_class class ON class.oid = index.indexrelid
+        WHERE class.relname = $1 AND class.relnamespace = to_regnamespace(current_schema())`,
+      [STATIC_MEMBERSHIP_HEAD_INDEX],
+    )
+    const { rows: legacy } = await client.query<{ present: boolean }>(
+      `SELECT to_regclass($1) IS NOT NULL AS present`, [STATIC_MEMBERSHIP_ENTITY_INDEX_V1],
+    )
+    if (before[0]?.valid === true && !legacy[0]?.present) return 'already-valid'
+    const outcome = await ensureStaticMembershipHeadIndex(client, { attempts: options.attempts, retryMs: options.retryMs, log, signal })
+    const result = outcome.valid && !outcome.deferred.length ? 'built' : 'deferred'
+    log(JSON.stringify({ event: 'read_model.static_membership_index_build', outcome: result, deferred: outcome.deferred, elapsedMs: Date.now() - startedAt }))
+    return result
+  } catch (error) {
+    if (signal?.aborted) {
+      failure = new HeadIndexBuildStoppedError()
+      log(JSON.stringify({ event: 'read_model.static_membership_index_build', outcome: 'stopped', elapsedMs: Date.now() - startedAt }))
+      return 'stopped'
+    }
+    failure = error instanceof Error ? error : new Error(String(error))
+    log(JSON.stringify({ event: 'read_model.static_membership_index_build', outcome: 'failed', error: failure.message }))
+    return 'failed'
+  } finally {
+    control.onSession?.(null)
+    if (client && !control.destroyed?.()) {
+      let destroyWith = failure
+      if (locked && !destroyWith) {
+        try {
+          await client.query('SELECT pg_advisory_unlock(hashtextextended($1, 0))', [key])
+        } catch (unlockError) {
+          destroyWith = unlockError instanceof Error ? unlockError : new Error(String(unlockError))
+          log(JSON.stringify({ event: 'read_model.static_membership_index_unlock_failed', error: destroyWith.message, action: 'connection destroyed' }))
+        }
+      }
+      // A STOPPED attempt never gives its connection back
+      // clean, whatever its outcome. `stop()` may have sent
+      // `pg_cancel_backend(pid)` while this attempt read the catalogue; an
+      // `already-valid` or `skipped` attempt ended without noticing, and its
+      // connection, back in the pool, then took the cancel in ANOTHER user's
+      // query (57014). Destroyed, its backend serves no one any more.
+      if (signal?.aborted) destroyWith ??= new HeadIndexBuildStoppedError()
+      client.release(destroyWith)
+    }
+  }
+}
+
+/**
+ * The head index, built in the BACKGROUND after
+ * readiness, outside the migration key — one attempt
+ * ({@link buildStaticMembershipHeadIndexOnce}), one per process at a time.
+ * Kept for the callers that want a single attempt; the server runs a
+ * {@link StaticMembershipHeadIndexBuilder}.
+ */
+export function startStaticMembershipHeadIndexBuild(
+  pool: { connect(): Promise<PoolClient> },
+  options: StaticMembershipHeadIndexBuildOptions = {},
+): Promise<StaticMembershipHeadIndexBuildOutcome> {
+  if (headIndexBuild) return headIndexBuild
+  const run = buildStaticMembershipHeadIndexOnce(pool, options)
+  headIndexBuild = run
+  void run.finally(() => { if (headIndexBuild === run) headIndexBuild = null })
+  return run
+}
+let headIndexBuild: Promise<StaticMembershipHeadIndexBuildOutcome> | null = null
+
+/**
+ * The server's background build.
+ *
+ * IT DOES NOT HOLD THE SHUTDOWN. A `CREATE INDEX CONCURRENTLY` waiting
+ * on an old snapshot holds a PRIMARY-pool connection for up to 80 % of
+ * `deadlock_timeout` per attempt; `pool.end()` waits for every checked-out
+ * connection, so a SIGTERM during a build ran to the 30 s forced exit, code 1,
+ * and left an INVALID index. {@link stop} (a traced step of
+ * `runGracefulShutdown`, started right after intake, awaited before the pools):
+ * no new attempt, no retry timer; the statement in flight is CANCELLED from
+ * another connection (`pg_cancel_backend(pid)` — the index is left invalid, the
+ * next attempt drops it); the attempt is awaited, bounded
+ * ({@link STATIC_MEMBERSHIP_HEAD_INDEX_STOP_MS}); past the bound its
+ * connection is DESTROYED, so the pool's end never waits for it.
+ *
+ * IT IS TRIED AGAIN. An attempt that did not end on a valid index
+ * (`skipped`: another cell held the key and may have died; `deferred`: an old
+ * snapshot outlasted the bounded attempts; `failed`) used to be the last one
+ * until the next boot. Now another attempt is scheduled every
+ * `retryIntervalMs` (default {@link STATIC_MEMBERSHIP_HEAD_INDEX_RETRY_MS}), the
+ * same tried key, until one ends `built` or `already-valid`; `stop()` ends it.
+ */
+export class StaticMembershipHeadIndexBuilder {
+  private readonly abort = new AbortController()
+  private current: Promise<StaticMembershipHeadIndexBuildOutcome> | null = null
+  private session: { client: PoolClient; pid: number } | null = null
+  private destroyed = false
+  /** False from an attempt's start to its outcome. */
+  private settled = true
+  private timer: ReturnType<typeof setTimeout> | null = null
+  /** Every finished attempt, in order (logged as well). */
+  readonly outcomes: StaticMembershipHeadIndexBuildOutcome[] = []
+
+  constructor(
+    private readonly pool: {
+      connect(): Promise<PoolClient>
+      query(text: string, values?: unknown[]): Promise<unknown>
+    },
+    private readonly options: StaticMembershipHeadIndexBuildOptions & { retryIntervalMs?: number } = {},
+  ) {}
+
+  get stopped(): boolean { return this.abort.signal.aborted }
+
+  /** The first attempt; the retries follow from it. */
+  start(): void { void this.runOnce() }
+
+  runOnce(): Promise<StaticMembershipHeadIndexBuildOutcome> {
+    if (this.current) return this.current
+    if (this.stopped) return Promise.resolve('stopped')
+    this.destroyed = false
+    this.settled = false
+    const run = buildStaticMembershipHeadIndexOnce(this.pool, this.options, {
+      signal: this.abort.signal,
+      onSession: (session) => { this.session = session },
+      destroyed: () => this.destroyed,
+    }).then((outcome) => {
+      this.settled = true
+      this.outcomes.push(outcome)
+      this.scheduleRetry(outcome)
+      return outcome
+    })
+    this.current = run
+    void run.finally(() => { if (this.current === run) this.current = null })
+    return run
+  }
+
+  private scheduleRetry(outcome: StaticMembershipHeadIndexBuildOutcome): void {
+    if (this.stopped || outcome === 'built' || outcome === 'already-valid' || outcome === 'stopped') return
+    const delayMs = this.options.retryIntervalMs ?? STATIC_MEMBERSHIP_HEAD_INDEX_RETRY_MS
+    this.timer = setTimeout(() => { this.timer = null; void this.runOnce() }, delayMs)
+    this.timer.unref?.()
+  }
+
+  /** `idle`: nothing ran; `stopped`: the attempt ended on its own check;
+   * `cancelled`: its statement was cancelled and it ended within the bound;
+   * `destroyed`: past the bound, its connection was destroyed. */
+  async stop(waitMs = STATIC_MEMBERSHIP_HEAD_INDEX_STOP_MS): Promise<'idle' | 'stopped' | 'cancelled' | 'destroyed'> {
+    this.abort.abort()
+    if (this.timer) { clearTimeout(this.timer); this.timer = null }
+    const run = this.current
+    if (!run) return 'idle'
+    const deadline = Date.now() + waitMs
+    const within = <T>(promise: Promise<T>, ms: number): Promise<{ done: true; value: T } | { done: false }> =>
+      new Promise((resolve) => {
+        const timer = setTimeout(() => resolve({ done: false }), Math.max(0, ms))
+        promise.then(
+          (value) => { clearTimeout(timer); resolve({ done: true, value }) },
+          () => { clearTimeout(timer); resolve({ done: false }) },
+        )
+      })
+    let how: 'stopped' | 'cancelled' = 'stopped'
+    const session = this.session
+    // Never for an attempt already over, nor for a
+    // connection it already gave up (its `finally` clears the session first).
+    // The guarantee does not rest on this check — between it and the cancel's
+    // arrival the attempt can still end: a stopped attempt DESTROYS its
+    // connection (`buildStaticMembershipHeadIndexOnce`), so the pid the cancel
+    // names serves no other user of the pool.
+    if (session && !this.settled && this.session === session) {
+      // From ANOTHER connection: the build's own is busy in its statement.
+      const cancel = await within(this.pool.query('SELECT pg_cancel_backend($1)', [session.pid]), (deadline - Date.now()) / 2)
+      if (cancel.done) how = 'cancelled'
+    }
+    if ((await within(run, deadline - Date.now())).done) return how
+    const late = this.session
+    if (late && !this.destroyed) {
+      this.destroyed = true
+      late.client.release(new HeadIndexBuildStoppedError())
+    }
+    return 'destroyed'
+  }
+}
+
+/** Migration `0008`'s body: the CATALOGUE only —
+ * the index's state, read and logged; the build runs in the background. */
+export async function reportStaticMembershipHeadIndex(
+  client: PoolClient,
+  log: (line: string) => void = (line) => console.warn(line),
+): Promise<'valid' | 'invalid' | 'absent'> {
+  const { rows } = await client.query<{ valid: boolean }>(
+    `SELECT index.indisvalid AS valid FROM pg_index index JOIN pg_class class ON class.oid = index.indexrelid
+      WHERE class.relname = $1 AND class.relnamespace = to_regnamespace(current_schema())`,
+    [STATIC_MEMBERSHIP_HEAD_INDEX],
+  )
+  const state = !rows[0] ? 'absent' : rows[0].valid ? 'valid' : 'invalid'
+  if (state !== 'valid') {
+    log(JSON.stringify({ event: 'read_model.static_membership_index_state', index: STATIC_MEMBERSHIP_HEAD_INDEX, state, note: 'built in the background after readiness' }))
+  }
+  return state
+}
+
+/** The baseline half (see {@link ensureStaticMembershipHeadIndex}): PLAIN, and
+ * only on an empty membership table, where its lock costs nothing. */
+async function ensureStaticMembershipHeadIndexOnEmptyTable(db: Queryable): Promise<void> {
+  const { rows } = await db.query<{ empty: boolean }>(
+    'SELECT NOT EXISTS (SELECT 1 FROM read_model_static_membership_deltas) AS empty',
+  )
+  if (!rows[0]?.empty) return
+  await db.query(`CREATE INDEX IF NOT EXISTS ${STATIC_MEMBERSHIP_HEAD_INDEX} ${STATIC_MEMBERSHIP_HEAD_INDEX_DDL}`)
+}
+
 /** Every workspace's `c4_parent_id`, repaired in place. Run once by the
  * `0005-ro-objects-c4-parent` migration (server/src/db/schemaMigrations.ts),
  * which upgrades rows written before the column existed (all NULL — every
@@ -1480,6 +2239,331 @@ async function currentSchemaHasColumn(
   return rows[0]?.exists ?? false
 }
 
+/** The body of `read_model_adopt_protocol_digests(landscape, version)`: the
+ * workspace's retirement and fold rows, each as one JSON array line, sorted
+ * by key in byte order, joined by newlines, sha256 in hex — the empty set
+ * hashes the empty string. Every column but the bookkeeping timestamps
+ * (`created_at`, `updated_at`); `retain_until` as epoch microseconds, never
+ * as text (its rendering depends on the session's TimeZone/DateStyle). */
+const ADOPT_PROTOCOL_DIGESTS_BODY = `
+  SELECT
+    encode(sha256(convert_to(coalesce((
+      SELECT string_agg(jsonb_build_array(collection, document_id, status, retirement_heads, forwarded_heads,
+               folded_into, (extract(epoch FROM retain_until) * 1000000)::bigint::text, arrival_watermark::text,
+               origin)::text, chr(10) ORDER BY collection COLLATE "C", document_id COLLATE "C")
+        FROM read_model_ordinary_head_retirements
+       WHERE landscape_id = p_landscape AND version_id = p_version), ''), 'UTF8')), 'hex'),
+    encode(sha256(convert_to(coalesce((
+      SELECT string_agg(jsonb_build_array(collection, product_document_id, source_document_ids)::text,
+               chr(10) ORDER BY collection COLLATE "C", product_document_id COLLATE "C")
+        FROM read_model_ordinary_chain_folds
+       WHERE landscape_id = p_landscape AND version_id = p_version), ''), 'UTF8')), 'hex')
+`
+
+/** The body of `read_model_adopt_protocol_restamp(landscape, version)`: the
+ * fence row FIRST (`adoptState.ts`, THE LOCK ORDER), then the adopt row,
+ * then the digests in a NEW statement — under READ COMMITTED each statement
+ * of a PL/pgSQL function takes its own snapshot, so the digests see every
+ * protocol write committed before the adopt row lock was granted. No adopt
+ * row: nothing (only a cold build writes one) — and the digests are not
+ * computed. The `UPDATE … FROM read_model_adopt_protocol_digests(…)` alone
+ * happens not to compute them either: measured with EXPLAIN ANALYZE on the
+ * aged-corpus shape, the planner puts the adopt
+ * row's index scan outside the function scan, which then runs zero times.
+ * That is a plan, not a guarantee (a function scan is estimated at one row
+ * and may be chosen as the outer side), so `FOUND` after the row lock
+ * decides instead. */
+const ADOPT_PROTOCOL_RESTAMP_BODY = `
+BEGIN
+  PERFORM 1 FROM read_model_projection_state
+    WHERE landscape_id = p_landscape AND version_id = p_version FOR UPDATE;
+  PERFORM 1 FROM read_model_adopt_state
+    WHERE landscape_id = p_landscape AND version_id = p_version FOR UPDATE;
+  IF FOUND THEN
+    UPDATE read_model_adopt_state AS state
+       SET retirements_digest = digests.retirements, folds_digest = digests.folds, updated_at = now()
+      FROM read_model_adopt_protocol_digests(p_landscape, p_version) AS digests
+     WHERE state.landscape_id = p_landscape AND state.version_id = p_version;
+  END IF;
+END
+`
+
+/** The body of the statement trigger function: every workspace the
+ * statement touched (its transition table), in key order; a TRUNCATE
+ * (tests only) re-stamps every adopt row.
+ *
+ * THE LOCK ORDER, enforced (`adoptState.ts`) on a participant connection
+ * (`protocolParticipant.ts`): before re-stamping a touched workspace, the
+ * statement's transaction must already hold that workspace's
+ * `read_model_projection_state` row — recorded, in the statement that took
+ * it, in the transaction-local `PROTOCOL_FENCE_ROWS_SETTING`
+ * (`assertReadModelWriteFence`, `health.ts`). A write made before it (or
+ * without it) RAISES here, at its own statement, every time — not only when
+ * another transaction happens to hold the row, which is all a `FOR UPDATE
+ * NOWAIT` in the re-stamp could detect: an uncontended misordered writer
+ * would pass it. The entry `<xid>:*` admits every workspace for that one
+ * transaction; only test fixtures write it (`testing/protocolFixture.ts`). */
+const ADOPT_PROTOCOL_TRIGGER_BODY = `
+DECLARE
+  touched RECORD;
+BEGIN
+  IF TG_OP = 'TRUNCATE' THEN
+    FOR touched IN SELECT landscape_id, version_id FROM read_model_adopt_state ORDER BY 1, 2 LOOP
+      PERFORM read_model_adopt_protocol_restamp(touched.landscape_id, touched.version_id);
+    END LOOP;
+  ELSIF TG_OP = 'INSERT' THEN
+    FOR touched IN SELECT DISTINCT landscape_id, version_id FROM adopt_protocol_new ORDER BY 1, 2 LOOP
+      PERFORM read_model_adopt_protocol_touched(touched.landscape_id, touched.version_id, TG_OP, TG_TABLE_NAME);
+    END LOOP;
+  ELSIF TG_OP = 'DELETE' THEN
+    FOR touched IN SELECT DISTINCT landscape_id, version_id FROM adopt_protocol_old ORDER BY 1, 2 LOOP
+      PERFORM read_model_adopt_protocol_touched(touched.landscape_id, touched.version_id, TG_OP, TG_TABLE_NAME);
+    END LOOP;
+  ELSE
+    FOR touched IN SELECT landscape_id, version_id FROM adopt_protocol_new
+                   UNION SELECT landscape_id, version_id FROM adopt_protocol_old ORDER BY 1, 2 LOOP
+      PERFORM read_model_adopt_protocol_touched(touched.landscape_id, touched.version_id, TG_OP, TG_TABLE_NAME);
+    END LOOP;
+  END IF;
+  RETURN NULL;
+END
+`
+
+/** The body of `read_model_adopt_protocol_touched(landscape, version, op,
+ * table)`: THE LOCK ORDER's check for one workspace a protocol statement
+ * touched (see the trigger body above), then its re-stamp. A workspace with
+ * NO `read_model_projection_state` row has no row to order against and is
+ * not checked: no production writer can reach that state and write (each
+ * asserts the fence, which fails closed on a missing row), so only a test
+ * fixture seeding rows by hand does. A connection whose participant
+ * version (`protocolParticipant.ts`, `PARTICIPANT_VERSION_SQL`: the marker
+ * parsed as an integer, 0 when absent, empty or not 1-9 digits) is below
+ * `LOCK_ORDER_RULE_SINCE` is not checked either — a process of a version
+ * that does not know the protocol: its digests are kept, its order is its
+ * own. A HIGHER version is checked by this rule (a later version keeps
+ * every earlier rule: the forward contract in `protocolParticipant.ts`). An
+ * entry counts only when it carries THIS transaction's id
+ * (`PROTOCOL_FENCE_ROWS_SETTING`'s doc comment, `health.ts`). */
+const ADOPT_PROTOCOL_TOUCHED_BODY = `
+DECLARE
+  held TEXT := coalesce(current_setting('${PROTOCOL_FENCE_ROWS_SETTING}', true), '') || ',';
+  mine TEXT := ',' || pg_current_xact_id()::text || ':';
+  participant INTEGER := ${PARTICIPANT_VERSION_SQL};
+BEGIN
+  IF participant >= ${LOCK_ORDER_RULE_SINCE}
+     AND held NOT LIKE '%' || mine || '*,%'
+     AND held NOT LIKE '%' || mine || md5(jsonb_build_array(p_landscape, p_version)::text) || ',%'
+     AND EXISTS (SELECT 1 FROM read_model_projection_state
+                  WHERE landscape_id = p_landscape AND version_id = p_version) THEN
+    RAISE EXCEPTION 'read-model lock order: % on % of %/% without its read_model_projection_state row held first',
+        p_op, p_table, p_landscape, p_version
+      USING HINT = 'take it with assertReadModelWriteFence before the first protocol write (adoptState.ts, THE LOCK ORDER)';
+  END IF;
+  PERFORM read_model_adopt_protocol_restamp(p_landscape, p_version);
+END
+`
+
+/** The version tag this version puts on every protocol function body it
+ * installs (`protocolParticipant.ts`, THE FORWARD CONTRACT). */
+const PROTOCOL_FUNCTION_TAG = `${PROTOCOL_TAG_PREFIX}${READ_MODEL_PROTOCOL_VERSION}`
+/** The function's tagged protocol version in SQL: the tag's digits, 0 for an
+ * untagged body (one installed before tags existed) or no function. ANCHORED:
+ * the comment must be exactly one tag and nothing else. A comment carrying
+ * two tags, or a tag inside other text, is not a tag this protocol wrote
+ * (only `ensureFunction` writes it, alone) and reads as untagged, so it is
+ * replaced — never read as a higher version that would freeze the body. */
+const taggedVersionSql = (oid: string) =>
+  `coalesce(substring(obj_description(${oid}, 'pg_proc') FROM '^${PROTOCOL_TAG_PREFIX}([0-9]{1,9})$')::integer, 0)`
+/** Signatures whose higher-version body this process has already reported
+ * keeping (once per process: this runs on every boot). */
+const keptHigherVersion = new Set<string>()
+
+/**
+ * Create or replace a protocol function, tagged with this version.
+ *
+ *  - A body tagged with a HIGHER version is NEVER replaced (a rollback from
+ *    a later version keeps the later bodies, which must accept everything
+ *    this version's connections do: `protocolParticipant.ts`, THE FORWARD
+ *    CONTRACT). Reported once per process.
+ *  - The same body with this version's tag: nothing — this runs on every
+ *    boot, and two boots replacing the same function at once can fail with
+ *    "tuple concurrently updated".
+ *  - Otherwise (no function, an older or untagged body, or this version's
+ *    tag on a DIFFERENT body — a build of the same version that changed it)
+ *    the body is replaced and tagged, in one `DO` block under a
+ *    transaction-scoped advisory lock that re-reads the tag: two boots that
+ *    both missed the fast path replace one after the other, and a later
+ *    version that tagged it in between is not overwritten (a later version
+ *    must take the same lock, and write its tag in the same transaction as
+ *    its body; the key is part of the contract).
+ */
+async function ensureFunction(db: Queryable, signature: string, body: string, create: string): Promise<void> {
+  const { rows } = await db.query<{ src: string | null; tagged: number }>(
+    `SELECT p.prosrc AS src, ${taggedVersionSql('f.oid')} AS tagged
+       FROM (SELECT to_regprocedure(current_schema() || '.' || $1) AS oid) f
+       LEFT JOIN pg_proc p ON p.oid = f.oid`,
+    [signature],
+  )
+  const found = rows[0]
+  if (found && found.tagged > READ_MODEL_PROTOCOL_VERSION) {
+    if (!keptHigherVersion.has(signature)) {
+      keptHigherVersion.add(signature)
+      console.log(`[read-model] ${signature} is tagged ${PROTOCOL_TAG_PREFIX}${found.tagged}, above this version's `
+        + `${READ_MODEL_PROTOCOL_VERSION}: kept, not replaced (protocolParticipant.ts, the forward contract)`)
+    }
+    return
+  }
+  if (found?.src === body && found.tagged === READ_MODEL_PROTOCOL_VERSION) return
+  if (create.includes('$ensure$') || create.includes('$create$') || signature.includes("'")) {
+    throw new Error(`ensureFunction(${signature}): the statement cannot be embedded in its DO block`)
+  }
+  await db.query(`
+    DO $ensure$
+    BEGIN
+      PERFORM pg_advisory_xact_lock(hashtextextended('maplespire:read-model-protocol-functions', 0));
+      IF ${taggedVersionSql(`to_regprocedure(current_schema() || '.${signature}')`)} > ${READ_MODEL_PROTOCOL_VERSION} THEN
+        RETURN;
+      END IF;
+      EXECUTE $create$${create}$create$;
+      EXECUTE format('COMMENT ON FUNCTION %I.%s IS %L', current_schema(), '${signature}', '${PROTOCOL_FUNCTION_TAG}');
+    END $ensure$
+  `)
+}
+
+/** One statement trigger, created only when absent (never dropped and
+ * recreated on boot: DROP TRIGGER takes ACCESS EXCLUSIVE on a table a
+ * rotator or forwarder may hold); a concurrent boot that created it first
+ * is not an error. */
+async function ensureAdoptProtocolTrigger(
+  db: Queryable,
+  table: 'read_model_ordinary_head_retirements' | 'read_model_ordinary_chain_folds',
+  event: 'INSERT' | 'UPDATE' | 'DELETE' | 'TRUNCATE',
+): Promise<void> {
+  const name = `read_model_adopt_protocol_${table === 'read_model_ordinary_chain_folds' ? 'folds' : 'retirements'}_${event.toLowerCase()}`
+  const referencing = event === 'INSERT' ? 'REFERENCING NEW TABLE AS adopt_protocol_new'
+    : event === 'UPDATE' ? 'REFERENCING NEW TABLE AS adopt_protocol_new OLD TABLE AS adopt_protocol_old'
+      : event === 'DELETE' ? 'REFERENCING OLD TABLE AS adopt_protocol_old' : ''
+  await db.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_trigger
+                      WHERE tgrelid = to_regclass(current_schema() || '.${table}') AND tgname = '${name}') THEN
+        CREATE TRIGGER ${name} AFTER ${event} ON ${table} ${referencing}
+          FOR EACH STATEMENT EXECUTE FUNCTION read_model_adopt_protocol_refresh();
+      END IF;
+    EXCEPTION WHEN duplicate_object THEN NULL;
+    END $$;
+  `)
+}
+
+/**
+ * THE ADOPT PROTOCOL DIGESTS, maintained by the database (G4-16f,
+ * `adoptState.ts`): after every statement that changes a retirement or fold
+ * row, in that statement's transaction, the adopt row of every workspace it
+ * touched gets the digests of the tables as they now stand. One trigger per
+ * table and event because PostgreSQL refuses transition tables on a trigger
+ * with more than one event (measured, postgres:16-alpine, 2026-11-07:
+ * "transition tables cannot be specified for triggers with more than one
+ * event"). Each is pinned by its own arm in `adoptState.integration.test.ts`.
+ *
+ * RELEASE NOTE — the mixed-version window (a rolling deploy, or a rollback,
+ * with processes of two versions on one database). The predecessor that
+ * matters is the previous release (read from the source of each of its
+ * writers, 2026-11-08). It has no adopt plane and never creates, replaces or
+ * drops these functions or triggers. Its protocol writers are of two kinds:
+ *  - FENCE FIRST, outside the projection mutex: the rotator
+ *    (`rotateOrdinaryHead`) and the fold writer's record, abandon and sweep
+ *    (`ordinaryChainFoldWriter.ts`) each run `assertTransactionAuthority`
+ *    (the fence row FOR UPDATE) before their first protocol write;
+ *  - WRITE FIRST, under the per-workspace projection advisory mutex
+ *    (`withReadModelProjectionTransaction`, which both versions take): only
+ *    the forward commit (`forwardRetiredHead`'s `commitForwardedHeads`) and
+ *    the folded-arrival advances (`commitFoldedArrival`,
+ *    `commitDetachedWatermarks`) write the row, then assert the fence.
+ * Once this version has booted on a database the triggers stay installed
+ * through any rollback, and a boot of this version REPLACES their bodies
+ * when they differ from its own — bounded by the version tags
+ * (`ensureFunction`): never a body tagged with a higher version. So they are
+ * written to be safe for a process that does not know them:
+ *  - they ENFORCE the lock order only on a connection whose participant
+ *    version (`protocolParticipant.ts`, set on every connection of this
+ *    version's pools by `guardIdleClientErrors`) is at least
+ *    `LOCK_ORDER_RULE_SINCE`. A previous-release process never sets it, so none of
+ *    its writes is refused (pinned by `adoptState.integration.test.ts`,
+ *    MIXED VERSION); a writer of this version that omits the fence still is
+ *    (LOCK ORDER 2), and one whose connection lost its marker is refused by
+ *    the fence assertion itself (`ReadModelProtocolMarkerError`, LOST
+ *    MARKER);
+ *  - they still re-stamp the digests on a previous-release write (taking
+ *    the fence row, then the adopt row, inside that transaction), so the
+ *    digests are correct when this version comes back;
+ *  - the residual, a 40P01: since the write-first writers run under the
+ *    mutex both versions take, a cycle needs a writer OUTSIDE the mutex —
+ *    the fold record, the sweep or abandon, or the compaction settle's
+ *    `commitForwardedHeadsBatch` (this version: fence first, then the row) —
+ *    holding the fence row and wanting a retirement row that a
+ *    previous-release forward or folded-arrival advance holds while it waits for the fence
+ *    row. PostgreSQL detects it after `deadlock_timeout` and aborts one
+ *    transaction, which rolls back whole; the fold writer, the forwarder and
+ *    the folded-arrival poll try again on their next pass. The compaction
+ *    settle has NO retry loop on 40P01: its error ends that compaction pass,
+ *    as its CAS failure does, and the next compaction run recovers. The SAME
+ *    cycle exists in the previous release alone (its fence-first fold record
+ *    against its write-first forward), so the window adds no new kind of
+ *    failure. (`adoptState.integration.test.ts`, MIXED VERSION 2, drives the
+ *    previous release's order against this version's: one 40P01, one commit, the
+ *    digests kept. Measured: with the production mutex, 1000/1000
+ *    first-try commits and 0 × 40P01; without it, 6+2 writers × 60
+ *    iterations met 40P01s that were retried to success, digests intact.)
+ *  - the previous release alone, after a rollback, with the triggers still
+ *    installed: the re-stamp takes the fence row FOR UPDATE inside the
+ *    statement that writes, so a previous-release write-first writer now
+ *    acquires the fence at its FIRST protocol write instead of at its
+ *    assertion. That creates no cycle between previous-release writers that
+ *    did not exist before (reasoned from the writers listed above, not
+ *    measured): the fence-first writers already hold the fence before any
+ *    row, so for them it is a re-entrant lock, then the adopt row, which no
+ *    previous-release code otherwise touches; the write-first writers keep
+ *    the order row-then-fence they had, and now
+ *    hold FEWER rows when they ask for the fence (one, rather than every
+ *    row of a multi-advance `commitDetachedWatermarks`), and they are
+ *    serialised with each other by the mutex. The only cycle — a
+ *    fence-first writer such as `recordOrdinaryChainFold` (several source
+ *    rows updated under the fence) wanting a row a previous-release
+ *    forwarder holds — is the one the previous release already had, with a
+ *    narrower window.
+ *  - the tags are a contract with every later version: it must write the
+ *    `COMMENT` tag in the same transaction as the body replacement, under
+ *    the same advisory-lock key (`maplespire:read-model-protocol-functions`,
+ *    re-reading the tag under it), as `ensureFunction` does; the tag is read
+ *    anchored (exactly `maplespire-protocol=<digits>`). Operators must never
+ *    `COMMENT ON` these functions. Earlier, unreleased G4-16f builds replaced
+ *    the bodies without re-tagging them; this version treats what they left
+ *    as older and replaces it.
+ */
+async function ensureAdoptProtocolTriggers(db: Queryable): Promise<void> {
+  await ensureFunction(db, 'read_model_adopt_protocol_digests(text,text)', ADOPT_PROTOCOL_DIGESTS_BODY,
+    `CREATE OR REPLACE FUNCTION read_model_adopt_protocol_digests(p_landscape TEXT, p_version TEXT,
+       OUT retirements TEXT, OUT folds TEXT) LANGUAGE sql STABLE AS $$${ADOPT_PROTOCOL_DIGESTS_BODY}$$`)
+  await ensureFunction(db, 'read_model_adopt_protocol_restamp(text,text)', ADOPT_PROTOCOL_RESTAMP_BODY,
+    `CREATE OR REPLACE FUNCTION read_model_adopt_protocol_restamp(p_landscape TEXT, p_version TEXT)
+       RETURNS void LANGUAGE plpgsql AS $$${ADOPT_PROTOCOL_RESTAMP_BODY}$$`)
+  await ensureFunction(db, 'read_model_adopt_protocol_touched(text,text,text,text)', ADOPT_PROTOCOL_TOUCHED_BODY,
+    `CREATE OR REPLACE FUNCTION read_model_adopt_protocol_touched(p_landscape TEXT, p_version TEXT, p_op TEXT, p_table TEXT)
+       RETURNS void LANGUAGE plpgsql AS $$${ADOPT_PROTOCOL_TOUCHED_BODY}$$`)
+  await ensureFunction(db, 'read_model_adopt_protocol_refresh()', ADOPT_PROTOCOL_TRIGGER_BODY,
+    `CREATE OR REPLACE FUNCTION read_model_adopt_protocol_refresh()
+       RETURNS trigger LANGUAGE plpgsql AS $$${ADOPT_PROTOCOL_TRIGGER_BODY}$$`)
+  await ensureAdoptProtocolTrigger(db, 'read_model_ordinary_head_retirements', 'INSERT')
+  await ensureAdoptProtocolTrigger(db, 'read_model_ordinary_head_retirements', 'UPDATE')
+  await ensureAdoptProtocolTrigger(db, 'read_model_ordinary_head_retirements', 'DELETE')
+  await ensureAdoptProtocolTrigger(db, 'read_model_ordinary_head_retirements', 'TRUNCATE')
+  await ensureAdoptProtocolTrigger(db, 'read_model_ordinary_chain_folds', 'INSERT')
+  await ensureAdoptProtocolTrigger(db, 'read_model_ordinary_chain_folds', 'UPDATE')
+  await ensureAdoptProtocolTrigger(db, 'read_model_ordinary_chain_folds', 'DELETE')
+  await ensureAdoptProtocolTrigger(db, 'read_model_ordinary_chain_folds', 'TRUNCATE')
+}
+
 /** Drop the read-model tables (used by self-heal rebuild paths + tests + the
  * legacy-schema migration above).
  *
@@ -1523,6 +2607,19 @@ export async function dropReadModelSchema(db: Queryable): Promise<void> {
       EXECUTE format('DROP TABLE IF EXISTS %I.ro_diagrams', s);
       EXECUTE format('DROP TABLE IF EXISTS %I.read_model_change_events', s);
       EXECUTE format('DROP TABLE IF EXISTS %I.read_model_projection_state', s);
+      EXECUTE format('DROP TABLE IF EXISTS %I.read_model_adopt_watermarks', s);
+      EXECUTE format('DROP TABLE IF EXISTS %I.read_model_adopt_state', s);
+      EXECUTE format('DROP TABLE IF EXISTS %I.read_model_sealed_product_entities', s);
+      EXECUTE format('DROP TABLE IF EXISTS %I.read_model_sealed_product_extracts', s);
+      -- The protocol tables (retirements, folds) are durable state and stay;
+      -- their adopt triggers read the two tables dropped above, so they go
+      -- too (CASCADE on the trigger function drops the eight triggers), or
+      -- every protocol write would fail 42P01 until the next ensure. The
+      -- next ensureReadModelSchema creates them again.
+      EXECUTE format('DROP FUNCTION IF EXISTS %I.read_model_adopt_protocol_refresh() CASCADE', s);
+      EXECUTE format('DROP FUNCTION IF EXISTS %I.read_model_adopt_protocol_touched(text, text, text, text)', s);
+      EXECUTE format('DROP FUNCTION IF EXISTS %I.read_model_adopt_protocol_restamp(text, text)', s);
+      EXECUTE format('DROP FUNCTION IF EXISTS %I.read_model_adopt_protocol_digests(text, text)', s);
     END $$;
   `)
 }

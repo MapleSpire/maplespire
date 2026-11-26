@@ -324,6 +324,185 @@ describe.skipIf(!CONNECTION)('verifyWorkspaceIntegrity', () => {
     expect(after.workspacesWithDefects).toBe(before.workspacesWithDefects)
   })
 
+  it('counts duplicate ids apart from unreadable documents, and the refusal names each', async () => {
+    // `defect_count` counts both; the unreadable-document gauge and its
+    // workspace count must not (`duplicate_id_count`). EXACT deltas on a
+    // schema this test owns.
+    const duplicate = (id: string) => ({ kind: 'duplicate-id' as const, source: 'object-shard' as const, url: null, entity: 'object' as const, id })
+    const before = await fleetDefectSummary(database.pool)
+    const both = await seed(['a'], 6)
+    await project(both, 7, {
+      defects: [{ kind: 'document-unreadable', source: 'object-shard', url: 'automerge:os1' }, duplicate('x'), duplicate('y')],
+    })
+    const duplicatesOnly = await seed(['a'], 6)
+    await project(duplicatesOnly, 7, { defects: [duplicate('z')] })
+    const after = await fleetDefectSummary(database.pool)
+    expect({
+      documents: after.totalDefects - before.totalDefects,
+      workspacesWithDocuments: after.workspacesWithDefects - before.workspacesWithDefects,
+      duplicateIds: after.totalDuplicateIds - before.totalDuplicateIds,
+      workspacesWithDuplicates: after.workspacesWithDuplicateIds - before.workspacesWithDuplicateIds,
+    }).toEqual({ documents: 1, workspacesWithDocuments: 1, duplicateIds: 3, workspacesWithDuplicates: 2 })
+    const columns = await database.pool.query<{ landscape_id: string; defect_count: number; duplicate_id_count: number }>(
+      `SELECT landscape_id, defect_count, duplicate_id_count FROM read_model_projection_state
+        WHERE landscape_id = ANY($1::text[]) ORDER BY landscape_id`,
+      [[both.landscapeId, duplicatesOnly.landscapeId]],
+    )
+    expect(columns.rows.map((row) => [row.landscape_id, row.defect_count, row.duplicate_id_count])).toEqual([
+      [both.landscapeId, 3, 2], [duplicatesOnly.landscapeId, 1, 1],
+    ].sort((a, b) => String(a[0]).localeCompare(String(b[0]))))
+    // A projection that did not look leaves both columns alone.
+    await project(both, 8, { digests: { group: digestOfIds([]) } })
+    expect((await database.pool.query<{ n: number }>(
+      'SELECT duplicate_id_count AS n FROM read_model_projection_state WHERE landscape_id = $1', [both.landscapeId],
+    )).rows[0].n).toBe(2)
+
+    const { readModelUntrustworthyReason } = await import('../maintenance/referenceIntegrityDocuments.js')
+    const bothReason = await readModelUntrustworthyReason(database.pool, both)
+    expect(bothReason).toMatch(/^its last full extraction recorded 1 unreadable document\(s\) and 2 duplicate id\(s\) dropped/)
+    const duplicatesReason = await readModelUntrustworthyReason(database.pool, duplicatesOnly)
+    expect(duplicatesReason).toMatch(/^its last full extraction recorded 1 duplicate id\(s\) dropped/)
+    expect(duplicatesReason).not.toContain('unreadable')
+  })
+
+  /**
+   * THE PREVIOUS RELEASE'S STAMP, its defect columns verbatim (from that
+   * release's `server/src/readModel/projectionIntegrity.ts`): a
+   * mixed-version fleet or a rollback runs this, and it knows neither
+   * `duplicate_id_count` nor `duplicate_ids_observed_at`. In production order,
+   * like `project`: stamp, then advance the generation.
+   */
+  async function developStamp(workspace: WorkspaceKey, generation: number, defects: number, summary: string): Promise<void> {
+    await database.pool.query(
+      `UPDATE read_model_projection_state SET
+         defect_count = CASE WHEN $3::integer IS NULL THEN defect_count ELSE $3::integer END,
+         defect_summary = CASE WHEN $3::integer IS NULL THEN defect_summary ELSE $4 END,
+         defects_observed_at = CASE WHEN $3::integer IS NULL THEN defects_observed_at ELSE now() END,
+         updated_at = now()
+       WHERE landscape_id = $1 AND version_id = $2 AND projected_generation < $5`,
+      [workspace.landscapeId, workspace.versionId, defects, summary, generation],
+    )
+    await database.pool.query(
+      `UPDATE read_model_projection_state
+          SET projected_generation = GREATEST(projected_generation, $2),
+              observed_generation = GREATEST(observed_generation, $2)
+        WHERE landscape_id = $1`,
+      [workspace.landscapeId, generation],
+    )
+  }
+
+  it('a stamp by the previous release, a pre-column row and an over-count: no ghost duplicate, nothing cancelled, worst and the refusal agree', async () => {
+    const duplicate = (id: string) => ({ kind: 'duplicate-id' as const, source: 'object-shard' as const, url: null, entity: 'object' as const, id })
+    const unreadable = (url: string) => ({ kind: 'document-unreadable' as const, source: 'object-shard' as const, url })
+    const before = await fleetDefectSummary(database.pool)
+    const delta = async () => {
+      const now = await fleetDefectSummary(database.pool)
+      return {
+        documents: now.totalDefects - before.totalDefects,
+        workspacesWithDocuments: now.workspacesWithDefects - before.workspacesWithDefects,
+        duplicateIds: now.totalDuplicateIds - before.totalDuplicateIds,
+        workspacesWithDuplicates: now.workspacesWithDuplicateIds - before.workspacesWithDuplicateIds,
+      }
+    }
+
+    // STALE: this version stamps 2 duplicates, then the previous release
+    // stamps 1 unreadable document and leaves duplicate_id_count = 2 behind.
+    const stale = await seed(['a'], 6)
+    await project(stale, 7, { defects: [duplicate('x'), duplicate('y')] })
+    // CONTROL: before the previous release's stamp, the pair is trusted.
+    expect(await delta(), 'stale, before the previous release stamps').toEqual({
+      documents: 0, workspacesWithDocuments: 0, duplicateIds: 2, workspacesWithDuplicates: 1,
+    })
+    await developStamp(stale, 8, 1, 'object-shard/document-unreadable automerge:os-stale')
+    const staleColumns = (await database.pool.query<{ defect_count: number; duplicate_id_count: number; matches: boolean }>(
+      `SELECT defect_count, duplicate_id_count, duplicate_ids_observed_at = defects_observed_at AS matches
+         FROM read_model_projection_state WHERE landscape_id = $1`, [stale.landscapeId],
+    )).rows[0]
+    // CONTROL: the previous release's UPDATE really left the old count and marker behind.
+    expect(staleColumns).toEqual({ defect_count: 1, duplicate_id_count: 2, matches: false })
+
+    // A REAL unreadable document elsewhere, which a -1 would cancel out.
+    const real = await seed(['a'], 6)
+    await project(real, 7, { defects: [unreadable('automerge:os-real')] })
+
+    // PRE-COLUMN: a row last stamped by a writer without the duplicate
+    // columns (the previous release on a fresh row): both NULL, defect_count 2. Its
+    // defects are documents.
+    const preColumn = await seed(['a'], 6)
+    await developStamp(preColumn, 7, 2, 'object-shard/document-unreadable automerge:os-pre ×2')
+
+    // OVER-COUNT: a trusted duplicate_id_count above defect_count. NO writer
+    // in this tree produces one (the stamp writes both from one list); set by
+    // hand, it is what the LEAST bound is for.
+    const overCount = await seed(['a'], 6)
+    await project(overCount, 7, { defects: [duplicate('z')] })
+    await database.pool.query(
+      'UPDATE read_model_projection_state SET duplicate_id_count = 3 WHERE landscape_id = $1', [overCount.landscapeId],
+    )
+
+    // DUPLICATE-ONLY, the largest defect_count of all: listed in `worst`,
+    // after every workspace missing data.
+    const duplicatesOnly = await seed(['a'], 6)
+    await project(duplicatesOnly, 7, { defects: [duplicate('p'), duplicate('q'), duplicate('r')] })
+
+    // stale 1 + real 1 + preColumn 2 documents; overCount 1 + duplicatesOnly 3 ids.
+    expect(await delta()).toEqual({
+      documents: 4, workspacesWithDocuments: 3, duplicateIds: 4, workspacesWithDuplicates: 2,
+    })
+
+    const mine = new Set([stale, real, preColumn, overCount, duplicatesOnly].map((workspace) => workspace.landscapeId))
+    const worst = (await fleetDefectSummary(database.pool, { worstLimit: 1_000 })).worst
+      .filter((entry) => mine.has(entry.landscapeId))
+      .map(({ landscapeId, defectCount, unreadableDocuments, duplicateIds }) => ({ landscapeId, defectCount, unreadableDocuments, duplicateIds }))
+    const [firstTie, secondTie] = [real.landscapeId, stale.landscapeId].sort()
+    const tie = (landscapeId: string) => ({ landscapeId, defectCount: 1, unreadableDocuments: 1, duplicateIds: 0 })
+    expect(worst).toEqual([
+      { landscapeId: preColumn.landscapeId, defectCount: 2, unreadableDocuments: 2, duplicateIds: 0 },
+      tie(firstTie),
+      tie(secondTie),
+      { landscapeId: duplicatesOnly.landscapeId, defectCount: 3, unreadableDocuments: 0, duplicateIds: 3 },
+      { landscapeId: overCount.landscapeId, defectCount: 1, unreadableDocuments: 0, duplicateIds: 1 },
+    ])
+
+    const { readModelUntrustworthyReason } = await import('../maintenance/referenceIntegrityDocuments.js')
+    const staleReason = await readModelUntrustworthyReason(database.pool, stale)
+    expect(staleReason).toMatch(/^its last full extraction recorded 1 unreadable document\(s\): /)
+    expect(staleReason).not.toContain('duplicate id')
+    expect(await readModelUntrustworthyReason(database.pool, preColumn))
+      .toMatch(/^its last full extraction recorded 2 unreadable document\(s\): /)
+    const overCountReason = await readModelUntrustworthyReason(database.pool, overCount)
+    expect(overCountReason).toMatch(/^its last full extraction recorded 1 duplicate id\(s\) dropped/)
+    expect(overCountReason).not.toContain('unreadable')
+  })
+
+  it('distrusts a duplicate marker NEWER than the defect stamp: the rule is equality, not >=', async () => {
+    // No writer in this tree produces this (the stamp sets both markers to
+    // one `now()`); it pins the comparison, which `>=` would pass today on
+    // every row the stamp writes. A marker newer than `defects_observed_at`
+    // did not come from the UPDATE that wrote this `defect_count`.
+    const duplicate = (id: string) => ({ kind: 'duplicate-id' as const, source: 'object-shard' as const, url: null, entity: 'object' as const, id })
+    const before = await fleetDefectSummary(database.pool)
+    const workspace = await seed(['a'], 6)
+    await project(workspace, 7, { defects: [duplicate('x'), duplicate('y')] })
+    // CONTROL: as stamped, the count is trusted.
+    const trusted = await fleetDefectSummary(database.pool)
+    expect(trusted.totalDuplicateIds - before.totalDuplicateIds).toBe(2)
+    expect(trusted.totalDefects - before.totalDefects).toBe(0)
+
+    await database.pool.query(
+      `UPDATE read_model_projection_state
+          SET duplicate_ids_observed_at = defects_observed_at + interval '1 second'
+        WHERE landscape_id = $1`,
+      [workspace.landscapeId],
+    )
+    const after = await fleetDefectSummary(database.pool)
+    expect(after.totalDuplicateIds - before.totalDuplicateIds, 'the count is not believed').toBe(0)
+    expect(after.totalDefects - before.totalDefects, 'so every defect counts as a document').toBe(2)
+    const { readModelUntrustworthyReason } = await import('../maintenance/referenceIntegrityDocuments.js')
+    expect(await readModelUntrustworthyReason(database.pool, workspace))
+      .toMatch(/^its last full extraction recorded 2 unreadable document\(s\): /)
+  })
+
   it('skips the ranked query when the caller only wants the totals', async () => {
     // `/metrics` scrapes three numbers and must not pay for a ranked scan it
     // would throw away on every scrape.

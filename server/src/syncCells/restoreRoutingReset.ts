@@ -101,13 +101,15 @@ export interface RestoreRoutingResetReport {
    * is still in the FUTURE.
    *
    * READ THE MECHANISM BEFORE TRUSTING THE NUMBER — it is NOT evidence that
-   * cells are still running. `lease_observed_expires_at` is written by exactly
-   * one function, `persistLease`, reached from three episodic call sites: the
-   * two ACQUISITION paths (`acquireMissing`, `recoverWorkspaceLease`) and the
-   * fence REPAIR. Renewal updates the lease's validity in memory and writes
-   * nothing. So with `leaseTtlMs` at its 15 s default, a cell that has been
-   * serving for an hour carries an observed expiry an hour in the PAST and is
-   * not counted here at all.
+   * cells are still running. `lease_observed_expires_at` is written by
+   * `persistLease`, reached from three episodic call sites (the two
+   * ACQUISITION paths, `acquireMissing` and `recoverWorkspaceLease`, and the
+   * fence REPAIR), and REFRESHED on renewal at most once per
+   * `LEASE_OBSERVATION_REFRESH_MS` (5 min; `refreshLeaseObservations`, G4-16f)
+   * to the lease's new validity. So with `leaseTtlMs` at its 15 s default, a
+   * cell that has been serving for an hour carries an observed expiry at most
+   * five minutes in the PAST, and is counted here only in the ~15 s after a
+   * refresh.
    *
    * WHAT THE NUMBER MEANS IS BOUNDED, NOT IMPOSSIBLE: a dump CAN carry a future
    * expiry (`restoreRoutingReset.integration.test.ts` seeds one).

@@ -477,6 +477,59 @@ describe.skipIf(!TEST_DATABASE_URL)('real PostgreSQL backup and restore drill', 
       await sourcePool.query(`DELETE FROM versions WHERE id = 'bad-url'`)
     }
   }, 180_000)
+
+  it('an INVALID index in the source: the restore still verifies AND the finding is counted (G4-16f M1)', async () => {
+    // The state a deferred 0006 drop leaves (readModel/schema.ts):
+    // DROP INDEX CONCURRENTLY marks the index invalid, then times out waiting
+    // for an older transaction. pg_dump does not export it (measured
+    // 2026-11-17), so a fingerprint that listed it would fail every restore
+    // over the SOURCE's state.
+    await sourcePool.query(`CREATE INDEX drill_invalid_probe ON versions (landscape_id)`)
+    const holder = await sourcePool.connect()
+    const dropper = await sourcePool.connect()
+    const restoreTarget = await createTemporaryRestoreDatabase(TEST_DATABASE_URL!)
+    try {
+      await holder.query('BEGIN')
+      await holder.query('SELECT count(*) FROM versions')
+      await dropper.query(`SET lock_timeout = '300ms'`)
+      await expect(dropper.query('DROP INDEX CONCURRENTLY drill_invalid_probe')).rejects.toMatchObject({ code: '55P03' })
+      await holder.query('ROLLBACK')
+      const { rows } = await sourcePool.query<{ indisvalid: boolean }>(
+        `SELECT x.indisvalid FROM pg_index x JOIN pg_class c ON c.oid = x.indexrelid WHERE c.relname = 'drill_invalid_probe'`,
+      )
+      expect(rows).toEqual([{ indisvalid: false }])
+
+      const bundleDirectory = join(temporaryDirectory, 'bundle-invalid-index')
+      const manifest = await createDatabaseBackup({
+        databaseUrl: source.url,
+        bundleDirectory,
+        pgTools: tools,
+        maxDocumentProbes: 8,
+        assetDirectory: assetVolume,
+      })
+      // Conjunctive: the bundle exists, the copy verifies, AND the finding is counted.
+      expect(manifest.dump.bytes).toBeGreaterThan(0)
+      expect(manifest.invalidIndexes).toEqual(['versions|drill_invalid_probe'])
+      const verdict = summariseSourceIntegrity(manifest)
+      expect(verdict.verdict).toBe('violations')
+      expect(verdict.detail).toContain('versions|drill_invalid_probe')
+      const verification = await restoreAndVerifyDatabase({
+        sourceDatabaseUrl: source.url,
+        targetDatabaseUrl: restoreTarget.url,
+        bundleDirectory,
+        pgTools: tools,
+        assetTargetDirectory: join(temporaryDirectory, 'restored-assets-invalid-index'),
+      })
+      expect(verification.outcome).toBe('passed')
+    } finally {
+      await holder.query('ROLLBACK').catch(() => undefined)
+      holder.release()
+      await dropper.query('RESET lock_timeout').catch(() => undefined)
+      await dropper.query('DROP INDEX CONCURRENTLY IF EXISTS drill_invalid_probe').catch(() => undefined)
+      dropper.release()
+      await restoreTarget.drop()
+    }
+  }, 180_000)
 })
 
 /**

@@ -19,9 +19,10 @@ import { Repo } from '@automerge/automerge-repo'
 import { PostgresStorageAdapter } from '../automergeStorage.js'
 import { createIsolatedSchemaDb, type IsolatedSchemaDb } from '../testing/isolatedSchema.js'
 import { ensureReadModelSchema } from './schema.js'
-import { getWorkspaceProjectionFreshness } from './health.js'
-import { prepareDocumentWatermarkProofs, recordProjectedWatermarks, recordSampledDocumentWatermark } from './arrivalWatermark.js'
-import { startReadModelProjector, awaitInitialDiagramProbe } from './projectorService.js'
+import { absenceProofMetricSamples, getWorkspaceProjectionFreshness, resetAbsenceProofForTest } from './health.js'
+import { markStaticEntryWatermarks, prepareDocumentWatermarkProofs, recordProjectedWatermarks, recordSampledDocumentWatermark } from './arrivalWatermark.js'
+import { durabilityWitnessPayload } from './queries.js'
+import { startReadModelProjector, awaitInitialDiagramProbe, awaitAdoptStamps } from './projectorService.js'
 
 const connection = process.env.TEST_DATABASE_URL
 const suite = describe.skipIf(!connection)
@@ -745,4 +746,286 @@ suite('ordinary projector arrival watermark races (real PostgreSQL and Repo)', (
       }
     })
   }
+
+  /**
+   * T-SUM-2c, the defect as measured on a stack: on
+   * the ordinary plane, the Repo's save of the ModelMeta revision a metadata
+   * pass had just projected landed 1-3 ms AFTER that pass's
+   * `last_projected_at`. ModelMeta has no `read_model_document_watermarks`
+   * row there, so the clause fell to its timestamp, and refused until the
+   * next pass of any kind — on a quiet workspace, until somebody wrote. Built
+   * here by holding that save until the pass has committed. The deferred
+   * adopt stamp of the pass then certifies the revision (durable = sampled =
+   * live), and that certificate is what must cover it, with no further write
+   * and no further pass. The stale detector reads the same input, so its
+   * grace is shortened to show it is not the next thing to refuse.
+   */
+  it('T-SUM-2c: a ModelMeta revision saved after the pass that projected it is provable without a future edit, and an arrival no pass projected is not', async () => {
+    const db = await database('control_saved_after_pass')
+    const saveGate = deferred(), saveEntered = deferred()
+    let blockedDocument: string | null = null
+    let repo: Repo | undefined
+    let stop: (() => void) | undefined
+    const grace = process.env.READ_MODEL_STALE_GRACE_MS
+    process.env.READ_MODEL_STALE_GRACE_MS = '200'
+    try {
+      const adapter = new PostgresStorageAdapter({ db: db.pool })
+      const storage = new Proxy(adapter, { get(target, property) {
+        if (property === 'save') return async (storageKey: string[], data: Uint8Array) => {
+          if (storageKey[0] === blockedDocument) { saveEntered.resolve(); await saveGate.promise }
+          return target.save(storageKey, data)
+        }
+        const value = Reflect.get(target, property, target)
+        return typeof value === 'function' ? value.bind(target) : value
+      } })
+      repo = new Repo({ storage, network: [], saveDebounceRate: 0 })
+      const shard = repo.create({ objects: { x: { id: 'x', name: 'X', type: 'system' } } })
+      const meta = repo.create({ groups: {} as Record<string, { id: string; name: string; objectIds: string[] }>,
+        objectShardUrls: [shard.url], connectionShardUrls: [] as string[] })
+      const root = repo.create({ modelMetaUrl: meta.url, modelUrl: '', shardUrls: [], diagrams: {} })
+      await repo.flush()
+      for (const handle of [shard, meta, root]) {
+        await db.pool.query('INSERT INTO automerge_document_workspace(document_id,landscape_id,version_id) VALUES($1,$2,$3)',
+          [handle.documentId, key.landscapeId, key.versionId])
+      }
+      stop = await startReadModelProjector(repo, root.url, db.pool, key, undefined, 0)
+      await awaitInitialDiagramProbe(key)
+      await awaitAdoptStamps(key)
+      const state = async () => (await db.pool.query<{ generation: string; kind: string; projected_at: Date }>(
+        `SELECT projected_generation::text AS generation, last_projection_kind AS kind, last_projected_at AS projected_at
+           FROM read_model_projection_state WHERE landscape_id = $1 AND version_id = $2`, [key.landscapeId, key.versionId])).rows[0]
+      await vi.waitFor(async () => expect((await getWorkspaceProjectionFreshness(db.pool, key)).absenceProvable).toBe(true),
+        { timeout: 2_000, interval: 10 })
+
+      // ModelMeta moves; its save is held until the pass projecting it committed.
+      blockedDocument = meta.documentId
+      meta.change((doc) => { doc.groups.g = { id: 'g', name: 'G', objectIds: [] } })
+      await saveEntered.promise
+      await vi.waitFor(async () => {
+        expect((await db.pool.query(`SELECT id FROM ro_groups WHERE landscape_id = $1 AND version_id = $2`,
+          [key.landscapeId, key.versionId])).rows.map((row) => row.id)).toEqual(['g'])
+        expect((await state()).kind).toBe('metadata')
+      }, { timeout: 2_000, interval: 10 })
+      const pass = await state()
+      blockedDocument = null
+      saveGate.resolve()
+      // The construction, checked: ModelMeta's newest write is now AFTER the
+      // pass that projected it, and above any certificate it had.
+      await vi.waitFor(async () => {
+        const { rows } = await db.pool.query<{ after: boolean }>(
+          `SELECT max(updated_at) > $2::timestamptz AS after FROM automerge_storage
+            WHERE split_part(key, '/', 1) = $1 AND split_part(key, '/', 2) <> 'sync-state'`,
+          [meta.documentId, pass.projected_at])
+        expect(rows[0].after).toBe(true)
+      }, { timeout: 2_000, interval: 10 })
+      await awaitAdoptStamps(key)
+      // Past the (shortened) stale grace, with no write and no pass.
+      await new Promise((resolve) => setTimeout(resolve, 400))
+      await vi.waitFor(async () => {
+        const freshness = await getWorkspaceProjectionFreshness(db.pool, key)
+        expect(freshness.status).toBe('healthy')
+        expect(freshness.arrivalRefusals).toEqual({ zero: 0, exact: 0, fallback: 0, sample: [] })
+        expect(freshness.absenceProvable).toBe(true)
+      }, { timeout: 3_000, interval: 25 })
+      // Nothing moved the timestamp either: the lift is the adopt certificate's.
+      const after = await state()
+      expect(after.generation, 'no pass ran after the metadata pass').toBe(pass.generation)
+      expect(after.projected_at.getTime(), 'last_projected_at did not move').toBe(pass.projected_at.getTime())
+
+      // An arrival NO pass projected (a raw chunk behind the Repo's back) is
+      // above the adopt certificate and after the last pass: refused, named.
+      await db.pool.query(`INSERT INTO automerge_storage (key, data) VALUES ($1, $2)`,
+        [`${meta.documentId}/incremental/t-sum-2c-unprojected`, Buffer.from([1, 2, 3])])
+      const refused = await getWorkspaceProjectionFreshness(db.pool, key)
+      expect(refused.absenceProvable).toBe(false)
+      expect(refused.arrivalRefusals?.fallback).toBe(1)
+      expect(refused.arrivalRefusals?.sample).toEqual([expect.stringMatching(new RegExp(`^${meta.documentId}:fallback:\\d+$`))])
+    } finally {
+      if (grace === undefined) delete process.env.READ_MODEL_STALE_GRACE_MS
+      else process.env.READ_MODEL_STALE_GRACE_MS = grace
+      saveGate.resolve()
+      stop?.()
+      if (repo) await repo.shutdown()
+      await db.teardown()
+    }
+  })
+
+  /**
+   * T-SUM-2c, the COLD BUILD half (the scheduling after a cold build had no
+   * test). A compaction's re-attach is a cold build. Built here: a
+   * ModelMeta revision whose save is still held when the cold build samples
+   * it, and the cold build's adopt preparation failing (its flush throws
+   * once), so the build stamps ModelMeta 0. The held save then lands AFTER
+   * the build's `last_projected_at`, so the timestamp refuses it, and no
+   * pass follows (the change fired before any watcher existed). Only the
+   * deferred stamp the cold build schedules can certify that revision.
+   */
+  it('T-SUM-2c: a control document the cold build could not certify is certified by the stamp it schedules, with no pass', async () => {
+    const db = await database('control_cold_build_uncertified')
+    const saveGate = deferred(), saveEntered = deferred()
+    let blockedDocument: string | null = null
+    let repo: Repo | undefined
+    let stop: (() => void) | undefined
+    let injected = 0
+    try {
+      const adapter = new PostgresStorageAdapter({ db: db.pool })
+      const storage = new Proxy(adapter, { get(target, property) {
+        if (property === 'save') return async (storageKey: string[], data: Uint8Array) => {
+          if (storageKey[0] === blockedDocument) { saveEntered.resolve(); await saveGate.promise }
+          return target.save(storageKey, data)
+        }
+        const value = Reflect.get(target, property, target)
+        return typeof value === 'function' ? value.bind(target) : value
+      } })
+      repo = new Repo({ storage, network: [], saveDebounceRate: 0 })
+      const shard = repo.create({ objects: { x: { id: 'x', name: 'X', type: 'system' } } })
+      const meta = repo.create({ groups: {} as Record<string, { id: string; name: string; objectIds: string[] }>,
+        objectShardUrls: [shard.url], connectionShardUrls: [] as string[] })
+      const root = repo.create({ modelMetaUrl: meta.url, modelUrl: '', shardUrls: [], diagrams: {} })
+      await repo.flush()
+      for (const handle of [shard, meta, root]) {
+        await db.pool.query('INSERT INTO automerge_document_workspace(document_id,landscape_id,version_id) VALUES($1,$2,$3)',
+          [handle.documentId, key.landscapeId, key.versionId])
+      }
+      // A ModelMeta revision whose save is held, before any projector exists.
+      blockedDocument = meta.documentId
+      meta.change((doc) => { doc.groups.g = { id: 'g', name: 'G', objectIds: [] } })
+      await saveEntered.promise
+      // The cold build's ADOPT preparation flushes the control documents
+      // first: that flush throws once (`prepareAdoptWatermarks` then stamps
+      // every control document 0). Any other flush passes through.
+      const controlledRepo = new Proxy(repo, { get(target, property) {
+        if (property === 'flush') return (ids?: Parameters<Repo['flush']>[0]) => {
+          if (injected === 0 && ids?.includes(meta.documentId)) {
+            injected += 1
+            return Promise.reject(new Error('T-SUM-2c: injected adopt-preparation failure'))
+          }
+          return target.flush(ids)
+        }
+        const value = Reflect.get(target, property, target)
+        return typeof value === 'function' ? value.bind(target) : value
+      } })
+      stop = await startReadModelProjector(controlledRepo, root.url, db.pool, key, undefined, 0)
+      await awaitInitialDiagramProbe(key)
+      const state = async () => (await db.pool.query<{ generation: string; projected_at: Date }>(
+        `SELECT projected_generation::text AS generation, last_projected_at AS projected_at
+           FROM read_model_projection_state WHERE landscape_id = $1 AND version_id = $2`, [key.landscapeId, key.versionId])).rows[0]
+      const adoptOf = async (id: string) => (await db.pool.query<{ w: string }>(
+        `SELECT adopt_watermark::text AS w FROM read_model_adopt_watermarks WHERE document_id = $1`, [id])).rows[0]?.w ?? null
+      // The construction, checked: the failure was injected, the build left
+      // ModelMeta at 0, and its group is in the rows (the build sampled it).
+      expect(injected).toBe(1)
+      expect(await adoptOf(meta.documentId)).toBe('0')
+      expect((await db.pool.query(`SELECT id FROM ro_groups`)).rows.map((row) => row.id)).toEqual(['g'])
+      const built = await state()
+      blockedDocument = null
+      saveGate.resolve()
+      await vi.waitFor(async () => {
+        const { rows } = await db.pool.query<{ after: boolean }>(
+          `SELECT max(updated_at) > $2::timestamptz AS after FROM automerge_storage
+            WHERE split_part(key, '/', 1) = $1 AND split_part(key, '/', 2) <> 'sync-state'`,
+          [meta.documentId, built.projected_at])
+        expect(rows[0].after, 'the held ModelMeta save landed after the cold build').toBe(true)
+      }, { timeout: 2_000, interval: 10 })
+      await awaitAdoptStamps(key)
+      await vi.waitFor(async () => {
+        const freshness = await getWorkspaceProjectionFreshness(db.pool, key)
+        expect(freshness.arrivalRefusals, 'nothing refuses the proof').toEqual({ zero: 0, exact: 0, fallback: 0, sample: [] })
+        expect(freshness.absenceProvable).toBe(true)
+        expect(Number(await adoptOf(meta.documentId)), 'the scheduled stamp certified ModelMeta').toBeGreaterThan(0)
+      }, { timeout: 3_000, interval: 25 })
+      const after = await state()
+      expect(after.generation, 'no pass ran after the cold build').toBe(built.generation)
+      expect(after.projected_at.getTime(), 'last_projected_at did not move').toBe(built.projected_at.getTime())
+    } finally {
+      saveGate.resolve()
+      stop?.()
+      if (repo) await repo.shutdown()
+      await db.teardown()
+    }
+  })
+
+  it('T-SUM-2c: the adopt branch never lifts an explicit refusal or an exact certificate below the arrival, and reads an adopt 0 as no evidence', async () => {
+    const db = await database('control_adopt_branch_order')
+    try {
+      await db.pool.query(`INSERT INTO read_model_projection_state
+          (landscape_id, version_id, observed_generation, projected_generation, last_projected_at, projector_attached)
+        VALUES ($1, $2, 1, 1, now() - interval '1 hour', true)`, [key.landscapeId, key.versionId])
+      await db.pool.query('INSERT INTO automerge_document_workspace(document_id,landscape_id,version_id) VALUES($1,$2,$3)',
+        ['doc', key.landscapeId, key.versionId])
+      // One arrival, AFTER the last completed projection: the timestamp
+      // refuses. Far from 0, so "below it" is a positive certificate.
+      await db.pool.query(`SELECT setval('automerge_arrival_seq', 100)`)
+      const { rows } = await db.pool.query<{ seq: string }>(
+        `INSERT INTO automerge_storage (key, data) VALUES ('doc/incremental/a', '\\x01') RETURNING arrival_seq::text AS seq`)
+      const seq = BigInt(rows[0].seq)
+      const set = async (watermark: string | null, adopt: string | null) => {
+        await db.pool.query('DELETE FROM read_model_document_watermarks')
+        await db.pool.query('DELETE FROM read_model_adopt_watermarks')
+        if (watermark !== null) await db.pool.query(`INSERT INTO read_model_document_watermarks (landscape_id, version_id, document_id, projected_watermark)
+          VALUES ($1, $2, 'doc', $3)`, [key.landscapeId, key.versionId, watermark])
+        if (adopt !== null) await db.pool.query(`INSERT INTO read_model_adopt_watermarks (landscape_id, version_id, document_id, adopt_watermark)
+          VALUES ($1, $2, 'doc', $3)`, [key.landscapeId, key.versionId, adopt])
+        return getWorkspaceProjectionFreshness(db.pool, key)
+      }
+      const covering = String(seq + 5n)
+      const below = String(seq - 1n)
+      expect((await set(null, null)).arrivalRefusals?.fallback, 'the control: no certificate, the timestamp refuses').toBe(1)
+      expect((await set(null, covering)).absenceProvable, 'an adopt certificate covering the arrival').toBe(true)
+      expect((await set(null, below)).arrivalRefusals?.fallback, 'an adopt certificate below the arrival: the timestamp decides').toBe(1)
+      expect((await set(null, '0')).arrivalRefusals?.fallback, 'an adopt 0 is no evidence: the timestamp decides').toBe(1)
+      expect((await set('0', covering)).arrivalRefusals?.zero, 'an explicit refusal wins over any adopt certificate').toBe(1)
+      expect((await set(below, covering)).arrivalRefusals?.exact, 'an exact certificate below the arrival wins too').toBe(1)
+      expect((await set(covering, null)).absenceProvable, 'the exact branch, unchanged').toBe(true)
+      expect((await set(below, covering)).arrivalRefusals?.sample, 'the sample names the refusing branch')
+        .toEqual([`doc:exact:${rows[0].seq}`])
+
+      // The stale detector leaves out ONLY what a certificate covers: past a
+      // (shortened) grace, a refused document still reads stale.
+      const grace = process.env.READ_MODEL_STALE_GRACE_MS
+      process.env.READ_MODEL_STALE_GRACE_MS = '1'
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 20))
+        expect((await set(below, covering)).status, 'exact certificate below the arrival').toBe('stale')
+        expect((await set('0', covering)).status, 'explicit refusal').toBe('stale')
+        expect((await set(null, null)).status, 'no certificate at all').toBe('stale')
+        expect((await set(null, covering)).status, 'covered by the adopt certificate').toBe('healthy')
+        expect((await set(covering, null)).status, 'covered by the exact certificate').toBe('healthy')
+      } finally {
+        if (grace === undefined) delete process.env.READ_MODEL_STALE_GRACE_MS
+        else process.env.READ_MODEL_STALE_GRACE_MS = grace
+      }
+
+      // The witness itself counts a caught-up refusal (`noteAbsenceProof`).
+      resetAbsenceProofForTest()
+      await set(null, null)
+      await durabilityWitnessPayload(db.pool, key, ['x'], [])
+      const counted = absenceProofMetricSamples().find((metric) => metric.name === 'maplespire_read_model_absence_unprovable_total')!
+      expect(counted.values.find((value) => value.labels?.branch === 'fallback')?.value).toBe(1)
+
+      // The static entry mark (promotion) turns an adopt-only coverage into an
+      // exact certificate at the newest arrival, and nothing else.
+      for (const [adopt, stamped] of [[below, null], ['0', null], [covering, rows[0].seq]] as const) {
+        await set(null, adopt)
+        const client = await db.pool.connect()
+        try {
+          await client.query('BEGIN')
+          await client.query(`INSERT INTO read_model_static_workspaces (landscape_id, version_id, source) VALUES ($1, $2, 'test')`,
+            [key.landscapeId, key.versionId])
+          await client.query(`INSERT INTO read_model_static_documents (landscape_id, version_id, document_id, kind)
+            VALUES ($1, $2, 'doc', 'model-meta')`, [key.landscapeId, key.versionId])
+          await markStaticEntryWatermarks(client, key)
+          const mark = await client.query<{ w: string }>(
+            `SELECT projected_watermark::text AS w FROM read_model_document_watermarks WHERE document_id = 'doc'`)
+          expect(mark.rows[0]?.w ?? null, `adopt ${adopt}`).toBe(stamped)
+        } finally {
+          await client.query('ROLLBACK')
+          client.release()
+        }
+      }
+    } finally {
+      resetAbsenceProofForTest()
+      await db.teardown()
+    }
+  })
 })

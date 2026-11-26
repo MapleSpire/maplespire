@@ -109,6 +109,7 @@ import { BASELINE_FENCE_ARMING_BOUND_MS, isBaselineDocumentKind } from '../rbac/
 import { CLAIM_PROTOCOL_VERSION, claimWorkspaceDocuments } from '../rbac/documentClaims.js'
 import { readWorkspaceCoverage } from '../rbac/claimCoverage.js'
 import { markStaticReadModelWorkspace } from '../readModel/staticWorkspace.js'
+import { markStaticEntryWatermarks } from '../readModel/arrivalWatermark.js'
 import { verifyWorkspaceIntegrity } from '../readModel/projectionIntegrity.js'
 import { claimLifecycleWriteFence, getWorkspaceProjectionFreshness } from '../readModel/health.js'
 import { PROJECTION_MUTEX_WAIT_MS, isDeadlockVictim, isProjectionMutexTimeout } from '../readModel/projectionAuthority.js'
@@ -118,8 +119,10 @@ import {
 } from './lifecycleApplyLock.js'
 import type { WorkspaceKey } from '../readModel/projector.js'
 import { countOrdinaryHeadRetirements } from '../readModel/ordinaryHeadForwarding.js'
+import { countModelEpochBlockers } from '../readModel/modelEpochStore.js'
 import type { Queryable } from '../readModel/types.js'
 import { collectReferencedUrls, fsckWorkspace, type WorkspaceFsckReport } from './workspaceFsck.js'
+import { withMetaUrlView } from '../modelMetaUrls.js'
 
 // ============================================================================
 // Shapes
@@ -173,6 +176,10 @@ export type PromotionBlockerCode =
    * by the ORDINARY projector's forwarder, which promotion detaches for good,
    * and the static plane projects every segment directly. */
   | 'ordinary-head-retirements'
+  /** G4-16f: an epoch roll is in flight, or a superseded epoch's documents
+   * are still live (their late writes are carried by the epoch forwarder,
+   * which the static plane does not run). */
+  | 'model-epoch-late-writes'
   | 'fsck-not-clean'
   | 'read-model-not-sealed'
   | 'read-model-not-caught-up'
@@ -404,8 +411,10 @@ export function buildPromotionAllowList(input: AllowListInput): {
   entries: AllowListEntry[]
   unclassified: string[]
 } {
-  const { root, modelMeta, registries, rootUrl, writeHeadUrl, diagramDocUrls } = input
-  const referenced = collectReferencedUrls(root, modelMeta, registries)
+  const { root, modelMeta: modelMetaRaw, registries, rootUrl, writeHeadUrl, diagramDocUrls } = input
+  const referenced = collectReferencedUrls(root, modelMetaRaw, registries)
+  // The topology below is the RULING one, as plain strings.
+  const modelMeta = modelMetaRaw ? withMetaUrlView(modelMetaRaw) : undefined
 
   const byId = new Map<string, AllowListEntry>()
   const put = (url: string, kind: StaticDocumentKind, entityId?: string): void => {
@@ -514,6 +523,9 @@ export interface PromotionFacts {
   /** Rows in `read_model_ordinary_head_retirements` for this workspace, any
    * status; `null` when they could not be counted — never read as zero. */
   ordinaryHeadRetirements: number | null
+  /** G4-16f: an epoch roll in flight plus the superseded epoch documents
+   * still live (late-write sources); `null` when they could not be counted. */
+  modelEpochBlockers: number | null
 }
 
 /** How many mismatching ids a blocker message names before it truncates. */
@@ -697,6 +709,18 @@ export function evaluatePromotionPreconditions(facts: PromotionFacts): Promotion
       + 'rotation (AM_ORDINARY_HEAD_ROTATION): their late writes are forwarded by the ordinary projector, which '
       + 'promotion detaches, and the static plane would project them directly. Promotion of a rotated '
       + 'workspace is not supported.')
+  }
+  // G4-16f epochs: a superseded epoch's documents still receive
+  // late writes that only the epoch forwarder carries, into base shards the
+  // static plane would then fence; and a roll in flight is about to rewrite
+  // the root. Refused until the workspace's superseded epochs have retired.
+  if (facts.modelEpochBlockers === null) {
+    block('model-epoch-late-writes', 'the model epoch tables could not be read, so it is not known whether a '
+      + 'superseded epoch still depends on the epoch forwarder')
+  } else if (facts.modelEpochBlockers > 0) {
+    block('model-epoch-late-writes', `${facts.modelEpochBlockers} model epoch document(s) or roll(s) are not `
+      + 'retired: a superseded epoch still forwards late writes into base shards the static plane would fence. '
+      + 'Promote once they have retired.')
   }
 
   // ── 5. document-claim coverage marker present ─────────────────────────────
@@ -948,6 +972,14 @@ function applyRootShape(handle: DocHandle<Record<string, unknown>>, next: Worksp
   const fields = next as unknown as Record<string, unknown>
   handle.change((doc) => {
     for (const field of ROOT_SHAPE_FIELDS) {
+      // G4-16f epochs (the second guard): the shape was built
+      // from a view read EARLIER, and the ModelMeta pointer is what an epoch
+      // roll moves. A root that already names a ModelMeta keeps the one it
+      // names NOW — re-assigning it from the earlier view would revert a
+      // repoint. (The first guard is the lifecycle lock, which every roll
+      // holds for its whole duration.) None of the three doors changes the
+      // pointer on purpose: each rebuilds the shape from the root it read.
+      if (field === 'modelMetaUrl' && typeof doc.modelMetaUrl === 'string' && doc.modelMetaUrl !== '') continue
       const value = fields[field]
       if (value === undefined) {
         if (field in doc) delete doc[field]
@@ -1123,7 +1155,7 @@ async function runSummaryPromotion(
       projectorInstanceId: null, expectedProjectorInstanceId, coverage: null,
       connectedPeers: null, quiesceAssertedByOperator: assumeQuiesced,
       staticSource: null, crdtDiagrams: null, readModelDiagrams: null,
-      unresolvedRegistryShards: [], ordinaryHeadRetirements: null,
+      unresolvedRegistryShards: [], ordinaryHeadRetirements: null, modelEpochBlockers: null,
     })
     return report
   }
@@ -1221,6 +1253,7 @@ async function runSummaryPromotion(
     readModelDiagrams,
     unresolvedRegistryShards: materialized.unresolved,
     ordinaryHeadRetirements: await countOrdinaryHeadRetirements(db, workspace).catch(() => null),
+    modelEpochBlockers: await countModelEpochBlockers(db, workspace).catch(() => null),
   })
   if (materialized.duplicateIds.length) {
     report.blockers.push({
@@ -1473,6 +1506,21 @@ async function runSummaryPromotion(
         client, workspace, PROMOTED_STATIC_SOURCE,
         mergePreservedOverlayEntries(built.entries, admittedOverlays), null,
       )
+      // T-SUM-2, MARK ONCE: every allow-listed document without a certificate
+      // leaves the timestamp fallback for an exact one, from this statement's
+      // snapshot and only where the `absenceProvable` clause covers it NOW
+      // (`markStaticEntryWatermarks`). On this client, so it commits with the
+      // allow-list or not at all.
+      //
+      // BEFORE the fence, as a lock order: an ordinary shard delta writes its
+      // certificate and asserts the fence (`FOR UPDATE` on the state row) at
+      // its END, i.e. watermark → state row. Marked after the fence, this
+      // transaction would hold the state row while its insert waits on a
+      // watermark row such a delta holds while it waits for the state row —
+      // 40P01. Here both go watermark → state row, and the state row stays
+      // terminal (see WHY LAST below). Pinned by no test: moving it after
+      // the fence stays green.
+      await markStaticEntryWatermarks(client, workspace)
       // THE WRITE FENCE, LAST — and both halves of that are load-bearing.
       //
       // WHY AT ALL. Everything above hands the `ro_*` plane to the static
@@ -2096,6 +2144,11 @@ export async function demoteSummaryWorkspace(options: DemoteSummaryOptions): Pro
       // the allow-list. Both CTE arms read ONE snapshot, so the count is taken
       // from before the cascade, and the workspace row lock is taken first,
       // with the cascade reaching the documents from it.
+      // A plain read, so it takes no lock and leaves the order below intact.
+      const staticKinds = await client.query<{ document_id: string; kind: string }>(
+        'SELECT document_id, kind FROM read_model_static_documents WHERE landscape_id = $1 AND version_id = $2',
+        [workspace.landscapeId, workspace.versionId],
+      )
       const removal = await client.query<{ document_rows: number; workspace_rows: number }>(
         `WITH counted AS (
            SELECT count(*)::int AS rows
@@ -2123,6 +2176,24 @@ export async function demoteSummaryWorkspace(options: DemoteSummaryOptions): Pro
       const swept = await client.query(
         'DELETE FROM read_model_static_documents WHERE landscape_id = $1 AND version_id = $2',
         [workspace.landscapeId, workspace.versionId],
+      )
+      // T-SUM-2: the certificates the STATIC plane wrote for documents the
+      // ORDINARY plane never stamps (root, ModelMeta, registry, DiagramDocs,
+      // the frozen non-shard baseline). Left behind, the first write to any
+      // of them after the demotion would be an exact refusal no ordinary
+      // handler ever lifts (`absenceProvable`'s doc comment) — a workspace
+      // that could never prove absence again. Object and connection shard
+      // documents keep theirs: the ordinary cold build and every shard delta
+      // re-stamp them under the same protocol. The kinds come from the
+      // allow-list as it stood before the cascade (`staticKinds`, read before
+      // the workspace delete), and the statement runs after it, in the global
+      // order (static row first).
+      await client.query(
+        `DELETE FROM read_model_document_watermarks
+          WHERE landscape_id = $1 AND version_id = $2 AND document_id = ANY($3::text[])`,
+        [workspace.landscapeId, workspace.versionId, staticKinds.rows
+          .filter((row) => !row.kind.startsWith('object-') && !row.kind.startsWith('connection-'))
+          .map((row) => row.document_id)],
       )
       await client.query('COMMIT')
       // Two disjoint populations, both counted. `document_rows` counts what the

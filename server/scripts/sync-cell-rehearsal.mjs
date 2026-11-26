@@ -16,6 +16,7 @@ import assert from 'node:assert/strict'
 import { performance } from 'node:perf_hooks'
 import { from, getHeads, save } from '@automerge/automerge'
 import { interpretAsDocumentId } from '@automerge/automerge-repo'
+import { readMetaUrls, writeMetaUrls } from '../src/modelMetaUrls.ts'
 
 /** The durability API accepts change hashes, not DocHandle's encoded UrlHeads. */
 export function rehearsalSeedFrontier(handle) {
@@ -69,7 +70,7 @@ export async function publishRehearsalBases({ repo, metaHandle, head, workspace,
   const originalMeta = metaHandle.doc()
   const metaFrontier = rehearsalSeedFrontier(metaHandle)
   assert.notEqual(originalMeta.registrySummaryOnly, true, 'seed requires ordinary metadata')
-  assert.deepEqual([...originalMeta.objectShardUrls], [head.url], 'seed requires one original object head')
+  assert.deepEqual(readMetaUrls(originalMeta, 'objectShardUrls'), [head.url], 'seed requires one original object head')
   const headIds = Object.keys(head.doc().objects)
   assert.equal(new Set([...headIds, ...backgroundIds]).size, headIds.length + backgroundIds.length, 'duplicate seed object id')
   const shardSize = 512
@@ -110,10 +111,12 @@ export async function publishRehearsalBases({ repo, metaHandle, head, workspace,
       await acknowledge(handle, `base-${index}`)
     }
     assert.deepEqual(rehearsalSeedFrontier(metaHandle), metaFrontier, 'metadata changed during seed')
-    metaHandle.change(meta => { meta.objectShardUrls.unshift(...bases.map(base => base.handle.url)) })
+    metaHandle.change(meta => {
+      writeMetaUrls(meta, 'objectShardUrls', [...bases.map(base => base.handle.url), ...(readMetaUrls(meta, 'objectShardUrls') ?? [])])
+    })
   }
   await acknowledge(metaHandle, 'model-meta')
-  assert.deepEqual([...metaHandle.doc().objectShardUrls], [...bases.map(base => base.handle.url), head.url], 'writer head must remain last')
+  assert.deepEqual(readMetaUrls(metaHandle.doc(), 'objectShardUrls'), [...bases.map(base => base.handle.url), head.url], 'writer head must remain last')
   assert.deepEqual(Object.keys(head.doc().objects), headIds, 'writer head changed during seed')
   return { shardSize, baseShards: bases.map(base => ({ url: base.handle.url, documentId: base.handle.documentId, objects: base.objectIds.length, bytes: base.bytes })),
     writerHead: { url: head.url, documentId: head.documentId, objects: headIds.length, bytes: save(head.doc()).byteLength },

@@ -100,6 +100,36 @@ export interface DeferredReference {
   writeHead?: boolean
   /** Boots that could not load the document locally (`noteResumeFailure`). */
   resumeFailures?: number
+  /**
+   * G4-16f: a RANDOM-id model shard, whose pointer
+   * was written at once (the server claims such a document only through
+   * it) and is ALSO journaled here until the server acknowledges the shard.
+   * Created offline, then a roll, then a reload: the pointer sits in a meta
+   * the new epoch superseded, and the reloaded tab — booted on the new meta,
+   * loading model shards only at boot — never saw it. The resume writes it
+   * into the CURRENT meta at once (no wait: nothing else would claim the
+   * shard) and loads the shard so its author sees it.
+   */
+  unminted?: true
+  /**
+   * The CONCRETE workspace (`landscape/version`) the entry was recorded in.
+   * The queue is namespaced by the workspace alias, which a fork and its
+   * source share; a fork made by an earlier build (before forks stopped
+   * carrying an epoch hint) names its source's epoch metas as predecessors,
+   * so without this an
+   * entry held on the source could be published into the fork. Absent on
+   * entries of earlier builds (and when the session cannot name its
+   * workspace): accepted as before.
+   */
+  workspace?: string
+  /**
+   * `unminted` entries only — the hash of the shard's FIRST change,
+   * recorded when the shard is created (then it IS the
+   * whole history). The resume asks the server about it; without it the boot
+   * would encode the shard's whole history to read one change. Absent on
+   * entries of earlier builds: computed from the document then.
+   */
+  firstChange?: string
 }
 
 export const DEFERRED_REFERENCES_KEY = 'deferred-references:v1'
@@ -116,6 +146,9 @@ function isDeferredReference(value: unknown): value is DeferredReference {
     && typeof ref.url === 'string'
     && (ref.writeHead === undefined || typeof ref.writeHead === 'boolean')
     && (ref.resumeFailures === undefined || typeof ref.resumeFailures === 'number')
+    && (ref.unminted === undefined || ref.unminted === true)
+    && (ref.workspace === undefined || typeof ref.workspace === 'string')
+    && (ref.firstChange === undefined || typeof ref.firstChange === 'string')
 }
 
 /**

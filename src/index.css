@@ -159,6 +159,10 @@
   /* Same 1.66:1 rule, hue-matched to --color-warning, so the warning badge sits
      in the same family as the error one instead of borrowing `line`. */
   --color-warning-border: #FAAD53;
+  /* G4-16f: the canvas outline of an overridden offline edit. Violet, so
+     it never reads as the orange selection accent (#D97A3D; --color-warning
+     was 1.03:1 against it). */
+  --color-override-outline: #7C3AED;
   --color-error-text: #B5392B;
   --color-info-bg: #EAF1FC;
   --color-info-text: #3A6DD9;
@@ -323,6 +327,7 @@
   --color-error-border: #5E362E;
   /* Same 1.65:1 against the dark --color-warning-bg. */
   --color-warning-border: #624011;
+  --color-override-outline: #B89DF2;
   --color-error-text: #E5806F;
   --color-info-bg: #1E2A3E;
   --color-info-text: #7FA8E6;

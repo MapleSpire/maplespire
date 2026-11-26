@@ -221,6 +221,7 @@ type WitnessPayload = {
   caughtUp?: boolean
   objects?: unknown
   connections?: unknown
+  batches?: unknown
 }
 function canonicalWitnessRoute(
   payload: WitnessPayload,
@@ -290,6 +291,51 @@ describe('fetchDurabilityWitness — the batched replay witness', () => {
     // …while PRESENCE stays usable: a projected value was durable when it was
     // projected. Only a discarded answer forfeits the values too.
     expect(result.objects.get('A')?.name).toBe('Auth service')
+  })
+
+  // ── T-SUM-2b: which of the asked batches the server received ─────────────
+
+  it('sends the asked batch ids and returns the LANDED ones — only those that were asked', async () => {
+    rootFetchResolvedCurrentTo(SERVER_DEFAULT_NOW)
+    const seen: Array<{ url: URL; init?: RequestInit }> = []
+    __setServerFetchForTest(canonicalWitnessRoute({
+      ...PROVABLE_WITH_VALUES,
+      batches: { 'batch-landed': 'projected', 'batch-forwarded': 'forwarding', 'never-asked': 'projected' },
+    }, seen))
+    const result = await fetchDurabilityWitness(JOURNAL, ['A'], [], ['batch-landed', 'batch-forwarded', 'batch-lost'])
+    const body = JSON.parse(String(seen[0].init?.body)) as { batches: string[] }
+    expect(body.batches).toEqual(['batch-landed', 'batch-forwarded', 'batch-lost'])
+    expect([...result.landedBatchIds].sort()).toEqual(['batch-forwarded', 'batch-landed'])
+    expect(result.absenceProvable).toBe(true)
+  })
+
+  it('a landed batch stays usable when the absence is NOT provable — it is a positive fact', async () => {
+    rootFetchResolvedCurrentTo(SERVER_DEFAULT_NOW)
+    __setServerFetchForTest(canonicalWitnessRoute({
+      ...PROVABLE_WITH_VALUES, absenceProvable: false, batches: { 'batch-landed': 'projected' },
+    }))
+    const result = await fetchDurabilityWitness(JOURNAL, [], [], ['batch-landed'])
+    expect(result.absenceProvable).toBe(false)
+    expect([...result.landedBatchIds]).toEqual(['batch-landed'])
+  })
+
+  for (const [name, batches] of [['an older server (no field)', undefined], ['a malformed field', ['batch-landed']]] as const) {
+    it(`batches asked, ${name}: the WHOLE answer is discarded — never "none landed" under a proof`, async () => {
+      rootFetchResolvedCurrentTo(SERVER_DEFAULT_NOW)
+      __setServerFetchForTest(canonicalWitnessRoute({ ...PROVABLE_WITH_VALUES, batches }))
+      const result = await fetchDurabilityWitness(JOURNAL, ['A'], [], ['batch-landed'])
+      expect(result.absenceProvable).toBe(false)
+      expect(result.objects.size).toBe(0)
+      expect(result.landedBatchIds.size).toBe(0)
+    })
+  }
+
+  it('no batch asked: an answer without the field is still the answer it was', async () => {
+    rootFetchResolvedCurrentTo(SERVER_DEFAULT_NOW)
+    __setServerFetchForTest(canonicalWitnessRoute(PROVABLE_WITH_VALUES))
+    const result = await fetchDurabilityWitness(JOURNAL, ['A'], [])
+    expect(result.absenceProvable).toBe(true)
+    expect(result.landedBatchIds.size).toBe(0)
   })
 
   // ── a `current` journal: ask about the documents' CONCRETE version ────────

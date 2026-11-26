@@ -45,6 +45,7 @@ import { canReparentObject } from '../../lib/modelHierarchy'
 import { useObjectExplorer, type ExplorerVisualRow } from '../diagram/useObjectExplorer'
 import { defaultShapeSize } from '../../lib/shapeDefaults'
 import { showsExternalUsage } from './externalUsage'
+import { OverrideRowMarker } from '../layout/EpochOverrideMarkers'
 
 const typeIcons: Record<string, React.ElementType> = {
   actor: User,
@@ -606,6 +607,7 @@ export function ModelObjectsTable({
                         />
                       )}
                       <span className={cn('min-w-0 truncate text-[13px]', selected ? 'text-accent font-medium' : 'text-fg')}>{row.name}</span>
+                      {!row.isInlineAdd && <OverrideRowMarker entityId={row.id} testIdPrefix="mo-override" />}
                       <span className="shrink-0 text-[10px] text-fg-muted bg-surface-200 px-1.5 py-0.5 rounded capitalize max-[1080px]:hidden">{row.type}</span>
                       {row.scope && (
                         <span className="shrink-0 text-[10px] text-fg-subtle max-[920px]:hidden">{row.scope}</span>

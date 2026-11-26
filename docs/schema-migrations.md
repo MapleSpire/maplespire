@@ -81,6 +81,22 @@ locks are session level and re-entrant, so asking the same pooled connection
 whether the lock is free gets a cheerful yes while it is the one still holding
 it — a check that cannot observe the failure it is checking for.
 
+## Rolling back past 0006 (the dropped trigram indexes)
+
+`0006-ro-objects-drop-redundant-trgm` drops two trigram indexes of
+`ro_objects` with `DROP INDEX CONCURRENTLY`. A build from before it still has
+them in its baseline, which re-runs every boot: **rolling back to it
+re-creates them with a plain `CREATE INDEX`** — a SHARE lock on `ro_objects`,
+which every workspace shares, so every workspace's read-model writes wait for
+the whole build (measured: a trigram index of that table took 4.7-30 s to
+build at 119 000-228 000 rows). Before such a rollback on a large database,
+create them yourself `CONCURRENTLY IF NOT EXISTS`, so the old baseline's
+`IF NOT EXISTS` finds them. Rolling forward again drops them the same bounded way; a drop
+deferred or left INVALID is retried hourly in the background
+(`readModel/redundantIndexDropRetry.ts`, gauge
+`maplespire_read_model_redundant_trigram_index{index,state}`).
+(`idx_ro_objects_search_trgm` is not dropped: it is kept.)
+
 ## One behaviour change
 
 The read-model schema is now created unconditionally, where boot gated it on

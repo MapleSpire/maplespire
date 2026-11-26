@@ -20,6 +20,7 @@ import { mergeShards } from './projection'
 import { currentWorkspaceRef, type WorkspaceRef } from './workspace'
 import { isBootFromServerActive } from './bridge'
 import type { ModelMeta, RegistryShard } from './types'
+import { readMetaUrlsUnion } from './modelMetaUrls'
 
 /**
  * Landscape VERSIONS — a version is a head-manifest over a workspace's Automerge
@@ -99,8 +100,9 @@ export async function enumerateWorkspaceDocs(
     refs.push({ url: root.modelMetaUrl, kind: 'modelMeta' })
     const metaHandle = await findModelMetaHandle(root.modelMetaUrl).catch(() => null)
     const meta = metaHandle?.doc() as ModelMeta | undefined
-    for (const u of meta?.objectShardUrls ?? []) refs.push({ url: u, kind: 'objectShard' })
-    for (const u of meta?.connectionShardUrls ?? []) refs.push({ url: u, kind: 'connectionShard' })
+    // A reference closure — what either copy names (`readMetaUrlsUnion`).
+    for (const u of readMetaUrlsUnion(meta, 'objectShardUrls') ?? []) refs.push({ url: u, kind: 'objectShard' })
+    for (const u of readMetaUrlsUnion(meta, 'connectionShardUrls') ?? []) refs.push({ url: u, kind: 'connectionShard' })
     for (const u of meta?.decisionRecordShardUrls ?? []) refs.push({ url: u, kind: 'decisionRecordShard' })
   } else if (root.modelUrl && isValidAutomergeUrl(root.modelUrl)) {
     refs.push({ url: root.modelUrl, kind: 'model' })

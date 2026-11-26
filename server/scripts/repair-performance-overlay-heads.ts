@@ -22,6 +22,7 @@ import { isValidAutomergeUrl, Repo, type AutomergeUrl } from '@automerge/automer
 import { PostgresStorageAdapter } from '../src/automergeStorage.js'
 import { initSchema, pool } from '../src/db.js'
 import { OVERLAY_WRITE_HEAD_VERSION } from '../src/modelMeta.js'
+import { readMetaUrl, readMetaUrls, writeMetaUrl, writeMetaUrls } from '../src/modelMetaUrls.js'
 import { ensureReadModelSchema } from '../src/readModel/schema.js'
 import { registerStaticReadModelDocuments } from '../src/readModel/staticWorkspace.js'
 
@@ -102,15 +103,17 @@ async function main(): Promise<void> {
   const before = metaHandle.doc()
   if (before?.staticBaseline !== true) throw new Error('ModelMeta is not a static baseline')
 
+  const objectHeadBefore = readMetaUrl(before, 'editsObjectShardUrl')
+  const connectionHeadBefore = readMetaUrl(before, 'editsConnectionShardUrl')
   const objects = await durableUrls(unique([
-    ...(before.editsObjectShardUrls ?? []),
-    ...(before.objectShardUrls ?? []),
-    ...(before.editsObjectShardUrl ? [before.editsObjectShardUrl] : []),
+    ...(readMetaUrls(before, 'editsObjectShardUrls') ?? []),
+    ...(readMetaUrls(before, 'objectShardUrls') ?? []),
+    ...(objectHeadBefore ? [objectHeadBefore] : []),
   ]))
   const connections = await durableUrls(unique([
-    ...(before.editsConnectionShardUrls ?? []),
-    ...(before.connectionShardUrls ?? []),
-    ...(before.editsConnectionShardUrl ? [before.editsConnectionShardUrl] : []),
+    ...(readMetaUrls(before, 'editsConnectionShardUrls') ?? []),
+    ...(readMetaUrls(before, 'connectionShardUrls') ?? []),
+    ...(connectionHeadBefore ? [connectionHeadBefore] : []),
   ]))
 
   const objectHead = repo.create({ objects: {}, writeBatchIds: [] as string[], writeHeadVersion: 1 })
@@ -144,12 +147,12 @@ async function main(): Promise<void> {
   }
 
   metaHandle.change((meta) => {
-    meta.editsObjectShardUrls = [...objects.durable, objectHead.url]
-    meta.objectShardUrls = [...objects.durable, objectHead.url]
-    meta.editsObjectShardUrl = objectHead.url
-    meta.editsConnectionShardUrls = [...connections.durable, connectionHead.url]
-    meta.connectionShardUrls = [...connections.durable, connectionHead.url]
-    meta.editsConnectionShardUrl = connectionHead.url
+    writeMetaUrls(meta, 'editsObjectShardUrls', [...objects.durable, objectHead.url])
+    writeMetaUrls(meta, 'objectShardUrls', [...objects.durable, objectHead.url])
+    writeMetaUrl(meta, 'editsObjectShardUrl', objectHead.url)
+    writeMetaUrls(meta, 'editsConnectionShardUrls', [...connections.durable, connectionHead.url])
+    writeMetaUrls(meta, 'connectionShardUrls', [...connections.durable, connectionHead.url])
+    writeMetaUrl(meta, 'editsConnectionShardUrl', connectionHead.url)
     // The constant, like `repair-overlay-heads.ts` next door. A repair tool is
     // the worst place to leave a stale literal: after a protocol bump this one
     // would stamp the OLD version onto the workspace it was invoked to fix,

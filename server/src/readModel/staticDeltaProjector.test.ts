@@ -18,18 +18,24 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   appendFreshStaticOverlayHead,
   appendUniqueOverlayRoute,
+  appliedOrUndone,
   mergeStaticOverlaySegments,
+  resolveStaticOverlayInnerIds,
   StaticDeltaProjector,
+  staticOverlayDeferralMetricSamples,
   substituteOverlayPrefix,
   updateStaticOverlaySegment,
 } from './staticDeltaProjector.js'
 import { isAppendOnlyOverlayOrder } from './overlayHistoryProtocol.js'
+import { lastOccurrenceById } from './projector.js'
 import { AutomergeResidencyLeases } from '../automergeResidency.js'
 import {
   isWorkspaceCoveredLocally,
   noteCoveredLocally,
   _resetWorkspaceClaimCoverageForTests,
 } from '../rbac/claimCoverage.js'
+import { adoptScalarMetaUrls, readMetaUrl, readMetaUrls } from '../modelMetaUrls.js'
+import { scalarRerun } from '../testing/scalarRerun.js'
 
 const running: StaticDeltaProjector[] = []
 
@@ -209,13 +215,17 @@ describe('StaticDeltaProjector', () => {
 
   it('appends an overlay route without recreating the existing Automerge list', () => {
     const existing = Array.from({ length: 200 }, (_, index) => `automerge:segment-${index}`)
-    const before = Automerge.from({ editsObjectShardUrls: existing })
+    let before = Automerge.from<Record<string, unknown>>({ editsObjectShardUrls: existing })
+    // G4-16f: in this suite's second run the document is scalar-ruled
+    // from its start (as an epoch meta is born), so the cost measured is the
+    // steady state's.
+    if (scalarRerun()) before = Automerge.change(before, (meta) => adoptScalarMetaUrls(meta))
     const beforeOps = Automerge.stats(before).numOps
     const after = Automerge.change(before, (meta) => {
       appendUniqueOverlayRoute(meta, 'editsObjectShardUrls', 'automerge:segment-200')
     })
 
-    expect(after.editsObjectShardUrls).toHaveLength(201)
+    expect(readMetaUrls(after, 'editsObjectShardUrls')).toHaveLength(201)
     // One list insert plus its scalar value stays constant as the retained
     // history grows. A whole-array assignment adds hundreds of operations.
     expect(Automerge.stats(after).numOps - beforeOps).toBeLessThan(64)
@@ -227,7 +237,7 @@ describe('StaticDeltaProjector', () => {
     const after = Automerge.change(Automerge.from<Record<string, unknown>>({ marker: 1 }), (meta) => {
       appendUniqueOverlayRoute(meta, 'editsObjectShardUrls', 'automerge:segment-0')
     })
-    expect(after.editsObjectShardUrls).toEqual(['automerge:segment-0'])
+    expect(readMetaUrls(after, 'editsObjectShardUrls')).toEqual(['automerge:segment-0'])
   })
 
   it('names the merged segment on a ModelMeta that has NO such list', () => {
@@ -240,7 +250,7 @@ describe('StaticDeltaProjector', () => {
       )
     })
     expect(substituted).toBe(true)
-    expect(after.objectShardUrls).toEqual(['automerge:merged-0'])
+    expect(readMetaUrls(after, 'objectShardUrls')).toEqual(['automerge:merged-0'])
   })
 
   it('reconstructs an already-projected ModelMeta without rewriting enterprise metadata', async () => {
@@ -324,6 +334,166 @@ describe('StaticDeltaProjector', () => {
       new Set(),
     )
     expect(shadowed).toMatchObject({ ready: true, upserts: [], deleteIds: [] })
+  })
+
+  it('lists the first-ready pass in segment ORDER, not arrival order, so a cross-segment twin keeps the client\'s copy', () => {
+    // The client merges the segments in meta order (`mergeObjectShards`,
+    // `Object.assign` oldest → newest) and lists them by first appearance;
+    // its by-id maps keep the LAST copy of an inner id in that list. Here the
+    // newer segment ARRIVES first.
+    const segments = new Map<string, Record<string, { id: string; name: string }>>()
+    const effective = new Map<string, { fingerprint: string; value: { id: string; name: string } }>()
+    updateStaticOverlaySegment(['old', 'new'], segments, effective, 'new',
+      { 'aa-twin': { id: 'o1', name: 'TWIN' } }, new Set())
+    const ready = updateStaticOverlaySegment(['old', 'new'], segments, effective, 'old',
+      { o1: { id: 'o1', name: 'ORIGINAL' } }, new Set())
+    const clientList = Object.values(Object.assign({}, segments.get('old'), segments.get('new')))
+    expect(clientList.map((entity) => entity.name)).toEqual(['ORIGINAL', 'TWIN'])
+    expect(ready.upserts.map((entity) => entity.name)).toEqual(['ORIGINAL', 'TWIN'])
+    expect(lastOccurrenceById('object', ready.upserts).kept).toEqual([{ id: 'o1', name: 'TWIN' }])
+  })
+
+  it('resolves rows by INNER id: a key whose inner id changes deletes the old row and upserts the new one', () => {
+    const segments = new Map<string, Record<string, { id: string; name: string }>>()
+    const effective = new Map<string, { fingerprint: string; value: { id: string; name: string } }>()
+    const first = updateStaticOverlaySegment(['only'], segments, effective, 'only',
+      { k: { id: 'x', name: 'X' } }, new Set())
+    expect(resolveStaticOverlayInnerIds('object', ['only'], segments, effective, first.touchedInnerIds))
+      .toEqual({ upserts: [{ id: 'x', name: 'X' }], deleteIds: [], dropped: [] })
+    const moved = updateStaticOverlaySegment(['only'], segments, effective, 'only',
+      { k: { id: 'y', name: 'Y' } }, new Set())
+    expect(moved.touchedInnerIds.sort()).toEqual(['x', 'y'])
+    expect(resolveStaticOverlayInnerIds('object', ['only'], segments, effective, moved.touchedInnerIds))
+      .toEqual({ upserts: [{ id: 'y', name: 'Y' }], deleteIds: ['x'], dropped: [] })
+  })
+
+  it('a key NAMED like another entity\'s inner id is not a holder of that id: key x holds z, key k moves from x to y', () => {
+    // Key `x` holds `{id: 'z'}` (misfiled). Key `k` moves from inner id `x`
+    // to `y`. Row x has no holder left: `effective.get('x')` is the entry of
+    // KEY x, whose inner id is z — listing it as a holder of x would upsert
+    // z's data as the "winner" of x and keep row x alive.
+    const segments = new Map<string, Record<string, { id: string; name: string }>>()
+    const effective = new Map<string, { fingerprint: string; value: { id: string; name: string } }>()
+    const first = updateStaticOverlaySegment(['only'], segments, effective, 'only',
+      { x: { id: 'z', name: 'Z' }, k: { id: 'x', name: 'X' } }, new Set())
+    expect(resolveStaticOverlayInnerIds('object', ['only'], segments, effective, first.touchedInnerIds).upserts
+      .map((entity) => entity.name).sort(), 'control: both rows served').toEqual(['X', 'Z'])
+    const moved = updateStaticOverlaySegment(['only'], segments, effective, 'only',
+      { x: { id: 'z', name: 'Z' }, k: { id: 'y', name: 'Y' } }, new Set())
+    expect(moved.touchedInnerIds.sort()).toEqual(['x', 'y'])
+    expect(resolveStaticOverlayInnerIds('object', ['only'], segments, effective, moved.touchedInnerIds))
+      .toEqual({ upserts: [{ id: 'y', name: 'Y' }], deleteIds: ['x'], dropped: [] })
+  })
+
+  it('a TOMBSTONED key a segment still holds is never served: not on the first-ready pass, and deleted on a later edit', () => {
+    const segments = new Map<string, Record<string, { id: string; name: string }>>()
+    const effective = new Map<string, { fingerprint: string; value: { id: string; name: string } }>()
+    const tombstones = new Set(['o1'])
+    const first = updateStaticOverlaySegment(['only'], segments, effective, 'only',
+      { o1: { id: 'o1', name: 'A' }, o2: { id: 'o2', name: 'B' } }, tombstones)
+    expect(first.upserts.map((entity) => entity.id), 'first-ready: the tombstoned key is not served').toEqual(['o2'])
+    expect(effective.has('o1')).toBe(false)
+
+    // An effective view that still holds the key (built before the
+    // tombstone): the next edit of the segment deletes it rather than
+    // serving the edit.
+    effective.set('o1', { fingerprint: JSON.stringify({ id: 'o1', name: 'A' }), value: { id: 'o1', name: 'A' } })
+    const edited = updateStaticOverlaySegment(['only'], segments, effective, 'only',
+      { o1: { id: 'o1', name: 'A2' }, o2: { id: 'o2', name: 'B' } }, tombstones)
+    expect(edited).toMatchObject({ ready: true, upserts: [], deleteIds: ['o1'] })
+    expect(resolveStaticOverlayInnerIds('object', ['only'], segments, effective, edited.touchedInnerIds))
+      .toEqual({ upserts: [], deleteIds: ['o1'], dropped: [] })
+  })
+
+  it('revert() puts back the segment and every entry the call wrote, so the retry of the SAME snapshot computes the same delta', () => {
+    const segments = new Map<string, Record<string, { id: string; name: string }>>()
+    const effective = new Map<string, { fingerprint: string; value: { id: string; name: string } }>()
+    updateStaticOverlaySegment(['only'], segments, effective, 'only',
+      { o1: { id: 'o1', name: 'A' }, o2: { id: 'o2', name: 'B' }, 'aa-twin': { id: 'o2', name: 'TWIN' } }, new Set())
+    // Build the misfiled index, as a resolve does, so revert must keep it in step.
+    resolveStaticOverlayInnerIds('object', ['only'], segments, effective, ['o1', 'o2'])
+    const segmentBefore = segments.get('only')
+    const effectiveBefore = [...effective.entries()]
+
+    const next = { o1: { id: 'o1', name: 'A2' }, o3: { id: 'o3', name: 'C' } }
+    const refused = updateStaticOverlaySegment(['only'], segments, effective, 'only', next, new Set())
+    const refusedRows = resolveStaticOverlayInnerIds('object', ['only'], segments, effective, refused.touchedInnerIds)
+    // CONTROL: the call did move the state (otherwise revert proves nothing).
+    expect(segments.get('only')).toBe(next)
+    expect(effective.has('o2')).toBe(false)
+    refused.revert()
+    expect(segments.get('only')).toBe(segmentBefore)
+    // A Map compared as a Map: by entry, not by insertion order (a deleted
+    // key put back is listed last, and nothing reads the effective view in
+    // order — holders are ranked by segment order).
+    expect(effective).toEqual(new Map(effectiveBefore))
+    expect(effective.size).toBe(3)
+
+    const retry = updateStaticOverlaySegment(['only'], segments, effective, 'only', next, new Set())
+    expect(retry.upserts).toEqual(refused.upserts)
+    expect(retry.deleteIds).toEqual(refused.deleteIds)
+    expect(resolveStaticOverlayInnerIds('object', ['only'], segments, effective, retry.touchedInnerIds)).toEqual(refusedRows)
+    expect(refusedRows.deleteIds.sort(), 'control: the delta has deletes').toEqual(['o2'])
+  })
+
+  it('revert() puts the MISFILED INDEX back: a twin the refused snapshot removed is a holder again, one it added is not', () => {
+    // Key `k` holds inner id `x` (misfiled: no key `x` exists), so `x` has a
+    // holder only through the index. The refused snapshot removes `k` and
+    // adds `j`, a second misfiled holder of `o1`.
+    const segments = new Map<string, Record<string, { id: string; name: string }>>()
+    const effective = new Map<string, { fingerprint: string; value: { id: string; name: string } }>()
+    updateStaticOverlaySegment(['only'], segments, effective, 'only',
+      { o1: { id: 'o1', name: 'A' }, k: { id: 'x', name: 'X' } }, new Set())
+    // Build the index BEFORE the refused call, so the call updates it in place.
+    const before = resolveStaticOverlayInnerIds('object', ['only'], segments, effective, ['x', 'o1'])
+    expect(before, 'control: x is held by k alone, o1 by its own key').toEqual({
+      upserts: [{ id: 'x', name: 'X' }, { id: 'o1', name: 'A' }], deleteIds: [], dropped: [],
+    })
+
+    const refused = updateStaticOverlaySegment(['only'], segments, effective, 'only',
+      { o1: { id: 'o1', name: 'A' }, j: { id: 'o1', name: 'J' } }, new Set())
+    expect(resolveStaticOverlayInnerIds('object', ['only'], segments, effective, ['x']).deleteIds,
+      'control: the refused snapshot left x without a holder').toEqual(['x'])
+    expect(resolveStaticOverlayInnerIds('object', ['only'], segments, effective, ['o1']).dropped,
+      'control: the refused snapshot gave o1 a second holder').toHaveLength(1)
+    refused.revert()
+
+    // After the revert the index must say what it said before: `k` holds x
+    // again (no phantom delete of row x), `j` holds nothing (no phantom
+    // duplicate of o1).
+    expect(resolveStaticOverlayInnerIds('object', ['only'], segments, effective, ['x', 'o1'])).toEqual(before)
+  })
+
+  it('revert() of a FIRST-ready pass makes the set not-ready again, and leaves an entry a later call rewrote alone', () => {
+    const segments = new Map<string, Record<string, { id: string; name: string }>>()
+    const effective = new Map<string, { fingerprint: string; value: { id: string; name: string } }>()
+    updateStaticOverlaySegment(['old', 'new'], segments, effective, 'old', { o1: { id: 'o1', name: 'OLD' } }, new Set())
+    const firstReady = updateStaticOverlaySegment(['old', 'new'], segments, effective, 'new',
+      { o2: { id: 'o2', name: 'NEW' } }, new Set())
+    expect(firstReady.ready).toBe(true)
+    // A later call rewrote o1 before the first one's publish came back.
+    effective.set('o1', { fingerprint: 'later', value: { id: 'o1', name: 'LATER' } })
+    firstReady.revert()
+    expect(segments.has('new')).toBe(false)
+    expect(effective.has('o2')).toBe(false)
+    expect(effective.get('o1')?.value.name, 'not this call\'s write').toBe('LATER')
+    const retry = updateStaticOverlaySegment(['old', 'new'], segments, effective, 'new',
+      { o2: { id: 'o2', name: 'NEW' } }, new Set())
+    expect(retry.ready).toBe(true)
+    expect(retry.upserts.map((entity) => entity.id)).toContain('o2')
+  })
+
+  it('appliedOrUndone: undoes on false, on a rejection and on a synchronous throw — never on true', async () => {
+    let undone = 0
+    const undo = () => { undone += 1 }
+    expect(await appliedOrUndone(undo, async () => true)).toBe(true)
+    expect(undone).toBe(0)
+    expect(await appliedOrUndone(undo, async () => false)).toBe(false)
+    expect(undone).toBe(1)
+    await expect(appliedOrUndone(undo, async () => { throw new Error('rejected') })).rejects.toThrow('rejected')
+    expect(undone).toBe(2)
+    await expect(appliedOrUndone(undo, () => { throw new Error('sync') })).rejects.toThrow('sync')
+    expect(undone).toBe(3)
   })
 
   it('retains projector state when a new current head is appended', () => {
@@ -1222,13 +1392,13 @@ describe('StaticDeltaProjector', () => {
     await projector.start()
 
     await expect.poll(
-      () => meta.doc()?.editsObjectShardUrl,
+      () => readMetaUrl(meta.doc(), 'editsObjectShardUrl'),
       { timeout: 3_000 },
     ).not.toBe(current.url)
-    const nextUrl = meta.doc()!.editsObjectShardUrl!
+    const nextUrl = readMetaUrl(meta.doc()!, 'editsObjectShardUrl')!
     const nextDocumentId = nextUrl.replace('automerge:', '')
-    expect(meta.doc()?.editsObjectShardUrls).toEqual([current.url, nextUrl])
-    expect(meta.doc()?.objectShardUrls).toEqual([current.url, nextUrl])
+    expect(readMetaUrls(meta.doc(), 'editsObjectShardUrls')).toEqual([current.url, nextUrl])
+    expect(readMetaUrls(meta.doc(), 'objectShardUrls')).toEqual([current.url, nextUrl])
     const activated = projector as unknown as {
       descriptors: Map<string, unknown>
       listened: Map<string, unknown>
@@ -1348,7 +1518,7 @@ describe('StaticDeltaProjector', () => {
     expect(isWorkspaceCoveredLocally({ landscapeId: 'land', versionId: 'version' })).toBe(false)
     // And the pointer was never published: the head still names the old
     // overlay, and nothing was admitted for the stillborn child.
-    expect(meta.doc()?.editsObjectShardUrl).toBe(current.url)
+    expect(readMetaUrl(meta.doc(), 'editsObjectShardUrl')).toBe(current.url)
     expect(query.mock.calls.some(([sql]) => String(sql).includes('INSERT INTO read_model_static_documents'))).toBe(false)
   })
 })
@@ -1443,6 +1613,17 @@ describe('StaticDeltaProjector — les tombstones de diagramme (T6)', () => {
       if (text.includes('SELECT landscape_id, version_id, collection')) {
         const rows = options.admittedRotations ?? []
         return { rows, rowCount: rows.length }
+      }
+      // The ModelMeta tombstone SEED (`unappliedTombstones`): an
+      // unseeded baseline asks which tombstoned ids still have a row. This
+      // fake holds no entity rows, so it answers "every one": the pre-seed
+      // behaviour (replay them all), which these fixtures were written for.
+      // The seed's own behaviour is pinned against real Postgres
+      // (staticDeltaProjector.unappliedPublish.integration, 'the tombstone seed
+      // and the overlay deferral').
+      if (/^SELECT id FROM ro_(objects|connections) WHERE/.test(text.trim())) {
+        const ids = (params[2] as string[] | undefined) ?? []
+        return { rows: ids.map((id) => ({ id })), rowCount: ids.length }
       }
       // `metaSourceAlreadyProjected` — the queue watermark. Answering `true`
       // reproduces a revision another process (or an older build) already
@@ -2146,5 +2327,22 @@ describe('StaticDeltaProjector — les tombstones de diagramme (T6)', () => {
     expect(ran('DELETE FROM ro_diagrams')).toBe(false)
     expect(ran('DELETE FROM ro_diagram_objects')).toBe(false)
     expect(ran('read_model_diagram_render_generations')).toBe(false)
+  })
+})
+
+describe('staticOverlayDeferralMetricSamples (G4-16f)', () => {
+  const values = (samples: ReturnType<typeof staticOverlayDeferralMetricSamples>, name: string) =>
+    samples.find((sample) => sample.name === name)?.values
+  it('sums the deferred overlays and publishes the OLDEST age, in seconds', () => {
+    const samples = staticOverlayDeferralMetricSamples([
+      { overlays: 2, oldestAgeMs: 12_500 }, { overlays: 0, oldestAgeMs: null }, { overlays: 1, oldestAgeMs: 61_000 },
+    ])
+    expect(values(samples, 'maplespire_read_model_static_overlay_deferred')).toEqual([{ value: 3 }])
+    expect(values(samples, 'maplespire_read_model_static_overlay_deferred_oldest_seconds')).toEqual([{ value: 61 }])
+  })
+  it('nothing deferred: a count of 0 and a NaN age, never an age of 0', () => {
+    const samples = staticOverlayDeferralMetricSamples([{ overlays: 0, oldestAgeMs: null }])
+    expect(values(samples, 'maplespire_read_model_static_overlay_deferred')).toEqual([{ value: 0 }])
+    expect(values(samples, 'maplespire_read_model_static_overlay_deferred_oldest_seconds')?.[0].value).toBeNaN()
   })
 })

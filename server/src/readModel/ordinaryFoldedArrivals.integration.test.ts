@@ -20,6 +20,7 @@ import { createIsolatedSchemaDb, type IsolatedSchemaDb } from '../testing/isolat
 import { ensureReadModelSchema } from './schema.js'
 import {
   advanceFoldedArrivalWatermark,
+  advanceFoldedArrivalWatermarks,
   arrivalAbove,
   databaseNow,
   documentContentArrivals,
@@ -38,6 +39,10 @@ import {
   PARKED_STAMP_MAX_WAITS,
 } from './ordinaryFoldedArrivals.js'
 import type { WorkspaceKey } from './projector.js'
+import { assertReadModelWriteFence } from './health.js'
+import { commitOrdinaryHeadRetirement } from './ordinaryHeadRotator.js'
+import { commitForwardedHeads } from './ordinaryHeadForwarding.js'
+import { recordOrdinaryChainFold } from './ordinaryChainFold.js'
 
 /**
  * G4-16b phase 4 step 4, the SQL of `ordinaryFoldedArrivals.ts` against real
@@ -385,5 +390,141 @@ suite('ordinaryFoldedArrivals SQL — real PostgreSQL', () => {
     // A row that is not folded is never advanced.
     expect(await advanceFoldedArrivalWatermark(db.pool, WS, 'object', 'r', null, '5')).toBe(false)
     expect(await watermark('r')).toBeNull()
+  })
+
+  it('the detach\'s BATCHED advance is the same CAS per head, from NULL only: a head already advanced, not folded, of another collection or workspace is left as it is', async () => {
+    await row(WS, 'n1')
+    await row(WS, 'n2')
+    await row(WS, 'set')
+    await row(WS, 'n1', { collection: 'connection' })
+    await row(OTHER, 'n1')
+    await row(WS, 'r', { status: 'retired' })
+    expect(await advanceFoldedArrivalWatermark(db.pool, WS, 'object', 'set', null, '3')).toBe(true)
+    const moved = await advanceFoldedArrivalWatermarks(db.pool, WS, 'object', [
+      { documentId: 'n1', arrivalSeq: '11' },
+      { documentId: 'n2', arrivalSeq: '12' },
+      { documentId: 'set', arrivalSeq: '13' },
+      { documentId: 'r', arrivalSeq: '14' },
+      { documentId: 'n1', arrivalSeq: '99' }, // named twice: its FIRST arrival
+    ])
+    expect([...moved].sort()).toEqual(['n1', 'n2'])
+    expect(await watermark('n1')).toBe('11')
+    expect(await watermark('n2')).toBe('12')
+    expect(await watermark('set')).toBe('3')
+    expect(await watermark('r')).toBeNull()
+    expect(await watermark('n1', 'connection')).toBeNull()
+    expect((await db.pool.query(
+      `SELECT arrival_watermark FROM read_model_ordinary_head_retirements WHERE version_id = 'v2'`,
+    )).rows[0]!.arrival_watermark).toBeNull()
+    expect(await advanceFoldedArrivalWatermarks(db.pool, WS, 'object', [])).toEqual(new Set())
+  })
+})
+
+/**
+ * The batched compare-and-sets (G4-16f): the fold record's sources in
+ * ONE UPDATE (`recordOrdinaryChainFold`) and the detach's advances in ONE
+ * UPDATE (`advanceFoldedArrivalWatermarks`), each row still by its own
+ * compare-and-set. Every write here is fenced, as production's are.
+ */
+suite('the batched compare-and-sets: fold record sources, folded-arrival advances — real PostgreSQL', () => {
+  const K: WorkspaceKey = { landscapeId: 'ls-batched-cas', versionId: 'v1' }
+  const K2: WorkspaceKey = { ...K, versionId: 'v2' }
+  const FENCE = 'fence'
+  let bdb: IsolatedSchemaDb
+  async function fenced<T>(run: (c: pg.PoolClient, key: WorkspaceKey) => Promise<T>, key = K): Promise<T> {
+    const client = await bdb.pool.connect()
+    try {
+      await client.query('BEGIN')
+      await assertReadModelWriteFence(client, key, FENCE)
+      const result = await run(client, key)
+      await client.query('COMMIT')
+      return result
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {})
+      throw error
+    } finally { client.release() }
+  }
+  const status = async (key: WorkspaceKey, collection: string, id: string) => (await bdb.pool.query<{ status: string }>(
+    'SELECT status FROM read_model_ordinary_head_retirements WHERE landscape_id = $1 AND version_id = $2 AND collection = $3 AND document_id = $4',
+    [key.landscapeId, key.versionId, collection, id])).rows[0]?.status
+  const fold = (c: pg.PoolClient, key: WorkspaceKey, product: string,
+    sources: Array<{ documentId: string; forwardedHeads: string[] | null }>) =>
+    recordOrdinaryChainFold(c, key, { collection: 'object', productDocumentId: product, productHeads: [`${product}-h`],
+      currentDocumentId: 'cur', sources, retainUntil: new Date(Date.now() + 3_600_000) })
+
+  beforeAll(async () => {
+    bdb = await createIsolatedSchemaDb(connection!, 'batched_protocol_cas')
+    await ensureReadModelSchema(bdb.pool)
+  })
+  afterAll(async () => { await bdb?.teardown() })
+  beforeEach(async () => {
+    await bdb.pool.query('TRUNCATE read_model_ordinary_head_retirements, read_model_ordinary_chain_folds, read_model_adopt_state, read_model_projection_state')
+    for (const key of [K, K2]) {
+      await bdb.pool.query('INSERT INTO read_model_projection_state (landscape_id, version_id, write_fence) VALUES ($1, $2, $3)',
+        [key.landscapeId, key.versionId, FENCE])
+    }
+  })
+
+  it('a source whose forward state is given UNSORTED matches the sorted stored one (the sort before the compare is part of the contract)', async () => {
+    await fenced(async (c, key) => {
+      await commitOrdinaryHeadRetirement(c, key, 'object', 's1', ['h'])
+      expect(await commitForwardedHeads(c, key, 'object', 's1', null, ['b', 'a'])).toBe(true)
+    })
+    expect((await bdb.pool.query(`SELECT forwarded_heads FROM read_model_ordinary_head_retirements WHERE document_id = 's1'`))
+      .rows[0]!.forwarded_heads).toEqual(['a', 'b'])
+    await fenced((c, key) => fold(c, key, 'p1', [{ documentId: 's1', forwardedHeads: ['b', 'a'] }]))
+    expect(await status(K, 'object', 's1')).toBe('folded')
+  })
+
+  it('an EMPTY forward state is not NULL: stored {} matches [] and conflicts with null; stored NULL matches null and conflicts with []', async () => {
+    await fenced(async (c, key) => {
+      await commitOrdinaryHeadRetirement(c, key, 'object', 'empty', ['h'])
+      await commitOrdinaryHeadRetirement(c, key, 'object', 'nul', ['h'])
+      await c.query(`UPDATE read_model_ordinary_head_retirements SET forwarded_heads = '{}' WHERE document_id = 'empty'`)
+    })
+    await expect(fenced((c, key) => fold(c, key, 'pn', [{ documentId: 'nul', forwardedHeads: [] }]))).rejects.toThrow(/not retired at the forward state/)
+    await expect(fenced((c, key) => fold(c, key, 'pe0', [{ documentId: 'empty', forwardedHeads: null }]))).rejects.toThrow(/not retired at the forward state/)
+    await fenced((c, key) => fold(c, key, 'pe', [{ documentId: 'empty', forwardedHeads: [] }]))
+    await fenced((c, key) => fold(c, key, 'pn2', [{ documentId: 'nul', forwardedHeads: null }]))
+    expect(await status(K, 'object', 'empty')).toBe('folded')
+    expect(await status(K, 'object', 'nul')).toBe('folded')
+  })
+
+  it('a fold touches only ITS collection and ITS version: the same document id retired elsewhere is left alone', async () => {
+    await fenced(async (c, key) => {
+      await commitOrdinaryHeadRetirement(c, key, 'object', 'dup', ['h'])
+      await commitOrdinaryHeadRetirement(c, key, 'connection', 'dup', ['h'])
+    })
+    await fenced((c, key) => commitOrdinaryHeadRetirement(c, key, 'object', 'dup', ['h']), K2)
+    await fenced((c, key) => fold(c, key, 'pd', [{ documentId: 'dup', forwardedHeads: null }]))
+    expect(await status(K, 'object', 'dup')).toBe('folded')
+    expect(await status(K, 'connection', 'dup'), 'other collection untouched').toBe('retired')
+    expect(await status(K2, 'object', 'dup'), 'other version untouched').toBe('retired')
+  })
+
+  it('ONE stale source of three: the whole record conflicts naming it, and NONE of the three is folded (all or nothing)', async () => {
+    await fenced(async (c, key) => { for (const id of ['a', 'b', 'c']) await commitOrdinaryHeadRetirement(c, key, 'object', id, ['h']) })
+    await fenced((c, key) => commitForwardedHeads(c, key, 'object', 'b', null, ['late']))
+    await expect(fenced((c, key) => fold(c, key, 'pf', [
+      { documentId: 'a', forwardedHeads: null }, { documentId: 'b', forwardedHeads: null }, { documentId: 'c', forwardedHeads: null },
+    ]))).rejects.toThrow(/not retired at the forward state.*\bb\b/)
+    for (const id of ['a', 'b', 'c']) expect(await status(K, 'object', id), id).toBe('retired')
+    expect((await bdb.pool.query('SELECT count(*)::int AS n FROM read_model_ordinary_chain_folds')).rows[0]!.n).toBe(0)
+  })
+
+  it('the batched advance moves 1 000 folded heads in one statement, never an already-advanced one, and keeps an arrival above 2^53 exact', async () => {
+    const ids = Array.from({ length: 1000 }, (_, at) => `d${at}`)
+    await fenced(async (c, key) => { for (const id of ids) await commitOrdinaryHeadRetirement(c, key, 'object', id, ['h']) })
+    await fenced((c, key) => fold(c, key, 'big', ids.map((documentId) => ({ documentId, forwardedHeads: null }))))
+    const moved = await fenced((c, key) => advanceFoldedArrivalWatermarks(c, key, 'object',
+      ids.map((documentId, at) => ({ documentId, arrivalSeq: String(at + 1) }))))
+    expect(moved.size).toBe(1000)
+    expect(await fenced((c, key) => advanceFoldedArrivalWatermarks(c, key, 'object', [{ documentId: 'd5', arrivalSeq: '99999999999' }])))
+      .toEqual(new Set())
+    await fenced((c, key) => commitOrdinaryHeadRetirement(c, key, 'object', 'huge', ['h']))
+    await fenced((c, key) => fold(c, key, 'ph', [{ documentId: 'huge', forwardedHeads: null }]))
+    await fenced((c, key) => advanceFoldedArrivalWatermarks(c, key, 'object', [{ documentId: 'huge', arrivalSeq: '9007199254740993' }]))
+    expect((await bdb.pool.query(`SELECT arrival_watermark::text AS w FROM read_model_ordinary_head_retirements WHERE document_id = 'huge'`))
+      .rows[0]!.w).toBe('9007199254740993')
   })
 })

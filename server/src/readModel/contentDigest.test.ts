@@ -15,6 +15,13 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  applyDigestDelta,
+  composeDigestDeltas,
+  IdSetDeltaRecorder,
+  recordIdSetDelta,
+  withIdSetDeltaRecorder,
+  xorDelta,
+  ZERO_DIGEST_DELTA,
   digestOfIds,
   digestsEqual,
   parseDigestRow,
@@ -169,5 +176,98 @@ describe('summarizeDigestVerdicts', () => {
     ])
     expect(summary).toContain('MISMATCH')
     expect(summary).toContain('object: sealed 3/aaaaaaaaaaaaaaaa vs rows 2/bbbbbbbbbbbbbbbb')
+  })
+})
+
+describe('xorDelta / applyDigestDelta (G4-16f C6a)', () => {
+  /** A small seeded PRNG, so a failure names a reproducible sequence. */
+  const prng = (seed: number) => () => {
+    seed = (seed + 0x6d2b79f5) | 0
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed)
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+  }
+
+  it('base ⊕ delta equals the digest of the resulting set, over random set evolutions', () => {
+    for (const seed of [1, 2, 3, 42, 1234]) {
+      const random = prng(seed)
+      const pool = Array.from({ length: 40 }, (_, i) => `id-${i}-${'é'.repeat(i % 3)}`)
+      let set = new Set<string>()
+      let digest = digestOfIds(set)
+      for (let step = 0; step < 200; step += 1) {
+        const entered = pool.filter((id) => !set.has(id) && random() < 0.15)
+        const left = [...set].filter(() => random() < 0.15)
+        digest = applyDigestDelta(digest, xorDelta(entered, left))
+        set = new Set([...[...set].filter((id) => !left.includes(id)), ...entered])
+        expect(digest, `seed ${seed} step ${step}`).toEqual(digestOfIds(set))
+      }
+    }
+  })
+
+  it('removing is the same XOR as adding; only the count tells them apart', () => {
+    const added = xorDelta(['a', 'b'], [])
+    const removed = xorDelta([], ['a', 'b'])
+    expect(added.x).toBe(removed.x)
+    expect(added.n).toBe(2)
+    expect(removed.n).toBe(-2)
+    expect(applyDigestDelta(digestOfIds(['a', 'b']), removed)).toEqual(digestOfIds([]))
+  })
+
+  it('XORs out the OLD id when one id replaces another (not just the count)', () => {
+    // Same cardinality, different set: a delta that only moved `n` would
+    // leave {a,b} where {a,c} is.
+    const next = applyDigestDelta(digestOfIds(['a', 'b']), xorDelta(['c'], ['b']))
+    expect(next).toEqual(digestOfIds(['a', 'c']))
+    expect(next).not.toEqual(digestOfIds(['a', 'b']))
+  })
+
+  it('composes associatively and commutatively, with the zero delta as identity', () => {
+    const d1 = xorDelta(['a'], [])
+    const d2 = xorDelta(['b'], ['a'])
+    const d3 = xorDelta([], ['b'])
+    expect(composeDigestDeltas(composeDigestDeltas(d1, d2), d3)).toEqual(composeDigestDeltas(d1, composeDigestDeltas(d2, d3)))
+    expect(composeDigestDeltas(d1, d2)).toEqual(composeDigestDeltas(d2, d1))
+    expect(composeDigestDeltas(d1, ZERO_DIGEST_DELTA)).toEqual(d1)
+    expect(composeDigestDeltas(composeDigestDeltas(d1, d2), d3)).toEqual(ZERO_DIGEST_DELTA)
+  })
+
+  it('renders 16 zero-padded hex characters even when the XOR has leading zeros', () => {
+    const d = xorDelta(['a'], ['a'])
+    expect(d.x).toBe('0000000000000000')
+    expect(d.n).toBe(0)
+    for (let i = 0; i < 50; i += 1) expect(xorDelta([`k${i}`], []).x).toMatch(/^[0-9a-f]{16}$/)
+  })
+
+  it('coerces a non-string id the way digestOfIds does', () => {
+    expect(xorDelta([5 as unknown as string], [])).toEqual({ n: 1, x: digestOfIds(['5']).x })
+  })
+})
+
+describe('IdSetDeltaRecorder binding', () => {
+  it('records only while bound to the transaction, and accumulates per kind', async () => {
+    const tx = {}
+    const recorder = new IdSetDeltaRecorder()
+    recordIdSetDelta(tx, 'object', ['before'], [])
+    await withIdSetDeltaRecorder(tx, recorder, async () => {
+      recordIdSetDelta(tx, 'object', ['a', 'b'], [])
+      recordIdSetDelta(tx, 'object', [], ['a'])
+      recordIdSetDelta({}, 'object', ['other-transaction'], [])
+      recordIdSetDelta(tx, 'connection', [], [])
+    })
+    recordIdSetDelta(tx, 'object', ['after'], [])
+    expect(recorder.touched().sort()).toEqual(['connection', 'object'])
+    expect(recorder.deltasByKind()).toEqual({ object: xorDelta(['b'], []), connection: ZERO_DIGEST_DELTA })
+  })
+
+  it('unbinds when the work throws, and refuses a second recorder on a bound transaction', async () => {
+    const tx = {}
+    await expect(withIdSetDeltaRecorder(tx, new IdSetDeltaRecorder(), async () => { throw new Error('boom') }))
+      .rejects.toThrow('boom')
+    const later = new IdSetDeltaRecorder()
+    await withIdSetDeltaRecorder(tx, later, async () => {
+      recordIdSetDelta(tx, 'object', ['x'], [])
+      await expect(withIdSetDeltaRecorder(tx, new IdSetDeltaRecorder(), async () => undefined)).rejects.toThrow(/already bound/)
+    })
+    expect(later.deltasByKind()).toEqual({ object: xorDelta(['x'], []) })
   })
 })

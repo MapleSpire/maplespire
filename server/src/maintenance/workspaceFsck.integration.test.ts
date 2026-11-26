@@ -1177,4 +1177,21 @@ describe.skipIf(!TEST_DATABASE_URL)('durability witness freshness (live Postgres
     expect((payload.objects.o1 as { name: string }).name).toBe('One')
     expect((payload.connections.c1 as { toId: string }).toId).toBe('o2')
   })
+
+  it('T-SUM-2b: the payload names exactly the asked batches the server acknowledged, in THIS workspace, any status', async () => {
+    // The replay's proof that a stamped write LANDED once its segment is out
+    // of sight. A row of another workspace must never answer, and an id no
+    // row names must be absent — the client reads absence of an id as "never
+    // received" and REPLAYS.
+    const { acknowledgeOverlayBatches } = await import('../readModel/overlayHistoryStore.js')
+    await acknowledgeOverlayBatches(db.pool, WS, 'object', 'doc-head-1', ['b-projected'], 'projected', 1, 1)
+    await acknowledgeOverlayBatches(db.pool, WS, 'connection', 'doc-head-2', ['b-forwarding'], 'forwarding', 1, 0)
+    await acknowledgeOverlayBatches(db.pool, { landscapeId: 'L-other', versionId: 'V-other' }, 'object', 'doc-x', ['b-elsewhere'], 'projected', 1, 1)
+    const payload = await durabilityWitnessPayload(db.pool, WS, [], [], ['b-projected', 'b-forwarding', 'b-elsewhere', 'b-never'])
+    expect({ ...payload.batches }).toEqual({ 'b-projected': 'projected', 'b-forwarding': 'forwarding' })
+    // Not asked, not answered; and nothing asked, an empty record — never a
+    // missing field (the client discards an answer without it).
+    expect({ ...(await durabilityWitnessPayload(db.pool, WS, [], [], ['b-never'])).batches }).toEqual({})
+    expect({ ...(await durabilityWitnessPayload(db.pool, WS, ['o1'], [])).batches }).toEqual({})
+  })
 })

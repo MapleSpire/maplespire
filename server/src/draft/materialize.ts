@@ -17,6 +17,7 @@ import { isValidAutomergeUrl } from '@automerge/automerge-repo'
 import type { SealedRepo } from '../rbac/sealedRepo.js'
 import { findReadyDocument } from '../automergeRepoCompat.js'
 import { emptyMonolithModel } from '../modelCollections.js'
+import { withMetaUrlView } from '../modelMetaUrls.js'
 
 /**
  * Materialize a whole workspace root into a normalized, id-keyed snapshot for the
@@ -214,7 +215,9 @@ export async function materializeFullModel(
   // --- Model collections (sharded ModelMeta + shards, or monolithic ModelDoc) ---
   // These are CRITICAL: a missing model doc throws (a partial model corrupts the diff).
   if (root.modelMetaUrl && isValidAutomergeUrl(root.modelMetaUrl)) {
-    const meta = await materializeDoc<MetaLike & object>(repo, root.modelMetaUrl, atHeads, missing, 'modelMeta', true)
+    const metaDoc = await materializeDoc<MetaLike & object>(repo, root.modelMetaUrl, atHeads, missing, 'modelMeta', true)
+    // The ruling URL values, plain strings.
+    const meta = metaDoc ? withMetaUrlView(metaDoc) : undefined
     if (meta) {
       Object.assign(model.groups, meta.groups ?? {})
       Object.assign(model.domains, meta.domains ?? {})

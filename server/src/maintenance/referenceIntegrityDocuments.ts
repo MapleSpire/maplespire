@@ -15,6 +15,7 @@
 import type { Repo } from '@automerge/automerge-repo'
 import { isValidAutomergeUrl } from '@automerge/automerge-repo'
 import type { Queryable } from '../readModel/types.js'
+import { DUPLICATE_IDS_SQL, UNREADABLE_DOCUMENTS_SQL } from '../readModel/projectionIntegrity.js'
 import { findReadyDocument } from '../automergeRepoCompat.js'
 import { staticReadModelQueryWorkspaceIfPresent } from '../readModel/staticWorkspace.js'
 import {
@@ -89,9 +90,13 @@ export async function readModelUntrustworthyReason(
     last_error_generation: string | null
     degraded_since: Date | null
     defect_count: number | null
+    unreadable_documents: number | null
+    duplicate_ids: number | null
     defect_summary: string | null
   }>(
-    `SELECT projected_generation, last_error_generation, degraded_since, defect_count, defect_summary
+    `SELECT projected_generation, last_error_generation, degraded_since, defect_count,
+            ${UNREADABLE_DOCUMENTS_SQL} AS unreadable_documents, ${DUPLICATE_IDS_SQL} AS duplicate_ids,
+            defect_summary
        FROM read_model_projection_state
       WHERE landscape_id = $1 AND version_id = $2`,
     [key.landscapeId, key.versionId],
@@ -99,8 +104,20 @@ export async function readModelUntrustworthyReason(
   const state = rows[0]
   if (!state) return 'it has never been projected, so every ro_* table is empty'
   if (state.degraded_since) return `its projector has been degraded since ${state.degraded_since.toISOString()}`
+  // `defect_count` counts unreadable documents AND dropped duplicate ids.
+  // Both refuse: a dropped duplicate's memberships are not in the rows either.
+  // The split is the fleet gauge's (`DUPLICATE_IDS_SQL`, projectionIntegrity.ts):
+  // a `duplicate_id_count` the last stamp did not write — a row stamped
+  // before the column, or by the previous release — is unknown, and every
+  // defect is then named a document.
   if ((state.defect_count ?? 0) > 0) {
-    return `its last full extraction recorded ${state.defect_count} unreadable document(s)`
+    const duplicates = Number(state.duplicate_ids ?? 0)
+    const documents = Number(state.unreadable_documents ?? 0)
+    const parts = [
+      ...(documents > 0 ? [`${documents} unreadable document(s)`] : []),
+      ...(duplicates > 0 ? [`${duplicates} duplicate id(s) dropped (the last occurrence kept)`] : []),
+    ]
+    return `its last full extraction recorded ${parts.join(' and ')}`
       + `${state.defect_summary ? `: ${state.defect_summary}` : ''}`
   }
   if (state.last_error_generation !== null

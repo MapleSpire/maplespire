@@ -34,6 +34,7 @@ import 'dotenv/config'
 import { Repo, isValidAutomergeUrl, type AutomergeUrl } from '@automerge/automerge-repo'
 import { PostgresStorageAdapter } from '../src/automergeStorage.js'
 import { initSchema, pool } from '../src/db.js'
+import { SCALAR_META_URL_FIELD, readMetaUrlsUnion, writeMetaUrl } from '../src/modelMetaUrls.js'
 
 interface MetaShape {
   editsObjectShardUrls?: string[]
@@ -91,10 +92,10 @@ async function main(): Promise<void> {
   // can carry content the singular heads no longer do.
   const headUrls = [...new Set(
     [
-      doc.editsObjectShardUrl,
-      doc.editsConnectionShardUrl,
-      ...(doc.editsObjectShardUrls ?? []),
-      ...(doc.editsConnectionShardUrls ?? []),
+      ...(readMetaUrlsUnion(doc, 'editsObjectShardUrl') ?? []),
+      ...(readMetaUrlsUnion(doc, 'editsConnectionShardUrl') ?? []),
+      ...(readMetaUrlsUnion(doc, 'editsObjectShardUrls') ?? []),
+      ...(readMetaUrlsUnion(doc, 'editsConnectionShardUrls') ?? []),
     ].filter((value): value is string => Boolean(value) && isValidAutomergeUrl(value!)),
   )]
   for (const headUrl of headUrls) {
@@ -111,10 +112,15 @@ async function main(): Promise<void> {
   }
 
   meta.change((m) => {
-    delete m.editsObjectShardUrl
-    delete m.editsConnectionShardUrl
-    delete m.editsObjectShardUrls
-    delete m.editsConnectionShardUrls
+    writeMetaUrl(m, 'editsObjectShardUrl', undefined)
+    writeMetaUrl(m, 'editsConnectionShardUrl', undefined)
+    // No API deletes a list field outright: drop BOTH copies (old text field
+    // and its scalar counterpart) so neither authority still names segments.
+    const record = m as Record<string, unknown>
+    for (const field of ['editsObjectShardUrls', 'editsConnectionShardUrls'] as const) {
+      delete record[field]
+      delete record[SCALAR_META_URL_FIELD[field]]
+    }
     delete m.editsOverlayWriteHeadVersion
   })
   await repo.flush([meta.documentId])

@@ -1,0 +1,86 @@
+{
+  "epochs": {
+    "hop": {
+      "updating": "Mise à jour du modèle…"
+    },
+    "retired": {
+      "message_one": "Cet onglet tenait une version archivée du modèle : {{count}} modification non synchronisée n’a pas pu être reportée.",
+      "message_other": "Cet onglet tenait une version archivée du modèle : {{count}} modifications non synchronisées n’ont pas pu être reportées.",
+      "export": "Les exporter",
+      "dismiss": "Fermer",
+      "confirmDismiss_one": "Fermer sans exporter ? Cette modification non synchronisée n’est conservée nulle part ailleurs.",
+      "confirmDismiss_other": "Fermer sans exporter ? Ces {{count}} modifications non synchronisées ne sont conservées nulle part ailleurs.",
+      "keep": "Les garder",
+      "confirmDiscard": "Fermer quand même"
+    },
+    "overrides": {
+      "notice_one": "{{count}} de vos modifications hors ligne a été remplacée par une modification plus récente.",
+      "notice_other": "{{count}} de vos modifications hors ligne ont été remplacées par des modifications plus récentes.",
+      "pill_one": "{{count}} modification remplacée",
+      "pill_other": "{{count}} modifications remplacées",
+      "review": "Examiner",
+      "later": "Plus tard",
+      "title": "Vos modifications hors ligne remplacées",
+      "explain": "Pendant que vous étiez hors ligne, quelqu’un a modifié les mêmes champs ; sa version a été conservée. Réappliquez celles que vous voulez garder — c’est annulable.",
+      "all": "Toutes",
+      "none": "Aucune",
+      "close": "Fermer",
+      "showInDiagram": "Voir dans le diagramme",
+      "yours": "La vôtre",
+      "current": "Actuelle (plus récente)",
+      "when": "Remplacée {{date}}",
+      "recreate": {
+        "objects": "Recréer l’objet supprimé",
+        "connections": "Recréer la connexion supprimée",
+        "groups": "Recréer le groupe supprimé"
+      },
+      "wholeEntity": {
+        "objects": "Objet entier",
+        "connections": "Connexion entière",
+        "groups": "Groupe entier"
+      },
+      "changedSince": "Modifiée depuis : maintenant {{value}}",
+      "endpointDeleted": "Extrémité supprimée",
+      "needs": "Nécessite {{object}}",
+      "unsupported": "À modifier sur sa propre page",
+      "dismissAll": "Abandonner mes modifications",
+      "discardConfirm_one": "Abandonner votre modification remplacée ? La version plus récente est conservée.",
+      "discardConfirm_other": "Abandonner vos {{count}} modifications remplacées ? La version plus récente est conservée.",
+      "discardConfirmYes": "Confirmer l'abandon",
+      "discardConfirmNo": "Les garder",
+      "discarded": "Vos modifications remplacées ont été abandonnées.",
+      "undo": "Annuler",
+      "reapply_one": "Réappliquer {{count}} modification",
+      "reapply_other": "Réappliquer {{count}} modifications",
+      "reviewing_one": "Revue de {{count}} modification remplacée",
+      "reviewing_other": "Revue de {{count}} modifications remplacées",
+      "backToReview": "Retour à la revue",
+      "refusal": {
+        "needsDiagram": "Ouvrez un diagramme pour réappliquer : la modification rejoint son historique d’annulation.",
+        "hop": "Le modèle se met à jour. Réessayez dans un instant.",
+        "notRecorded": "Vos modifications n’ont pas été réappliquées : le changement n’a pas pu rejoindre l’historique d’annulation. Rien n’a été modifié. Réessayez."
+      },
+      "openDiagram": "Ouvrir le diagramme",
+      "marker": "Votre modification hors ligne a été remplacée",
+      "markerShort": "Remplacée",
+      "kind": {
+        "objects": "Objet",
+        "connections": "Connexion",
+        "groups": "Groupe",
+        "other": "Modèle"
+      },
+      "field": {
+        "name": "Nom",
+        "description": "Description",
+        "status": "Statut",
+        "technology": "Technologie",
+        "label": "Libellé",
+        "type": "Type",
+        "scope": "Portée",
+        "owners": "Responsables",
+        "tags": "Étiquettes",
+        "properties": "Propriétés"
+      }
+    }
+  }
+}

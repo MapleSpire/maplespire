@@ -218,10 +218,12 @@ export interface CompactionQueueTick {
  * What the pass did, and `ran: false` is not a failure.
  *
  * A UNION AND NOT A NULLABLE COUNT. `runWorkspaceCompaction` returns NORMALLY
- * with `objectsFolded: 0` and a `skippedReason` for four of its own refusals —
- * `summary_workspace`, `projection_not_acknowledged`, `foreign_projector_instance`
- * and `ownership_lost_mid_fold` — and the coordinator stamps every one of them
- * `status: 'completed'`. A caller that read only the status would book all four
+ * with `objectsFolded: 0` and a `skippedReason` for seven of its own refusals —
+ * `summary_workspace`, `projection_not_acknowledged`, `foreign_projector_instance`,
+ * `ownership_lost_mid_fold`, `retired_head_forward_pending`,
+ * `ordinary_fold_unpublished` and `overlay_rotation_lock_contended`
+ * (`WorkspaceCompactionSkip`) — and the coordinator stamps every one of them
+ * `status: 'completed'`. A caller that read only the status would book all seven
  * as a successful compaction of zero, DELETE the due-work row, and report a
  * green window; in the `projection_not_acknowledged` case — the normal state of
  * a workspace with a fat overlay — the workspace would lose its turn for ever.

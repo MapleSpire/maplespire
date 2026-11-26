@@ -156,8 +156,8 @@ import type { Queryable } from './types.js'
  * delay (at most 60 s). Plus the barrier: one `pg_stat_activity` query per
  * poll period while it waits. A head whose re-check fails
  * `HANDOVER_RECHECK_MAX_ATTEMPTS` times is given up, and logged. Steady-state
- * poll query is unchanged (what else changes: read-model-projector-health.md,
- * "What this changes even where no handover ever happens"); a workspace that neither rotates nor holds a
+ * poll query is unchanged (what else changes:
+ * https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/read-model-projector-health.md#what-this-changes-even-where-no-handover-ever-happens); a workspace that neither rotates nor holds a
  * retirement row arms nothing.
  *
  * A storage compaction (snapshot over incrementals) mints an arrival with no
@@ -501,4 +501,32 @@ export async function advanceFoldedArrivalWatermark(
     [key.landscapeId, key.versionId, collection, documentId, expected, next],
   )
   return (result.rowCount ?? 0) > 0
+}
+
+/** Several advances from NULL (the detach's batch) in ONE statement, each a
+ * CAS like {@link advanceFoldedArrivalWatermark}'s: the protocol tables'
+ * statement trigger re-stamps the adopt digests ONCE for the batch, not once
+ * per head (`schema.ts`; measured). A head named
+ * twice is advanced once, to its first arrival, as the per-head loop did.
+ * Returns the ids whose CAS moved. */
+export async function advanceFoldedArrivalWatermarks(
+  db: Queryable,
+  key: WorkspaceKey,
+  collection: OverlayCollection,
+  hits: ReadonlyArray<{ documentId: string; arrivalSeq: string }>,
+): Promise<Set<string>> {
+  const first = new Map<string, string>()
+  for (const hit of hits) if (!first.has(hit.documentId)) first.set(hit.documentId, hit.arrivalSeq)
+  if (!first.size) return new Set()
+  const { rows } = await db.query<{ document_id: string }>(
+    `UPDATE read_model_ordinary_head_retirements AS row
+        SET arrival_watermark = hit.next, updated_at = now()
+       FROM unnest($4::text[], $5::bigint[]) AS hit(id, next)
+      WHERE row.landscape_id = $1 AND row.version_id = $2 AND row.collection = $3 AND row.document_id = hit.id
+        AND row.status = 'folded'
+        AND row.arrival_watermark IS NULL
+      RETURNING row.document_id`,
+    [key.landscapeId, key.versionId, collection, [...first.keys()], [...first.values()]],
+  )
+  return new Set(rows.map((row) => row.document_id))
 }

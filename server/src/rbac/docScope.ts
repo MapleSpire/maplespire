@@ -39,6 +39,7 @@ import { upsertOrgScope, upsertLandscapeScope, upsertVersionScope } from './sche
 import type { SessionClaims } from '../auth/tokens.js'
 import type { MetricSample } from '../runtime/metrics.js'
 import { enumerateMaintainableWorkspaces } from '../maintenance/maintainableWorkspaces.js'
+import { readMetaUrlsUnion } from '../modelMetaUrls.js'
 
 /**
  * The workspace doc index (Automerge WebSocket auth + scoping).
@@ -296,6 +297,32 @@ export async function createClaimedDocument<T>(
   return handle
 }
 
+/**
+ * {@link createClaimedDocument} for a document whose CONTENT is already an
+ * Automerge binary: the epoch builders (`modelEpochs.ts`) produce a fresh
+ * document whose one change carries every value with its stored datatype,
+ * which `repo.create(value)` cannot reproduce — it goes through `A.from`,
+ * whose nested encoding turns a stored `int -5` into `f64` and an
+ * `Int`/`Uint`/`Float64` wrapper into a MAP (measured on Automerge 3.2.6;
+ * see `modelEpochs.ts`). `repo.import` without
+ * a `docId` mints a new id and installs a clone of the binary's document.
+ * Same order as the value variant: placement noted synchronously, durable,
+ * claimed, returned. The same widening as above (one site, two shapes).
+ */
+export async function createClaimedDocumentFromBinary<T>(
+  repo: SealedRepo,
+  workspace: WorkspaceKey,
+  rootUrl: string,
+  binary: Uint8Array,
+): Promise<DocHandle<T>> {
+  const handle = (repo as Repo).import<T>(binary)
+  noteServerCreationPlacement(String(handle.documentId), workspace)
+  await handle.whenReady()
+  await repo.flush([handle.documentId])
+  await notifyWorkspaceDocumentsCreated({ ...workspace, rootUrl, documentIds: [String(handle.documentId)] })
+  return handle
+}
+
 /** Subscribe an additional lifecycle consumer without replacing the primary
  * doc-index registration. Sync-cell ownership uses this to acquire a lease for
  * a newly-created version immediately; the periodic reconciliation remains the
@@ -396,6 +423,17 @@ const DEFAULT_STALE_REPAIR_CONCURRENCY = 4
 /** After this many consecutive failures a workspace stops being retried, so a
  * permanently failing repair cannot be re-attempted on every resolve miss. */
 export const MAX_STALE_REPAIR_FAILURES = 3
+
+/** The orphaned control documents remembered at most (`noteDocumentMessage`):
+ * one entry per evicted root,
+ * meta or registry shard not watched again. */
+export const ORPHANED_CONTROL_DOCS_MAX = 4_096
+let orphanedControlDocsMax = ORPHANED_CONTROL_DOCS_MAX
+
+/** Test hook: the bound (null restores it). */
+export function _setOrphanedControlDocsMaxForTests(max: number | null): void {
+  orphanedControlDocsMax = max ?? ORPHANED_CONTROL_DOCS_MAX
+}
 
 /** Local retries inside `coalescedRewalk` before it hands the workspace to the
  * scheduled repair. The fault it is retrying is a database one (that is the only
@@ -764,6 +802,10 @@ export class WorkspaceDocIndex {
    * whose eviction can orphan this index. Deliberately not `byDoc`, which holds
    * every document in the workspace — see `trackResidency`. */
   private readonly controlDocWorkspace = new Map<string, string>()
+  /** documentId -> workspace key: the control documents eviction took the
+   * listener from, not watched again since. A peer's message about one of
+   * them re-walks its workspace ONCE (`noteDocumentMessage`) — see there. */
+  private readonly orphanedControlDocs = new Map<string, string>()
   /** Workspaces whose control-document watchers were orphaned by eviction. */
   private readonly staleWorkspaces = new Map<string, WorkspaceKey>()
   private readonly staleRepairFailures = new Map<string, number>()
@@ -996,6 +1038,17 @@ export class WorkspaceDocIndex {
       if (workspace === undefined) return
       const entry = this.byWorkspace.get(workspace)
       if (!entry) return
+      // BOUNDED: an old meta
+      // after a roll, evicted and never asked for again, kept its entry for
+      // the life of the process. The oldest goes first; a document dropped
+      // from here still repairs on a resolve miss, as it did before this
+      // watch existed.
+      this.orphanedControlDocs.delete(documentId)
+      this.orphanedControlDocs.set(documentId, workspace)
+      if (this.orphanedControlDocs.size > orphanedControlDocsMax) {
+        const oldest = this.orphanedControlDocs.keys().next().value
+        if (oldest !== undefined) this.orphanedControlDocs.delete(oldest)
+      }
       this.staleWorkspaces.set(workspace, entry.key)
       // Any walk in flight right now watched the handle being evicted, so it
       // must not be joined as if it were a repair (see ensureWorkspace).
@@ -1006,6 +1059,36 @@ export class WorkspaceDocIndex {
       // its retry budget gets it back rather than staying written off.
       this.routeBackfillFailures.delete(workspace)
     })
+  }
+
+  /**
+   * A peer sent a sync or request message about `documentId` (the transport
+   * adapter calls this for every such inbound message, before any gate).
+   *
+   * Eviction marks the workspace stale, and the repair runs on the next
+   * resolve MISS. That is not enough on its own (measured on the e2e stack,
+   * AUTH off): a compaction released its projector and evicted the
+   * CURRENT ModelMeta while the author was offline; the only miss after it
+   * fell inside the repair's rate limit and was dropped; and under the
+   * claim-only access check (and for any document whose allow automerge-repo
+   * already pinned) no further miss ever comes. The author then wrote a new
+   * shard's pointer into that meta — on a NEW handle with no listener — and
+   * the shard was never claimed: never durable, its objects in her tab only.
+   *
+   * So the return of an orphaned control document re-walks its workspace,
+   * once per eviction: the walk watches the new handle (before reading it, so
+   * a change applied after the read still fires) and claims what it already
+   * references. Only on a message about it — a document someone is using
+   * again, already being loaded — never on eviction itself, which would
+   * re-hydrate every control document the idle sweep lets go. Synchronous and
+   * O(1) on the inbound path; the walk is not awaited.
+   */
+  noteDocumentMessage(documentId: string): void {
+    const workspace = this.orphanedControlDocs.get(documentId)
+    if (workspace === undefined) return
+    this.orphanedControlDocs.delete(documentId)
+    const entry = this.byWorkspace.get(workspace)
+    if (entry) void this.coalescedRewalk(entry)
   }
 
   /**
@@ -1816,7 +1899,10 @@ export class WorkspaceDocIndex {
      * listener: they reference nothing. */
     const watch = (handle: DocHandle<unknown>, control = false) => {
       newDocIds.add(String(handle.documentId))
-      if (control) this.controlDocWorkspace.set(String(handle.documentId), k)
+      if (control) {
+        this.controlDocWorkspace.set(String(handle.documentId), k)
+        this.orphanedControlDocs.delete(String(handle.documentId))
+      }
       if (!entry.watched.has(handle)) {
         entry.watched.add(handle)
         // ONLY control documents re-walk. A re-walk is a full traversal of the
@@ -1951,24 +2037,25 @@ export class WorkspaceDocIndex {
         if (summaryOnly) {
           // Static clients need only the tiny current overlay documents. Index
           // their trusted references without opening them during the walk.
-          await reference(meta.editsObjectShardUrl)
-          await reference(meta.editsConnectionShardUrl)
+          // A reference closure — what either copy names (`readMetaUrlsUnion`).
+          for (const u of readMetaUrlsUnion(meta, 'editsObjectShardUrl') ?? []) await reference(u)
+          for (const u of readMetaUrlsUnion(meta, 'editsConnectionShardUrl') ?? []) await reference(u)
         } else {
-          for (const u of meta.objectShardUrls ?? []) {
+          for (const u of readMetaUrlsUnion(meta, 'objectShardUrls') ?? []) {
             await findLeaf(u)
           }
-          for (const u of meta.connectionShardUrls ?? []) {
+          for (const u of readMetaUrlsUnion(meta, 'connectionShardUrls') ?? []) {
             await findLeaf(u)
           }
           for (const u of meta.decisionRecordShardUrls ?? []) {
             await findLeaf(u)
           }
-          await findLeaf(meta.editsObjectShardUrl)
-          await findLeaf(meta.editsConnectionShardUrl)
-          for (const url of meta.editsObjectShardUrls ?? []) {
+          for (const url of readMetaUrlsUnion(meta, 'editsObjectShardUrl') ?? []) await findLeaf(url)
+          for (const url of readMetaUrlsUnion(meta, 'editsConnectionShardUrl') ?? []) await findLeaf(url)
+          for (const url of readMetaUrlsUnion(meta, 'editsObjectShardUrls') ?? []) {
             await findLeaf(url)
           }
-          for (const url of meta.editsConnectionShardUrls ?? []) {
+          for (const url of readMetaUrlsUnion(meta, 'editsConnectionShardUrls') ?? []) {
             await findLeaf(url)
           }
         }

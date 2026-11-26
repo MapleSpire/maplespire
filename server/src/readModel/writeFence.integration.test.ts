@@ -24,6 +24,7 @@ import {
 } from './health.js'
 import { ReadModelPlaneError, assertReadModelPlane } from './projectionAuthority.js'
 import { roObject } from './queries.js'
+import { verifyWorkspaceIntegrity } from './projectionIntegrity.js'
 import type { WorkspaceKey } from './projector.js'
 import type { Queryable } from './types.js'
 import { guardIdleClientErrors } from '../db/poolErrorGuard.js'
@@ -286,6 +287,10 @@ suite('read-model row-write fence (NC-2)', () => {
       const fence = (await stateRow(WS))?.write_fence
       expect(fence).toBeTruthy()
 
+      const objectSeal = async () =>
+        (await verifyWorkspaceIntegrity(pool!, WS)).verdicts.find((verdict) => verdict.kind === 'object')
+      expect((await objectSeal())?.outcome, 'control: the cold build sealed objects').toBe('match')
+
       // (a) Legitimate owner, begin fails: the fallback commits.
       failNextBegin = true
       os0.change((doc: { objects: Record<string, unknown> }) => {
@@ -294,6 +299,12 @@ suite('read-model row-write fence (NC-2)', () => {
       await until(async () => beginFailures, (n) => n >= 1)
       const committed = await until(() => roObject(pool!, WS, 'oF1'), (v) => !!v)
       expect(committed).toBeTruthy()
+      // G4-16f C6a: the fallback moved rows WITHOUT advancing the generation,
+      // so the object seal must not stay comparable over them — it is
+      // removed (`invalidateContentDigests`), not left as a stale match.
+      const afterFallback = await objectSeal()
+      expect(afterFallback?.outcome).toBe('not-verifiable')
+      expect(afterFallback?.expected).toBeNull()
 
       // (b) Foreign fence, raced pre-check (the lie), begin fails: the
       // fallback's own assert rolls everything back.

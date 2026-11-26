@@ -153,6 +153,17 @@ describe('Tag capability check — a registry that cannot be read', () => {
 
 const connectionString = process.env.TEST_DATABASE_URL
 
+/**
+ * An event timestamp a minute in the past, not "now". The summary window ends
+ * at the DATABASE's now() while this timestamp comes from the test process's
+ * clock, and the two are different clocks (under ci:local, Postgres runs in a
+ * container): any lead of this process over the database puts a "now" event
+ * in the database's future, out of the 24h window — the 2026-10-22 ci:local
+ * red, reproduced exactly by skewing the timestamp +2 s. Every timestamp these
+ * tests send for a windowed read goes through here.
+ */
+const pastNow = (): string => new Date(Date.now() - 60_000).toISOString()
+
 describe.skipIf(!connectionString)('Tag catalog PostgreSQL invariants', () => {
   let db: IsolatedSchemaDb
   let pool: Pool
@@ -338,13 +349,7 @@ describe.skipIf(!connectionString)('Tag catalog PostgreSQL invariants', () => {
   })
 
   it('deduplicates privacy-minimized outbox telemetry and isolates organization summaries', async () => {
-    // A minute in the past, not "now": the window ends at the DATABASE's now()
-    // while this timestamp comes from the test process's clock, and the two are
-    // different clocks (under ci:local, Postgres runs in a container). Any lead
-    // of this process over the database puts the events in the database's
-    // future, out of the 24h window — the 2026-10-22 ci:local red, reproduced
-    // exactly by skewing this timestamp +2 s. (The real skew was not measured.)
-    const now = new Date(Date.now() - 60_000).toISOString()
+    const now = pastNow()
     const events = [
       {
         id: `tagop_client_${'e'.repeat(32)}`,
@@ -720,7 +725,7 @@ describe.skipIf(!connectionString)('Tag catalog PostgreSQL invariants', () => {
     app.use(express.json())
     registerTagRoutes(app, pool)
     const server: Server = await new Promise((resolve) => {
-      const listener = app.listen(0, () => resolve(listener))
+      const listener = app.listen(0, '127.0.0.1', () => resolve(listener))
     })
     const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}/api/orgs/${orgId}`
     try {
@@ -820,7 +825,7 @@ describe.skipIf(!connectionString)('Tag catalog PostgreSQL invariants', () => {
           reasonCode: null,
           ageMs: 2_500,
           attemptCount: 2,
-          occurredAt: new Date().toISOString(),
+          occurredAt: pastNow(),
         }] }),
       })
       expect(operationResponse.status).toBe(202)
@@ -842,7 +847,7 @@ describe.skipIf(!connectionString)('Tag catalog PostgreSQL invariants', () => {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ events: [{
           id: 'unsafe', eventType: 'queued', itemKind: 'tag', ageMs: 0, attemptCount: 0,
-          occurredAt: new Date().toISOString(),
+          occurredAt: pastNow(),
         }] }),
       })
       expect(invalidOperationResponse.status).toBe(400)

@@ -62,7 +62,10 @@ import type { AnyDocumentId, DocHandle, DocumentId, Repo } from '@automerge/auto
  * `grep -rn "as Repo" server/src --include=*.ts | grep -v sealedRepo.ts`
  * (the filter excludes this docblock):
  *
- *   1. `createClaimedDocument` (rbac/docScope.ts) — mints, flushes, claims.
+ *   1. `createClaimedDocument` (rbac/docScope.ts) — mints, flushes, claims;
+ *      and its binary twin `createClaimedDocumentFromBinary` (same file, same
+ *      contract, `repo.import` instead of `repo.create`, for the epoch
+ *      builders' typed documents).
  *   2. `createSegment` (overlaySegments.ts) — same contract, needed because
  *      the residency lease must be taken between ready and flush.
  *   3. `bootstrapRepo` (ai/core/tools/workflowTools.ts) — the wide one. It

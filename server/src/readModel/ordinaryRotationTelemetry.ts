@@ -66,8 +66,8 @@ import type { WorkspaceKey } from './projector.js'
  * `parkedHeads` and `currentHead` are facts of a live projector and are null.
  *
  * THE ALERT (G4-16e step 3). With rotation `on` and the fold `off`, nothing
- * ever shortens the chain (`docs/read-model-projector-health.md`, "Unbounded
- * segment chain"). When the overlay list ModelMeta names for a kind is longer
+ * ever shortens the chain (known limit 2 in
+ * https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/read-model-projector-health.md#known-limits). When the overlay list ModelMeta names for a kind is longer
  * than `AM_ORDINARY_CHAIN_ALERT_LENGTH` (0 disables), the entry carries
  * `chainAlert: true`, the snapshot counts it in `chainAlerts` (and so does
  * the gauge), and one `read_model.ordinary_chain_length_alert` line is logged
@@ -166,7 +166,7 @@ export function ordinaryChainUnboundedBootWarning(config: OrdinaryHeadRotationCo
     chainFold: 'off',
     workspaces: config.allowlist === 'all' ? 'all' : config.allowlist.size,
     chainAlertLength: ordinaryChainAlertLength(config),
-    detail: 'every rotation appends a segment and nothing removes one; see docs/read-model-projector-health.md, "Runbook: ReadModelOrdinaryChainUnbounded"',
+    detail: 'every rotation appends a segment and nothing removes one; see https://github.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/read-model-projector-health.md#runbook-readmodelordinarychainunbounded',
   })
 }
 

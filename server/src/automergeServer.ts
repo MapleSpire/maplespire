@@ -19,7 +19,7 @@ import { WebSocket, WebSocketServer } from 'ws'
 import { Repo, type DocHandle, type AutomergeUrl, type DocumentId } from '@automerge/automerge-repo'
 import { NodeWSServerAdapter } from '@automerge/automerge-repo-network-websocket'
 import * as Automerge from '@automerge/automerge'
-import { PostgresStorageAdapter, type StorageFenceSnapshot } from './automergeStorage.js'
+import { PostgresStorageAdapter, type SnapshotCompactionOutcome, type StorageFenceSnapshot } from './automergeStorage.js'
 import { cachedHandles, drainEntries, syncedHandle } from './automergeRepoCompat.js'
 import { pool, storageWritePool } from './db.js'
 import { envNumber } from './envNumber.js'
@@ -147,6 +147,10 @@ export class AuthenticatedWSServerAdapter extends NodeWSServerAdapter {
    * socket, so the ledger has to hear about the disconnect or it keeps asking
    * for re-evaluations on behalf of a connection that no longer exists. */
   denyLedger: Pick<DenyLedger, 'forgetPeer'> | null = null
+  /** Told the document of every inbound sync/request message, before any
+   * gate (the doc index re-watches an evicted control document on its return,
+   * `WorkspaceDocIndex.noteDocumentMessage`). Must be synchronous and cheap. */
+  documentMessage: ((documentId: string) => void) | null = null
 
   constructor(
     server: ConstructorParameters<typeof NodeWSServerAdapter>[0],
@@ -263,6 +267,16 @@ export class AuthenticatedWSServerAdapter extends NodeWSServerAdapter {
       }
     }
     if (event === 'message') this.transportTelemetry?.recordInboundMessage(args[0] as TransportMessage)
+    if (event === 'message' && this.documentMessage) {
+      const message = args[0] as GateMessage | undefined
+      if (message && (message.type === 'sync' || message.type === 'request') && message.documentId != null) {
+        try {
+          this.documentMessage(String(message.documentId))
+        } catch (error) {
+          console.warn('[automerge] document-message hook failed', error)
+        }
+      }
+    }
     if (event === 'message' && this.presenceGate) {
       const message = args[0] as GateMessage | undefined
       if (message?.type === 'ephemeral') {
@@ -872,6 +886,9 @@ export async function startAutomergeSync(
   transportTelemetry: AutomergeTransportTelemetry
   storageFenceSnapshot: () => StorageFenceSnapshot
   storageFenceRejectionCount: () => number
+  /** The Repo's adapter's on-demand snapshot compaction of one document
+   * (G4-16f diagnosis F1/F2), for the compaction pass's base shards. */
+  compactDocumentStorage: (documentId: string, doc: Automerge.Doc<unknown>) => Promise<SnapshotCompactionOutcome>
   /** Null when no doc index is configured — which no boot does since
    * 2026-10-16 (the index is built at every stage); kept nullable for callers. */
   denyLedgerSnapshot: () => DenyLedgerSnapshot | null
@@ -1633,6 +1650,9 @@ export async function startAutomergeSync(
   // well before `residency` exists. Must precede startIdleEviction so no sweep
   // can run before the index is following it.
   const untrackDocIndexResidency = docIndex?.trackResidency(residency) ?? null
+  // ...and an evicted control document coming back (a peer's message about
+  // it) re-walks its workspace: see `WorkspaceDocIndex.noteDocumentMessage`.
+  if (docIndex) adapter.documentMessage = (documentId) => docIndex.noteDocumentMessage(documentId)
 
   // Peer-aware + lease-aware eviction. Projectors pin only live listener docs,
   // so READ_MODEL no longer turns eviction off for the entire repository.
@@ -1699,6 +1719,7 @@ export async function startAutomergeSync(
     transportTelemetry,
     storageFenceSnapshot: () => storageAdapter.snapshot(),
     storageFenceRejectionCount: () => storageAdapter.readRejectedMutationCount(),
+    compactDocumentStorage: (documentId, doc) => storageAdapter.compactToSnapshot(documentId, doc),
     /** Outstanding recoverable denials. `outstanding` returning to 0 after a
      * workspace settles is the observable proof that the pairing invariant is
      * holding; a number that only grows means denials are being recorded that no

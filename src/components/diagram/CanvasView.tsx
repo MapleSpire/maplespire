@@ -80,6 +80,7 @@ import { CommentDetail } from '../comments/CommentDetail'
 import { CommentComposer } from '../comments/CommentComposer'
 import type { C4Object, C4Type, Comment, Connection, Group, SelectedItem } from '../../types'
 import type { Scene3D } from '../../canvas3d'
+import { useEpochOverridesStore } from '../../stores/epochOverridesStore'
 import { defaultShapeSize } from '../../lib/shapeDefaults'
 
 // The 2D engine is fed through the SAME `filterAndMergeDiagramData` as the 3D
@@ -126,6 +127,7 @@ export function CanvasView() {
   const visualReady = useAutomergeStatus((s) => s.visualReady)
   const bridgeStatus = useAutomergeStatus((s) => s.status)
   const bridgeError = useAutomergeStatus((s) => s.error)
+  const bridgeErrorCause = useAutomergeStatus((s) => s.errorCause ?? null)
   /**
    * The boot ENDED, and it ended badly.
    *
@@ -974,6 +976,18 @@ export function CanvasView() {
     syncEngineFromStore()
   }, [objects, connections, groups, diagrams, activeDiagramLayouts, flows, tags, currentDiagramId, inlineExpansions, expandedContentsVersion, setZoom, syncEngineFromStore])
 
+  // G4-16f: the overridden-edit outline, view-only, while the override
+  // review's highlight layer is on ("Show in diagram").
+  const overrideHighlight = useEpochOverridesStore((s) => s.highlight)
+  const overrideRows = useEpochOverridesStore((s) => s.rows)
+  useEffect(() => {
+    const engine = engineRef.current
+    if (!engine) return
+    engine.setOverrideHighlightIds(overrideHighlight
+      ? new Set(overrideRows.map((row) => row.entityId).filter((id): id is string => !!id))
+      : new Set())
+  }, [overrideHighlight, overrideRows, currentDiagramId])
+
   // The summary-registry boot path keeps only a bounded diagram window in
   // memory. Resolve all visible related-diagram affordances in one server query;
   // the paged query falls back to the local registry when offline.
@@ -1378,6 +1392,7 @@ export function CanvasView() {
     return (
       <div
         data-testid="canvas-boot-error"
+        data-cause={bridgeErrorCause ?? undefined}
         role="alert"
         className="w-full h-full bg-surface-50 flex items-center justify-center px-6"
       >
@@ -1389,7 +1404,11 @@ export function CanvasView() {
             {t('canvasViewChrome.bootFailed.title')}
           </div>
           <div className="mt-1.5 text-[13px] leading-5 text-fg-secondary">
-            {t('canvasViewChrome.bootFailed.body')}
+            {/* T-DIAGDEF-2 (B): "still syncing" is wrong when nothing answered
+                and this device has no copy of the workspace to open instead. */}
+            {bridgeErrorCause === 'server-unreachable'
+              ? t('canvasViewChrome.bootFailed.unreachableBody')
+              : t('canvasViewChrome.bootFailed.body')}
           </div>
           {/* The bridge's message already names the document that failed. It is
               the only thing a user can quote and an operator can grep for, so

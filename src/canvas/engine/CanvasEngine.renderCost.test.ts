@@ -27,7 +27,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { C4Object, Connection } from '../../types'
 import { defaultSkin } from '../../skins/defaultSkin'
-import { CanvasEngine } from './CanvasEngine'
+import { CanvasEngine, DATA_RENDER_MAX_GAP_MS, DATA_RENDER_SLOW_FRAME_MS } from './CanvasEngine'
 
 function object(id: string, x: number, extra: Partial<C4Object> = {}): C4Object {
   return {
@@ -353,5 +353,86 @@ describe('selection highlight animation', () => {
     expect(render).toHaveBeenCalledTimes(2)
     expect(animate).not.toHaveBeenCalled()
     engine.destroy()
+  })
+})
+
+describe('data paints after a slow frame', () => {
+  afterEach(() => { vi.useRealTimers() })
+
+  it('a new data set after a SLOW frame is painted at most once per twice that frame — an interaction is not delayed; after a fast frame, at once', () => {
+    expect(DATA_RENDER_SLOW_FRAME_MS).toBe(50)
+    expect(DATA_RENDER_MAX_GAP_MS).toBe(1_000)
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] })
+    const { engine, internals } = engineWith([object('a', 0)])
+    const raf = vi.mocked(requestAnimationFrame)
+    const slow = engine as unknown as { lastFrameMs: number; lastFrameEndedAt: number }
+    // The last frame took 400 ms and just ended.
+    internals.rafId = 0
+    slow.lastFrameMs = 400
+    slow.lastFrameEndedAt = performance.now()
+    raf.mockClear()
+    engine.setData([object('a', 10)], [])
+    engine.setData([object('a', 20)], [])
+    expect(raf).not.toHaveBeenCalled()
+    vi.advanceTimersByTime(700)
+    expect(raf).not.toHaveBeenCalled()
+    // One paint for both data sets, 800 ms after the slow frame.
+    vi.advanceTimersByTime(150)
+    expect(raf).toHaveBeenCalledTimes(1)
+    // An interaction's render is never held back.
+    internals.rafId = 0
+    raf.mockClear()
+    slow.lastFrameEndedAt = performance.now()
+    engine.setViewport({ x: 0, y: 0, scale: 1.2 })
+    expect(raf).toHaveBeenCalledTimes(1)
+    // A fast last frame: painted at once.
+    internals.rafId = 0
+    raf.mockClear()
+    slow.lastFrameMs = 10
+    engine.setData([object('a', 30)], [])
+    expect(raf).toHaveBeenCalledTimes(1)
+    engine.destroy()
+  })
+
+  it('a THROTTLE, not a debounce — data sets every 40 ms for 2 s after slow frames are painted every 800 ms, never held for the whole stream', () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] })
+    const { engine, internals } = engineWith([object('a', 0)])
+    const raf = vi.mocked(requestAnimationFrame)
+    const slow = engine as unknown as { lastFrameMs: number; lastFrameEndedAt: number }
+    const frame = () => { internals.rafId = 0; slow.lastFrameMs = 400; slow.lastFrameEndedAt = performance.now() }
+    frame()
+    raf.mockClear()
+    let paints = 0
+    for (let t = 0; t < 2_000; t += 40) {
+      engine.setData([object('a', t)], [])
+      vi.advanceTimersByTime(40)
+      if (raf.mock.calls.length > 0) { paints += 1; raf.mockClear(); frame() }
+    }
+    expect(paints).toBe(2)
+    engine.destroy()
+  })
+
+  it('the gap is CAPPED at 1 s (a 900 ms frame waits 1 s, not 1.8); destroy() cancels a pending paint', () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] })
+    const { engine, internals } = engineWith([object('a', 0)])
+    const raf = vi.mocked(requestAnimationFrame)
+    const slow = engine as unknown as { lastFrameMs: number; lastFrameEndedAt: number }
+    internals.rafId = 0
+    slow.lastFrameMs = 900
+    slow.lastFrameEndedAt = performance.now()
+    raf.mockClear()
+    engine.setData([object('a', 10)], [])
+    vi.advanceTimersByTime(990)
+    expect(raf).not.toHaveBeenCalled()
+    vi.advanceTimersByTime(20)
+    expect(raf).toHaveBeenCalledTimes(1)
+    // A paint pending at destroy() never runs.
+    internals.rafId = 0
+    slow.lastFrameEndedAt = performance.now()
+    raf.mockClear()
+    engine.setData([object('a', 20)], [])
+    engine.destroy()
+    vi.advanceTimersByTime(3_000)
+    expect(raf).not.toHaveBeenCalled()
   })
 })

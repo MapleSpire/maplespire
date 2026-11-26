@@ -102,16 +102,41 @@ export class ColdBuildAdmission {
 
   constructor(private readonly config: ColdBuildAdmissionConfig = coldBuildAdmissionConfig()) {}
 
-  run<T>(task: () => Promise<T>): Promise<T> {
+  /**
+   * `options` (G4-16f C6-2b, the fleet's adopting starts):
+   *  - `signal`: an abort while QUEUED removes the job from the queue (it no
+   *    longer counts toward `maxQueued`, `cancelled` + 1) and rejects with
+   *    the signal's reason; a job already running is not affected;
+   *  - `exemptFromQueueLimit`: queued even when `maxQueued` is reached — for
+   *    a caller whose number is bounded elsewhere (a claimed adopting start,
+   *    bounded by the claims that committed), whose refusal here would waste
+   *    work already done.
+   */
+  run<T>(task: () => Promise<T>, options: { signal?: AbortSignal; exemptFromQueueLimit?: boolean } = {}): Promise<T> {
     if (this.stopped) return Promise.reject(new ColdBuildAdmissionStoppedError())
+    if (options.signal?.aborted) return Promise.reject(options.signal.reason)
     if (this.active < this.config.maxConcurrent) return this.start(task)
-    if (this.queue.length >= this.config.maxQueued) {
+    if (!options.exemptFromQueueLimit && this.queue.length >= this.config.maxQueued) {
       this.counters.rejected += 1
       return Promise.reject(new ColdBuildQueueFullError())
     }
 
     return new Promise<T>((resolve, reject) => {
-      this.queue.push({ run: task, resolve, reject } as QueuedJob<unknown>)
+      const signal = options.signal
+      const onAbort = () => {
+        const at = this.queue.indexOf(job)
+        if (at < 0) return
+        this.queue.splice(at, 1)
+        this.counters.cancelled += 1
+        reject(signal!.reason)
+      }
+      const job: QueuedJob<unknown> = {
+        run: task,
+        resolve: (value) => { signal?.removeEventListener('abort', onAbort); resolve(value as T) },
+        reject: (error) => { signal?.removeEventListener('abort', onAbort); reject(error) },
+      }
+      this.queue.push(job)
+      signal?.addEventListener('abort', onAbort, { once: true })
       this.counters.maxObservedQueued = Math.max(this.counters.maxObservedQueued, this.queue.length)
     })
   }

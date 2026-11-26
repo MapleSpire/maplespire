@@ -66,8 +66,10 @@ function fakeDb(onFenceClaimed?: () => void) {
         onFenceClaimed?.()
         return { rows: [], rowCount: 1 }
       }
-      if (/SELECT write_fence FROM read_model_projection_state/.test(text)) {
-        return { rows: [{ write_fence: fence }] as never[], rowCount: 1 }
+      // The pre-check and the assertion (whose select list also carries the
+      // connection's protocol version, refused below 2: protocolParticipant.ts).
+      if (/SELECT write_fence\b[^;]*?FROM read_model_projection_state/.test(text)) {
+        return { rows: [{ write_fence: fence, participant: 2 }] as never[], rowCount: 1 }
       }
       return { rows: [], rowCount: 0 }
     },

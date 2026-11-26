@@ -3,6 +3,7 @@
     "bootFailed": {
       "title": "Ce paysage n’a pas fini de charger",
       "body": "L’espace de travail se synchronisait encore quand le chargement a abandonné. Rien n’est perdu — réessayez, ou rechargez la page.",
+      "unreachableBody": "Le serveur est injoignable, et cet appareil n’a aucune copie locale de ce paysage à ouvrir à la place. Rien n’est perdu — réessayez quand le serveur sera revenu.",
       "action": "Réessayer"
     },
     "diagramNotFound": {

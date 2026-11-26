@@ -112,6 +112,30 @@ test('the compaction queue is wired OFF by default, at two independent switches'
   )
 })
 
+test('the compaction re-attach retry is wired through wireCompactionReattach, with the objects it is tested with, and its hooks reach the pass (G4-16f)', () => {
+  // What each object is USED for is decided and tested in
+  // `readModel/compactionReattachWiring.test.ts` (the slot, the shutdown
+  // flag, the ownership, the stops, the fleet's resident listener). What is
+  // left to a source check is that index.ts hands over THOSE objects, and
+  // spreads the hooks into the pass.
+  const at = source.indexOf('wireCompactionReattach({')
+  assert.ok(at > 0, 'index.ts no longer wires the compaction re-attach retry')
+  const call = source.slice(at, source.indexOf('})', at))
+  for (const arg of [
+    'fleet: readModelFleet!', 'ownership: syncCellOwnership', 'readiness,', 'holds: unyieldingHolds,',
+    'stops: maintenanceScheduleStops,', 'writeGate: () => installedPoolConcurrencyGate(storageWritePool)', 'trace: epochTrace',
+  ]) {
+    assert.ok(call.includes(arg), `wireCompactionReattach is no longer given \`${arg}\``)
+  }
+  const pass = source.slice(source.indexOf('runWorkspaceCompaction(key, {'))
+  assert.ok(source.includes('runWorkspaceCompaction(key, {'), 'the compaction pass call is gone from index.ts')
+  assert.ok(
+    pass.slice(0, pass.indexOf('}))')).includes('...compactionReattachWiring.passHooks,'),
+    'the pass no longer gets the hooks: a failed re-attach would stay DETACHED until the next pass',
+  )
+  assert.ok(!source.includes('new CompactionReattachSupervisor('), 'the supervisor is built outside the tested wiring')
+})
+
 test('the known-unwired jobs are still the ones the record says they are', () => {
   // A LIST THAT IS ALLOWED TO SHRINK, NEVER TO GROW SILENTLY. If somebody wires
   // the fsck tick, this test fails and the entry must be moved to `WIRED` — so

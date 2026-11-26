@@ -23,6 +23,7 @@ import {
   type WorkspaceKey,
 } from '../readModel/projector.js'
 import { markStaticReadModelWorkspace } from '../readModel/staticWorkspace.js'
+import { markStaticEntryWatermarks } from '../readModel/arrivalWatermark.js'
 import { rebuildReadModelDerivedStats, upsertDecisionRecords } from '../readModel/derivedStats.js'
 import type { PerformanceSeedPlan } from './generator.js'
 import type { PerformanceWorkspaceResult } from './workspace.js'
@@ -381,6 +382,10 @@ export async function materializePerformanceReadModel(
        degraded_error_code = NULL,
        projector_attached = false,
        projector_instance_id = NULL,
+       -- The seed rewrote the rows and reset the generation to 1, so a seal
+       -- left by an earlier projection could read as current over rows it
+       -- never described. The seed seals nothing: not comparable (G4-16f C6a).
+       content_digest = NULL,
        last_projection_kind = 'cold_build',
        updated_at = now()`,
     [key.landscapeId, key.versionId, orgId],
@@ -395,4 +400,11 @@ export async function materializePerformanceReadModel(
       diagramDocumentUrls.map((_, index) => plan.diagramAt(index).id),
     ),
   )
+  // T-SUM-2, MARK ONCE: the seed wrote these documents AND their rows, with
+  // the server stopped (`seed-performance.ts` refuses a live one), so the
+  // allow-listed documents take their exact certificate here — after the
+  // projection state above, whose `last_projected_at` is what covers them.
+  // No DB test drives this call; it was measured on a running stack instead
+  // (T-SUM-2).
+  await markStaticEntryWatermarks(db, key)
 }

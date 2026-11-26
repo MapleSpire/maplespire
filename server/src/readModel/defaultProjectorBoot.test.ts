@@ -136,7 +136,9 @@ describe('index.ts boots the default projector through ensureDefaultProjectorAtB
   it('hands it the fleet, the two expected refusals and the shutdown flag', async () => {
     const source = await code()
     expect(source).toContain('const outcome = await ensureDefaultProjectorAtBoot({')
-    expect(source).toContain('ensure: () => fleet.ensure(defaultWorkspaceKey),')
+    // Through the serving helper (G4-16f C6-2b): it calls `fleet.ensure` until
+    // SERVED, so an adopted start makes the pod ready at its claim.
+    expect(source).toContain('ensure: () => ensureServedForReadiness(fleet, defaultWorkspaceKey),')
     expect(source).toContain('isStaticRefusal: (error) => error instanceof ProjectorStaticWorkspaceError,')
     expect(source).toContain('isOwnershipRefusal: (error) => error instanceof ProjectorOwnershipError,')
     expect(source).toContain('stopped: () => readiness.shuttingDown,')

@@ -13,6 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import type { ModelMeta } from './types'
+import { withMetaUrlView } from './modelMetaUrls'
 
 /**
  * Version of the bounded write-head protocol. Historical overlay segments are
@@ -49,8 +50,14 @@ export function planOverlayWriteHeads(
   isValidUrl: (url: string) => boolean,
   allowLegacyRotation = true,
 ): OverlayWriteHeadPlan {
-  const objectUrls = (meta.editsObjectShardUrls ?? []).filter(isValidUrl)
-  const connectionUrls = (meta.editsConnectionShardUrls ?? []).filter(isValidUrl)
+  // The ruling URL values as plain strings — a scalar head is an object
+  // that `isValidUrl` and `===` would reject (`modelMetaUrls.ts`).
+  meta = withMetaUrlView(meta)
+  // Deduplicated, first occurrence kept (the server's `overlaySegmentUrls`):
+  // two writers rewriting the list in place at once can leave a url twice,
+  // and a segment counted twice is not two historical segments.
+  const objectUrls = [...new Set((meta.editsObjectShardUrls ?? []).filter(isValidUrl))]
+  const connectionUrls = [...new Set((meta.editsConnectionShardUrls ?? []).filter(isValidUrl))]
   const objectUrl = meta.editsObjectShardUrl
   const connectionUrl = meta.editsConnectionShardUrl
   const currentObjectUrl = objectUrl && isValidUrl(objectUrl) ? objectUrl : undefined
@@ -114,6 +121,9 @@ export function planBfsWriteMode(
   >,
   isValidUrl: (url: string) => boolean,
 ): BfsWriteMode {
+  // As above — a scalar head read raw would send this build to
+  // `bfs-degraded`, which is exactly what an OLD build does with one.
+  meta = withMetaUrlView(meta)
   const objectHead = meta.editsObjectShardUrl && isValidUrl(meta.editsObjectShardUrl)
   const connectionHead = meta.editsConnectionShardUrl && isValidUrl(meta.editsConnectionShardUrl)
   const versionCurrent = meta.editsOverlayWriteHeadVersion === OVERLAY_WRITE_HEAD_VERSION

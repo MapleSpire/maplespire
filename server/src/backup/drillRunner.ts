@@ -870,6 +870,17 @@ export function summariseSourceIntegrity(manifest: BackupManifest | null): Sourc
   if (probeFailures.length > 0) {
     reasons.push(new DocumentProbeError(probeFailures).message)
   }
+  // An INVALID index in the source (an interrupted CONCURRENTLY build or drop,
+  // e.g. a deferred 0006 drop): pg_dump does not copy it, the schema
+  // fingerprint leaves it out, and it is reported HERE — the source's health,
+  // never the copy's fidelity.
+  const invalidIndexes = manifest.invalidIndexes ?? []
+  if (invalidIndexes.length > 0) {
+    reasons.push(
+      `${invalidIndexes.length} INVALID index(es) in the source, not in the copy (an unfinished CONCURRENTLY build or drop): `
+      + invalidIndexes.slice(0, 5).join(', ') + (invalidIndexes.length > 5 ? ', …' : ''),
+    )
+  }
   // A backup whose probes covered NOTHING while the database holds loadable
   // documents has not been cold-load tested at all (e.g. `--document-probes 0`),
   // so it is a finding, not a silent pass.

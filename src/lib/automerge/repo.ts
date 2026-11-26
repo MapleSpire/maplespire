@@ -55,8 +55,16 @@ import { ActiveDocumentShare } from './activeDocumentShare'
 import { serializeAutomergeDocumentMessages } from './serializeMessages'
 import { AdaptiveWebSocketClientAdapter } from './adaptiveWebSocketClientAdapter'
 import { repoPeerAwareness } from './peerAwareness'
+import { syncedHandle } from './repoCompat'
 import { createWaiverAllocation, type WaiverAllocation } from './waiverBudget'
-import { mayUseCachedRootAfter, resolveRootUrlWithRetry, workspaceRootHttpError } from './rootFetchPolicy'
+import {
+  isGatewayFailure,
+  isRequestTransportFailure,
+  mayUseCachedRootAfter,
+  resolveRootUrlWithRetry,
+  WorkspaceRootUnreachableError,
+  workspaceRootHttpError,
+} from './rootFetchPolicy'
 import { accountDatabaseName, accountStorageKey } from '../auth/accountNamespace'
 
 import { API_BASE } from '../api/base'
@@ -137,6 +145,33 @@ export function __setWorkspaceNetworkRouteForTest(route: WorkspaceNetworkRoute |
 
 export function routeWorkspaceNetwork(ref: WorkspaceRef, force = false): Promise<void> {
   return workspaceNetworkRoute(ref, force)
+}
+
+/** Whether the routed transport has a peer at all
+ * — none, and a switch's drain cannot send anything (`workspaceSwitchDrain.ts`). */
+export function hasConnectedSyncPeer(): boolean {
+  return repo.peers.length > 0
+}
+
+/** Per document, the heads the connected SERVER is
+ * known to hold (`DocHandle.getSyncInfo` of its storage id), or nothing when
+ * that is unknown. The drain reads them to tell a sync still progressing from
+ * one that cannot. */
+export function serverKnownHeads(documentIds: readonly string[]): Map<string, string[]> {
+  const known = new Map<string, string[]>()
+  const storageIds = repo.peers
+    .map((peerId) => repo.getStorageIdOfPeer(peerId))
+    .filter((storageId): storageId is NonNullable<typeof storageId> => storageId !== undefined)
+  if (!storageIds.length || !documentIds.length) return known
+  for (const documentId of documentIds) {
+    // O(1) per document (`repoCompat.ts`), not `repo.handles`.
+    const handle = syncedHandle(repo, documentId)
+    for (const storageId of storageIds) {
+      const info = handle?.getSyncInfo(storageId)
+      if (info) { known.set(documentId, [...info.lastHeads].sort()); break }
+    }
+  }
+  return known
 }
 
 /** Make one explicit `find()` eligible for synchronization without announcing
@@ -489,7 +524,19 @@ async function fetchRootUrl(ref: WorkspaceRef = DEFAULT_WORKSPACE_REF): Promise<
       // No caller passes a signal of its own into this fetch, so there is
       // nothing to compose (use AbortSignal.any if one ever does).
       const res = await rootUrlFetch(endpoint, { signal: AbortSignal.timeout(BOOT_HTTP_TIMEOUT_MS) })
-      if (!res.ok) throw await workspaceRootHttpError(res)
+        .catch((error: unknown) => {
+          // T-DIAGDEF-2: the REQUEST failed, with no answer. Typed here,
+          // at the fetch, so nothing the response handling below throws is
+          // mistaken for an unreachable server.
+          throw isRequestTransportFailure(error) ? new WorkspaceRootUnreachableError(error) : error
+        })
+      if (!res.ok) {
+        const refused = await workspaceRootHttpError(res)
+        // T-DIAGDEF-2: behind the same-origin proxy a dead backend
+        // is no transport failure but a fast UNMARKED 502/503/504 — the
+        // proxy's answer, not the server's (`isTransientRootFetchError`).
+        throw isGatewayFailure(refused) ? new WorkspaceRootUnreachableError(refused) : refused
+      }
       const body = (await res.json()) as {
         url: string
         landscapeId?: string | null

@@ -15,7 +15,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import * as A from '@automerge/automerge'
 import type { DocumentId } from '@automerge/automerge-repo'
-import { rotateOrdinaryHead, type RotateOrdinaryHeadArgs } from './ordinaryHeadRotator.js'
+import { rotateOrdinaryHead, unpublishedRotationChildOf, type RotateOrdinaryHeadArgs } from './ordinaryHeadRotator.js'
 import type { Queryable } from './types.js'
 
 /**
@@ -236,5 +236,53 @@ describe('rotateOrdinaryHead — the refusals under the lock', () => {
     expect(await rotateOrdinaryHead(h.args)).toEqual({ outcome: 'nothing-published' })
     expect(h.createChild).not.toHaveBeenCalled()
     expect(h.events.some((event) => event.startsWith('insert:'))).toBe(false)
+  })
+})
+
+// G4-16f: a throw after the child exists loses it unless the error says
+// which it was — the projector gives that child's lease back from the mark.
+describe('rotateOrdinaryHead — the child a failed rotation leaves (unpublishedRotationChildOf)', () => {
+  const failingAt = async (failOn: RegExp | null, flushFails?: (ids: readonly string[]) => boolean) => {
+    const h = harness(failOn ? { failOn } : {})
+    if (flushFails) {
+      const flush = h.args.flush
+      h.args.flush = async (ids) => {
+        if (flushFails(ids)) throw new Error(`injected flush failure ${ids.join(',')}`)
+        return flush(ids)
+      }
+    }
+    const error = await rotateOrdinaryHead(h.args).then(() => null, (thrown: unknown) => thrown)
+    expect(error).toBeInstanceOf(Error)
+    return { h, error }
+  }
+
+  it('the retired head flush throws after createChild: the error names the child', async () => {
+    const { h, error } = await failingAt(null, (ids) => ids.includes('retired'))
+    expect(h.createChild).toHaveBeenCalledTimes(1)
+    expect(unpublishedRotationChildOf(error)).toBe('child')
+  })
+
+  it('BEGIN throws: the error names the child', async () => {
+    const { error } = await failingAt(/^BEGIN/)
+    expect(unpublishedRotationChildOf(error)).toBe('child')
+  })
+
+  it('the row insert throws: the error names the child', async () => {
+    const { error } = await failingAt(/INSERT INTO read_model_ordinary_head_retirements/)
+    expect(unpublishedRotationChildOf(error)).toBe('child')
+  })
+
+  it('the meta flush throws AFTER the repoint: NOT marked — the child is the current head', async () => {
+    const { h, error } = await failingAt(null, (ids) => ids.includes('meta'))
+    expect(h.publish).toHaveBeenCalledTimes(1)
+    expect(unpublishedRotationChildOf(error)).toBeNull()
+  })
+
+  it('a throw before the child exists: nothing to name', async () => {
+    const h = harness()
+    h.args.assertAuthority = async () => { throw new Error('fence lost') }
+    const error = await rotateOrdinaryHead(h.args).then(() => null, (thrown: unknown) => thrown)
+    expect(unpublishedRotationChildOf(error)).toBeNull()
+    expect(unpublishedRotationChildOf(undefined)).toBeNull()
   })
 })

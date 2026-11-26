@@ -23,7 +23,7 @@ import { createDiagramPresenceGate, DIAGRAM_PRESENCE_CHANNEL } from './diagramPr
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
 function client(port: number, peerId: string) {
-  const adapter = new BrowserWebSocketClientAdapter(`ws://localhost:${port}`)
+  const adapter = new BrowserWebSocketClientAdapter(`ws://127.0.0.1:${port}`)
   const repo = new Repo({ network: [adapter], sharePolicy: async () => true, peerId: peerId as PeerId })
   return { repo, close: () => adapter.disconnect() }
 }
@@ -43,7 +43,7 @@ describe('diagram presence gate — real WebSocket relay', () => {
       identityForPeer: async () => ({ participantId: 'p_0123456789abcdef', firstName: 'Alice', initials: 'A' }),
     })
     const serverRepo = new Repo({ network: [adapter], sharePolicy: async () => true })
-    await new Promise<void>((resolve) => http.listen(0, resolve))
+    await new Promise<void>((resolve) => http.listen(0, '127.0.0.1', resolve))
     const port = (http.address() as { port: number }).port
     const allowedServerHandle = serverRepo.create({ diagram: 'allowed' })
     const deniedServerHandle = serverRepo.create({ diagram: 'denied' })

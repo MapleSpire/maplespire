@@ -98,6 +98,12 @@ for (const match of metricsSource.matchAll(/name:\s*(?:'(maplespire_[a-z0-9_]+)'
 
 /** Names the server pushes. */
 const emitted = new Set(emittedSites.map((site) => site.name))
+// A HISTOGRAM is queried by the names of its series: `_bucket`,
+// `_sum`, `_count`. Only for a sample block that declares the type.
+for (const site of emittedSites) {
+  if (!/type:\s*'histogram'/.test(metricBlock(site.name) ?? '')) continue
+  for (const suffix of ['_bucket', '_sum', '_count']) emitted.add(`${site.name}${suffix}`)
+}
 
 /** Does this ONE file bind a metric name into a sample?
  *
@@ -417,19 +423,110 @@ test('cell ownership and critical Redis alerts retain severity, windows and both
   }
 })
 
-test('the ordinary chain alert (G4-16e) keeps its severity, window, max() and both fixture directions', () => {
+// The read-model runbooks live in the sponsor kit (MapleSpire/maplespire-sponsor-kit);
+// each alert links to its own section there. The kit's CI checks that the anchor exists.
+const runbookIn = (anchor) => new RegExp(
+  `runbook: https://github\\.com/MapleSpire/maplespire-sponsor-kit/blob/main/docs/operations/read-model-projector-health\\.md#${anchor}[ \\t]*$`, 'm')
+
+test('read-model runbooks link to the sponsor-kit guide, never to a relative docs/ path', () => {
+  // The guide is not in this repository: no runbook or description may cite it as a local path.
+  assert.doesNotMatch(alertsSource, /docs\/read-model-projector-health\.md/)
+  const links = [...alertsSource.matchAll(/runbook: (\S*read-model-projector-health\.md\S*)/g)].map((m) => m[1])
+  assert.ok(links.length >= 20, `only ${links.length} read-model runbook links`)
+  for (const link of links) {
+    assert.match(link,
+      /^https:\/\/github\.com\/MapleSpire\/maplespire-sponsor-kit\/blob\/main\/docs\/operations\/read-model-projector-health\.md(#[a-z0-9-]+)?$/)
+  }
+})
+
+test('the ordinary chain alert keeps its severity, window, max() and both fixture directions', () => {
   const name = 'ReadModelOrdinaryChainUnbounded'
   const block = alertsSource.split(`- alert: ${name}\n`)[1]?.split('- alert:')[0] ?? ''
   assert.match(block, /severity: ticket[ \t]*$/m)
   assert.match(block, /for: 10m[ \t]*$/m)
   // max(), never sum(): a cell keeps a lost workspace's last known chain.
   assert.match(block, /expr: max\(maplespire_read_model_ordinary_chain_alerts\) > 0[ \t]*$/m)
-  assert.match(block, /runbook: docs\/read-model-projector-health\.md[ \t]*$/m)
+  assert.match(block, runbookIn('runbook-readmodelordinarychainunbounded'))
   assert.ok(fixtureSource.includes(`alertname="${name}", alertstate="firing"`), `${name} must be proven to fire`)
   assert.match(fixtureSource, new RegExp(`alertname: ${name}\\n[ \\t]+exp_alerts: \\[\\]`), `${name} must be proven silent`)
 })
 
-test('the G4-16d storage-write and handover alerts retain severity, windows and both fixture directions', () => {
+test('the compaction re-attach alerts keep their severity, window, per-cell max and both fixture directions', () => {
+  // The windows are pinned here AND by fixtures one evaluation either side
+  // of each `for`; `max by (instance)` keeps the cell.
+  for (const [name, severity, window, expr] of [
+    // On the outage's AGE, so a flapping lease cannot restart them.
+    ['ReadModelCompactionReattachPending', 'ticket', '1m',
+      'max by (instance) (maplespire_read_model_compaction_detached_oldest_seconds{job="maplespire-api"}) > 300'],
+    ['ReadModelCompactionReattachOutage', 'page', '1m',
+      'max by (instance) (maplespire_read_model_compaction_detached_oldest_seconds{job="maplespire-api"}) > 1800'],
+    ['ReadModelCompactionReattachNoRoot', 'ticket', '15m',
+      'max by (instance) (maplespire_read_model_compaction_reattach_dormant{job="maplespire-api", reason="no_root"}) > 0'],
+    ['ReadModelCompactionReattachSlotStarving', 'ticket', '5m',
+      'max by (instance) (increase(maplespire_read_model_compaction_reattach_slot_held_seconds_total{job="maplespire-api"}[1h])) > 600'],
+    ['ReadModelCompactionReattachStuck', 'ticket', '1m',
+      'max by (instance) (maplespire_read_model_compaction_reattach_running_seconds{job="maplespire-api"}) > 600'],
+  ]) {
+    const block = alertsSource.split(`- alert: ${name}\n`)[1]?.split('- alert:')[0] ?? ''
+    assert.ok(block.includes(`expr: ${expr}\n`), `${name}: the expression changed`)
+    assert.match(block, new RegExp(`severity: ${severity}[ \\t]*$`, 'm'), `${name}: severity`)
+    assert.match(block, new RegExp(`for: ${window}[ \\t]*$`, 'm'), `${name}: window`)
+    assert.match(block, runbookIn('runbook-readmodelcompactionreattachpending'))
+    assert.ok(fixtureSource.includes(`alertname="${name}", alertstate="firing"`), `${name} must be proven to fire`)
+    assert.match(fixtureSource, new RegExp(`alertname: ${name}\\n[ \\t]+exp_alerts: \\[\\]`), `${name} must be proven silent`)
+  }
+})
+
+test('the stalled epoch hop alert keeps its severity, window, per-cell max and both fixture directions', async () => {
+  // Read here: the module's `dashboardSource` is declared further down.
+  const dashboardText = await readFile(
+    new URL('../infra/monitoring/grafana/dashboards/maplespire-sante.json', import.meta.url), 'utf8')
+  const name = 'EpochHopStalled'
+  const block = alertsSource.split(`- alert: ${name}\n`)[1]?.split('- alert:')[0] ?? ''
+  assert.ok(block.includes('expr: max by (instance) (maplespire_model_epoch_hop_stalled_metas{job="maplespire-api"}) > 0\n'),
+    `${name}: the expression changed`)
+  assert.match(block, /severity: ticket[ \t]*$/m)
+  assert.match(block, /for: 5m[ \t]*$/m)
+  assert.match(block, runbookIn('runbook-epochhopstalled'))
+  assert.ok(fixtureSource.includes(`alertname="${name}", alertstate="firing"`), `${name} must be proven to fire`)
+  assert.match(fixtureSource, new RegExp(`alertname: ${name}\\n[ \\t]+exp_alerts: \\[\\]`), `${name} must be proven silent`)
+  // The dashboard plots the gauge and the latch series beside it.
+  for (const metric of ['maplespire_model_epoch_hop_stalled_metas', 'maplespire_model_epoch_latch_requests_total',
+    'maplespire_model_epoch_latch_hold_seconds_bucket', 'maplespire_model_epoch_durable_heads_answers_total']) {
+    assert.ok(dashboardText.includes(metric), `the dashboard no longer plots ${metric}`)
+  }
+})
+
+test('the stuck-roll alert keeps its fleet max(), threshold, window and both fixture directions', async () => {
+  const dashboardText = await readFile(
+    new URL('../infra/monitoring/grafana/dashboards/maplespire-sante.json', import.meta.url), 'utf8')
+  const name = 'EpochRollStuckBeforeS7'
+  const block = alertsSource.split(`- alert: ${name}\n`)[1]?.split('- alert:')[0] ?? ''
+  // max(), never sum(): every cell reads the same table and reports the same rows.
+  assert.ok(block.includes('expr: max(maplespire_model_epoch_rows_stuck_repointing{job="maplespire-api"}) > 0\n'),
+    `${name}: the expression changed`)
+  assert.match(block, /severity: ticket[ \t]*$/m)
+  assert.match(block, /for: 2m[ \t]*$/m)
+  assert.match(block, runbookIn('runbook-epochhopstalled'))
+  assert.ok(fixtureSource.includes(`alertname="${name}", alertstate="firing"`), `${name} must be proven to fire`)
+  assert.match(fixtureSource, new RegExp(`alertname: ${name}\\n[ \\t]+exp_alerts: \\[\\]`), `${name} must be proven silent`)
+  for (const metric of ['maplespire_model_epoch_rows_stuck_repointing', 'maplespire_model_epoch_rows_stuck_repointing_oldest_seconds']) {
+    assert.ok(dashboardText.includes(metric), `the dashboard no longer plots ${metric}`)
+  }
+  // Its blind spot (NaN on every cell) has a rule of its own.
+  const blind = alertsSource.split('- alert: EpochStuckRowsSamplerBlind\n')[1]?.split('- alert:')[0] ?? ''
+  // The WHOLE expression: without its `count(…) > 0` half,
+  // a missing series would fire it.
+  assert.ok(blind.includes('absent(maplespire_model_epoch_rows_stuck_repointing{job="maplespire-api"} >= 0)\n'
+    + '          and on() (count(maplespire_model_epoch_rows_stuck_repointing{job="maplespire-api"}) > 0)\n'),
+  'EpochStuckRowsSamplerBlind: the expression changed')
+  assert.match(blind, /severity: ticket[ \t]*$/m)
+  assert.match(blind, /for: 15m[ \t]*$/m)
+  assert.ok(fixtureSource.includes('alertname="EpochStuckRowsSamplerBlind", alertstate="firing"'), 'EpochStuckRowsSamplerBlind must be proven to fire')
+  assert.match(fixtureSource, /alertname: EpochStuckRowsSamplerBlind\n[ \t]+exp_alerts: \[\]/, 'EpochStuckRowsSamplerBlind must be proven silent')
+})
+
+test('the storage-write and handover alerts retain severity, windows and both fixture directions', () => {
   for (const [name, severity, window] of [
     ['AutomergeStorageWriteCeiling', 'ticket', '5m'],
     ['ReadModelHandoverBarrierTimeouts', 'ticket', '1m'],
@@ -681,8 +778,20 @@ test('every alert rule BEHAVES — the rules run against fixture series', async 
     'SyncCellFenceRejections', 'SyncCellForeignProjector', 'RedisMemoryNearLimit',
     'PlacementProposerSignalUnknown', 'PlacementProposerDown', 'PlacementProposerMetricsMissing',
     'AlertmanagerEmailDeliveryFailed',
-    // G4-16e: the fold-off chain alert.
+    // The fold-off chain alert.
     'ReadModelOrdinaryChainUnbounded',
+    // A static overlay write head blocked at `!ready`.
+    'ReadModelStaticOverlayHeadNotReady',
+    // A static projection pass in flight past its ceiling.
+    'ReadModelStaticPassOverdue', 'ReadModelStaticPassOverdueOutage',
+    // A read plane a compaction left detached, and its retry.
+    'ReadModelCompactionReattachPending', 'ReadModelCompactionReattachOutage',
+    'ReadModelCompactionReattachNoRoot', 'ReadModelCompactionReattachSlotStarving',
+    'ReadModelCompactionReattachStuck',
+    // An epoch hop that loops without the S7 proof.
+    'EpochHopStalled',
+    // The roll row itself, stuck before S7.
+    'EpochRollStuckBeforeS7', 'EpochStuckRowsSamplerBlind',
   ]
   const uncovered = covered.filter((name) => !fixtureSource.includes(name))
   assert.deepEqual(uncovered, [], `alerts.test.yml no longer exercises: ${uncovered.join(', ')}`)

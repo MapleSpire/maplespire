@@ -27,10 +27,26 @@ export function setLocalDocumentChangeListener(listener: LocalDocumentChangeList
   localDocumentChangeListener = listener
 }
 
+/** The message every change made inside `withChangeMessage` carries (G4-16f:
+ * a batch re-apply's `{reapplyBatch: <id>}`, found again by message
+ * after a crash, never by value). */
+let changeMessage: string | null = null
+
+export function withChangeMessage<T>(message: string, fn: () => T): T {
+  const previous = changeMessage
+  changeMessage = message
+  try {
+    return fn()
+  } finally {
+    changeMessage = previous
+  }
+}
+
 /** Single write boundary used by bridge and history/checkpoint commands. */
 export function changeWithDurabilityTracking<T>(handle: DocHandle<T>, callback: ChangeFn<T>): void {
   const before = handle.doc() ? getHeads(handle.doc() as never) : []
-  handle.change(callback)
+  if (changeMessage !== null) handle.change(callback, { message: changeMessage })
+  else handle.change(callback)
   const doc = handle.doc()
   if (!doc) return
   const after = getHeads(doc as never)
@@ -49,7 +65,16 @@ export interface DurableHeadSnapshot {
    * tab's ledger hydrates the OLD version's documents into the NEW version's
    * session, and only the tag tells them apart. */
   workspace?: string | null
+  /** The Automerge actors this browser wrote the document with since the entry
+   * was opened — everything the server has not acknowledged was written under
+   * one of them. Absent: unknown (an entry persisted before the field, or one
+   * written under more than `DURABLE_ENTRY_ACTORS_MAX` actors), and then
+   * nothing may be filtered by actor for it. Never sent to the server. */
+  actors?: string[]
 }
+
+/** Past this many actors an entry's list says "unknown" (`actors` absent). */
+export const DURABLE_ENTRY_ACTORS_MAX = 64
 
 export interface DurableHeadAcknowledgement {
   documentId: string
@@ -86,15 +111,27 @@ export function mergeDurableHeadSnapshots(
 ): DurableHeadSnapshot[] {
   const merged = new Map<DocumentId, DurableHeadSnapshot>()
   for (const entry of Array.isArray(persisted) ? persisted : []) {
-    if (isDurableHeadSnapshot(entry)) merged.set(entry.documentId, withHeads(entry, entry.heads, workspaceTagOf(entry)))
+    if (isDurableHeadSnapshot(entry)) merged.set(entry.documentId, withHeads(entry, entry.heads, workspaceTagOf(entry), actorsOf(entry)))
   }
   for (const entry of local) {
     // The workspace tag travels with its document: a local entry without one
     // keeps the persisted tag rather than erasing it.
-    const tag = workspaceTagOf(entry) ?? workspaceTagOf(merged.get(entry.documentId))
-    merged.set(entry.documentId, withHeads(entry, entry.heads, tag))
+    const before = merged.get(entry.documentId)
+    const tag = workspaceTagOf(entry) ?? workspaceTagOf(before)
+    // The writers of BOTH sides (another tab wrote it too); unknown on either
+    // side is unknown.
+    const mine = actorsOf(entry)
+    const theirs = before ? actorsOf(before) : new Set<string>()
+    merged.set(entry.documentId, withHeads(entry, entry.heads, tag, mine && theirs ? new Set([...theirs, ...mine]) : null))
   }
   return [...merged.values()]
+}
+
+/** A persisted actor list, if it is one; null when unknown. */
+function actorsOf(entry: Partial<DurableHeadSnapshot> | undefined): Set<string> | null {
+  const actors = entry?.actors
+  if (!Array.isArray(actors) || actors.length > DURABLE_ENTRY_ACTORS_MAX) return null
+  return actors.every((a) => typeof a === 'string' && /^[0-9a-f]{2,128}$/.test(a)) ? new Set(actors) : null
 }
 
 /** A persisted tag, if it is one (see `DurableHeadSnapshot.workspace`). */
@@ -107,11 +144,13 @@ function withHeads(
   entry: DurableHeadSnapshot,
   heads: readonly string[],
   workspace: string | null | undefined,
+  actors: ReadonlySet<string> | null = null,
 ): DurableHeadSnapshot {
   return {
     documentId: entry.documentId,
     heads: [...heads],
     ...(workspace !== undefined ? { workspace } : {}),
+    ...(actors && actors.size <= DURABLE_ENTRY_ACTORS_MAX ? { actors: [...actors] } : {}),
   }
 }
 
@@ -120,6 +159,8 @@ export class DurableHeadLedger {
   private readonly pending = new Map<DocumentId, string[]>()
   /** See `DurableHeadSnapshot.workspace`; a document with no entry is untagged. */
   private readonly workspaces = new Map<DocumentId, string | null>()
+  /** See `DurableHeadSnapshot.actors`; null is unknown. */
+  private readonly writers = new Map<DocumentId, Set<string> | null>()
   /**
    * Entries this session holds but does not owe the server: DORMANT. Every
    * hydrated entry starts dormant — it may belong to a version the session
@@ -142,8 +183,20 @@ export class DurableHeadLedger {
    */
   hydrate(entries: unknown): void {
     for (const entry of Array.isArray(entries) ? entries : []) {
-      if (!isDurableHeadSnapshot(entry) || this.pending.has(entry.documentId)) continue
+      if (!isDurableHeadSnapshot(entry)) continue
+      if (this.pending.has(entry.documentId)) {
+        // Marked during the read: its frontier
+        // stays, but the persisted entry's writers JOIN the session's — the
+        // earlier session's edits are still unacknowledged, and filtering by
+        // the new actor alone would drop them. Unknown on either side: unknown.
+        const mine = this.writers.get(entry.documentId) ?? null
+        const theirs = actorsOf(entry)
+        const joined = mine && theirs ? new Set([...theirs, ...mine]) : null
+        this.writers.set(entry.documentId, joined && joined.size <= DURABLE_ENTRY_ACTORS_MAX ? joined : null)
+        continue
+      }
       this.mark(entry.documentId, entry.heads, workspaceTagOf(entry))
+      this.writers.set(entry.documentId, actorsOf(entry))
       this.dormant.add(entry.documentId)
     }
   }
@@ -163,9 +216,26 @@ export class DurableHeadLedger {
    * version (a FOLLOW's lifecycle flush) would otherwise retag it with the new
    * version, and the next boot would activate it there (architect lens,
    * 2026-10-31). */
-  mark(documentId: DocumentId, heads: readonly string[], workspace?: string | null): void {
+  mark(documentId: DocumentId, heads: readonly string[], workspace?: string | null, actor?: string): void {
+    const opened = !this.pending.has(documentId)
     this.pending.set(documentId, [...heads].sort())
     if (workspace !== undefined && !this.dormant.has(documentId)) this.workspaces.set(documentId, workspace)
+    // The writer: a mark that names none, or one past the
+    // bound, leaves the entry's writers unknown until it is acknowledged.
+    const writers = opened ? new Set<string>() : this.writers.get(documentId) ?? null
+    if (writers && actor !== undefined && (writers.has(actor) || writers.size < DURABLE_ENTRY_ACTORS_MAX)) {
+      writers.add(actor)
+      this.writers.set(documentId, writers)
+    } else {
+      this.writers.set(documentId, null)
+    }
+  }
+
+  /** The actors this browser wrote `documentId` with since its entry opened:
+   * null when unknown, undefined when the ledger does not owe it. */
+  writersOf(documentId: DocumentId): ReadonlySet<string> | null | undefined {
+    if (!this.pending.has(documentId)) return undefined
+    return this.writers.get(documentId) ?? null
   }
 
   /** The tag of a pending document: a workspace, null (unknown), or undefined
@@ -187,10 +257,12 @@ export class DurableHeadLedger {
   private entries(): DurableHeadSnapshot[] {
     return [...this.pending.entries()].map(([documentId, heads]) => {
       const workspace = this.workspaces.get(documentId)
+      const writers = this.writers.get(documentId)
       return {
         documentId,
         heads: [...heads],
         ...(workspace !== undefined ? { workspace } : {}),
+        ...(writers ? { actors: [...writers] } : {}),
       }
     })
   }
@@ -208,14 +280,32 @@ export class DurableHeadLedger {
       if (durable.has(item.documentId) && current && sameHeads(current, item.heads)) {
         this.pending.delete(item.documentId)
         this.workspaces.delete(item.documentId)
+        this.writers.delete(item.documentId)
         this.dormant.delete(item.documentId)
       }
+    }
+  }
+
+  /**
+   * Stop owing the server these documents. ONE caller, and only one is
+   * sound: the epoch hop's RETIRED path (G4-16f). A retired epoch
+   * document is answered `durable: false` for good — it was swept — so its
+   * entry would keep the badge on "Saving…" forever; what it held that the
+   * server lacks has just been collected into the `epoch-retired` export.
+   */
+  forget(documentIds: Iterable<DocumentId>): void {
+    for (const documentId of documentIds) {
+      this.pending.delete(documentId)
+      this.workspaces.delete(documentId)
+      this.writers.delete(documentId)
+      this.dormant.delete(documentId)
     }
   }
 
   clear(): void {
     this.pending.clear()
     this.workspaces.clear()
+    this.writers.clear()
     this.dormant.clear()
   }
 
@@ -272,13 +362,18 @@ export async function acknowledgeDurableDocumentHeads(
      * version the documents came from whether it already holds them. */
     workspace?: { landscapeId: string; versionId: string }
     signal?: AbortSignal
+    /** G4-16f: a hopping tab's latch asks (`latch=1`) — the server
+     * starts its next forward pass without the rest. */
+    latch?: boolean
   } = {},
 ): Promise<DurableHeadAcknowledgement[]> {
   const params = options.workspace
     ? new URLSearchParams({ landscapeId: options.workspace.landscapeId, versionId: options.workspace.versionId }).toString()
     : withWorkspaceParams('')
+  // The listener is told the WORKSPACE parameters only (it compares them).
+  const query = options.latch ? `${params}${params ? '&' : ''}latch=1` : params
   const response = await apiFetch(
-    `${API_BASE}/api/automerge/durable-heads?${params}`,
+    `${API_BASE}/api/automerge/durable-heads?${query}`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -288,7 +383,20 @@ export async function acknowledgeDurableDocumentHeads(
     },
   )
   if (!response.ok) throw new Error(`durable-heads API → HTTP ${response.status}`)
-  const body = await response.json() as { documents?: DurableHeadAcknowledgement[] }
+  const body = await response.json() as { documents?: DurableHeadAcknowledgement[]; epochs?: unknown }
   if (!Array.isArray(body.documents)) throw new Error('durable-heads API returned an invalid payload')
+  // Told with the workspace the request was FOR: a late answer
+  // for a workspace the tab has left, or a repoint's ask about another
+  // version, is not this workspace's capability.
+  if (typeof body.epochs === 'boolean') epochCapabilityListener?.(body.epochs, params)
   return body.documents
+}
+
+/** G4-16f: the server says, on every acknowledgement, whether
+ * the workspace has model epochs, with the request's workspace parameters
+ * (`withWorkspaceParams('')` for the session's own). The bridge keeps it. */
+export type EpochCapabilityListener = (epochs: boolean, workspaceParams: string) => void
+let epochCapabilityListener: EpochCapabilityListener | null = null
+export function setEpochCapabilityListener(listener: EpochCapabilityListener | null): void {
+  epochCapabilityListener = listener
 }

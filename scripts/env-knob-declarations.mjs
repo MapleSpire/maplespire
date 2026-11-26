@@ -43,6 +43,18 @@ export const DECLARED_OFF_BY_DEFAULT_FLAGS = [{
   benchManifests: ['infra/compose/sync-cell-failover.yml'],
   benchWhy: 'G4-16b phase 4 run: sync-cell-bench.mjs --ordinary-chain-fold sets it on the armed cells, with --ordinary-head-rotation=on.',
 }, {
+  knob: 'AM_MODEL_EPOCHS',
+  file: 'server/src/readModel/modelEpochConfig.ts',
+  exportName: 'MODEL_EPOCHS_FLAG',
+  test: 'server/src/readModel/modelEpochConfig.test.ts',
+  why: 'G4-16f: missing, blank and off roll no epoch; on lets the compaction pass roll a ModelMeta and base-shard epoch once the current one is AM_MODEL_EPOCH_PERIOD_DAYS old; any other value refuses to boot, and AM_MODEL_EPOCH_RETAIN below 3 refuses whatever the flag. Forwarding and GC marking of existing epoch rows run under every value.',
+}, {
+  knob: 'READ_MODEL_ADOPT',
+  file: 'server/src/readModel/adoptVerify.ts',
+  exportName: 'READ_MODEL_ADOPT_FLAG',
+  test: 'server/src/readModel/adoptVerify.test.ts',
+  why: 'G4-16f C6-1/C6-2a: missing, blank and off verify nothing; shadow runs the verify-and-adopt checks before each ordinary cold build and logs the verdict, then cold-builds anyway; on claims and attaches to the kept read model when the checks pass (a refusal cold-builds); any other value refuses to boot.',
+}, {
   knob: 'SYNC_DIAG_CPU_PROFILE',
   file: 'server/src/diagnostics/cpuProfileCapture.ts',
   exportName: 'CPU_PROFILE_FLAG',

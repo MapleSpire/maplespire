@@ -41,6 +41,18 @@ describe('bounded overlay write heads', () => {
     })
   })
 
+  it('counts a segment listed twice once (two concurrent in-place rewrites can duplicate it, G4-16f)', () => {
+    const plan = planOverlayWriteHeads({
+      editsOverlayWriteHeadVersion: OVERLAY_WRITE_HEAD_VERSION,
+      editsObjectShardUrls: ['automerge:old-a', 'automerge:old-b', 'automerge:old-a', 'automerge:object-head', 'automerge:old-b'],
+      editsObjectShardUrl: 'automerge:object-head',
+      editsConnectionShardUrls: ['automerge:old-c', 'automerge:old-c', 'automerge:connection-head'],
+      editsConnectionShardUrl: 'automerge:connection-head',
+    }, valid)
+    expect(plan.historicalObjectSegments).toBe(2)
+    expect(plan.historicalConnectionSegments).toBe(1)
+  })
+
   it('rotates legacy heads without resolving their contents', () => {
     const validator = vi.fn(valid)
     const plan = planOverlayWriteHeads({

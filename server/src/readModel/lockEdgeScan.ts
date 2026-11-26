@@ -197,6 +197,133 @@ export function projectionLockOrderViolations(
   return violations
 }
 
+/** `LIFECYCLE_LOCK_CLASS` (`maintenance/lifecycleApplyLock.ts`), restated as
+ * a WIRE value — it must never change there either — so this scanner does
+ * not import the maintenance layer. Pinned equal by `lockEdgeScan.test.ts`. */
+export const LIFECYCLE_LOCK_CLASS_ON_THE_WIRE = 0x5359
+
+const isLifecycle = (call: LockEdgeCall) => Number((call.params ?? [])[0]) === LIFECYCLE_LOCK_CLASS_ON_THE_WIRE
+  && /pg_(try_)?advisory_(xact_)?(un)?lock\(\s*\$1\s*,\s*\$2\s*\)/.test(String(call.sql))
+const isRotationKey = (key: string) => key.startsWith('overlay-rotation:')
+
+export interface LifecycleRotationEdge {
+  /** `rotation→lifecycle`: holds an `overlay-rotation:` key, then asks for
+   * the lifecycle lock (the compaction pass's epoch step). `lifecycle→rotation`:
+   * the opposite (a promotion or demotion whose publish takes the rotation key). */
+  direction: 'rotation→lifecycle' | 'lifecycle→rotation'
+  form: 'try' | 'blocking'
+}
+
+/**
+ * GATE G4-16f — the `overlay-rotation:` ↔ LIFECYCLE
+ * edge. The compaction pass holds both rotation keys (session) and the epoch
+ * step then asks for the lifecycle lock; a promotion or demotion holds the
+ * lifecycle lock and its static publish takes the rotation key
+ * (`promoteSummaryWorkspace.ts`, the `overlay-rotation:` acquisition its
+ * `lock_timeout` ceiling bounds). Opposite orders. That is a CYCLE only if
+ * BOTH sides wait; the rule this gate makes executable: the
+ * `rotation→lifecycle` side is a TRY, always — the step answers
+ * `lifecycle_lock_contended` and the fold stands; the door's wait is bounded
+ * by its own ceiling. Mutual refusal, never a deadlock.
+ *
+ * Returns every edge seen, and a violation for a BLOCKING `rotation→lifecycle`
+ * acquisition.
+ */
+export function lifecycleRotationEdges(calls: readonly LockEdgeCall[]): { edges: LifecycleRotationEdge[]; violations: string[] } {
+  const edges: LifecycleRotationEdge[] = []
+  const violations: string[] = []
+  const rotationSession: string[] = []
+  const rotationXact: string[] = []
+  let lifecycleHeld = 0
+  for (const call of calls) {
+    const text = String(call.sql)
+    if (endsTransaction(call)) { rotationXact.length = 0; continue }
+    if (isLifecycle(call)) {
+      if (text.includes('pg_advisory_unlock(')) { lifecycleHeld = Math.max(0, lifecycleHeld - 1); continue }
+      const form = text.includes('pg_try_advisory') ? 'try' : 'blocking'
+      if (rotationSession.length + rotationXact.length > 0) {
+        edges.push({ direction: 'rotation→lifecycle', form })
+        if (form === 'blocking') {
+          violations.push(`the lifecycle lock WAITED for while holding ${[...rotationSession, ...rotationXact].join(', ')} — `
+            + 'a promotion holds it and waits for the rotation key: a cycle. This side must be a try-lock')
+        }
+      }
+      lifecycleHeld += 1
+      continue
+    }
+    const released = releasedKey(call)
+    if (released !== null) {
+      const at = rotationSession.lastIndexOf(released)
+      if (at >= 0) rotationSession.splice(at, 1)
+      continue
+    }
+    const acquired = acquiredKey(call)
+    if (acquired === null || !isRotationKey(acquired.key)) continue
+    if (lifecycleHeld > 0) {
+      edges.push({ direction: 'lifecycle→rotation', form: text.includes('pg_try_advisory') ? 'try' : 'blocking' })
+    }
+    ;(acquired.scope === 'session' ? rotationSession : rotationXact).push(acquired.key)
+  }
+  return { edges, violations }
+}
+
+const isModelEpochKey = (key: string) => key.startsWith('model-epoch:')
+
+export interface ModelEpochRotationEdge {
+  /** `rotation→model-epoch`: holds an `overlay-rotation:` key, then asks for
+   * the `model-epoch:` key — the compaction pass's epoch step and forwarder,
+   * and the epoch SWEEP's forwarder. `model-epoch→rotation`:
+   * the opposite order, which nothing may take. */
+  direction: 'rotation→model-epoch' | 'model-epoch→rotation'
+  form: 'try' | 'blocking'
+}
+
+/**
+ * GATE G4-16f — the `overlay-rotation:` ↔ `model-epoch:`
+ * edge, REGISTERED. Compaction holds both rotation keys and then its epoch
+ * step and its forwarder take the `model-epoch:` key; the epoch sweep now does
+ * the same, in the same order (object, connection, model-epoch), so the fold
+ * writer and compaction — which check for an open forward journal ONCE and
+ * then fold or clear — never run beside a sweep's forwarder. One direction
+ * only, and a try on both sides: no cycle, mutual refusal at worst.
+ *
+ * Returns every edge seen, and a violation for a `model-epoch→rotation`
+ * acquisition (the inverted order) or a BLOCKING one in either direction.
+ */
+export function modelEpochRotationEdges(calls: readonly LockEdgeCall[]): { edges: ModelEpochRotationEdge[]; violations: string[] } {
+  const edges: ModelEpochRotationEdge[] = []
+  const violations: string[] = []
+  const rotation: string[] = []
+  const epoch: string[] = []
+  for (const call of calls) {
+    const released = releasedKey(call)
+    if (released !== null) {
+      for (const held of [rotation, epoch]) {
+        const at = held.lastIndexOf(released)
+        if (at >= 0) held.splice(at, 1)
+      }
+      continue
+    }
+    const acquired = acquiredKey(call)
+    if (acquired === null || acquired.scope !== 'session') continue
+    const form = String(call.sql).includes('pg_try_advisory') ? 'try' : 'blocking'
+    if (isModelEpochKey(acquired.key)) {
+      if (rotation.length > 0) {
+        edges.push({ direction: 'rotation→model-epoch', form })
+        if (form === 'blocking') violations.push(`${acquired.key} WAITED for while holding ${rotation.join(', ')}: this side must be a try-lock`)
+      }
+      epoch.push(acquired.key)
+    } else if (isRotationKey(acquired.key)) {
+      if (epoch.length > 0) {
+        edges.push({ direction: 'model-epoch→rotation', form })
+        violations.push(`${acquired.key} taken while holding ${epoch.join(', ')}: the order is overlay-rotation THEN model-epoch, never the reverse`)
+      }
+      rotation.push(acquired.key)
+    }
+  }
+  return { edges, violations }
+}
+
 /**
  * The keys this subsystem is allowed to acquire at all, for the gate that checks
  * a NEW one was thought about.
@@ -204,11 +331,22 @@ export function projectionLockOrderViolations(
  * Not an ordering — a REGISTRY. D8 adds `maintenance-workspace:`; anything else
  * appearing in a statement stream is a key nobody has reasoned about, and the
  * reasoning is what this whole gate exists to force.
+ *
+ * G4-16f adds `model-epoch:` (`modelEpochRoll.ts`, the epoch roll and its
+ * forwarder). The reasoning, as this gate asks: it is a SESSION try-lock taken
+ * on its own client, never from inside a projection transaction (no inbound
+ * edge), and the row transactions run under it assert the write fence on the
+ * pass's own client instead of taking the projection mutex (no A8 edge) —
+ * pinned by `modelEpochRoll.test.ts`, "the lock-order scanners". Its one edge
+ * with another key — taken under both `overlay-rotation:` keys, never the
+ * reverse — is {@link modelEpochRotationEdges}'s, pinned on the real sweep by
+ * `modelEpochForwarder.integration.test.ts`.
  */
 export const KNOWN_ADVISORY_KEY_PREFIXES = [
   PROJECTION_KEY_PREFIX,
   'overlay-rotation:',
   'maintenance-workspace:',
+  'model-epoch:',
 ] as const
 
 export function unknownAdvisoryKeys(calls: readonly LockEdgeCall[]): string[] {

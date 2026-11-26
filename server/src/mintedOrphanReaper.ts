@@ -327,6 +327,16 @@ export async function reapMintedOrphans(
         `DELETE FROM read_model_document_watermarks WHERE document_id = ANY($1::text[])`,
         [batch],
       )
+      // The G4-16f siblings, as gc.ts deletes them (the parity gate in the
+      // integration test pins the table set).
+      await client.query(
+        `DELETE FROM read_model_adopt_watermarks WHERE document_id = ANY($1::text[])`,
+        [batch],
+      )
+      await client.query(
+        `DELETE FROM read_model_sealed_product_extracts WHERE product_document_id = ANY($1::text[])`,
+        [batch],
+      )
       await client.query('COMMIT')
       const distinct = [...new Set(deletedRows.map(({ doc }) => doc))]
       reaped += distinct.length

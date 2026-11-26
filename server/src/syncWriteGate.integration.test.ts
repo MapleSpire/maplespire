@@ -65,7 +65,7 @@ async function makeGatedServer(): Promise<{ repo: Repo; port: number; close: () 
     canWrite: async (peerId) => peerId.startsWith('writer'),
   })
   const repo = new Repo({ network: [adapter], sharePolicy: async () => true })
-  await new Promise<void>((res) => http.listen(0, res))
+  await new Promise<void>((res) => http.listen(0, '127.0.0.1', res))
   const port = (http.address() as { port: number }).port
   return {
     repo,
@@ -79,7 +79,7 @@ async function makeGatedServer(): Promise<{ repo: Repo; port: number; close: () 
 }
 
 function makeClient(port: number, peerId: string): { repo: Repo; close: () => void } {
-  const adapter = new BrowserWebSocketClientAdapter(`ws://localhost:${port}`)
+  const adapter = new BrowserWebSocketClientAdapter(`ws://127.0.0.1:${port}`)
   const repo = new Repo({ network: [adapter], sharePolicy: async () => true, peerId: peerId as PeerId })
   return {
     repo,
@@ -106,7 +106,7 @@ describe('sync write gate — end-to-end over real WebSockets', () => {
         access: async () => true,
       },
     })
-    await new Promise<void>((resolve) => http.listen(0, resolve))
+    await new Promise<void>((resolve) => http.listen(0, '127.0.0.1', resolve))
     const port = (http.address() as { port: number }).port
     const serverHandle = serverRepo.create<DocShape>({ title: 'fanout-ready' })
     const clients = Array.from({ length: 50 }, (_, index) => makeClient(port, `fanout-${index}`))
@@ -143,7 +143,7 @@ describe('sync write gate — end-to-end over real WebSockets', () => {
         },
       },
     })
-    await new Promise<void>((resolve) => http.listen(0, resolve))
+    await new Promise<void>((resolve) => http.listen(0, '127.0.0.1', resolve))
     const port = (http.address() as { port: number }).port
     const serverHandle = serverRepo.create<DocShape>({ title: 'identity-ready' })
     const client = makeClient(port, 'bound-before-policy')
@@ -218,7 +218,7 @@ describe('sync write gate — end-to-end over real WebSockets', () => {
     type WssParam = ConstructorParameters<typeof NodeWSServerAdapter>[0]
     const adapter = new AuthenticatedWSServerAdapter(wss as unknown as WssParam) // writeGate stays null
     const repo = new Repo({ network: [adapter], sharePolicy: async () => true })
-    await new Promise<void>((res) => http.listen(0, res))
+    await new Promise<void>((res) => http.listen(0, '127.0.0.1', res))
     const port = (http.address() as { port: number }).port
 
     const serverHandle = repo.create<DocShape>({ title: 'open' })

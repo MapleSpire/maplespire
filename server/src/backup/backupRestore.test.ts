@@ -443,6 +443,9 @@ describe('sweeping orphaned restore databases', () => {
     }
     const pool = {
       on: () => pool,
+      // pg-pool's constructor options: `guardIdleClientErrors` installs the
+      // protocol marker's `onConnect` there and refuses a pool without it.
+      options: {},
       end: async () => { closed = true },
       query,
       // The sweep checks out ONE client for the whole pass. Without `connect`

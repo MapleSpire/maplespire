@@ -214,8 +214,10 @@ describe('entity-family contract — client documents and references', () => {
   it('a version snapshot captures every shard family document (landscapeVersions)', () => {
     const text = source('./landscapeVersions.ts')
     for (const family of where((candidate) => candidate.shards !== null)) {
-      expect(text, family.shards!.urlsField).toMatch(
-        new RegExp(`for \\(const u of meta\\?\\.${family.shards!.urlsField} \\?\\? \\[\\]\\) refs\\.push\\(`),
+      // A raw read, or the reference-closure read of both copies.
+      const field = family.shards!.urlsField
+      expect(text, field).toMatch(
+        new RegExp(`for \\(const u of (?:meta\\?\\.${field}|readMetaUrlsUnion\\(meta, '${field}'\\)) \\?\\? \\[\\]\\) refs\\.push\\(`),
       )
     }
   })

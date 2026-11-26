@@ -17,11 +17,14 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   changeWithDurabilityTracking,
   DurableHeadLedger,
+  DURABLE_ENTRY_ACTORS_MAX,
   durableConnectionStatus,
   mergeDurableHeadSnapshots,
   pendingDurabilityDebts,
   setLocalDocumentChangeListener,
+  withChangeMessage,
 } from './durableSync'
+import { decodeChange, getAllChanges } from '@automerge/automerge'
 
 afterEach(() => setLocalDocumentChangeListener(null))
 
@@ -73,6 +76,74 @@ describe('durable sync ledger', () => {
     ])
   })
 
+  it('an entry keeps its WRITERS until acknowledged — persisted, merged with another tab\'s, unknown when a mark names none or past the bound', () => {
+    const ledger = new DurableHeadLedger()
+    const head = (c: string) => [c.repeat(64)]
+    ledger.mark('doc-1' as never, head('a'), undefined, 'aa11')
+    ledger.mark('doc-1' as never, head('b'), undefined, 'bb22')
+    expect([...ledger.writersOf('doc-1' as never)!].sort()).toEqual(['aa11', 'bb22'])
+    expect(ledger.snapshot()[0]!.actors?.sort()).toEqual(['aa11', 'bb22'])
+    // A mark that names no writer (a creation, a resumed handle): unknown.
+    ledger.mark('doc-1' as never, head('c'))
+    expect(ledger.writersOf('doc-1' as never)).toBeNull()
+    expect(ledger.snapshot()[0]).not.toHaveProperty('actors')
+    // Acknowledged, the entry closes; the next local write opens a new one.
+    ledger.acknowledge(ledger.snapshot(), [{ documentId: 'doc-1', durable: true }])
+    expect(ledger.writersOf('doc-1' as never)).toBeUndefined()
+    ledger.mark('doc-1' as never, head('d'), undefined, 'cc33')
+    expect([...ledger.writersOf('doc-1' as never)!]).toEqual(['cc33'])
+    // Past the bound: unknown, never a truncated list.
+    for (let i = 0; i < DURABLE_ENTRY_ACTORS_MAX; i += 1) ledger.mark('doc-2' as never, head('e'), undefined, i.toString(16).padStart(4, '0'))
+    expect(ledger.writersOf('doc-2' as never)?.size).toBe(DURABLE_ENTRY_ACTORS_MAX)
+    ledger.mark('doc-2' as never, head('e'), undefined, 'ffff')
+    expect(ledger.writersOf('doc-2' as never)).toBeNull()
+
+    const id = new Repo({ network: [] }).create({}).documentId
+    const hydrated = new DurableHeadLedger()
+    hydrated.hydrate([{ documentId: id, heads: head('a'), actors: ['aa11'] }])
+    expect([...hydrated.writersOf(id)!]).toEqual(['aa11'])
+    // An entry persisted before the field: unknown.
+    const legacy = new DurableHeadLedger()
+    legacy.hydrate([{ documentId: id, heads: head('a') }])
+    expect(legacy.writersOf(id)).toBeNull()
+    // Merged with another tab's entry: both writers; unknown on one side, unknown.
+    expect(mergeDurableHeadSnapshots([{ documentId: id, heads: head('a'), actors: ['aa11'] }], [{ documentId: id, heads: head('b'), actors: ['bb22'] }])[0]!.actors?.sort())
+      .toEqual(['aa11', 'bb22'])
+    expect(mergeDurableHeadSnapshots([{ documentId: id, heads: head('a') }], [{ documentId: id, heads: head('b'), actors: ['bb22'] }])[0])
+      .not.toHaveProperty('actors')
+    expect(mergeDurableHeadSnapshots([], [{ documentId: id, heads: head('b'), actors: ['bb22'] }])[0]!.actors).toEqual(['bb22'])
+  })
+
+  it('a document marked DURING hydration keeps the persisted writers too; an unknown set never becomes known by a later mark', () => {
+    const head = (c: string) => [c.repeat(64)]
+    const id = new Repo({ network: [] }).create({}).documentId
+    // A boot-time write marks it (actor a2) before the persisted ledger is read…
+    const ledger = new DurableHeadLedger()
+    ledger.mark(id, head('b'), undefined, 'a2a2')
+    // …whose entry holds an earlier session's unacknowledged edits (a1).
+    ledger.hydrate([{ documentId: id, heads: head('a'), actors: ['a1a1'] }])
+    expect([...ledger.writersOf(id)!].sort()).toEqual(['a1a1', 'a2a2'])
+    // A persisted entry with unknown writers makes them unknown.
+    const unknown = new DurableHeadLedger()
+    unknown.mark(id, head('b'), undefined, 'a2a2')
+    unknown.hydrate([{ documentId: id, heads: head('a') }])
+    expect(unknown.writersOf(id)).toBeNull()
+    // Unknown stays unknown: a later LOCAL mark does not make it known (Wd).
+    const opened = new DurableHeadLedger()
+    opened.mark('doc-1' as never, head('a'))
+    opened.mark('doc-1' as never, head('b'), undefined, 'a3a3')
+    expect(opened.writersOf('doc-1' as never)).toBeNull()
+  })
+
+  it('forget() drops exactly the named documents (the epoch-retired path: never durable, exported)', () => {
+    const ledger = new DurableHeadLedger()
+    ledger.mark('retired' as never, ['a'.repeat(64)])
+    ledger.mark('live' as never, ['b'.repeat(64)])
+    ledger.forget(['retired' as never])
+    expect(ledger.size).toBe(1)
+    expect(ledger.snapshot().map((e) => e.documentId)).toEqual(['live'])
+  })
+
   it('keeps rejected documents pending and clears durable documents independently', () => {
     const ledger = new DurableHeadLedger()
     ledger.mark('doc-1' as never, ['a'.repeat(64)])
@@ -99,6 +170,28 @@ describe('durable sync ledger', () => {
     expect(listener).not.toHaveBeenCalled()
     changeWithDurabilityTracking(handle, (doc) => { doc.value = 2 })
     expect(listener).toHaveBeenCalledWith(handle)
+  })
+
+  it('withChangeMessage tags every change inside it; nested restores the outer; an exception restores none', () => {
+    const repo = new Repo({ network: [] })
+    const handle = repo.create<{ value: number }>({ value: 1 })
+    const lastMessage = () => {
+      const changes = getAllChanges(handle.doc() as never)
+      return decodeChange(changes[changes.length - 1]!).message ?? null
+    }
+    withChangeMessage('outer', () => {
+      changeWithDurabilityTracking(handle, (doc) => { doc.value = 2 })
+      expect(lastMessage()).toBe('outer')
+      withChangeMessage('inner', () => {
+        changeWithDurabilityTracking(handle, (doc) => { doc.value = 3 })
+      })
+      expect(lastMessage()).toBe('inner')
+      changeWithDurabilityTracking(handle, (doc) => { doc.value = 4 })
+      expect(lastMessage()).toBe('outer')
+    })
+    expect(() => withChangeMessage('boom', () => { throw new Error('x') })).toThrow('x')
+    changeWithDurabilityTracking(handle, (doc) => { doc.value = 5 })
+    expect(lastMessage()).toBeNull()
   })
 
   it('restores only valid pending frontiers after a browser restart', () => {

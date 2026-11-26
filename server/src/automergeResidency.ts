@@ -29,10 +29,15 @@ export type AutomergeDocumentType =
 interface LeaseOwner {
   workspace: string
   documentType: AutomergeDocumentType
+  /** T-ZEROWM-3: taken by `acquireTransient` (leaves by `relinquish`). */
+  transient?: boolean
 }
 
 interface DocumentLease {
   owners: Map<string, LeaseOwner>
+  /** T-ZEROWM-3: an owner that RELEASES (evicting intent) left while others
+   * still held the document — see {@link AutomergeResidencyLeases.relinquish}. */
+  evictionIntent?: boolean
 }
 
 export interface AutomergeResidencySnapshot {
@@ -191,18 +196,35 @@ export class AutomergeResidencyLeases {
     this.protectedIds.add(handle.documentId)
   }
 
+  /** An owner that wants the document KEPT resident: it clears a pending
+   * eviction intent (its own `release` evicts when it is the last owner). */
   acquire(
     handle: DocHandle<unknown>,
     owner: string,
     workspace: string,
     documentType = classifyAutomergeDocument(handle.doc()),
   ): void {
+    this.lease(handle, owner, workspace, documentType, false).evictionIntent = false
+  }
+
+  /** T-ZEROWM-3: an owner that only keeps the document resident for the
+   * length of a pass and leaves with {@link relinquish}: it does NOT clear a
+   * pending eviction intent, so the document goes when it leaves last if a
+   * releasing owner meant it to. */
+  acquireTransient(handle: DocHandle<unknown>, owner: string, workspace: string): void {
+    this.lease(handle, owner, workspace, classifyAutomergeDocument(handle.doc()), true)
+  }
+
+  private lease(
+    handle: DocHandle<unknown>, owner: string, workspace: string, documentType: AutomergeDocumentType, transient: boolean,
+  ): DocumentLease {
     let lease = this.leases.get(handle.documentId)
     if (!lease) {
       lease = { owners: new Map() }
       this.leases.set(handle.documentId, lease)
     }
-    lease.owners.set(owner, { workspace, documentType })
+    lease.owners.set(owner, { workspace, documentType, transient })
+    return lease
   }
 
   /**
@@ -221,32 +243,82 @@ export class AutomergeResidencyLeases {
     this.acquire(handle, owner, workspace, documentType)
     for (const [documentId, lease] of this.leases) {
       if (documentId === handle.documentId || !lease.owners.delete(owner)) continue
-      if (lease.owners.size > 0) continue
-      this.leases.delete(documentId)
-      this.track(this.evict(documentId))
+      this.dropReleased(documentId, lease)
     }
   }
 
   /** Drop ONE document from `owner`'s lease, evicting it when no other owner
    * holds it. For a document the owner stops watching while it keeps running
    * (a folded ordinary head, `ordinaryChainFold.ts`); `releaseOwner` drops all
-   * of them. Returns whether `owner` held it. */
+   * of them. Returns whether `owner` held it.
+   *
+   * T-ZEROWM-3: when other owners still hold it, the eviction is REMEMBERED
+   * (the lease's eviction intent) rather than lost, and carried out by the
+   * last owner to leave — even one that only {@link relinquish}es. */
   release(documentId: DocumentId, owner: string): boolean {
     const lease = this.leases.get(documentId)
     if (!lease || !lease.owners.delete(owner)) return false
-    if (lease.owners.size === 0) {
-      this.leases.delete(documentId)
-      this.track(this.evict(documentId))
-    }
+    this.dropReleased(documentId, lease)
     return true
+  }
+
+  /**
+   * T-ZEROWM-3: drop ONE document from `owner`'s lease without asking for its
+   * eviction. For an owner that only kept a document resident for the length
+   * of a pass ({@link acquireTransient}; the static recovery pass) and must not
+   * drop a handle someone else may be using unleased the moment that pass
+   * ends. Returns whether `owner` held it.
+   *
+   * THE RULE of the eviction intent, so that the order in which owners leave
+   * never decides residency:
+   * - an owner leaving by `release` / `releaseOwner` / `replaceOwner` means
+   *   "evict": it evicts at once when it is the last owner, and otherwise
+   *   MARKS the lease;
+   * - the last owner to leave by `relinquish` evicts iff the lease is marked,
+   *   and otherwise leaves the document resident and unleased — where only
+   *   whatever else evicts unleased documents (the idle sweep, when it is
+   *   running: `AM_IDLE_MS`/`AM_SWEEP_MS`) will ever take it;
+   * - `acquire` (an owner that wants the document kept) clears the mark — its
+   *   own `release` will evict when it leaves last; `acquireTransient` does
+   *   not;
+   * - the mark lives on the lease, so it goes with the lease's last owner;
+   * - the pairing is ENFORCED, not a convention: an owner
+   *   taken by `acquire` that leaves by `relinquish` leaves as by `release`.
+   *
+   * A remembered eviction is carried out when the transient owner leaves —
+   * later than the releasing owner asked for it, and possibly under an
+   * in-process caller that took the handle unleased meanwhile: without the
+   * transient owner the same eviction would simply have happened earlier.
+   */
+  relinquish(documentId: DocumentId, owner: string): boolean {
+    const lease = this.leases.get(documentId)
+    const leaving = lease?.owners.get(owner)
+    if (!lease || !leaving || !lease.owners.delete(owner)) return false
+    if (!leaving.transient) {
+      this.dropReleased(documentId, lease)
+      return true
+    }
+    if (lease.owners.size > 0) return true
+    this.leases.delete(documentId)
+    if (lease.evictionIntent) this.track(this.evict(documentId))
+    return true
+  }
+
+  /** The bookkeeping of an owner that left by releasing: evict when it was the
+   * last, mark the intent otherwise. */
+  private dropReleased(documentId: DocumentId, lease: DocumentLease): void {
+    if (lease.owners.size > 0) {
+      lease.evictionIntent = true
+      return
+    }
+    this.leases.delete(documentId)
+    this.track(this.evict(documentId))
   }
 
   releaseOwner(owner: string): void {
     for (const [documentId, lease] of this.leases) {
       if (!lease.owners.delete(owner)) continue
-      if (lease.owners.size > 0) continue
-      this.leases.delete(documentId)
-      this.track(this.evict(documentId))
+      this.dropReleased(documentId, lease)
     }
   }
 

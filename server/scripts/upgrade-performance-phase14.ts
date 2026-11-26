@@ -30,6 +30,7 @@ import type { PoolClient } from 'pg'
 import { PostgresStorageAdapter } from '../src/automergeStorage.js'
 import { initSchema, pool } from '../src/db.js'
 import { OVERLAY_WRITE_HEAD_VERSION } from '../src/modelMeta.js'
+import { readMetaUrl, readMetaUrls, writeMetaUrl, writeMetaUrls } from '../src/modelMetaUrls.js'
 import { preparePerformanceCatalog } from '../src/performanceSeed/catalog.js'
 import { PerformanceSeedPlan } from '../src/performanceSeed/generator.js'
 import { performanceTeamIds, seedPerformancePrincipals } from '../src/performanceSeed/principals.js'
@@ -349,7 +350,7 @@ async function existingPhase14Overlay(
   meta: MetaLike,
   marker: Phase14FixtureMarker,
 ): Promise<DocHandle<ConnectionOverlayLike> | undefined> {
-  for (const url of unique(meta.editsConnectionShardUrls ?? [])) {
+  for (const url of unique(readMetaUrls(meta, 'editsConnectionShardUrls') ?? [])) {
     try {
       const handle = await resolve<ConnectionOverlayLike>(repo, url)
       if (markerMatches(handle.doc()?.phase14Fixture, marker)) return handle
@@ -372,7 +373,7 @@ async function ensureDenseOverlay(
   const existing = await existingPhase14Overlay(repo, before, marker)
   if (existing) return { handle: existing, created: false }
 
-  const oldCurrentUrl = before.editsConnectionShardUrl
+  const oldCurrentUrl = readMetaUrl(before, 'editsConnectionShardUrl')
   const batchId = `maintenance/phase14/${key.landscapeId}/${key.versionId}`
   const handle = repo.create<ConnectionOverlayLike>({
     connections: Object.fromEntries(connections.map((connection) => [connection.id, connection])),
@@ -392,9 +393,11 @@ async function ensureDenseOverlay(
   await repo.flush([handle.documentId])
 
   metaHandle.change((meta) => {
-    meta.editsConnectionShardUrls = unique([...(meta.editsConnectionShardUrls ?? []), handle.url])
-    meta.connectionShardUrls = unique([...(meta.connectionShardUrls ?? []), handle.url])
-    meta.editsConnectionShardUrl = handle.url
+    writeMetaUrls(meta, 'editsConnectionShardUrls',
+      unique([...(readMetaUrls(meta, 'editsConnectionShardUrls') ?? []), handle.url]))
+    writeMetaUrls(meta, 'connectionShardUrls',
+      unique([...(readMetaUrls(meta, 'connectionShardUrls') ?? []), handle.url]))
+    writeMetaUrl(meta, 'editsConnectionShardUrl', handle.url)
     // The meta's protocol version, which is a DIFFERENT field from the child's
     // `writeHeadVersion = 2` above — that one is only a forced post-admission
     // Automerge revision, matching server rotation. The constant is used
@@ -407,8 +410,8 @@ async function ensureDenseOverlay(
     pool,
     key,
     'connection',
-    published.editsConnectionShardUrls ?? [handle.url],
-    published.editsConnectionShardUrl,
+    readMetaUrls(published, 'editsConnectionShardUrls') ?? [handle.url],
+    readMetaUrl(published, 'editsConnectionShardUrl'),
   )
   if (oldCurrentUrl && documentIdOf(oldCurrentUrl) !== handle.documentId) {
     await pool.query(

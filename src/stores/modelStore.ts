@@ -1025,7 +1025,10 @@ interface ModelState {
    *  from the window is never a deletion, only this list is. */
   pendingDeletedDiagramIds: string[]
   /** Diagram ids currently tombstoned in `ModelMeta.deletedDiagramIds`, as the
-   *  bridge last read them (local intents included). The diagram list is served
+   *  bridge last read them (local intents included), PLUS the session-created
+   *  diagrams whose removal the bridge expressed in the summary write head —
+   *  a durable deletion that is deliberately not a tombstone (T-DIAGDEF (1)).
+   *  Read it as "deleted, durably", not as "in ModelMeta". The diagram list is served
    *  by the SERVER under a summary registry, so a module-level memo would
    *  re-render nothing — this has to be reactive store state. Written only
    *  through `withRemote`. */
@@ -1056,6 +1059,10 @@ interface ModelState {
     connections?: ConnectionBatchUpdate[]
   }) => void
   addConnection: (conn: Omit<Connection, 'id'>) => string
+  /** G4-16f: re-create entities ANOTHER user deleted, under their own
+   * ids (the batch re-apply's "re-create deleted object"). An id already
+   * present is skipped; a connection whose endpoint is absent is skipped. */
+  restoreDeletedEntities: (entities: { objects?: C4Object[]; connections?: Connection[]; groups?: Group[] }) => void
   updateConnection: (id: string, data: Partial<Connection>) => void
   updateConnectionsBatch: (updates: ConnectionBatchUpdate[]) => void
   toggleConnectionLock: (id: string) => void
@@ -2116,6 +2123,34 @@ export const useModelStore = create<ModelState>()(
 
     updateConnection: (id, data) => {
       get().updateConnectionsBatch([{ id, data }])
+    },
+
+    restoreDeletedEntities: ({ objects = [], connections = [], groups = [] }) => {
+      set((state) => {
+        const objectIds = new Set(state.objects.map((o) => o.id))
+        for (const obj of objects) {
+          if (objectIds.has(obj.id)) continue
+          state.objects.push(obj)
+          objectIds.add(obj.id)
+          state.pendingDeletedObjectIds = state.pendingDeletedObjectIds.filter((id) => id !== obj.id)
+        }
+        const groupIds = new Set(state.groups.map((g) => g.id))
+        for (const group of groups) {
+          if (groupIds.has(group.id)) continue
+          state.groups.push(group)
+          groupIds.add(group.id)
+          state.pendingDeletedGroupIds = state.pendingDeletedGroupIds.filter((id) => id !== group.id)
+        }
+        // A connection may end on an object OR a group.
+        const endpoint = (id: string) => objectIds.has(id) || groupIds.has(id)
+        const connectionIds = new Set(state.connections.map((c) => c.id))
+        for (const conn of connections) {
+          if (connectionIds.has(conn.id) || !endpoint(conn.fromId) || !endpoint(conn.toId)) continue
+          state.connections.push(conn)
+          connectionIds.add(conn.id)
+          state.pendingDeletedConnectionIds = state.pendingDeletedConnectionIds.filter((id) => id !== conn.id)
+        }
+      })
     },
 
     toggleConnectionLock: (id) => {
@@ -3451,7 +3486,7 @@ export const UNDOABLE_ACTIONS = [
   'setObjectScopeOnDiagram',
   'removeObjectFromDiagram', 'removeObjectsFromDiagram', 'removeConnectionFromDiagram',
   'removeGroupFromDiagram', 'removeGroupsFromDiagram', 'addGroupToDiagram', 'addObjectToDiagram',
-  'applyDiagramLayout', 'resetDiagram3dLayout', 'pasteEntities',
+  'applyDiagramLayout', 'resetDiagram3dLayout', 'pasteEntities', 'restoreDeletedEntities',
 ] as const satisfies ReadonlyArray<keyof ModelState>
 
 ;(function installUndoHistory() {

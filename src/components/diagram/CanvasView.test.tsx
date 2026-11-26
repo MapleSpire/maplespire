@@ -103,7 +103,7 @@ afterEach(cleanup)
 beforeEach(() => {
   reloadWorkspace.mockClear()
   useAutomergeStatus.setState({
-    status: 'connecting', ready: false, visualReady: false, editReady: false, error: null,
+    status: 'connecting', ready: false, visualReady: false, editReady: false, error: null, errorCause: null,
   })
 })
 
@@ -127,6 +127,28 @@ describe('CanvasView boot failure', () => {
 
     fireEvent.click(screen.getByTestId('canvas-boot-error-retry'))
     expect(reloadWorkspace).toHaveBeenCalledTimes(1)
+  })
+
+  it('T-DIAGDEF-2 (B): an unreachable server is said as such, not as "still syncing"', () => {
+    useAutomergeStatus.setState({
+      status: 'error',
+      error: 'The server could not be reached for the workspace root (Failed to fetch)',
+      errorCause: 'server-unreachable',
+    })
+    render(<CanvasView />)
+    const panel = screen.getByTestId('canvas-boot-error')
+    expect(panel.getAttribute('data-cause')).toBe('server-unreachable')
+    expect(panel.textContent).toContain('canvasViewChrome.bootFailed.unreachableBody')
+    expect(panel.textContent).not.toContain('canvasViewChrome.bootFailed.body')
+    cleanup()
+
+    // Any other failure keeps the general text, and no cause.
+    useAutomergeStatus.setState({ status: 'error', error: 'Document x is unavailable after 3 attempt(s)', errorCause: null })
+    render(<CanvasView />)
+    const other = screen.getByTestId('canvas-boot-error')
+    expect(other.getAttribute('data-cause')).toBeNull()
+    expect(other.textContent).toContain('canvasViewChrome.bootFailed.body')
+    expect(other.textContent).not.toContain('unreachableBody')
   })
 
   it('still shows the hourglass while the boot is merely IN FLIGHT', () => {

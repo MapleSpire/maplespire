@@ -15,13 +15,16 @@
 // @ts-check
 import { parentPort } from 'node:worker_threads'
 import * as Automerge from '@automerge/automerge'
+import { decodeFailureResponse } from './durableDecodeFailure.mjs'
 
 if (!parentPort) throw new Error('durable heads worker requires a parent port')
 const port = parentPort
-port.on('message', /** @param {{ id: number, documentId: string, bytes: Uint8Array }} request */ request => {
+port.on('message', /** @param {{ id: number, documentId: string, bytes: Uint8Array, field?: string }} request */ request => {
   try {
     const durable = Automerge.load(request.bytes)
     let heads
+    /** @type {string | undefined} */
+    let json
     try {
       // A readable prefix with buffered, dependency-less arrivals is not a
       // proof of the complete durable document. Never use loadIncremental's
@@ -30,12 +33,28 @@ port.on('message', /** @param {{ id: number, documentId: string, bytes: Uint8Arr
         throw new Error(`incomplete durable document dependencies: ${request.documentId}`)
       }
       heads = [...Automerge.getHeads(durable)]
+      // G4-16f: the one top-level field asked for, as the projector copies a
+      // sealed product's entity map (`JSON.stringify` of the document's
+      // value; `null` when absent). Same strict load, same heads.
+      if (typeof request.field === 'string') {
+        try {
+          json = JSON.stringify(/** @type {Record<string, unknown>} */ (durable)[request.field] ?? null)
+        } catch (error) {
+          // The bytes decoded and are complete; the VALUE has no JSON form
+          // (a BigInt — an integer Automerge holds beyond 2^53). Not a refusal
+          // of the bytes: `errorKind` tells the caller which it is.
+          throw Object.assign(error instanceof Error ? error : new Error(String(error)), { errorKind: 'serialize' })
+        }
+      }
     } finally {
       Automerge.free(durable)
     }
-    port.postMessage({ id: request.id, documentId: request.documentId, heads })
+    port.postMessage(json === undefined
+      ? { id: request.id, documentId: request.documentId, heads }
+      : { id: request.id, documentId: request.documentId, heads, json })
   } catch (error) {
-    port.postMessage({ id: request.id, documentId: request.documentId,
-      error: error instanceof Error ? error.message : String(error) })
+    // `refused`, `serialize` or `transient`, and whether the module
+    // trapped — `durableDecodeFailure.mjs`, `decodeFailureResponse`.
+    port.postMessage(decodeFailureResponse(request, error))
   }
 })

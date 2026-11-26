@@ -43,12 +43,17 @@ export interface ShardPlan {
  * `shardCount` is the number of shard DOCS that currently exist (empty shards are
  * kept and reused, like the registry). Returns a fresh route map + the possibly-
  * grown shard count; never mutates its inputs. O(ids) — cheap (no Automerge proxy).
+ *
+ * `closed` (G4-16f): shard indices that keep the ids already routed to
+ * them but take no NEW id — a shard shown while the server has not said
+ * whether it already holds it (bridge.ts, `provisionalModelShardUrls`).
  */
 export function planShardAssignment(
   ids: readonly string[],
   prevRoute: ReadonlyMap<string, number>,
   shardCount: number,
-  shardSize: number
+  shardSize: number,
+  closed?: ReadonlySet<number>
 ): ShardPlan {
   if (!Number.isInteger(shardSize) || shardSize < 1) {
     throw new Error(`shardSize must be a positive integer, got ${shardSize}`)
@@ -69,6 +74,8 @@ export function planShardAssignment(
       fill[idx]++
     }
   }
+
+  for (const idx of closed ?? []) if (idx >= 0 && idx < shardCount) fill[idx] = Math.max(fill[idx], shardSize)
 
   // Pass 2 — place new ids into the first shard with room, else a new shard.
   for (const id of ids) {

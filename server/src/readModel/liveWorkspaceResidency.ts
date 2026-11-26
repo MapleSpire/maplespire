@@ -13,6 +13,7 @@
 // GNU Affero General Public License for more details.
 
 import type { WorkspaceKey } from './projector.js'
+import { ProjectorCompactionInProgressError } from './projectorService.js'
 
 /**
  * RESIDENCY FOLLOWS THE LIVE WORKSPACE.
@@ -116,6 +117,8 @@ export interface LiveWorkspaceResidencySnapshot {
 }
 
 const DEFAULT_THROTTLE_MS = 5_000
+/** After a compaction-window refusal (T-VANISH): when the next frame may ask. */
+export const COMPACTION_WINDOW_RETRY_MS = 250
 const DEFAULT_SUPPRESS_MS = 10 * 60_000
 /** Bound on the per-workspace maps: a wholesale clear, like the gate's own
  * denial throttles — losing one costs one extra `ensure()`, never a verdict. */
@@ -209,7 +212,7 @@ export class LiveWorkspaceResidency {
     if (this.lastEnsureAt.size >= MAP_LIMIT) this.lastEnsureAt.clear()
     this.lastEnsureAt.set(key, now)
     this.counters.ensuresRequested += 1
-    const task = this.ensure(fleet, workspace, key)
+    const task = this.ensure(fleet, workspace, key, now)
       .finally(() => {
         if (this.inFlight.get(key) === task) this.inFlight.delete(key)
       })
@@ -228,11 +231,21 @@ export class LiveWorkspaceResidency {
     return { ...this.counters }
   }
 
-  private async ensure(fleet: ResidencyFleet, workspace: WorkspaceKey, key: string): Promise<void> {
+  private async ensure(fleet: ResidencyFleet, workspace: WorkspaceKey, key: string, stampedAt: number): Promise<void> {
     try {
       if (await fleet.ensure(workspace)) this.counters.ensured += 1
       else this.counters.unresolved += 1
     } catch (error) {
+      // T-VANISH: a compaction window refuses every start but its own
+      // re-attach for one pass (103-151 ms measured on the e2e stack). The
+      // full throttle would make the first frame AFTER the window wait up to
+      // `throttleMs` for nothing; asking on every frame would be an ensure
+      // per frame for the whole window. Re-stamped so the next ask comes
+      // {@link COMPACTION_WINDOW_RETRY_MS} after this one. Still counted
+      // `refused` below (an expected refusal).
+      if (error instanceof ProjectorCompactionInProgressError && this.lastEnsureAt.get(key) === stampedAt) {
+        this.lastEnsureAt.set(key, stampedAt - this.throttleMs + COMPACTION_WINDOW_RETRY_MS)
+      }
       if ((error as { retryable?: unknown } | null)?.retryable === false) {
         if (this.suppressedUntil.size >= MAP_LIMIT) this.suppressedUntil.clear()
         this.suppressedUntil.set(key, this.now() + this.suppressMs)
