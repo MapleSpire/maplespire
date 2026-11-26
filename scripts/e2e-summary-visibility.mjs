@@ -756,6 +756,27 @@ async function main() {
      * check let an empty `docUrl` and a NULL `org_id` through).
      */
     const automerge = serverRequire('@automerge/automerge')
+    /** True once a rotation of `target`'s object overlay is published. */
+    const waitForObjectRotation = async (target, timeoutMs) => {
+      const check = new pg.Client({ connectionString: DATABASE_URL })
+      await check.connect()
+      try {
+        const deadline = Date.now() + timeoutMs
+        while (Date.now() < deadline) {
+          const { rows } = await check.query(
+            `SELECT 1 FROM read_model_overlay_rotations
+              WHERE landscape_id = $1 AND version_id = $2 AND collection = 'object' AND status = 'published'
+              LIMIT 1`,
+            [target.landscapeId, target.versionId],
+          )
+          if (rows.length > 0) return true
+          await new Promise((resolve) => setTimeout(resolve, 500))
+        }
+        return false
+      } finally {
+        await check.end()
+      }
+    }
     const postCheck = async (label, target, createdFile) => {
       let created = null
       try { created = JSON.parse(readFileSync(createdFile, 'utf8')) } catch { /* judged below */ }
@@ -803,7 +824,24 @@ async function main() {
         const serverOk = await postCheck(label, target, env.E2E_SUMMARY_CREATED_FILE)
         return browserOk && serverOk
       }
-      if (fixture) verdicts.push(await both('fixture', fixture))
+      if (fixture) {
+        // The object post-check requires the rename to land in a head that a
+        // rotation published BEFORE it (the head the static plane enters
+        // with). The server publishes that rotation on its own once the
+        // seeded, over-full object overlay has been quiet for
+        // AM_OVERLAY_ROTATION_QUIET_MS after boot; nothing ordered it before
+        // the spec, so the run only passed while the client build outlasted
+        // that window (18 s builds green, 1 s builds red every time). Wait
+        // for the fact instead of the build.
+        const rotated = await waitForObjectRotation(fixture, 90_000)
+        if (!rotated) {
+          console.log('[summary-e2e] fixture: RED — no object overlay rotation was published within 90 s of boot; '
+            + 'the object post-check could not exercise the rotated write head')
+          verdicts.push(false)
+        } else {
+          verdicts.push(await both('fixture', fixture))
+        }
+      }
       // The spec opens the ordinary workspace in a real browser first, then
       // promotes it through the route with Paul's session (it fails loudly).
       if (ordinary) verdicts.push(await both('promoted', ordinary, { E2E_SUMMARY_PROMOTE: '1' }))
